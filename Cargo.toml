@@ -1,0 +1,4 @@
+[workspace]
+members = ["workspace/wavesyncdb", "examples"]
+# exclude = ["examples"]
+resolver = "3"
