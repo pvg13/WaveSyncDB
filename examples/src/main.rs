@@ -4,89 +4,74 @@ mod model;
 
 use std::{error::Error, time::Duration};
 
-use diesel::prelude::*;
+use diesel::{prelude::*, r2d2::{ConnectionManager, Pool}};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use dotenvy::dotenv;
 use wavesyncdb::prelude::WaveSyncInstrument;
 use model::Task;
-use libp2p::{futures::StreamExt, noise, ping, swarm::SwarmEvent, tcp, yamux, Multiaddr};
+use wavesyncdb::instrument::dialects::DialectType;
 
+const MIGRATIONS: EmbeddedMigrations = diesel_migrations::embed_migrations!();
 
-// 
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
 
     dotenv().ok();
     env_logger::init();
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let mut connection = SqliteConnection::establish(&database_url)
-        .unwrap_or_else(|_| panic!("Error connecting to {}", database_url));
 
-    connection.set_instrumentation(WaveSyncInstrument::new());
+    let database_url = std::env::var("DATABASE_URL_TX").expect("DATABASE_URL must be set");
 
-    // Your insertion logic here
-    log::debug!("Connected to the database successfully.");
+    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+    let pool = Pool::builder()
+        .max_size(16)                               // tamaño del pool
+        .min_idle(Some(2))
+        .connection_timeout(Duration::from_secs(3)) // timeout al pedir conexión
+        .build(manager)?;
 
-    // Example insertion (assuming a table named `tasks` exists)
+    
+    let mut conn = pool.get()?;
+    // Run migrations if needed
+    conn.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
 
-    use crate::schema::tasks::dsl::*;
-    // use wavesyncdb::schema::tasks;
-    let task = Task {
-        id: None,
-        title: "Sample Task".to_string(),
-        description: Some("This is a sample task".to_string()),
-        completed: false,
-        created_at: None,
-        updated_at: None,
-    };
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-    diesel::insert_into(tasks)
-        .values(&task)
-        .execute(&mut connection)
-        .expect("Error inserting new task");
+    conn.set_instrumentation(WaveSyncInstrument::new(tx, DialectType::SQLite));
 
-    // Update
-    diesel::update(tasks.filter(id.eq(1)))
-        .set(completed.eq(true))
-        .execute(&mut connection)
-        .expect("Error updating task");
+    let mut wavesync_engine = wavesyncdb::sync::WaveSyncEngine::new(rx, pool.get()?);
 
-    // Delete
-    diesel::delete(tasks.filter(id.eq(1)))
-        .execute(&mut connection)
-        .expect("Error deleting task");
+    tokio::spawn(async move {
+        wavesync_engine.run().await;
+    });
 
-    log::debug!("Operations completed successfully.");
-
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?.with_behaviour(|_| ping::Behaviour::default())?
-        .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
-        })
-        .build();
-
-    // Tell the swarm to listen on all interfaces and a random, OS-assigned
-    // port.
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
-    // Dial the peer identified by the multi-address given as the second
-    // command-line argument, if any.
-    if let Some(addr) = std::env::args().nth(1) {
-        let remote: Multiaddr = addr.parse()?;
-        swarm.dial(remote)?;
-        println!("Dialed {addr}")
-    }
-
+    // Insert a new task
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
-            SwarmEvent::Behaviour(event) => println!("{event:?}"),
-            _ => {}
+        // Get user input
+        let mut input = String::new();
+        let user_input = std::io::stdin().read_line(&mut input);
+        match user_input {
+            Ok(_) => {
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    break;
+                }
+                let new_task = Task {
+                    id: None,
+                    title: trimmed.to_string(),
+                    description: None,
+                    completed: false,
+                    created_at: Some(chrono::Utc::now().naive_utc()),
+                    updated_at: Some(chrono::Utc::now().naive_utc()),
+                };
+                diesel::insert_into(schema::tasks::table)
+                    .values(&new_task)
+                    .execute(&mut conn)
+                    .expect("Error inserting new task");
+
+            }
+            Err(error) => {
+                println!("error: {}", error);
+            }
         }
     }
 

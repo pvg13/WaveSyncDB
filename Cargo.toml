@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "workspace/wavesyncdb", 
+    "wavesyncdb", 
     "examples"
 ]
 # exclude = ["examples"]
