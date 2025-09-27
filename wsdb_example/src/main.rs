@@ -20,7 +20,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
     env_logger::init();
 
-    let database_url = std::env::var("DATABASE_URL_TX").expect("DATABASE_URL must be set");
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     let pool = Pool::builder()
