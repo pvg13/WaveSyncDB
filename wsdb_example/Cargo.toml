@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 chrono = "0.4.42"
-diesel = { version = "2.3.2", features = ["chrono", "i-implement-a-third-party-backend-and-opt-into-breaking-changes", "r2d2", "returning_clauses_for_sqlite_3_35", "sqlite", "uuid"] }
+diesel = { version = "2.3.2", features = ["chrono", "i-implement-a-third-party-backend-and-opt-into-breaking-changes", "sqlite", "uuid"] }
 libsqlite3-sys = { version = "0.28.0", features = ["bundled"] }
 log = "0.4.28"
 dotenvy = "0.15.6"
@@ -16,4 +16,5 @@ wavesyncdb = { path = "../wavesyncdb" }
 tokio = { version = "1.47.1", features = ["full"] }
 libp2p = { version = "0.56.0", features = ["noise", "ping", "tcp", "tokio", "yamux"] }
 diesel_migrations = { version = "2.3.0", features = ["sqlite"] }
+diesel-async = { version = "0.7.4", features = ["sqlite", "migrations", "pool", "deadpool"] }
 
