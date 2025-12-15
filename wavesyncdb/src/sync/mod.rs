@@ -72,23 +72,23 @@ impl<T: AsyncConnection> WaveSyncEngine<T> {
                     
                 },
                 event = self.swarm.select_next_some() => match event {
-                    SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+                    SwarmEvent::NewListenAddr { address, .. } => log::info!("Listening on {address:?}"),
                     // Prints peer id identify info is being sent to.
                     SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
-                        println!("Sent identify info to {peer_id:?}")
+                        log::info!("Sent identify info to {peer_id:?}")
                     }
                     // Prints out the info received via the identify event
                     SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
-                        println!("Received {info:?}")
+                        log::info!("Received {info:?}")
                     },
                     SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Ping(ping::Event { peer, connection, result })) => {
-                        println!("Ping event with {peer:?} over {connection:?}: {result:?}");
+                        log::info!("Ping event with {peer:?} over {connection:?}: {result:?}");
                     },
                     SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mdns(event)) => {
                         match event {
                             mdns::Event::Discovered(list) => {
                                 for (peer_id, multiaddr) in list {
-                                    println!("Discovered peer {peer_id} at {multiaddr}");
+                                    log::info!("Discovered peer {peer_id} at {multiaddr}");
                                     self.peers.insert(peer_id, multiaddr);
                                     // Subscribe to a topic to start receiving messages
                                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
