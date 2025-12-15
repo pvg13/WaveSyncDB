@@ -3,13 +3,14 @@ mod behaviour;
 use std::collections::HashMap;
 
 use diesel::Connection;
+use diesel_async::AsyncConnection;
 use libp2p::{futures::StreamExt, gossipsub::{self, Topic}, identify, identity, mdns, noise, ping, swarm::SwarmEvent, yamux, SwarmBuilder};
 use tokio::{select, sync::mpsc};
 use behaviour::WaveSyncBehaviour;
 
 use crate::{sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
 
-pub struct WaveSyncEngine<T: Connection> {
+pub struct WaveSyncEngine<T: AsyncConnection> {
     peer_id: identity::PeerId,
     query_rx: mpsc::Receiver<DbQuery>,
     swarm: libp2p::Swarm<WaveSyncBehaviour>,
@@ -17,7 +18,7 @@ pub struct WaveSyncEngine<T: Connection> {
     connection: T,
 }
 
-impl<T: Connection> WaveSyncEngine<T> {
+impl<T: AsyncConnection> WaveSyncEngine<T> {
     pub fn new(query_rx: mpsc::Receiver<DbQuery>, connection: T) -> Self {
 
         let swarm = SwarmBuilder::with_new_identity()
@@ -43,8 +44,6 @@ impl<T: Connection> WaveSyncEngine<T> {
         // Tell the swarm to listen on all interfaces and a random, OS-assigned
         // port.
         self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
-
-        let peer_id_local = self.peer_id;
         
 
         let topic = gossipsub::IdentTopic::new(format!("wavesync-queries"));
@@ -115,7 +114,7 @@ impl<T: Connection> WaveSyncEngine<T> {
                                 log::debug!("Got message: {} with id: {} from peer: {:?}", String::from_utf8_lossy(&message.data), message_id, propagation_source);
                                 // Here you would handle the received message, e.g., apply the query to the local database
                                 let sql = String::from_utf8_lossy(&message.data);
-                                match self.connection.batch_execute(&sql) {
+                                match self.connection.batch_execute(&sql).await {
                                     Ok(_) => log::info!("Successfully executed query from peer {}: {}", propagation_source, sql),
                                     Err(e) => log::error!("Error executing query from peer {}: {}: {}", propagation_source, sql, e),
                                 }
