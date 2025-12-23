@@ -53,7 +53,7 @@ pub fn main() {
     conn.set_instrumentation(WaveSyncInstrument::new(tx, topic, DialectType::SQLite));
 
     // Start the Wavesync engine to run in the background
-    let mut wavesync_engine = wavesyncdb::sync::WaveSyncEngine::new(rx, pool.get()?, "wsexample");
+    let mut wavesync_engine = wavesyncdb::sync::WaveSyncEngine::new(rx, pool.get()?, topic);
 
     tokio::spawn(async move {
         wavesync_engine.run().await;
