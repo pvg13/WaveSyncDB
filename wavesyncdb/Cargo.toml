@@ -2,6 +2,10 @@
 name = "wavesyncdb"
 version = "0.2.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
+description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
+repository = "https://github.com/pvg13/WaveSyncDB"
+readme = "README.md"
 
 [dependencies]
 chrono = "0.4.42"
