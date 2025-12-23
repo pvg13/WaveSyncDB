@@ -35,8 +35,8 @@ pub fn classify_sql_query(debug_query: &str) -> SqlQueryKind {
         "delete" => SqlQueryKind::Delete,
         "select" => SqlQueryKind::Select,
         "create" => SqlQueryKind::Create,
-        "alter"  => SqlQueryKind::Alter,
-        "drop"   => SqlQueryKind::Drop,
+        "alter" => SqlQueryKind::Alter,
+        "drop" => SqlQueryKind::Drop,
         _ => SqlQueryKind::Other,
     }
 }

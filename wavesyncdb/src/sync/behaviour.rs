@@ -1,8 +1,5 @@
-use libp2p::{
-    gossipsub, identify, mdns, ping
-};
+use libp2p::{gossipsub, identify, mdns, ping};
 use libp2p_swarm_derive::NetworkBehaviour;
-
 
 #[derive(NetworkBehaviour)]
 pub struct WaveSyncBehaviour {
@@ -14,11 +11,10 @@ pub struct WaveSyncBehaviour {
 
 impl WaveSyncBehaviour {
     pub fn new(key: &libp2p::identity::Keypair) -> Self {
-
         let identify_behaviour = identify::Behaviour::new(identify::Config::new(
-                    "/wavesync/1.0.0".into(),
-                    key.public()
-                ));
+            "/wavesync/1.0.0".into(),
+            key.public(),
+        ));
 
         let ping_behaviour = ping::Behaviour::default();
 
@@ -35,9 +31,11 @@ impl WaveSyncBehaviour {
             ping: ping_behaviour,
             identify: identify_behaviour,
             mdns: mdns_behaviour,
-            gossipsub: gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), gossipsub_config).unwrap(),
+            gossipsub: gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .unwrap(),
         }
     }
 }
-
-
