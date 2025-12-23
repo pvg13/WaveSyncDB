@@ -2,6 +2,7 @@ pub mod dialects;
 mod types;
 mod util;
 
+use diesel::IntoSql;
 use diesel::connection::Instrumentation;
 use diesel::connection::InstrumentationEvent;
 
@@ -13,13 +14,15 @@ use crate::instrument::util::rewrite_debugquery_to_sql;
 pub struct WaveSyncInstrument {
     // You can add fields here if needed for state tracking
     dialect: DialectType,
+    topic: String,
     tx: tokio::sync::mpsc::Sender<crate::types::DbQuery>
 }
 
 impl WaveSyncInstrument {
-    pub fn new(tx: tokio::sync::mpsc::Sender<crate::types::DbQuery>, dialect: DialectType) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::Sender<crate::types::DbQuery>, topic: impl Into<String>, dialect: DialectType) -> Self {
         WaveSyncInstrument {
             dialect,
+            topic: topic.into(),
             tx,
         }
     }
@@ -44,7 +47,7 @@ impl Instrumentation for WaveSyncInstrument {
 
                 let query_string = rewrite_debugquery_to_sql(&query.to_string(), &self.dialect).unwrap();
                 
-                let db_query = crate::types::DbQuery::new(query_string.to_string());
+                let db_query = crate::types::DbQuery::new(query_string.to_string(), vec![], self.topic.clone());
 
                 match query_kind {
                     SqlQueryKind::Select => {
