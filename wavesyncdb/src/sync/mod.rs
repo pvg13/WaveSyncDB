@@ -1,12 +1,18 @@
 mod behaviour;
 
-use std::{collections::HashMap, string};
+use std::collections::HashMap;
 
-use diesel::Connection;
-use diesel_async::AsyncConnection;
-use libp2p::{SwarmBuilder, futures::StreamExt, gossipsub::{self, IdentTopic, Topic}, identify, identity, mdns, noise, ping, swarm::{self, SwarmEvent}, yamux};
-use tokio::{select, sync::mpsc};
 use behaviour::WaveSyncBehaviour;
+use diesel::Connection;
+use libp2p::{
+    SwarmBuilder,
+    futures::StreamExt,
+    gossipsub::{self, IdentTopic, Topic},
+    identify, identity, mdns, noise, ping,
+    swarm::SwarmEvent,
+    yamux,
+};
+use tokio::{select, sync::mpsc};
 
 use crate::{sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
 
@@ -15,9 +21,8 @@ use crate::{sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
 // #[cfg(not(feature="async"))]
 // type WSConnection = Connection;
 
-
 pub struct WaveSyncEngine<T: Connection> {
-    peer_id: identity::PeerId,
+    _peer_id: identity::PeerId,
     query_rx: mpsc::Receiver<DbQuery>,
     swarm: libp2p::Swarm<WaveSyncBehaviour>,
     peers: HashMap<libp2p::PeerId, libp2p::Multiaddr>,
@@ -27,42 +32,51 @@ pub struct WaveSyncEngine<T: Connection> {
 
 impl<T: Connection> WaveSyncEngine<T> {
     pub fn new(query_rx: mpsc::Receiver<DbQuery>, connection: T, topic: impl Into<String>) -> Self {
-
         let builder = SwarmBuilder::with_new_identity()
             .with_tokio()
-            .with_tcp(Default::default(),
+            .with_tcp(
+                Default::default(),
                 noise::Config::new,
-                yamux::Config::default).unwrap()
+                yamux::Config::default,
+            )
+            .unwrap()
             .with_quic()
-            .with_behaviour(|key| {
-                WaveSyncBehaviour::new(key)
-            }).unwrap();
-        
+            .with_behaviour(WaveSyncBehaviour::new)
+            .unwrap();
+
         // #[cfg(feature="wasm")]
         // builder.with_wasm_bindgen();
 
         let swarm = builder.build();
 
-            // .build();
+        // .build();
 
-        let peer_id = swarm.local_peer_id().clone();
+        let peer_id = *swarm.local_peer_id();
 
         let topic = gossipsub::IdentTopic::new(topic.into());
 
-        WaveSyncEngine { query_rx, swarm, peers: HashMap::new(), peer_id, connection, topic }
-    }
-
-    pub fn subscribe(&mut self, topic: impl Into<String>) {
-        
+        WaveSyncEngine {
+            query_rx,
+            swarm,
+            peers: HashMap::new(),
+            _peer_id: peer_id,
+            connection,
+            topic,
+        }
     }
 
     pub async fn run(&mut self) {
-
         // Tell the swarm to listen on all interfaces and a random, OS-assigned
         // port.
-        self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
+        self.swarm
+            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .unwrap();
 
-        self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic).unwrap();
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&self.topic)
+            .unwrap();
 
         loop {
             select! {
@@ -74,7 +88,7 @@ impl<T: Connection> WaveSyncEngine<T> {
 
 
                     // let topic_clone = topic.clone();
-                    for (peer_id, _addr) in &self.peers {
+                    for peer_id in self.peers.keys() {
                         let message = gossipsub::Message {
                             data: query.sql().as_bytes().to_vec(),
                             sequence_number: None,
@@ -87,7 +101,7 @@ impl<T: Connection> WaveSyncEngine<T> {
                             log::info!("Published query to peer {}", peer_id);
                         }
                     }
-                    
+
                 },
                 event = self.swarm.select_next_some() => match event {
                     SwarmEvent::NewListenAddr { address, .. } => log::info!("Listening on {address:?}"),
@@ -117,7 +131,7 @@ impl<T: Connection> WaveSyncEngine<T> {
                                     log::debug!("Expired peer {peer_id} at {multiaddr}");
                                     self.peers.remove(&peer_id);
                                     self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                    
+
 
                                     // self.swarm.behaviour_mut().identify.remove_address(&peer_id, &multiaddr);
                                 }
@@ -137,13 +151,14 @@ impl<T: Connection> WaveSyncEngine<T> {
                                     Err(e) => log::error!("Error executing query from peer {}: {}: {}", propagation_source, sql, e),
                                 }
                             },
-                            _ => {}
+                            _ => {
+                                log::debug!("Other gossipsub event: {:?}", event);
+                            }
                         }
                     },
                     _ => {}
                 }
             }
-            
         }
     }
 }

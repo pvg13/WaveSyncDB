@@ -1,14 +1,17 @@
-
 #[derive(Debug, Clone)]
 pub struct DbQuery {
     sql: String,
     parameters: Vec<String>,
-    topic: String
+    topic: String,
 }
 
 impl DbQuery {
     pub fn new(sql: String, parameters: Vec<String>, topic: String) -> Self {
-        DbQuery { sql, parameters, topic }
+        DbQuery {
+            sql,
+            parameters,
+            topic,
+        }
     }
 
     pub fn sql(&self) -> &str {

@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 
 use sqlparser::dialect::Dialect;
 
@@ -8,7 +7,6 @@ pub enum DialectType {
     SQLite,
     Unknown,
 }
-
 
 impl DialectType {
     pub(crate) fn from_url(url: &str) -> Self {
@@ -23,7 +21,7 @@ impl DialectType {
         }
     }
 
-    pub(crate) fn build(&self) -> Box<dyn Dialect> {
+    pub fn build(&self) -> Box<dyn Dialect> {
         match self {
             DialectType::PostgreSQL => Box::new(sqlparser::dialect::PostgreSqlDialect {}),
             DialectType::MySQL => Box::new(sqlparser::dialect::MySqlDialect {}),
