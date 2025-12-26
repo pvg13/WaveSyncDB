@@ -1,6 +1,5 @@
 use diesel::{Connection, SqliteConnection};
-use tokio::sync::mpsc;
-use wavesyncdb::{instrument::dialects::DialectType, sync::{WaveSyncBuilder, WaveSyncEngine}};
+use wavesyncdb::{instrument::dialects::DialectType, sync::WaveSyncBuilder};
 
 
 pub fn new_pool() -> diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<SqliteConnection>> {

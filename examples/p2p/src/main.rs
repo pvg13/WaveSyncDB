@@ -15,14 +15,14 @@ const MIGRATIONS: EmbeddedMigrations = diesel_migrations::embed_migrations!();
 
 type WSPool = Pool<ConnectionManager<SqliteConnection>>;
 
-async fn establish_pool(database_url: &str) -> Result<WSPool, Box<dyn Error>> {
+fn establish_pool(database_url: &str) -> Result<WSPool, Box<dyn Error>> {
     let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     let pool = Pool::builder().max_size(16).build(manager)?;
 
     Ok(pool)
 }
 
-async fn run_migrations(pool: &mut impl MigrationHarness<Sqlite>) -> Result<(), Box<dyn Error>> {
+fn run_migrations(pool: &mut impl MigrationHarness<Sqlite>) -> Result<(), Box<dyn Error>> {
     // Run migrations if needed
     pool.run_pending_migrations(MIGRATIONS)
         .expect("Error running migrations");
@@ -30,7 +30,7 @@ async fn run_migrations(pool: &mut impl MigrationHarness<Sqlite>) -> Result<(), 
     Ok(())
 }
 
-async fn start_wavesync(pool: &WSPool, conn: &mut impl Connection) -> Result<(), Box<dyn Error>> {
+fn start_wavesync(pool: &WSPool, conn: &mut impl Connection) -> Result<(), Box<dyn Error>> {
     let builder = wavesyncdb::sync::WaveSyncBuilder::new(pool.get()?, "testtopic")
         .connect(conn, DialectType::SQLite);
 
@@ -53,10 +53,8 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     // Establish the pools
 
     let alice_pool = establish_pool(&format!("{}.1.db", database_url))
-        .await
         .unwrap();
     let bob_pool = establish_pool(&format!("{}.2.db", database_url))
-        .await
         .unwrap();
 
     let mut alice = alice_pool
@@ -65,13 +63,13 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     let mut bob = bob_pool.get().expect("Failed to get connection from pool");
 
     // Run the migrations
-    let _ = run_migrations(&mut alice);
-    let _ = run_migrations(&mut bob);
+    run_migrations(&mut alice)?;
+    run_migrations(&mut bob)?;
 
     // Start wavesync on both
 
-    let _ = start_wavesync(&alice_pool, &mut alice).await;
-    let _ = start_wavesync(&bob_pool, &mut bob).await;
+    start_wavesync(&alice_pool, &mut alice)?;
+    start_wavesync(&bob_pool, &mut bob)?;
 
     // Get the actual connections for the application
 
