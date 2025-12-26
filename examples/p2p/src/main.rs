@@ -1,19 +1,15 @@
 mod model;
 mod schema;
 
-use std::{error::Error, thread::sleep, time::Duration};
+use std::{error::Error, time::Duration};
 
-use chrono::Timelike;
-use diesel::connection::Instrumentation;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::{prelude::*, sqlite::Sqlite};
 
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use dotenvy::dotenv;
 use model::Task;
-use tokio::time::sleep_until;
 use wavesyncdb::instrument::dialects::DialectType;
-use wavesyncdb::prelude::WaveSyncInstrument;
 
 const MIGRATIONS: EmbeddedMigrations = diesel_migrations::embed_migrations!();
 
