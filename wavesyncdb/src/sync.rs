@@ -14,7 +14,7 @@ use libp2p::{
 };
 use tokio::{select, sync::mpsc};
 
-use crate::{sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
+use crate::{instrument::dialects::{DialectType}, sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
 
 // #[cfg(feature="async")]
 // type WSConnection = AsyncConnection;
@@ -23,16 +23,54 @@ use crate::{sync::behaviour::WaveSyncBehaviourEvent, types::DbQuery};
 
 pub struct WaveSyncEngine<T: Connection> {
     _peer_id: identity::PeerId,
-    query_rx: mpsc::Receiver<DbQuery>,
     swarm: libp2p::Swarm<WaveSyncBehaviour>,
     peers: HashMap<libp2p::PeerId, libp2p::Multiaddr>,
     topic: IdentTopic,
     connection: T,
+    rx: mpsc::Receiver<DbQuery>,
 }
 
-impl<T: Connection> WaveSyncEngine<T> {
-    pub fn new(query_rx: mpsc::Receiver<DbQuery>, connection: T, topic: impl Into<String>) -> Self {
-        let builder = SwarmBuilder::with_new_identity()
+pub struct WaveSyncBuilder<T: Connection> {
+    identity: Option<identity::Keypair>,
+    connection: T,
+    topic: String,
+    tx: mpsc::Sender<DbQuery>,
+    rx: mpsc::Receiver<DbQuery>,
+}
+
+impl<T: Connection> WaveSyncBuilder<T> {
+    pub fn new(connection: T, topic: impl Into<String>) -> Self {
+
+        let (tx, rx) = mpsc::channel(100);
+
+        Self {
+            identity: None,
+            connection,
+            topic: topic.into(),
+            tx,
+            rx
+        }
+    }
+
+    pub fn with_identity(mut self, keypair: identity::Keypair) -> Self {
+        self.identity = Some(keypair);
+        self
+    }
+
+    pub fn connect(self, conn: &mut impl Connection, dialect: DialectType) -> Self {
+
+        conn.set_instrumentation(crate::instrument::WaveSyncInstrument::new(
+            self.tx.clone(),
+            &self.topic,
+            dialect,
+        ));
+        self
+    }
+
+    pub fn build(self) -> WaveSyncEngine<T> {
+        let keypair = self.identity.unwrap_or_else(identity::Keypair::generate_ed25519);
+
+        let builder = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 Default::default(),
@@ -44,26 +82,26 @@ impl<T: Connection> WaveSyncEngine<T> {
             .with_behaviour(WaveSyncBehaviour::new)
             .unwrap();
 
-        // #[cfg(feature="wasm")]
-        // builder.with_wasm_bindgen();
-
         let swarm = builder.build();
-
-        // .build();
 
         let peer_id = *swarm.local_peer_id();
 
-        let topic = gossipsub::IdentTopic::new(topic.into());
+        let topic = gossipsub::IdentTopic::new(self.topic);
+
+        
 
         WaveSyncEngine {
-            query_rx,
             swarm,
             peers: HashMap::new(),
             _peer_id: peer_id,
-            connection,
+            connection: self.connection,
             topic,
+            rx: self.rx, 
         }
     }
+}
+
+impl<T: Connection> WaveSyncEngine<T> {
 
     pub async fn run(&mut self) {
         // Tell the swarm to listen on all interfaces and a random, OS-assigned
@@ -80,7 +118,7 @@ impl<T: Connection> WaveSyncEngine<T> {
 
         loop {
             select! {
-                Some(query) = self.query_rx.recv() => {
+                Some(query) = self.rx.recv() => {
                     log::debug!("Received query to sync: {}", query.sql());
                     // Here you would handle the query, e.g., broadcast it to peers
                     // Build the topic

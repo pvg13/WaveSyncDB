@@ -10,4 +10,3 @@ pub struct Task {
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
 }
-

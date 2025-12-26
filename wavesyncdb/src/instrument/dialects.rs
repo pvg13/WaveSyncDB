@@ -1,4 +1,5 @@
 
+use diesel::{Connection, backend::Backend, r2d2::{ConnectionManager, PooledConnection, R2D2Connection}, sqlite::Sqlite};
 use sqlparser::dialect::Dialect;
 
 pub enum DialectType {
@@ -30,3 +31,39 @@ impl DialectType {
         }
     }
 }
+
+// // 2. Define the bridge trait
+// pub trait HasDialectType {
+//     fn dialect_type() -> DialectType;
+// }
+
+// // 3. Conditional Implementations based on Features
+// #[cfg(feature = "postgres")]
+// impl HasDialectType for diesel::pg::Pg {
+//     fn dialect_type() -> DialectType { DialectType::PostgreSQL }
+// }
+
+// #[cfg(feature = "mysql")]
+// impl HasDialectType for diesel::mysql::Mysql {
+//     fn dialect_type() -> DialectType { DialectType::MySQL }
+// }
+
+// #[cfg(feature = "sqlite")]
+// impl HasDialectType for diesel::sqlite::Sqlite {
+//     fn dialect_type() -> DialectType { DialectType::SQLite }
+// }
+
+// impl<T: HasDialectType + R2D2Connection + 'static> HasDialectType for PooledConnection<ConnectionManager<T>> {
+//     fn dialect_type() -> DialectType { T::dialect_type() }
+// }
+
+// // 4. The generic conversion
+// impl<T> From<&T> for DialectType 
+// where 
+//     T: Connection,
+//     T::Backend: HasDialectType 
+// {
+//     fn from(_conn: &T) -> Self {
+//         T::Backend::dialect_type()
+//     }
+// }
