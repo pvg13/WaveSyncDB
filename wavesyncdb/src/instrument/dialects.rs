@@ -1,5 +1,4 @@
 
-use diesel::{Connection, backend::Backend, r2d2::{ConnectionManager, PooledConnection, R2D2Connection}, sqlite::Sqlite};
 use sqlparser::dialect::Dialect;
 
 pub enum DialectType {

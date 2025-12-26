@@ -1,6 +1,6 @@
 use diesel::{Connection, SqliteConnection};
 use tokio::sync::mpsc;
-use wavesyncdb::sync::{WaveSyncBuilder, WaveSyncEngine};
+use wavesyncdb::{instrument::dialects::DialectType, sync::{WaveSyncBuilder, WaveSyncEngine}};
 
 
 pub fn new_pool() -> diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<SqliteConnection>> {
@@ -17,7 +17,7 @@ pub fn new_node() -> impl Connection {
     let mut conn = pool.get().expect("Failed to get connection from pool");
     
     let mut wavesyncdb = WaveSyncBuilder::new(connection, "testtopic")
-        .connect(&mut conn)
+        .connect(&mut conn, DialectType::SQLite)
         .build();
 
 
