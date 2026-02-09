@@ -1,7 +1,4 @@
-use diesel::prelude::*;
 
-#[derive(Queryable, Selectable, Insertable, Debug, Default)]
-#[diesel(table_name = crate::schema::tasks)]
 pub struct Task {
     pub id: Option<i32>,
     pub title: String,
