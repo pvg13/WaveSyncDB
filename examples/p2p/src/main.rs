@@ -1,124 +1,81 @@
 mod model;
-mod schema;
 
-use std::{error::Error, time::Duration};
-
-use diesel::r2d2::{ConnectionManager, Pool};
-use diesel::{prelude::*, sqlite::Sqlite};
-
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
-use dotenvy::dotenv;
 use model::Task;
-use wavesyncdb::instrument::dialects::DialectType;
+use wavesyncdb::{CrudModel, WaveSyncBuilder, SyncedModel, Migration};
 
-const MIGRATIONS: EmbeddedMigrations = diesel_migrations::embed_migrations!();
 
-type WSPool = Pool<ConnectionManager<SqliteConnection>>;
-
-fn establish_pool(database_url: &str) -> Result<WSPool, Box<dyn Error>> {
-    let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-    let pool = Pool::builder().max_size(16).build(manager)?;
-
-    Ok(pool)
-}
-
-fn run_migrations(pool: &mut impl MigrationHarness<Sqlite>) -> Result<(), Box<dyn Error>> {
-    // Run migrations if needed
-    pool.run_pending_migrations(MIGRATIONS)
-        .expect("Error running migrations");
-
-    Ok(())
-}
-
-fn start_wavesync(pool: &WSPool, conn: &mut impl Connection) -> Result<(), Box<dyn Error>> {
-    let builder = wavesyncdb::sync::WaveSyncBuilder::new(pool.get()?, "testtopic")
-        .connect(conn, DialectType::SQLite);
-
-    let mut wavesyncdb = builder.build();
-
-    tokio::spawn(async move {
-        wavesyncdb.run().await;
-    });
-
-    Ok(())
+pub fn menu() {
+    println!("1. Create Task");
+    println!("2. Update Task");
+    println!("3. Delete Task");
+    println!("4. List Tasks");
+    println!("5. Exit");
 }
 
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn Error>> {
-    dotenv().ok();
+pub async fn main() {
+
     env_logger::init();
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    // Initialize the engine and start processing operations
+    WaveSyncBuilder::new("p2p_tasks").build().start();
 
-    // Establish the pools
+    let _ = wavesyncdb::DATABASE.get_or_init(|| async {
+        wavesyncdb::sqlx::SqlitePool::connect("sqlite::memory:").await.expect("Failed to create database pool")
+    }).await;
 
-    let alice_pool = establish_pool(&format!("{}.1.db", database_url))
-        .unwrap();
-    let bob_pool = establish_pool(&format!("{}.2.db", database_url))
-        .unwrap();
+    Task::up().await.expect("Error creating tasks table"); // Create the tasks table
 
-    let mut alice = alice_pool
-        .get()
-        .expect("Failed to get connection from pool");
-    let mut bob = bob_pool.get().expect("Failed to get connection from pool");
-
-    // Run the migrations
-    run_migrations(&mut alice)?;
-    run_migrations(&mut bob)?;
-
-    // Start wavesync on both
-
-    start_wavesync(&alice_pool, &mut alice)?;
-    start_wavesync(&bob_pool, &mut bob)?;
-
-    // Get the actual connections for the application
-
-    tokio::spawn(async move {
-        loop {
-            use schema::tasks::dsl::*;
-
-            let results = tasks
-                .limit(5)
-                .select(Task::as_select())
-                .load(&mut bob)
-                .expect("Error loading posts");
-
-            println!("Displaying {} posts", results.len());
-            for post in results {
-                println!("{}", post.title);
-            }
-            println!("------------------\n");
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
-    });
-
-    // Insert a new task
     loop {
-        // Get user input
-        let mut input = String::new();
-        let user_input = std::io::stdin().read_line(&mut input);
-        match user_input {
-            Ok(_) => {
-                let trimmed = input.trim();
-                if trimmed.is_empty() {
-                    break;
-                }
+        // Simple user interface to CRUD tasks
+        menu();
+        let mut choice = String::new();
+        std::io::stdin().read_line(&mut choice).expect("Failed to read input");
+        let choice = choice.trim().parse::<u32>().expect("Invalid input");
 
-                let new_task = Task {
-                    id: None,
-                    title: trimmed.to_string(),
-                    ..Task::default()
-                };
-                diesel::insert_into(schema::tasks::table)
-                    .values(&new_task)
-                    .execute(&mut alice)
-                    .expect("Error inserting new task");
-            }
-            Err(error) => {
-                println!("error: {}", error);
-            }
+        match choice {
+            1 => {
+                println!("Enter task title:");
+                let mut title = String::new();
+                std::io::stdin().read_line(&mut title).expect("Failed to read input");
+                let title = title.trim().to_string();
+
+                Task::create_synced_new(title, None, false).await.expect("Failed to create task");
+                // Task::create_sync(&task).await.expect("Failed to create task");
+            },
+            2 => {
+                println!("Enter task ID to update:");
+                let mut id = String::new();
+                std::io::stdin().read_line(&mut id).expect("Failed to read input");
+                let id = id.trim().parse::<i32>().expect("Invalid input");
+
+                let mut task: Task = Task::get(id).await.expect("Failed to retrieve task");
+                println!("Enter new task title:");
+                let mut title = String::new();
+                std::io::stdin().read_line(&mut title).expect("Failed to read input");
+                task.title = title.trim().to_string();
+                task.update_sync().await.expect("Failed to update task");
+            },
+            3 => {
+                println!("Enter task ID to delete:");
+                let mut id = String::new();
+                std::io::stdin().read_line(&mut id).expect("Failed to read input");
+                let id = id.trim().parse::<i32>().expect("Invalid input");
+                let task = Task::get(id).await.expect("Failed to retrieve task");
+                task.delete_sync().await.expect("Failed to delete task");
+            },
+            4 => {
+                let tasks = Task::all().await.expect("Failed to retrieve tasks");
+                for task in tasks {
+                    println!("ID: {}, Title: {}", task.id, task.title);
+                }
+            },
+            5 => {
+                break;
+            },
+            _ => {
+                println!("Invalid choice");
+            },
         }
     }
-
-    Ok(())
 }

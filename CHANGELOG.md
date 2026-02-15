@@ -9,3 +9,10 @@
 - Added the `Operation` enum as the main synced message to sync and execute the network operations safetly (I hope to protect better against sql injections)
 - Started to sketch the derive trait to easily implement the `Crud` and `Synced` traits
 
+
+### 10/02/2026
+- Fixed some derive erros
+- Tested p2p example: The data does not correctly sync :(
+
+### 12/02/2026
+- Added dioxus signals

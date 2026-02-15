@@ -1,0 +1,8 @@
+[package]
+name = "wavesyncdb_dioxus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dioxus-signals = "0.7.3"
+wavesyncdb = { workspace = true }
