@@ -3,6 +3,8 @@ use std::error::Error;
 
 use thiserror::Error;
 
+use crate::messages::OpValue;
+
 #[derive(Error, Debug)]
 pub enum CrudError {
     #[error("Database connection failed: {0}")]
@@ -20,14 +22,17 @@ pub enum CrudError {
     #[error("Unknown internal error")]
     Unknown,
 
+    #[error("Database not initialized")]
+    DbNotInitialized
 }
 
-pub trait Crud where Self: Sized {
+#[async_trait::async_trait]
+pub trait CrudModel where Self: Sized {
 
     type PrimaryKey;
 
     // Creates a new record in the database and returns the created instance
-    async fn create(value: &Self) -> Result<(), CrudError>;
+    async fn create(&mut self) -> Result<(), CrudError>;
 
     // Reads a record from the database by its primary key and updates the instance with the retrieved data
     async fn read(&mut self) -> Result<(), CrudError>;
@@ -38,18 +43,6 @@ pub trait Crud where Self: Sized {
     // Deletes the record from the database corresponding to the instance's primary key
     async fn delete(self) -> Result<(), CrudError>;
 
-    async fn up() -> Result<(), CrudError> {
-        // This method can be used to create the necessary database schema for the type implementing Crud
-        // For example, it could create a table in the database corresponding to the struct
-        Ok(())
-    }
-
-    async fn down() -> Result<(), CrudError> {
-        // This method can be used to drop the database schema for the type implementing Crud
-        // For example, it could drop a table from the database corresponding to the struct
-        Ok(())
-    }
-
     // Retrieves a record from the database by its primary key
     async fn get(id: Self::PrimaryKey) -> Result<Self, CrudError>;
 
@@ -59,12 +52,17 @@ pub trait Crud where Self: Sized {
     // Delete record by primary key
     async fn delete_by_id(id: Self::PrimaryKey) -> Result<(), CrudError>;
 
-    fn fields(&self) -> Vec<(String, String)>;
+    fn fields(&self) -> Vec<(String, OpValue)>;
     fn table_name() -> String;
     fn id(&self) -> Self::PrimaryKey;
 
 }
 
+#[async_trait::async_trait]
+pub trait Migration {
+    async fn up() -> Result<(), CrudError>;
+    async fn down() -> Result<(), CrudError>;
+}
 
 // Example implementation for a User struct
 /*
@@ -139,16 +137,16 @@ mod test {
 
     }
     
-
-    impl Crud for User {
+    #[async_trait::async_trait]
+    impl CrudModel for User {
         type PrimaryKey = i32;
 
-        async fn create(value: &Self) -> Result<(), CrudError> {
+        async fn create(&mut self) -> Result<(), CrudError> {
             // Insert the user into the database and return the created instance
             sqlx::query("INSERT INTO users (id, name, email) VALUES ($1, $2, $3)")
-                .bind(value.id)
-                .bind(&value.name)
-                .bind(&value.email)
+                .bind(self.id)
+                .bind(&self.name)
+                .bind(&self.email)
                 .execute(DATABASE.get().unwrap())
                 .await.map(|_| ())?;
 
@@ -187,26 +185,6 @@ mod test {
             // Delete the user record from the database corresponding to self.id
             sqlx::query("DELETE FROM users WHERE id = $1")
                 .bind(self.id)
-                .execute(DATABASE.get().unwrap())
-                .await
-                .map(|_| ())?;
-
-            Ok::<(), CrudError>(())
-        }
-
-        async fn up() -> Result<(), CrudError> {
-            // Create the users table in the database
-            sqlx::query("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
-                .execute(DATABASE.get().unwrap())
-                .await
-                .map(|_| ())?;
-
-            Ok::<(), CrudError>(())
-        }
-
-        async fn down() -> Result<(), CrudError> {
-            // Drop the users table from the database
-            sqlx::query("DROP TABLE IF EXISTS users")
                 .execute(DATABASE.get().unwrap())
                 .await
                 .map(|_| ())?;
@@ -255,11 +233,11 @@ mod test {
         }
 
 
-        fn fields(&self) -> Vec<(String, String)> {
+        fn fields(&self) -> Vec<(String, OpValue)> {
             vec![
-                ("id".to_string(), self.id.to_string()),
-                ("name".to_string(), self.name.clone()),
-                ("email".to_string(), self.email.clone()),
+                ("id".to_string(), OpValue::Integer(self.id as i64)),
+                ("name".to_string(), OpValue::Text(self.name.clone())),
+                ("email".to_string(), OpValue::Text(self.email.clone())),
             ]
         }
 
@@ -274,6 +252,29 @@ mod test {
 
     }
 
+    #[async_trait::async_trait]
+    impl Migration for User {
+        async fn up() -> Result<(), CrudError> {
+            // Create the users table in the database
+            sqlx::query("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+                .execute(DATABASE.get().unwrap())
+                .await
+                .map(|_| ())?;
+
+            Ok::<(), CrudError>(())
+        }
+
+        async fn down() -> Result<(), CrudError> {
+            // Drop the users table from the database
+            sqlx::query("DROP TABLE IF EXISTS users")
+                .execute(DATABASE.get().unwrap())
+                .await
+                .map(|_| ())?;
+
+            Ok::<(), CrudError>(())
+        }
+    }
+
 
     #[tokio::test]
     async fn test_crud() {
@@ -285,7 +286,7 @@ mod test {
         let mut user = User::new(1, "Alice".to_string(), "alice@example.com".to_string());
 
         // Call the create method to insert the user into the database
-        User::create(&user).await.expect("Failed to create user");
+        user.create().await.expect("Failed to create user");
 
         let result = User::get(1).await.expect("Failed to retrieve user"); // Retrieve the user from the database
 
@@ -330,11 +331,11 @@ mod test {
         assert!(result.is_err());
 
         // Add multiple users to test the all() method
-        let user3 = User::new(2, "Charlie".to_string(), "charlie@example.com".to_string());
-        let user4 = User::new(3, "David".to_string(), "david@example.com".to_string());
+        let mut user3 = User::new(2, "Charlie".to_string(), "charlie@example.com".to_string());
+        let mut user4 = User::new(3, "David".to_string(), "david@example.com".to_string());
 
-        User::create(&user3).await.expect("Failed to create user");
-        User::create(&user4).await.expect("Failed to create user");
+        user3.create().await.expect("Failed to create user");
+        user4.create().await.expect("Failed to create user");
 
         let all_users = User::all().await.expect("Failed to retrieve all users"); // Retrieve all users from the database
 

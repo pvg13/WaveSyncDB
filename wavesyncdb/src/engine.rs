@@ -75,6 +75,10 @@ impl WaveSyncBuilder {
         // Set the global sender for the engine
         ENGINE_TX.set(self.tx).expect("Failed to set engine sender");
 
+        // Start the database
+        
+        // Start the engine's main loop in a background task
+
         WaveSyncEngine {
             swarm,
             peers: HashMap::new(),
@@ -95,7 +99,13 @@ impl WaveSyncEngine {
         }
     }
 
-    pub async fn run(&mut self) {
+    pub fn start(mut self) {
+        tokio::spawn(async move {
+            self.run().await;
+        });
+    }
+
+    async fn run(&mut self) {
         // Tell the swarm to listen on all interfaces and a random, OS-assigned
         // port.
         self.swarm
@@ -165,6 +175,10 @@ impl WaveSyncEngine {
                                         return;
                                     }
                                 };
+
+                                log::info!("Deserialized operation from peer {}: {:?}", propagation_source, op);
+
+                                let _ = op.execute().await;
 
                                 
                             },

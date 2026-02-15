@@ -1,19 +1,28 @@
 // pub mod instrument;
 pub mod engine;
 // mod types;
-pub(crate) mod messages;
+pub mod messages;
 
 use std::sync::OnceLock;
 
-use sqlx::{AnyConnection, AnyPool, database::Database};
+use sqlx::{AnyConnection, AnyPool, Sqlite, SqlitePool, database::Database};
+use tokio::sync::OnceCell;
 
-mod crud;
-mod sync;
+pub mod crud;
+pub mod sync;
 
+pub use crud::{CrudModel, CrudError, Migration};
+pub use sync::{SyncedModel, SyncError};
+
+pub use engine::{WaveSyncBuilder, WaveSyncEngine};
 // Database connection
-static DATABASE: OnceLock<AnyPool> = OnceLock::new();
+pub static DATABASE: OnceCell<SqlitePool> = OnceCell::const_new();
 
-pub mod prelude {
-    // pub use crate::instrument::WaveSyncInstrument;
-    // pub use crate::types::DbQuery;
+#[cfg(feature = "derive")]
+pub mod derive {
+    pub use wavesyncdb_derive::*;
 }
+
+// Re-export sqlx for users of the library
+pub use sqlx;
+pub use async_trait;

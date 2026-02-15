@@ -1,4 +1,4 @@
-use crate::{crud::{Crud, CrudError}, engine::ENGINE_TX, messages::Operation};
+use crate::{crud::{CrudModel, CrudError}, engine::ENGINE_TX, messages::Operation};
 
 use thiserror::Error;
 
@@ -11,55 +11,77 @@ pub enum SyncError {
     EngineSendError(#[from] tokio::sync::mpsc::error::SendError<Operation>),
 }
 
-pub trait SyncedCrud where Self: Sized {
+#[async_trait::async_trait]
+pub trait SyncedModel: CrudModel {
     type PrimaryKey;
 
     // Creates a new record in the database and returns the created instance
-    async fn create_sync(value: &Self) -> Result<(), SyncError>;
+    async fn sync_create(&mut self) -> Result<(), SyncError>;
 
     // Updates an existing record in the database with the current state of the instance
-    async fn update_sync(&mut self) -> Result<(), SyncError>;
+    async fn sync_update(&mut self) -> Result<(), SyncError>;
 
     // Deletes the record from the database corresponding to the instance's primary key
-    async fn delete_sync(self) -> Result<(), SyncError>;
+    async fn sync_delete(&self) -> Result<(), SyncError>;
 
-}
 
-impl<T> SyncedCrud for T where T: Crud<PrimaryKey = i32> {
-    type PrimaryKey = T::PrimaryKey;
-
-    async fn create_sync(value: &Self) -> Result<(), SyncError> {
-        // Insert value into the database
-        Self::create(value).await?;
-
-        ENGINE_TX.get().unwrap().send(Operation::Create(
-            Self::table_name(),
-            value.fields(), 
-        )).await?;
-
-        Ok(())
+    // Convienience method to create, update and delete without needing to call the non-sync versions first
+    async fn create_sync(&mut self) -> Result<(), SyncError> {
+        self.create().await?;
+        self.sync_create().await
     }
 
     async fn update_sync(&mut self) -> Result<(), SyncError> {
-        // Update value in the database
-        Self::update(self).await?;
+        self.update().await?;
+        self.sync_update().await
+    }
 
-        ENGINE_TX.get().unwrap().send(Operation::Update(
-            Self::table_name(),
-            self.fields(), 
-        )).await?;
+    async fn delete_sync(&self) -> Result<(), SyncError> {
+        Self::delete_by_id(self.id()).await?;
+        self.sync_delete().await
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: CrudModel<PrimaryKey = i32> + Send + Sync> SyncedModel for T {
+    type PrimaryKey = T::PrimaryKey;
+
+    async fn sync_create(&mut self) -> Result<(), SyncError> {
+        // Insert value into the database
+        // self.create().await?;
+
+        ENGINE_TX.get().unwrap().send(Operation::Create {
+            table: Self::table_name(),
+            fields: self.fields(), 
+        }
+        ).await?;
 
         Ok(())
     }
 
-    async fn delete_sync(self) -> Result<(), SyncError> {
-        // Delete value from the database
-        Self::delete_by_id(self.id()).await?;
+    async fn sync_update(&mut self) -> Result<(), SyncError> {
+        // Update value in the database
+        // self.update().await?;
 
-        ENGINE_TX.get().unwrap().send(Operation::Delete(
-            Self::table_name(),
-            self.id(), 
-        )).await?;
+        ENGINE_TX.get().unwrap().send(Operation::Update {
+            table: Self::table_name(),
+            pk: self.id(),
+            fields: self.fields(), 
+        }
+        ).await?;
+
+        Ok(())
+    }
+
+    async fn sync_delete(&self) -> Result<(), SyncError> {
+        // Delete value from the database
+        // Self::delete_by_id(self.id()).await?;
+
+        ENGINE_TX.get().unwrap().send(Operation::Delete {
+            table: Self::table_name(),
+            pk: self.id(), 
+        }
+        ).await?;
 
         Ok(())
     }
