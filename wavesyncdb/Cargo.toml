@@ -1,6 +1,6 @@
 [package]
 name = "wavesyncdb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
@@ -8,19 +8,15 @@ repository = "https://github.com/pvg13/WaveSyncDB"
 readme = "README.md"
 
 [dependencies]
-async-trait = "0.1.89"
-chrono = "0.4.42"
-libp2p = { version = "0.56.0", features = ["gossipsub", "identify", "mdns", "ping", "quic", "request-response", "serde", "tokio", "noise", "yamux", "tcp"] }
+sea-orm = { workspace = true }
+uhlc = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+libp2p = { workspace = true }
 libp2p-swarm-derive = "0.35.1"
-log = "0.4.28"
-postcard = { version = "1.1.3", features = ["use-std"] }
-serde = { version = "1.0.228", features = ["derive"] }
-sqlparser = "0.58.0"
-sqlx = { workspace = true }
-thiserror = "2.0.18"
-tokio = { version = "1.47.1", features = ["full"] }
-wavesyncdb_derive = { workspace = true, optional = true }
-
-[features]
-default = []
-derive = ["wavesyncdb_derive"]
+log = { workspace = true }
+thiserror = { workspace = true }
+serde_json = "1.0"
+uuid = { workspace = true }
+inventory = { workspace = true }

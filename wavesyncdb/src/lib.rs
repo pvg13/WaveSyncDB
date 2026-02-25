@@ -1,28 +1,54 @@
-// pub mod instrument;
+//! # WaveSyncDB
+//!
+//! Transparent peer-to-peer sync for SeaORM applications.
+//!
+//! WaveSyncDB wraps a SeaORM [`DatabaseConnection`](sea_orm::DatabaseConnection) via
+//! [`WaveSyncDb`], intercepting write operations (INSERT, UPDATE, DELETE) and replicating
+//! them to peers over libp2p gossipsub. Conflicts are resolved automatically using
+//! Last-Write-Wins (LWW) with hybrid logical clocks.
+//!
+//! ## Quick start
+//!
+//! ```ignore
+//! use sea_orm::*;
+//! use wavesyncdb::WaveSyncDbBuilder;
+//!
+//! let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic")
+//!     .build()
+//!     .await?;
+//!
+//! // Auto-discover #[derive(SyncEntity)] entities
+//! db.get_schema_registry(module_path!().split("::").next().unwrap())
+//!     .sync()
+//!     .await?;
+//!
+//! // Standard SeaORM — sync is transparent
+//! let task = task::ActiveModel { /* ... */ };
+//! task.insert(&db).await?;
+//! ```
+//!
+//! ## Key types
+//!
+//! - [`WaveSyncDb`] — connection wrapper that intercepts writes
+//! - [`WaveSyncDbBuilder`] — configures and builds the connection + P2P engine
+//! - [`SchemaBuilder`] — fluent API for registering entities
+//! - [`SyncOperation`] — a serialized write operation sent over the network
+//! - [`ChangeNotification`] — lightweight event emitted after every write
+
+pub mod connection;
+pub mod conflict;
 pub mod engine;
-// mod types;
 pub mod messages;
+pub mod protocol;
+pub mod registry;
+pub mod sync_log;
 
-use std::sync::OnceLock;
+pub use connection::{SchemaBuilder, WaveSyncDb, WaveSyncDbBuilder};
+pub use messages::{ChangeNotification, NodeId, SyncOperation, WriteKind};
+pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
 
-use sqlx::{AnyConnection, AnyPool, Sqlite, SqlitePool, database::Database};
-use tokio::sync::OnceCell;
+// Re-export for use by the #[derive(SyncEntity)] macro
+pub use inventory::submit as register_sync_entity;
 
-pub mod crud;
-pub mod sync;
-
-pub use crud::{CrudModel, CrudError, Migration};
-pub use sync::{SyncedModel, SyncError};
-
-pub use engine::{WaveSyncBuilder, WaveSyncEngine};
-// Database connection
-pub static DATABASE: OnceCell<SqlitePool> = OnceCell::const_new();
-
-#[cfg(feature = "derive")]
-pub mod derive {
-    pub use wavesyncdb_derive::*;
-}
-
-// Re-export sqlx for users of the library
-pub use sqlx;
-pub use async_trait;
+// Re-export sea-orm for users of the library
+pub use sea_orm;
