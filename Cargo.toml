@@ -1,13 +1,22 @@
 [workspace]
 members = [
-    "wavesyncdb", 
+    "wavesyncdb",
     "wavesyncdb_derive",
-    "examples/*"
-, "wavesyncdb_dioxus"]
-# exclude = ["examples"]
+    "wavesyncdb_dioxus",
+    "examples/*",
+]
 resolver = "3"
 
 [workspace.dependencies]
-wavesyncdb = { path = "wavesyncdb", version = "0.2.0"}
-wavesyncdb_derive = { path = "wavesyncdb_derive", version = "0.1.0"}
-sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite", "chrono"] }
+wavesyncdb = { path = "wavesyncdb", version = "0.3.0" }
+wavesyncdb_derive = { path = "wavesyncdb_derive", version = "0.2.0" }
+sea-orm = { version = "2.0.0-rc", features = ["sqlx-sqlite", "runtime-tokio", "macros"] }
+uhlc = "0.9"
+postcard = { version = "1.1", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.47", features = ["full"] }
+libp2p = { version = "0.56.0", features = ["gossipsub", "identify", "mdns", "ping", "quic", "request-response", "serde", "tokio", "noise", "yamux", "tcp", "relay", "dcutr", "autonat"] }
+thiserror = "2.0"
+log = "0.4"
+uuid = { version = "1", features = ["v4"] }
+inventory = "0.3"

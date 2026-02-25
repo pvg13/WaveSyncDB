@@ -1,0 +1,14 @@
+[package]
+name = "example-dioxus-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wavesyncdb = { workspace = true }
+wavesyncdb_derive = { workspace = true }
+wavesyncdb_dioxus = { path = "../../wavesyncdb_dioxus" }
+sea-orm = { workspace = true }
+dioxus = { version = "0.7", features = ["desktop"] }
+log = { workspace = true }
+env_logger = "0.10.0"
+uuid = { workspace = true }

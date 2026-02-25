@@ -1,18 +1,34 @@
+//! Dioxus integration for WaveSyncDB.
+//!
+//! Provides a turnkey setup for Dioxus desktop apps with peer-to-peer sync:
+//!
+//! - [`launch()`] — creates a tokio runtime, builds [`WaveSyncDb`](wavesyncdb::WaveSyncDb),
+//!   runs your setup closure, and launches Dioxus desktop with the DB available via context.
+//! - [`use_db()`] — retrieves the `&'static WaveSyncDb` from Dioxus context.
+//! - [`use_synced_table`] — reactive signal of all rows in a table, auto-refreshes on writes.
+//! - [`use_synced_row`] — reactive signal for a single row by primary key.
+//!
+//! ## Example
+//!
+//! ```ignore
+//! fn main() {
+//!     wavesyncdb_dioxus::launch("sqlite:./app.db?mode=rwc", "my-topic", |db| async move {
+//!         db.get_schema_registry(module_path!().split("::").next().unwrap())
+//!             .sync().await?;
+//!         Ok(())
+//!     }, App);
+//! }
+//!
+//! fn App() -> Element {
+//!     let db = wavesyncdb_dioxus::use_db();
+//!     let tasks = wavesyncdb_dioxus::use_synced_table::<task::Entity>(db);
+//!     // ... render tasks
+//!     todo!()
+//! }
+//! ```
 
-use wavesyncdb::CrudModel;
+pub mod hooks;
+pub mod launch;
 
-// There are two types of signals, one that checks updates in an specific row
-// And another that checks updates in the whole table, this is useful for tables that have a lot of rows and we want to check updates in the whole table instead of checking each row individually mod database; mod signals; pub use database::*; pub use signals::*;
-
-pub trait TableStorage: Clone + 'static {
-    type TableName: Into<String> + 'static;
-
-    fn get_all<T: CrudModel>(table: &Self::TableName) -> Vec<T>;
-    fn set<T: CrudModel>(&self, item: T);
-    fn delete<T: CrudModel>(&self, id: i32);
-    fn update<T: CrudModel>(&self, item: T);
-}
-
-pub trait TableSubscriber<S: TableStorage> {
-    fn subscribe<T: CrudModel>(&self, table: &S::TableName) -> Vec<T>;
-}
+pub use hooks::*;
+pub use launch::{launch, use_db};

@@ -1,8 +1,11 @@
 [package]
 name = "wavesyncdb_dioxus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-dioxus-signals = "0.7.3"
+dioxus = { version = "0.7", features = ["desktop"] }
+sea-orm = { workspace = true }
 wavesyncdb = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
