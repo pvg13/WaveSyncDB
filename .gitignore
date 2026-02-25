@@ -19,3 +19,7 @@ target/
 **/*.env
 **/*.db
 Cargo.lock
+
+*.md
+!README.md
+!CHANGELOG.md
