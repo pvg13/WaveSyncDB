@@ -97,19 +97,17 @@ pub async fn main() {
                     Err(e) => println!("Error deleting task: {}", e),
                 }
             }
-            4 => {
-                match task::Entity::find().all(&db).await {
-                    Ok(tasks) => {
-                        for t in tasks {
-                            println!(
-                                "ID: {}, Title: {}, Completed: {}",
-                                t.id, t.title, t.completed
-                            );
-                        }
+            4 => match task::Entity::find().all(&db).await {
+                Ok(tasks) => {
+                    for t in tasks {
+                        println!(
+                            "ID: {}, Title: {}, Completed: {}",
+                            t.id, t.title, t.completed
+                        );
                     }
-                    Err(e) => println!("Error listing tasks: {}", e),
                 }
-            }
+                Err(e) => println!("Error listing tasks: {}", e),
+            },
             5 => break,
             _ => println!("Invalid choice"),
         }

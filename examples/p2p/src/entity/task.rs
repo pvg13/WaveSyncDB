@@ -1,5 +1,5 @@
 use sea_orm::entity::prelude::*;
-use wavesyncdb_derive::SyncEntity;
+use wavesyncdb::SyncEntity;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
 #[sea_orm(table_name = "tasks")]

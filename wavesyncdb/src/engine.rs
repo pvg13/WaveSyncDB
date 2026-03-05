@@ -77,10 +77,10 @@ async fn run_engine(
         )?
         .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| {
-            WaveSyncBehaviour::new(key, relay_client)
-        })?
+        .with_behaviour(|key, relay_client| WaveSyncBehaviour::new(key, relay_client))?
         .build();
+
+    let local_peer_id = keypair.public().to_peer_id();
 
     let mut engine = EngineRunner {
         swarm,
@@ -90,6 +90,7 @@ async fn run_engine(
         change_tx,
         registry,
         relay_server,
+        local_peer_id,
     };
 
     engine.run(&mut sync_rx).await
@@ -104,6 +105,7 @@ struct EngineRunner {
     #[allow(dead_code)] // Used in Phase 3 (full sync)
     registry: Arc<TableRegistry>,
     relay_server: Option<String>,
+    local_peer_id: libp2p::PeerId,
 }
 
 impl EngineRunner {
@@ -112,26 +114,33 @@ impl EngineRunner {
         sync_rx: &mut mpsc::Receiver<SyncOperation>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-            .unwrap();
+            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())?;
+
+        self.swarm
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())?;
 
         self.swarm
             .behaviour_mut()
             .gossipsub
-            .subscribe(&self.topic)
-            .unwrap();
+            .subscribe(&self.topic)?;
 
         // If a relay server is configured, dial it
         if let Some(ref relay_addr) = self.relay_server
             && let Ok(addr) = relay_addr.parse::<libp2p::Multiaddr>()
         {
-            let _ = self.swarm.dial(addr);
-            log::info!("Dialing relay server: {}", relay_addr);
+            if let Err(e) = self.swarm.dial(addr) {
+                log::warn!("Failed to dial relay server {}: {}", relay_addr, e);
+            } else {
+                log::info!("Dialing relay server: {}", relay_addr);
+            }
         }
 
         let mut pending_full_sync = false;
         let mut full_sync_delay: Pin<Box<tokio::time::Sleep>> =
             Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
+
+        // Compaction interval: every 5 minutes, prune log entries older than 24 hours
+        let mut compaction_interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
         loop {
             tokio::select! {
@@ -151,6 +160,20 @@ impl EngineRunner {
                 () = &mut full_sync_delay, if pending_full_sync => {
                     pending_full_sync = false;
                     self.publish_full_state().await;
+                },
+                _ = compaction_interval.tick() => {
+                    // Compact log entries older than 24 hours.
+                    // NTP64 timestamps are in nanoseconds, so we use Duration directly.
+                    let twenty_four_hours = std::time::Duration::from_secs(24 * 60 * 60);
+                    let cutoff = uhlc::NTP64::from(twenty_four_hours);
+                    match sync_log::compact(&self.db, cutoff.as_u64()).await {
+                        Ok(result) => {
+                            log::info!("Sync log compaction complete: {:?}", result);
+                        }
+                        Err(e) => {
+                            log::error!("Sync log compaction failed: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -171,6 +194,7 @@ impl EngineRunner {
                     .publish(self.topic.clone(), data)
                 {
                     log::warn!("Failed to publish to gossipsub: {}", e);
+                    self.trigger_rediscovery();
                 }
             }
             Err(e) => {
@@ -185,9 +209,10 @@ impl EngineRunner {
             SwarmEvent::NewListenAddr { address, .. } => {
                 log::info!("Listening on {address:?}");
             }
-            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(
-                identify::Event::Sent { peer_id, .. },
-            )) => {
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(identify::Event::Sent {
+                peer_id,
+                ..
+            })) => {
                 log::info!("Sent identify info to {peer_id:?}");
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(
@@ -232,6 +257,9 @@ impl EngineRunner {
                     log::info!("Discovered peer {peer_id} at {multiaddr}");
                     if !self.peers.contains_key(&peer_id) {
                         new_peer_found = true;
+                        if let Err(e) = self.swarm.dial(multiaddr.clone()) {
+                            log::warn!("Failed to dial discovered peer {peer_id}: {e}");
+                        }
                     }
                     self.peers.insert(peer_id, multiaddr);
                     self.swarm
@@ -299,6 +327,19 @@ impl EngineRunner {
         }
     }
 
+    /// Recreate the mDNS behaviour to restart the probe cycle.
+    /// A fresh mDNS behaviour probes at 500ms, doubling until the query interval,
+    /// giving rapid rediscovery when no peers are available.
+    fn trigger_rediscovery(&mut self) {
+        log::info!("No peers available, triggering mDNS rediscovery");
+        match mdns::tokio::Behaviour::new(mdns::Config::default(), self.local_peer_id) {
+            Ok(new_mdns) => {
+                self.swarm.behaviour_mut().mdns = new_mdns;
+            }
+            Err(e) => log::error!("Failed to restart mDNS: {e}"),
+        }
+    }
+
     async fn publish_full_state(&mut self) {
         let ops = match sync_log::get_ops_since(&self.db, 0).await {
             Ok(ops) => ops,
@@ -315,7 +356,9 @@ impl EngineRunner {
 
         log::info!("Full sync: publishing {} operations", ops.len());
 
-        for mut op in ops {
+        const BATCH_SIZE: usize = 50;
+
+        for (i, mut op) in ops.into_iter().enumerate() {
             // Assign a fresh op_id to avoid gossipsub message deduplication
             op.op_id = uuid::Uuid::new_v4().as_u128();
 
@@ -333,6 +376,11 @@ impl EngineRunner {
                 Err(e) => {
                     log::error!("Failed to serialize full sync op: {}", e);
                 }
+            }
+
+            // Yield between batches to avoid flooding the network
+            if (i + 1) % BATCH_SIZE == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
     }
@@ -376,7 +424,11 @@ async fn apply_remote_op(
 
         match db.execute_unprepared(&final_sql).await {
             Ok(_) => {
-                log::info!("Applied remote op: table={} pk={}", op.table, op.primary_key);
+                log::info!(
+                    "Applied remote op: table={} pk={}",
+                    op.table,
+                    op.primary_key
+                );
             }
             Err(e) => {
                 log::error!("Failed to apply remote op: {}", e);

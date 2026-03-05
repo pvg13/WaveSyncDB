@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 log = { workspace = true }
 env_logger = "0.10.0"
-wavesyncdb = { workspace = true }
-wavesyncdb_derive = { workspace = true }
+wavesyncdb = { workspace = true, features = ["derive"] }
 sea-orm = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

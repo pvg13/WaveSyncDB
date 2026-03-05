@@ -35,8 +35,8 @@
 //! - [`SyncOperation`] — a serialized write operation sent over the network
 //! - [`ChangeNotification`] — lightweight event emitted after every write
 
-pub mod connection;
 pub mod conflict;
+pub mod connection;
 pub mod engine;
 pub mod messages;
 pub mod protocol;
@@ -52,3 +52,6 @@ pub use inventory::submit as register_sync_entity;
 
 // Re-export sea-orm for users of the library
 pub use sea_orm;
+
+#[cfg(feature = "derive")]
+pub use wavesyncdb_derive::SyncEntity;
