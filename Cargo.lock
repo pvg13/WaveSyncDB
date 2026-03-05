@@ -1962,7 +1962,19 @@ dependencies = [
  "sea-orm",
  "uuid",
  "wavesyncdb",
- "wavesyncdb_derive",
+ "wavesyncdb_dioxus",
+]
+
+[[package]]
+name = "example-dioxus-dynamic"
+version = "0.1.0"
+dependencies = [
+ "dioxus",
+ "env_logger",
+ "log",
+ "sea-orm",
+ "uuid",
+ "wavesyncdb",
  "wavesyncdb_dioxus",
 ]
 
@@ -1976,7 +1988,6 @@ dependencies = [
  "tokio",
  "uuid",
  "wavesyncdb",
- "wavesyncdb_derive",
 ]
 
 [[package]]
@@ -7449,7 +7460,7 @@ dependencies = [
 
 [[package]]
 name = "wavesyncdb"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "inventory",
  "libp2p",
@@ -7463,6 +7474,7 @@ dependencies = [
  "tokio",
  "uhlc",
  "uuid",
+ "wavesyncdb_derive",
 ]
 
 [[package]]

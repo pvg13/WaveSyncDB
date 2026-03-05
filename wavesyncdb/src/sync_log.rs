@@ -7,9 +7,7 @@
 //!
 //! The table is created automatically by [`WaveSyncDbBuilder::build()`](crate::WaveSyncDbBuilder::build).
 
-use sea_orm::{
-    ConnectionTrait, DbErr, ExecResult, FromQueryResult, Statement,
-};
+use sea_orm::{ConnectionTrait, DbErr, ExecResult, FromQueryResult, Statement};
 
 use crate::messages::{NodeId, SyncOperation, WriteKind};
 
@@ -94,9 +92,7 @@ impl LogRow {
         let len = self.node_id.len().min(16);
         node_id[..len].copy_from_slice(&self.node_id[..len]);
 
-        let columns: Option<Vec<String>> = self
-            .columns
-            .and_then(|c| serde_json::from_str(&c).ok());
+        let columns: Option<Vec<String>> = self.columns.and_then(|c| serde_json::from_str(&c).ok());
 
         SyncOperation {
             op_id: self.op_id.parse().unwrap_or(0),
@@ -159,12 +155,10 @@ pub async fn get_latest_for_row(
 /// Garbage collection for the sync log. After compaction, incremental sync
 /// requests for timestamps older than `before_hlc` will miss those operations.
 pub async fn compact(db: &impl ConnectionTrait, before_hlc: u64) -> Result<ExecResult, DbErr> {
-    db.execute_raw(
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "DELETE FROM _wavesync_log WHERE hlc_time < $1",
-            [sea_orm::Value::BigInt(Some(before_hlc as i64))],
-        ),
-    )
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "DELETE FROM _wavesync_log WHERE hlc_time < $1",
+        [sea_orm::Value::BigInt(Some(before_hlc as i64))],
+    ))
     .await
 }

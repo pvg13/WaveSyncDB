@@ -13,10 +13,7 @@ pub struct WaveSyncBehaviour {
 }
 
 impl WaveSyncBehaviour {
-    pub fn new(
-        key: &libp2p::identity::Keypair,
-        relay_client: relay::client::Behaviour,
-    ) -> Self {
+    pub fn new(key: &libp2p::identity::Keypair, relay_client: relay::client::Behaviour) -> Self {
         let identify_behaviour = identify::Behaviour::new(identify::Config::new(
             "/wavesync/2.0.0".into(),
             key.public(),
@@ -26,11 +23,13 @@ impl WaveSyncBehaviour {
 
         let peer_id = key.public().to_peer_id();
 
-        let mdns_behaviour =
-            mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap();
+        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap();
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(std::time::Duration::from_secs(1))
+            .mesh_n(3)
+            .mesh_n_low(2)
+            .mesh_n_high(6)
             .build()
             .expect("Valid gossipsub config");
 

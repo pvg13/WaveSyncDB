@@ -34,11 +34,15 @@ where
         });
     });
 
-    // Subscribe to changes
+    // Subscribe to changes (filtered by table name)
     use_effect(move || {
         let mut rx = db.change_rx();
+        let target_table = E::default().table_name().to_string();
         spawn(async move {
-            while let Ok(_notification) = rx.recv().await {
+            while let Ok(notification) = rx.recv().await {
+                if notification.table != target_table {
+                    continue;
+                }
                 match E::find().all(db).await {
                     Ok(rows) => signal.set(rows),
                     Err(e) => log::error!("Failed to refresh table: {}", e),
@@ -65,7 +69,8 @@ pub fn use_synced_row<E>(
 where
     E: EntityTrait,
     E::Model: FromQueryResult + Clone + Send + Sync + 'static,
-    <E::PrimaryKey as sea_orm::PrimaryKeyTrait>::ValueType: Clone + Send + Sync + 'static + Into<sea_orm::Value>,
+    <E::PrimaryKey as sea_orm::PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value>,
 {
     let mut signal: Signal<Option<E::Model>> = use_signal(|| None);
     let pk_clone = pk.clone();
@@ -81,12 +86,16 @@ where
         });
     });
 
-    // Subscribe to changes
+    // Subscribe to changes (filtered by table name)
     use_effect(move || {
         let mut rx = db.change_rx();
         let pk = pk.clone();
+        let target_table = E::default().table_name().to_string();
         spawn(async move {
-            while let Ok(_notification) = rx.recv().await {
+            while let Ok(notification) = rx.recv().await {
+                if notification.table != target_table {
+                    continue;
+                }
                 let pk = pk.clone();
                 match E::find_by_id(pk).one(db).await {
                     Ok(row) => signal.set(row),
