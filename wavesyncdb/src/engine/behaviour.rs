@@ -1,5 +1,7 @@
-use libp2p::{autonat, dcutr, gossipsub, identify, mdns, ping, relay};
+use libp2p::{autonat, dcutr, gossipsub, identify, mdns, ping, relay, request_response};
 use libp2p_swarm_derive::NetworkBehaviour;
+
+use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
 
 #[derive(NetworkBehaviour)]
 pub struct WaveSyncBehaviour {
@@ -7,13 +9,18 @@ pub struct WaveSyncBehaviour {
     pub identify: identify::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
+    pub snapshot: request_response::Behaviour<SnapshotCodec>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::v2::client::Behaviour,
 }
 
 impl WaveSyncBehaviour {
-    pub fn new(key: &libp2p::identity::Keypair, relay_client: relay::client::Behaviour) -> Self {
+    pub fn new(
+        key: &libp2p::identity::Keypair,
+        relay_client: relay::client::Behaviour,
+        mdns_config: mdns::Config,
+    ) -> Self {
         let identify_behaviour = identify::Behaviour::new(identify::Config::new(
             "/wavesync/2.0.0".into(),
             key.public(),
@@ -23,12 +30,12 @@ impl WaveSyncBehaviour {
 
         let peer_id = key.public().to_peer_id();
 
-        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).unwrap();
+        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns_config, peer_id).unwrap();
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(std::time::Duration::from_secs(1))
             .mesh_n(3)
-            .mesh_n_low(2)
+            .mesh_n_low(1)
             .mesh_n_high(6)
             .build()
             .expect("Valid gossipsub config");
@@ -36,6 +43,11 @@ impl WaveSyncBehaviour {
         let dcutr_behaviour = dcutr::Behaviour::new(peer_id);
 
         let autonat_behaviour = autonat::v2::client::Behaviour::default();
+
+        let snapshot_behaviour = request_response::Behaviour::new(
+            [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
 
         Self {
             ping: ping_behaviour,
@@ -46,6 +58,7 @@ impl WaveSyncBehaviour {
                 gossipsub_config,
             )
             .unwrap(),
+            snapshot: snapshot_behaviour,
             relay_client,
             dcutr: dcutr_behaviour,
             autonat: autonat_behaviour,

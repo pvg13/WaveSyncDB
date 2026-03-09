@@ -1,9 +1,12 @@
 mod entity;
 
+use std::sync::OnceLock;
+
 use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
-use wavesyncdb_dioxus::{use_db, use_synced_row, use_synced_table};
+use wavesyncdb::WaveSyncDbBuilder;
+use wavesyncdb::dioxus::{use_synced_table, use_wavesync, use_wavesync_provider};
 
 use dioxus::prelude::*;
 
@@ -21,23 +24,46 @@ const STYLE: &str = r#"
     .empty { color: #999; font-style: italic; }
 "#;
 
+static DB_REF: OnceLock<&'static wavesyncdb::WaveSyncDb> = OnceLock::new();
+
 fn main() {
-    env_logger::init();
-    wavesyncdb_dioxus::launch(
-        "sqlite::memory:",
-        "dioxus-tasks",
-        |db| async move {
-            db.get_schema_registry(module_path!().split("::").next().unwrap())
-                .sync()
-                .await?;
-            Ok(())
-        },
-        App,
-    );
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("libp2p_gossipsub", log::LevelFilter::Warn)
+        .filter_module("libp2p_autonat", log::LevelFilter::Warn)
+        .filter_module("libp2p_mdns", log::LevelFilter::Warn)
+        .filter_module("libp2p_swarm", log::LevelFilter::Warn)
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    let _guard = rt.enter();
+
+    let db: &'static wavesyncdb::WaveSyncDb = rt.block_on(async {
+        let db = WaveSyncDbBuilder::new("sqlite::memory:", "dioxus-tasks")
+            .build()
+            .await
+            .expect("Failed to create WaveSyncDb");
+        let db: &'static wavesyncdb::WaveSyncDb = Box::leak(Box::new(db));
+        db.get_schema_registry(module_path!().split("::").next().unwrap())
+            .sync()
+            .await
+            .expect("Schema sync failed");
+        db
+    });
+
+    if DB_REF.set(db).is_err() {
+        panic!("DB already initialized");
+    }
+    dioxus::launch(App);
 }
 
 #[allow(non_snake_case)]
 fn App() -> Element {
+    let db = *DB_REF.get().expect("DB not initialized");
+    use_wavesync_provider(db);
+
     rsx! {
         style { {STYLE} }
         h1 { "WaveSyncDB Task Manager" }
@@ -48,7 +74,7 @@ fn App() -> Element {
 
 #[component]
 fn AddTaskForm() -> Element {
-    let db = use_db();
+    let db = use_wavesync();
     let mut input = use_signal(String::new);
 
     let on_submit = move |evt: FormEvent| {
@@ -86,7 +112,7 @@ fn AddTaskForm() -> Element {
 
 #[component]
 fn TaskList() -> Element {
-    let db = use_db();
+    let db = use_wavesync();
     let tasks = use_synced_table::<task::Entity>(db);
 
     rsx! {
@@ -103,7 +129,7 @@ fn TaskList() -> Element {
 
 #[component]
 fn TaskItem(task: task::Model) -> Element {
-    let db = use_db();
+    let db = use_wavesync();
     let id = task.id.clone();
     let completed = task.completed;
 

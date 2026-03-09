@@ -51,6 +51,24 @@ pub enum WriteKind {
     Delete,
 }
 
+/// Tagged envelope for gossipsub messages, supporting multiple message types.
+///
+/// Gossipsub handlers deserialize as `SyncMessage` first. For backward
+/// compatibility, if deserialization fails, the raw bytes are tried as a
+/// plain `SyncOperation`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SyncMessage {
+    /// A standard sync operation.
+    Op(SyncOperation),
+    /// A watermark announcement from a peer.
+    Watermark {
+        /// The announcing node's ID.
+        node_id: NodeId,
+        /// The HLC time up to which this node has received all ops.
+        hlc_time: u64,
+    },
+}
+
 /// Lightweight notification emitted after every local or remote write.
 ///
 /// Subscribe via [`WaveSyncDb::change_rx()`](crate::WaveSyncDb::change_rx) to receive

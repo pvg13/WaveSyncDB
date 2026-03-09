@@ -52,7 +52,7 @@ pub async fn insert_op(db: &impl ConnectionTrait, op: &SyncOperation) -> Result<
             "INSERT OR REPLACE INTO _wavesync_log (op_id, hlc_time, hlc_counter, node_id, table_name, kind, primary_key, data, columns)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             [
-                op.op_id.to_string().into(),
+                format!("{:032x}", op.op_id).into(),
                 (op.hlc_time as i64).into(),
                 (op.hlc_counter as i32).into(),
                 op.node_id.to_vec().into(),
@@ -95,7 +95,7 @@ impl LogRow {
         let columns: Option<Vec<String>> = self.columns.and_then(|c| serde_json::from_str(&c).ok());
 
         SyncOperation {
-            op_id: self.op_id.parse().unwrap_or(0),
+            op_id: u128::from_str_radix(&self.op_id, 16).unwrap_or(0),
             hlc_time: self.hlc_time as u64,
             hlc_counter: self.hlc_counter as u32,
             node_id,
@@ -119,7 +119,7 @@ pub async fn get_ops_since(
     let rows = LogRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
         "SELECT op_id, hlc_time, hlc_counter, node_id, table_name, kind, primary_key, data, columns
-         FROM _wavesync_log WHERE hlc_time > $1 ORDER BY hlc_time ASC, hlc_counter ASC",
+         FROM _wavesync_log WHERE hlc_time >= $1 ORDER BY hlc_time ASC, hlc_counter ASC",
         [sea_orm::Value::BigInt(Some(since_hlc as i64))],
     ))
     .all(db)
@@ -150,6 +150,57 @@ pub async fn get_latest_for_row(
     Ok(row.map(|r| r.into_sync_op()))
 }
 
+#[derive(Debug, FromQueryResult)]
+struct MaxHlcRow {
+    max_hlc: Option<i64>,
+}
+
+/// Get the maximum HLC time from the sync log.
+pub async fn get_max_hlc(db: &impl ConnectionTrait) -> Result<Option<u64>, DbErr> {
+    let row = MaxHlcRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT MAX(hlc_time) as max_hlc FROM _wavesync_log",
+        [],
+    ))
+    .one(db)
+    .await?;
+
+    Ok(row.and_then(|r| r.max_hlc).map(|v| v as u64))
+}
+
+/// Info about the latest operation for a single (table, primary_key) pair.
+#[derive(Debug, FromQueryResult)]
+pub struct LatestRowInfo {
+    pub table_name: String,
+    pub primary_key: String,
+    pub hlc_time: i64,
+    pub hlc_counter: i32,
+    pub node_id: Vec<u8>,
+}
+
+/// Get the latest operation per (table_name, primary_key) pair.
+///
+/// Used at startup to build Merkle trees. Returns one entry per row,
+/// ordered by table_name then primary_key.
+pub async fn get_latest_per_row(
+    db: &impl ConnectionTrait,
+) -> Result<Vec<LatestRowInfo>, DbErr> {
+    LatestRowInfo::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT table_name, primary_key, hlc_time, hlc_counter, node_id
+         FROM (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY table_name, primary_key
+                 ORDER BY hlc_time DESC, hlc_counter DESC
+             ) as rn FROM _wavesync_log
+         ) WHERE rn = 1
+         ORDER BY table_name, primary_key",
+        [],
+    ))
+    .all(db)
+    .await
+}
+
 /// Delete all log entries with `hlc_time` older than `before_hlc`.
 ///
 /// Garbage collection for the sync log. After compaction, incremental sync
@@ -161,4 +212,346 @@ pub async fn compact(db: &impl ConnectionTrait, before_hlc: u64) -> Result<ExecR
         [sea_orm::Value::BigInt(Some(before_hlc as i64))],
     ))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::WriteKind;
+    use sea_orm::Database;
+
+    async fn setup_log_db() -> sea_orm::DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        create_log_table(&db).await.unwrap();
+        db
+    }
+
+    fn make_op(
+        op_id: u128,
+        hlc_time: u64,
+        hlc_counter: u32,
+        table: &str,
+        pk: &str,
+        kind: WriteKind,
+    ) -> SyncOperation {
+        SyncOperation {
+            op_id,
+            hlc_time,
+            hlc_counter,
+            node_id: [1u8; 16],
+            table: table.to_string(),
+            kind,
+            primary_key: pk.to_string(),
+            data: Some(b"INSERT INTO tasks VALUES ('1')".to_vec()),
+            columns: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_log_table() {
+        let db = setup_log_db().await;
+        let result = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) as cnt FROM _wavesync_log",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i32 = result.try_get("", "cnt").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_log_table_idempotent() {
+        let db = setup_log_db().await;
+        // Call create_log_table a second time — should not error.
+        create_log_table(&db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_insert_kind() {
+        let db = setup_log_db().await;
+        let op = make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert);
+        insert_op(&db, &op).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT kind FROM _wavesync_log WHERE op_id = '00000000000000000000000000000001'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let kind: String = row.try_get("", "kind").unwrap();
+        assert_eq!(kind, "insert");
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_update_kind() {
+        let db = setup_log_db().await;
+        let op = make_op(2, 100, 0, "tasks", "pk1", WriteKind::Update);
+        insert_op(&db, &op).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT kind FROM _wavesync_log WHERE op_id = '00000000000000000000000000000002'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let kind: String = row.try_get("", "kind").unwrap();
+        assert_eq!(kind, "update");
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_delete_kind() {
+        let db = setup_log_db().await;
+        let op = make_op(3, 100, 0, "tasks", "pk1", WriteKind::Delete);
+        insert_op(&db, &op).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT kind FROM _wavesync_log WHERE op_id = '00000000000000000000000000000003'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let kind: String = row.try_get("", "kind").unwrap();
+        assert_eq!(kind, "delete");
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_with_columns() {
+        let db = setup_log_db().await;
+        let mut op = make_op(4, 100, 0, "tasks", "pk1", WriteKind::Insert);
+        op.columns = Some(vec!["id".to_string(), "name".to_string()]);
+        insert_op(&db, &op).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT columns FROM _wavesync_log WHERE op_id = '00000000000000000000000000000004'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let columns: String = row.try_get("", "columns").unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&columns).unwrap();
+        assert_eq!(parsed, vec!["id".to_string(), "name".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_without_data() {
+        let db = setup_log_db().await;
+        let mut op = make_op(5, 100, 0, "tasks", "pk1", WriteKind::Insert);
+        op.data = None;
+        insert_op(&db, &op).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT data FROM _wavesync_log WHERE op_id = '00000000000000000000000000000005'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let data: Option<Vec<u8>> = row.try_get("", "data").ok();
+        assert!(data.is_none() || data == Some(vec![]));
+    }
+
+    #[tokio::test]
+    async fn test_insert_op_replaces_on_same_op_id() {
+        let db = setup_log_db().await;
+        let op1 = make_op(10, 100, 0, "tasks", "pk1", WriteKind::Insert);
+        let op2 = make_op(10, 200, 1, "tasks", "pk1", WriteKind::Update);
+        insert_op(&db, &op1).await.unwrap();
+        insert_op(&db, &op2).await.unwrap();
+
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) as cnt FROM _wavesync_log WHERE op_id = '0000000000000000000000000000000a'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i32 = row.try_get("", "cnt").unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_since_returns_newer() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(3, 300, 0, "tasks", "pk3", WriteKind::Insert)).await.unwrap();
+
+        let ops = get_ops_since(&db, 150).await.unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].hlc_time, 200);
+        assert_eq!(ops[1].hlc_time, 300);
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_since_includes_boundary() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(3, 200, 1, "tasks", "pk3", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(4, 300, 0, "tasks", "pk4", WriteKind::Insert)).await.unwrap();
+
+        // Ops at hlc_time=200 should be included (>= boundary)
+        let ops = get_ops_since(&db, 200).await.unwrap();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].hlc_time, 200);
+        assert_eq!(ops[1].hlc_time, 200);
+        assert_eq!(ops[2].hlc_time, 300);
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_since_empty() {
+        let db = setup_log_db().await;
+        let ops = get_ops_since(&db, 0).await.unwrap();
+        assert!(ops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_since_ordering() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(3, 300, 0, "tasks", "pk3", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+
+        let ops = get_ops_since(&db, 0).await.unwrap();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].hlc_time, 100);
+        assert_eq!(ops[1].hlc_time, 200);
+        assert_eq!(ops[2].hlc_time, 300);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_for_row_found() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 0, "tasks", "pk1", WriteKind::Update)).await.unwrap();
+
+        let latest = get_latest_for_row(&db, "tasks", "pk1").await.unwrap().unwrap();
+        assert_eq!(latest.hlc_time, 200);
+        assert_eq!(latest.op_id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_for_row_not_found() {
+        let db = setup_log_db().await;
+        let result = get_latest_for_row(&db, "nonexistent", "pk1").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_max_hlc_with_data() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 500, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(3, 300, 0, "tasks", "pk3", WriteKind::Insert)).await.unwrap();
+
+        let max = get_max_hlc(&db).await.unwrap().unwrap();
+        assert_eq!(max, 500);
+    }
+
+    #[tokio::test]
+    async fn test_get_max_hlc_empty() {
+        let db = setup_log_db().await;
+        let max = get_max_hlc(&db).await.unwrap();
+        assert!(max.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_compact_removes_old() {
+        let db = setup_log_db().await;
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(3, 300, 0, "tasks", "pk3", WriteKind::Insert)).await.unwrap();
+
+        compact(&db, 250).await.unwrap();
+
+        let ops = get_ops_since(&db, 0).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].hlc_time, 300);
+    }
+
+    #[tokio::test]
+    async fn test_compact_empty_table() {
+        let db = setup_log_db().await;
+        compact(&db, 1000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_per_row_returns_latest() {
+        let db = setup_log_db().await;
+        // Insert multiple ops for same row — only latest should be returned
+        insert_op(&db, &make_op(1, 100, 0, "tasks", "pk1", WriteKind::Insert)).await.unwrap();
+        insert_op(&db, &make_op(2, 200, 1, "tasks", "pk1", WriteKind::Update)).await.unwrap();
+        insert_op(&db, &make_op(3, 300, 0, "tasks", "pk1", WriteKind::Update)).await.unwrap();
+        // Different row
+        insert_op(&db, &make_op(4, 150, 0, "tasks", "pk2", WriteKind::Insert)).await.unwrap();
+        // Different table
+        insert_op(&db, &make_op(5, 250, 0, "users", "u1", WriteKind::Insert)).await.unwrap();
+
+        let rows = get_latest_per_row(&db).await.unwrap();
+        assert_eq!(rows.len(), 3, "Expected 3 unique (table, pk) pairs");
+
+        // Should be ordered by table_name, primary_key
+        assert_eq!(rows[0].table_name, "tasks");
+        assert_eq!(rows[0].primary_key, "pk1");
+        assert_eq!(rows[0].hlc_time, 300); // latest for pk1
+
+        assert_eq!(rows[1].table_name, "tasks");
+        assert_eq!(rows[1].primary_key, "pk2");
+        assert_eq!(rows[1].hlc_time, 150);
+
+        assert_eq!(rows[2].table_name, "users");
+        assert_eq!(rows[2].primary_key, "u1");
+        assert_eq!(rows[2].hlc_time, 250);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_per_row_empty() {
+        let db = setup_log_db().await;
+        let rows = get_latest_per_row(&db).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_into_sync_op_unknown_kind() {
+        let db = setup_log_db().await;
+        db.execute_unprepared(
+            "INSERT INTO _wavesync_log (op_id, hlc_time, hlc_counter, node_id, table_name, kind, primary_key, data, columns)
+             VALUES ('42', 100, 0, X'01010101010101010101010101010101', 'tasks', 'unknown', 'pk1', NULL, NULL)",
+        )
+        .await
+        .unwrap();
+
+        let ops = get_ops_since(&db, 0).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0].kind, WriteKind::Insert));
+    }
+
+    #[tokio::test]
+    async fn test_into_sync_op_short_node_id() {
+        let db = setup_log_db().await;
+        db.execute_unprepared(
+            "INSERT INTO _wavesync_log (op_id, hlc_time, hlc_counter, node_id, table_name, kind, primary_key, data, columns)
+             VALUES ('99', 100, 0, X'AABBCCDD', 'tasks', 'insert', 'pk1', NULL, NULL)",
+        )
+        .await
+        .unwrap();
+
+        let ops = get_ops_since(&db, 0).await.unwrap();
+        assert_eq!(ops.len(), 1);
+        let expected: [u8; 16] = [0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(ops[0].node_id, expected);
+    }
 }

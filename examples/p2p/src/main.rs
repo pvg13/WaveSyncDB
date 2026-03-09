@@ -15,7 +15,12 @@ pub fn menu() {
 
 #[tokio::main]
 pub async fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("libp2p_gossipsub", log::LevelFilter::Warn)
+        .filter_module("libp2p_autonat", log::LevelFilter::Warn)
+        .filter_module("libp2p_mdns", log::LevelFilter::Warn)
+        .filter_module("libp2p_swarm", log::LevelFilter::Warn)
+        .init();
 
     // Initialize WaveSyncDb — one call sets up DB + sync engine
     let db = WaveSyncDbBuilder::new("sqlite::memory:", "p2p_tasks")
