@@ -38,9 +38,12 @@
 pub mod conflict;
 pub mod connection;
 pub mod engine;
+pub mod merkle;
 pub mod messages;
+pub mod peer_tracker;
 pub mod protocol;
 pub mod registry;
+pub mod snapshot;
 pub mod sync_log;
 
 pub use connection::{SchemaBuilder, WaveSyncDb, WaveSyncDbBuilder};
@@ -55,3 +58,6 @@ pub use sea_orm;
 
 #[cfg(feature = "derive")]
 pub use wavesyncdb_derive::SyncEntity;
+
+#[cfg(feature = "dioxus")]
+pub mod dioxus;

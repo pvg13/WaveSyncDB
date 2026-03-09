@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wavesyncdb = { workspace = true, features = ["derive"] }
-wavesyncdb_dioxus = { path = "../../wavesyncdb_dioxus" }
+wavesyncdb = { workspace = true, features = ["derive", "dioxus"] }
 sea-orm = { workspace = true }
 dioxus = { version = "0.7.3", features = ["desktop"] }
+tokio = { workspace = true }
 log = { workspace = true }
 env_logger = "0.10.0"
 uuid = { workspace = true }

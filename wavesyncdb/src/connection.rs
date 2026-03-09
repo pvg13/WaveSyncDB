@@ -5,10 +5,49 @@ use sea_orm::{
     EntityTrait, ExecResult, Iterable, PrimaryKeyToColumn, QueryResult, Schema, Statement,
     sea_query::SqliteQueryBuilder,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::messages::{ChangeNotification, NodeId, SyncOperation, WriteKind};
 use crate::registry::{SyncEntityInfo, TableMeta, TableRegistry};
+
+/// Try to classify a SQL statement as a write and extract relevant info.
+///
+/// Uses keyword-anchor parsing to handle variants like `INSERT OR REPLACE INTO`,
+/// multi-line SQL, and leading whitespace/comments.
+pub(crate) fn classify_write(sql: &str) -> Option<(WriteKind, String)> {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("INSERT") {
+        // INSERT [OR REPLACE|OR IGNORE] INTO <table> ...
+        let into_pos = upper.find("INTO ")?;
+        let after_into = &trimmed[into_pos + 5..];
+        let table = after_into.split_whitespace().next()?;
+        let table = table.trim_matches('"').trim_matches('`').to_string();
+        Some((WriteKind::Insert, table))
+    } else if upper.starts_with("UPDATE") {
+        // UPDATE <table> SET ...
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        // Find the token just before SET
+        let set_idx = parts.iter().position(|p| p.eq_ignore_ascii_case("SET"))?;
+        if set_idx == 0 {
+            return None;
+        }
+        let table = parts[set_idx - 1]
+            .trim_matches('"')
+            .trim_matches('`')
+            .to_string();
+        Some((WriteKind::Update, table))
+    } else if upper.starts_with("DELETE") {
+        // DELETE FROM <table> ...
+        let from_pos = upper.find("FROM ")?;
+        let after_from = &trimmed[from_pos + 5..];
+        let table = after_from.split_whitespace().next()?;
+        let table = table.trim_matches('"').trim_matches('`').to_string();
+        Some((WriteKind::Delete, table))
+    } else {
+        None
+    }
+}
 
 /// A SeaORM connection wrapper that transparently intercepts write operations
 /// and dispatches them to the sync engine.
@@ -19,6 +58,7 @@ pub struct WaveSyncDb {
     hlc: Arc<Mutex<uhlc::HLC>>,
     node_id: NodeId,
     registry: Arc<TableRegistry>,
+    registry_ready: Arc<Notify>,
 }
 
 impl PartialEq for WaveSyncDb {
@@ -187,44 +227,6 @@ impl WaveSyncDb {
         (raw, (raw & 0xF) as u32)
     }
 
-    /// Try to classify a SQL statement as a write and extract relevant info.
-    ///
-    /// Uses keyword-anchor parsing to handle variants like `INSERT OR REPLACE INTO`,
-    /// multi-line SQL, and leading whitespace/comments.
-    fn classify_write(sql: &str) -> Option<(WriteKind, String)> {
-        let upper = sql.trim_start().to_uppercase();
-        if upper.starts_with("INSERT") {
-            // INSERT [OR REPLACE|OR IGNORE] INTO <table> ...
-            let into_pos = upper.find("INTO ")?;
-            let after_into = &sql[into_pos + 5..];
-            let table = after_into.split_whitespace().next()?;
-            let table = table.trim_matches('"').trim_matches('`').to_string();
-            Some((WriteKind::Insert, table))
-        } else if upper.starts_with("UPDATE") {
-            // UPDATE <table> SET ...
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            // Find the token just before SET
-            let set_idx = parts.iter().position(|p| p.eq_ignore_ascii_case("SET"))?;
-            if set_idx == 0 {
-                return None;
-            }
-            let table = parts[set_idx - 1]
-                .trim_matches('"')
-                .trim_matches('`')
-                .to_string();
-            Some((WriteKind::Update, table))
-        } else if upper.starts_with("DELETE") {
-            // DELETE FROM <table> ...
-            let from_pos = upper.find("FROM ")?;
-            let after_from = &sql[from_pos + 5..];
-            let table = after_from.split_whitespace().next()?;
-            let table = table.trim_matches('"').trim_matches('`').to_string();
-            Some((WriteKind::Delete, table))
-        } else {
-            None
-        }
-    }
-
     /// After a successful write, create and dispatch a sync operation.
     /// `resolved_sql` must be a fully-resolved SQL string with parameter values
     /// inlined (no `?` placeholders), so it can be executed on remote nodes.
@@ -262,12 +264,13 @@ impl WaveSyncDb {
         let table_owned = table.to_string();
 
         tokio::spawn(async move {
-            let _ = sync_tx.send(op).await;
-            let _ = change_tx.send(ChangeNotification {
-                table: table_owned,
-                kind,
-                primary_key,
-            });
+            if sync_tx.send(op).await.is_ok() {
+                let _ = change_tx.send(ChangeNotification {
+                    table: table_owned,
+                    kind,
+                    primary_key,
+                });
+            }
         });
     }
 }
@@ -326,21 +329,20 @@ fn extract_pk_from_insert(sql: &str, pk_column: &str) -> String {
 }
 
 fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     let where_pos = match upper.find("WHERE") {
         Some(i) => i + 5,
         None => return String::new(),
     };
     let after_where = &sql[where_pos..];
+    let search = after_where.to_ascii_uppercase();
+    let pk_upper = pk_column.to_ascii_uppercase();
 
-    // Look for patterns like: "pk_col" = value  or  pk_col = value
-    let needle_quoted = format!("\"{}\"", pk_column);
-    let search = after_where.to_uppercase();
-
-    let col_pos = search.find(&needle_quoted.to_uppercase()).or_else(|| {
-        // Also try unquoted
-        search.find(&pk_column.to_uppercase())
-    });
+    // Try quoted form first: "pk_col", then unquoted: pk_col
+    // Use word-boundary matching to avoid substring matches (e.g., "active" matching "id")
+    let needle_quoted = format!("\"{}\"", pk_upper);
+    let col_pos = find_whole_word(&search, &needle_quoted)
+        .or_else(|| find_whole_word(&search, &pk_upper));
 
     let col_pos = match col_pos {
         Some(i) => i,
@@ -360,8 +362,29 @@ fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
         .find([' ', '\n', '\r'])
         .unwrap_or(value_part.len());
     let value = &value_part[..end];
-    // Check if the remaining part starts with AND/OR and trim accordingly
     value.trim().trim_matches('\'').to_string()
+}
+
+/// Find `needle` in `haystack` only at word boundaries.
+/// A word boundary is the start/end of the string, or a non-alphanumeric/underscore character.
+fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs_pos = start + pos;
+        let before_ok = abs_pos == 0
+            || !haystack.as_bytes()[abs_pos - 1]
+                .is_ascii_alphanumeric()
+                && haystack.as_bytes()[abs_pos - 1] != b'_';
+        let after_pos = abs_pos + needle.len();
+        let after_ok = after_pos >= haystack.len()
+            || !haystack.as_bytes()[after_pos].is_ascii_alphanumeric()
+                && haystack.as_bytes()[after_pos] != b'_';
+        if before_ok && after_ok {
+            return Some(abs_pos);
+        }
+        start = abs_pos + 1;
+    }
+    None
 }
 
 /// Split a SQL VALUES list respecting single-quoted strings.
@@ -446,7 +469,7 @@ impl ConnectionTrait for WaveSyncDb {
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
             let result = self.inner.execute_raw(stmt).await?;
-            if let Some((kind, table)) = Self::classify_write(&resolved_sql) {
+            if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
             Ok(result)
@@ -467,7 +490,7 @@ impl ConnectionTrait for WaveSyncDb {
         let sql_owned = sql.to_string();
         Box::pin(async move {
             let result = self.inner.execute_unprepared(&sql_owned).await?;
-            if let Some((kind, table)) = Self::classify_write(&sql_owned) {
+            if let Some((kind, table)) = classify_write(&sql_owned) {
                 self.dispatch_sync(kind, &table, &sql_owned);
             }
             Ok(result)
@@ -492,7 +515,7 @@ impl ConnectionTrait for WaveSyncDb {
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
             let result = self.inner.query_one_raw(stmt).await?;
-            if let Some((kind, table)) = Self::classify_write(&resolved_sql) {
+            if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
             Ok(result)
@@ -514,7 +537,7 @@ impl ConnectionTrait for WaveSyncDb {
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
             let result = self.inner.query_all_raw(stmt).await?;
-            if let Some((kind, table)) = Self::classify_write(&resolved_sql) {
+            if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
             Ok(result)
@@ -583,6 +606,8 @@ impl<'a> SchemaBuilder<'a> {
                 self.db.register_table(entry.meta);
             }
         }
+        // Signal the engine that tables are registered and sync can begin
+        self.db.registry_ready.notify_one();
         Ok(())
     }
 
@@ -627,15 +652,26 @@ pub struct WaveSyncDbBuilder {
     node_id: Option<NodeId>,
     relay_server: Option<String>,
     topic: String,
+    eviction_timeout: std::time::Duration,
+    watermark_interval: std::time::Duration,
+    compaction_interval: std::time::Duration,
+    mdns_query_interval: std::time::Duration,
+    mdns_ttl: std::time::Duration,
 }
 
 impl WaveSyncDbBuilder {
     pub fn new(url: &str, topic: &str) -> Self {
+        let defaults = crate::engine::EngineConfig::default();
         Self {
             database_url: url.to_string(),
             node_id: None,
             relay_server: None,
             topic: topic.to_string(),
+            eviction_timeout: defaults.eviction_timeout,
+            watermark_interval: defaults.watermark_interval,
+            compaction_interval: defaults.compaction_interval,
+            mdns_query_interval: defaults.mdns_query_interval,
+            mdns_ttl: defaults.mdns_ttl,
         }
     }
 
@@ -646,6 +682,31 @@ impl WaveSyncDbBuilder {
 
     pub fn with_relay_server(mut self, addr: &str) -> Self {
         self.relay_server = Some(addr.to_string());
+        self
+    }
+
+    pub fn with_eviction_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.eviction_timeout = timeout;
+        self
+    }
+
+    pub fn with_watermark_interval(mut self, interval: std::time::Duration) -> Self {
+        self.watermark_interval = interval;
+        self
+    }
+
+    pub fn with_compaction_interval(mut self, interval: std::time::Duration) -> Self {
+        self.compaction_interval = interval;
+        self
+    }
+
+    pub fn with_mdns_query_interval(mut self, interval: std::time::Duration) -> Self {
+        self.mdns_query_interval = interval;
+        self
+    }
+
+    pub fn with_mdns_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.mdns_ttl = ttl;
         self
     }
 
@@ -674,12 +735,14 @@ impl WaveSyncDbBuilder {
         let hlc = uhlc::HLCBuilder::new().with_id(hlc_id).build();
 
         let (sync_tx, sync_rx) = mpsc::channel::<SyncOperation>(256);
-        let (change_tx, _) = broadcast::channel::<ChangeNotification>(256);
+        let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
 
         let registry = Arc::new(TableRegistry::new());
+        let registry_ready = Arc::new(Notify::new());
 
-        // Create the sync log table
+        // Create the sync log and peers tables
         crate::sync_log::create_log_table(&inner).await?;
+        crate::peer_tracker::create_peers_table(&inner).await?;
 
         let db = WaveSyncDb {
             inner: inner.clone(),
@@ -688,6 +751,15 @@ impl WaveSyncDbBuilder {
             hlc: Arc::new(Mutex::new(hlc)),
             node_id,
             registry: registry.clone(),
+            registry_ready: registry_ready.clone(),
+        };
+
+        let engine_config = crate::engine::EngineConfig {
+            eviction_timeout: self.eviction_timeout,
+            watermark_interval: self.watermark_interval,
+            compaction_interval: self.compaction_interval,
+            mdns_query_interval: self.mdns_query_interval,
+            mdns_ttl: self.mdns_ttl,
         };
 
         // Start the P2P engine in a background task
@@ -699,6 +771,8 @@ impl WaveSyncDbBuilder {
             node_id,
             self.topic,
             self.relay_server,
+            engine_config,
+            registry_ready,
         );
 
         Ok(db)
@@ -714,40 +788,40 @@ mod tests {
     #[test]
     fn test_classify_insert_basic() {
         let result =
-            WaveSyncDb::classify_write(r#"INSERT INTO "tasks" ("id", "name") VALUES ('1', 'foo')"#);
+            classify_write(r#"INSERT INTO "tasks" ("id", "name") VALUES ('1', 'foo')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_insert_or_replace() {
         let result =
-            WaveSyncDb::classify_write(r#"INSERT OR REPLACE INTO "tasks" ("id") VALUES ('1')"#);
+            classify_write(r#"INSERT OR REPLACE INTO "tasks" ("id") VALUES ('1')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_insert_or_ignore() {
         let result =
-            WaveSyncDb::classify_write(r#"INSERT OR IGNORE INTO "tasks" ("id") VALUES ('1')"#);
+            classify_write(r#"INSERT OR IGNORE INTO "tasks" ("id") VALUES ('1')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_update() {
         let result =
-            WaveSyncDb::classify_write(r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" = '1'"#);
+            classify_write(r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" = '1'"#);
         assert_eq!(result, Some((WriteKind::Update, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_delete() {
-        let result = WaveSyncDb::classify_write(r#"DELETE FROM "tasks" WHERE "id" = '1'"#);
+        let result = classify_write(r#"DELETE FROM "tasks" WHERE "id" = '1'"#);
         assert_eq!(result, Some((WriteKind::Delete, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_select_returns_none() {
-        let result = WaveSyncDb::classify_write(r#"SELECT * FROM "tasks""#);
+        let result = classify_write(r#"SELECT * FROM "tasks""#);
         assert_eq!(result, None);
     }
 
@@ -803,5 +877,112 @@ mod tests {
     fn test_split_sql_values_with_quotes() {
         let values = split_sql_values("'hello, world', 42, 'foo'");
         assert_eq!(values, vec!["'hello, world'", " 42", " 'foo'"]);
+    }
+
+    // classify_write edge cases
+
+    #[test]
+    fn test_classify_leading_whitespace() {
+        let result =
+            classify_write(r#"   INSERT INTO "tasks" ("id") VALUES ('1')"#);
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_multiline_insert() {
+        let result =
+            classify_write("INSERT\n  INTO \"tasks\" (\"id\") VALUES ('1')");
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_backtick_table() {
+        let result =
+            classify_write("INSERT INTO `tasks` (\"id\") VALUES ('1')");
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_update_no_set() {
+        let result = classify_write("UPDATE tasks");
+        assert_eq!(result, None);
+    }
+
+    // extract_primary_key edge cases
+
+    #[test]
+    fn test_extract_pk_delete_from_where() {
+        let sql = r#"DELETE FROM "tasks" WHERE "id" = 'abc'"#;
+        let pk = extract_primary_key(sql, &WriteKind::Delete, "id");
+        assert_eq!(pk, "abc");
+    }
+
+    #[test]
+    fn test_extract_pk_insert_no_parens() {
+        let sql = "INSERT INTO tasks";
+        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_pk_insert_no_values() {
+        let sql = r#"INSERT INTO "tasks" ("id")"#;
+        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_pk_insert_pk_not_found() {
+        let sql = r#"INSERT INTO "tasks" ("name") VALUES ('foo')"#;
+        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_pk_where_no_where() {
+        let sql = r#"UPDATE "tasks" SET "name" = 'bar'"#;
+        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_pk_where_col_not_found() {
+        let sql = r#"UPDATE "tasks" SET "name" = 'bar' WHERE "name" = 'old'"#;
+        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
+        assert_eq!(pk, "");
+    }
+
+    // extract_columns + split_sql_values edge cases
+
+    #[test]
+    fn test_extract_pk_where_no_equals() {
+        let sql = r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" LIKE 'abc%'"#;
+        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_columns_delete() {
+        let sql = "DELETE FROM tasks WHERE id = 1";
+        let cols = extract_columns(sql, &WriteKind::Delete);
+        assert_eq!(cols, None);
+    }
+
+    #[test]
+    fn test_split_sql_values_empty() {
+        let values = split_sql_values("");
+        assert_eq!(values, vec![""]);
+    }
+
+    #[test]
+    fn test_split_sql_values_single() {
+        let values = split_sql_values("42");
+        assert_eq!(values, vec!["42"]);
+    }
+
+    #[test]
+    fn test_split_sql_values_no_quotes() {
+        let values = split_sql_values("1, 2, 3");
+        assert_eq!(values, vec!["1", " 2", " 3"]);
     }
 }

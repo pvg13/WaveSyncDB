@@ -1,6 +1,6 @@
 [package]
 name = "wavesyncdb"
-version = "0.3.2"
+version = "0.3.5"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
@@ -15,12 +15,21 @@ serde = { workspace = true }
 tokio = { workspace = true }
 libp2p = { workspace = true }
 libp2p-swarm-derive = "0.35.1"
+async-trait = "0.1"
+futures = "0.3"
 log = { workspace = true }
 thiserror = { workspace = true }
 serde_json = "1.0"
 uuid = { workspace = true }
 inventory = { workspace = true }
+blake3 = "1"
 wavesyncdb_derive = { path = "../wavesyncdb_derive", optional = true }
+dioxus = { version = "0.7.3", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
 
 [features]
+default = []
 derive = ["dep:wavesyncdb_derive"]
+dioxus = ["dep:dioxus"]

@@ -3,7 +3,9 @@ mod entity;
 use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
-use wavesyncdb_dioxus::{use_db_opt, use_init_db, use_synced_table};
+use wavesyncdb::dioxus::{
+    use_synced_table, use_wavesync_init, use_wavesync_opt, use_wavesync_provider_lazy,
+};
 
 use dioxus::prelude::*;
 
@@ -27,13 +29,26 @@ const STYLE: &str = r#"
 "#;
 
 fn main() {
-    env_logger::init();
-    wavesyncdb_dioxus::launch_dynamic(App);
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("libp2p_gossipsub", log::LevelFilter::Warn)
+        .filter_module("libp2p_autonat", log::LevelFilter::Warn)
+        .filter_module("libp2p_mdns", log::LevelFilter::Warn)
+        .filter_module("libp2p_swarm", log::LevelFilter::Warn)
+        .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    let _guard = rt.enter();
+
+    dioxus::launch(App);
 }
 
 #[allow(non_snake_case)]
 fn App() -> Element {
-    let db = use_db_opt();
+    use_wavesync_provider_lazy();
+    let db = use_wavesync_opt();
 
     rsx! {
         style { {STYLE} }
@@ -52,7 +67,7 @@ fn App() -> Element {
 
 #[component]
 fn DatabasePicker() -> Element {
-    let init = use_init_db();
+    let init = use_wavesync_init();
     let mut url = use_signal(|| "sqlite:./tasks.db?mode=rwc".to_string());
     let mut error: Signal<Option<String>> = use_signal(|| None);
     let mut loading = use_signal(|| false);
@@ -110,7 +125,7 @@ fn DatabasePicker() -> Element {
 
 #[component]
 fn AddTaskForm() -> Element {
-    let db = use_db_opt()().unwrap();
+    let db = use_wavesync_opt()().unwrap();
     let mut input = use_signal(String::new);
 
     let on_submit = move |evt: FormEvent| {
@@ -148,7 +163,7 @@ fn AddTaskForm() -> Element {
 
 #[component]
 fn TaskList() -> Element {
-    let db = use_db_opt()().unwrap();
+    let db = use_wavesync_opt()().unwrap();
     let tasks = use_synced_table::<task::Entity>(db);
 
     rsx! {
@@ -165,7 +180,7 @@ fn TaskList() -> Element {
 
 #[component]
 fn TaskItem(task: task::Model) -> Element {
-    let db = use_db_opt()().unwrap();
+    let db = use_wavesync_opt()().unwrap();
     let id = task.id.clone();
     let completed = task.completed;
 
