@@ -48,6 +48,7 @@ fn main() {
 #[allow(non_snake_case)]
 fn App() -> Element {
     use_wavesync_provider_lazy();
+    wavesyncdb::dioxus::use_wavesync_generation();
     let db = use_wavesync_opt();
 
     rsx! {
@@ -135,6 +136,7 @@ fn AddTaskForm() -> Element {
             return;
         }
         input.set(String::new());
+        let db = db.clone();
         spawn(async move {
             let new_task = task::ActiveModel {
                 id: Set(Uuid::new_v4().to_string()),
@@ -142,7 +144,7 @@ fn AddTaskForm() -> Element {
                 completed: Set(false),
                 ..Default::default()
             };
-            if let Err(e) = new_task.insert(db).await {
+            if let Err(e) = new_task.insert(&db).await {
                 log::error!("Failed to insert task: {}", e);
             }
         });
@@ -185,15 +187,17 @@ fn TaskItem(task: task::Model) -> Element {
     let completed = task.completed;
 
     let toggle_id = id.clone();
+    let db2 = db.clone();
     let toggle = move |_| {
         let id = toggle_id.clone();
+        let db = db2.clone();
         spawn(async move {
             let active = task::ActiveModel {
                 id: Set(id),
                 completed: Set(!completed),
                 ..Default::default()
             };
-            if let Err(e) = active.update(db).await {
+            if let Err(e) = active.update(&db).await {
                 log::error!("Failed to toggle task: {}", e);
             }
         });
@@ -202,8 +206,9 @@ fn TaskItem(task: task::Model) -> Element {
     let delete_id = id.clone();
     let delete = move |_| {
         let id = delete_id.clone();
+        let db = db.clone();
         spawn(async move {
-            if let Err(e) = task::Entity::delete_by_id(id).exec(db).await {
+            if let Err(e) = task::Entity::delete_by_id(id).exec(&db).await {
                 log::error!("Failed to delete task: {}", e);
             }
         });

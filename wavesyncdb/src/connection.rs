@@ -1,13 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
     EntityTrait, ExecResult, Iterable, PrimaryKeyToColumn, QueryResult, Schema, Statement,
     sea_query::SqliteQueryBuilder,
 };
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
-use crate::messages::{ChangeNotification, NodeId, SyncOperation, WriteKind};
+use crate::messages::{
+    ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
+};
 use crate::registry::{SyncEntityInfo, TableMeta, TableRegistry};
 
 /// Try to classify a SQL statement as a write and extract relevant info.
@@ -49,70 +51,299 @@ pub(crate) fn classify_write(sql: &str) -> Option<(WriteKind, String)> {
     }
 }
 
-/// A SeaORM connection wrapper that transparently intercepts write operations
-/// and dispatches them to the sync engine.
-pub struct WaveSyncDb {
+/// Parsed write information with column-value pairs.
+pub(crate) struct ParsedWrite {
+    #[allow(dead_code)]
+    pub kind: WriteKind,
+    #[allow(dead_code)]
+    pub table: String,
+    pub primary_key: String,
+    pub columns: Vec<(String, serde_json::Value)>,
+}
+
+/// Parse a SQL write statement to extract column names and values.
+///
+/// For INSERT: pairs column list with VALUES list positionally.
+/// For UPDATE: parses `SET col = val` pairs.
+/// For DELETE: returns empty columns (tombstone handles it).
+pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<ParsedWrite> {
+    let (kind, table) = classify_write(sql)?;
+
+    match kind {
+        WriteKind::Insert => {
+            let primary_key = extract_pk_from_insert(sql, pk_column);
+            let columns = extract_column_values_insert(sql);
+            Some(ParsedWrite {
+                kind,
+                table,
+                primary_key,
+                columns,
+            })
+        }
+        WriteKind::Update => {
+            let primary_key = extract_pk_from_where(sql, pk_column);
+            let columns = extract_column_values_update(sql);
+            Some(ParsedWrite {
+                kind,
+                table,
+                primary_key,
+                columns,
+            })
+        }
+        WriteKind::Delete => {
+            let primary_key = extract_pk_from_where(sql, pk_column);
+            Some(ParsedWrite {
+                kind,
+                table,
+                primary_key,
+                columns: vec![],
+            })
+        }
+    }
+}
+
+/// Extract column-value pairs from an INSERT statement.
+fn extract_column_values_insert(sql: &str) -> Vec<(String, serde_json::Value)> {
+    // Find column list between first ( and )
+    let col_start = match sql.find('(') {
+        Some(i) => i + 1,
+        None => return vec![],
+    };
+    let col_end = match sql[col_start..].find(')') {
+        Some(i) => col_start + i,
+        None => return vec![],
+    };
+    let columns: Vec<String> = sql[col_start..col_end]
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').trim_matches('`').to_string())
+        .collect();
+
+    // Find VALUES list
+    let upper = sql.to_uppercase();
+    let values_pos = match upper.find("VALUES") {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let val_start = match sql[values_pos..].find('(') {
+        Some(i) => values_pos + i + 1,
+        None => return vec![],
+    };
+    let val_end = match sql[val_start..].rfind(')') {
+        Some(i) => val_start + i,
+        None => return vec![],
+    };
+
+    let values = split_sql_values(&sql[val_start..val_end]);
+
+    columns
+        .into_iter()
+        .zip(values)
+        .map(|(col, val)| {
+            let val = val.trim();
+            let json_val = sql_value_to_json(val);
+            (col, json_val)
+        })
+        .collect()
+}
+
+/// Extract column-value pairs from an UPDATE SET clause.
+fn extract_column_values_update(sql: &str) -> Vec<(String, serde_json::Value)> {
+    let upper = sql.to_uppercase();
+    let set_pos = match upper.find("SET ") {
+        Some(i) => i + 4,
+        None => return vec![],
+    };
+    let end_pos = upper[set_pos..]
+        .find("WHERE")
+        .map(|i| set_pos + i)
+        .unwrap_or(sql.len());
+    let set_clause = &sql[set_pos..end_pos];
+
+    set_clause
+        .split(',')
+        .filter_map(|part| {
+            let eq = part.find('=')?;
+            let col = part[..eq]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('`')
+                .to_string();
+            let val = part[eq + 1..].trim();
+            let json_val = sql_value_to_json(val);
+            Some((col, json_val))
+        })
+        .collect()
+}
+
+/// Convert a SQL literal value to a JSON value.
+fn sql_value_to_json(val: &str) -> serde_json::Value {
+    let val = val.trim();
+    if val.eq_ignore_ascii_case("NULL") {
+        serde_json::Value::Null
+    } else if val.starts_with('\'') && val.ends_with('\'') {
+        // String literal
+        serde_json::Value::String(val[1..val.len() - 1].replace("''", "'"))
+    } else if let Ok(i) = val.parse::<i64>() {
+        serde_json::Value::Number(i.into())
+    } else if let Ok(f) = val.parse::<f64>() {
+        serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::String(val.to_string()))
+    } else if val.eq_ignore_ascii_case("TRUE") {
+        serde_json::Value::Bool(true)
+    } else if val.eq_ignore_ascii_case("FALSE") {
+        serde_json::Value::Bool(false)
+    } else {
+        serde_json::Value::String(val.to_string())
+    }
+}
+
+/// Internal shared state for [`WaveSyncDb`].
+struct WaveSyncDbInner {
     inner: DatabaseConnection,
-    sync_tx: mpsc::Sender<SyncOperation>,
+    sync_tx: mpsc::Sender<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
-    hlc: Arc<Mutex<uhlc::HLC>>,
+    site_id: NodeId,
+    db_version: Mutex<u64>,
     node_id: NodeId,
     registry: Arc<TableRegistry>,
     registry_ready: Arc<Notify>,
+    cmd_tx: mpsc::Sender<crate::engine::EngineCommand>,
+    engine_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// A SeaORM connection wrapper that transparently intercepts write operations
+/// and dispatches them to the sync engine via column-level CRDT changesets.
+///
+/// `WaveSyncDb` is cheap to clone (internally Arc-based), matching the
+/// ergonomics of SeaORM's `DatabaseConnection`.
+#[derive(Clone)]
+pub struct WaveSyncDb {
+    inner: Arc<WaveSyncDbInner>,
+}
+
+impl Drop for WaveSyncDbInner {
+    fn drop(&mut self) {
+        // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk between tests)
+        if let Some(handle) = self.engine_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 impl PartialEq for WaveSyncDb {
-    fn eq(&self, _other: &Self) -> bool {
-        false
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl std::fmt::Debug for WaveSyncDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaveSyncDb")
+            .field("site_id", &self.inner.site_id)
+            .finish_non_exhaustive()
     }
 }
 
 impl WaveSyncDb {
     /// Get a reference to the underlying SeaORM connection.
-    /// Use this when you need to bypass sync interception (e.g., applying remote ops).
     pub fn inner(&self) -> &DatabaseConnection {
-        &self.inner
+        &self.inner.inner
     }
 
     /// Get the node ID.
     pub fn node_id(&self) -> &NodeId {
-        &self.node_id
+        &self.inner.node_id
+    }
+
+    /// Get the persistent site_id.
+    pub fn site_id(&self) -> &NodeId {
+        &self.inner.site_id
     }
 
     /// Get a handle to the change notification broadcast channel.
     pub fn change_rx(&self) -> broadcast::Receiver<ChangeNotification> {
-        self.change_tx.subscribe()
+        self.inner.change_tx.subscribe()
     }
 
     /// Get a reference to the change notification sender.
     pub fn change_tx(&self) -> &broadcast::Sender<ChangeNotification> {
-        &self.change_tx
+        &self.inner.change_tx
     }
 
-    /// Get a reference to the sync operation sender.
-    pub fn sync_tx(&self) -> &mpsc::Sender<SyncOperation> {
-        &self.sync_tx
-    }
-
-    /// Get a reference to the HLC.
-    pub fn hlc(&self) -> &Arc<Mutex<uhlc::HLC>> {
-        &self.hlc
+    /// Get a reference to the sync changeset sender.
+    pub fn sync_tx(&self) -> &mpsc::Sender<SyncChangeset> {
+        &self.inner.sync_tx
     }
 
     /// Get a reference to the table registry.
     pub fn registry(&self) -> &Arc<TableRegistry> {
-        &self.registry
+        &self.inner.registry
+    }
+
+    /// Gracefully shut down the engine and close the database connection.
+    pub async fn shutdown(&self) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .send(crate::engine::EngineCommand::Shutdown)
+            .await;
+
+        let handle = { self.inner.engine_handle.lock().unwrap().take() };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+
+        self.inner.inner.clone().close().await.ok();
+    }
+
+    /// Check if the engine background task is still running.
+    pub fn is_engine_alive(&self) -> bool {
+        self.inner
+            .engine_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Signal the engine to resync after the app resumes from background.
+    pub fn resume(&self) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::Resume);
+    }
+
+    /// Request a full sync from connected peers.
+    pub fn request_full_sync(&self) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::RequestFullSync);
+    }
+
+    /// Register or update the push notification token with the relay server.
+    ///
+    /// Call this when the app receives a new FCM/APNs device token, or when
+    /// the token rotates. The engine will send a `RegisterToken` request to
+    /// the relay on the next connection (or immediately if already connected).
+    /// `platform` should be `"Fcm"` or `"Apns"`.
+    pub fn register_push_token(&self, platform: &str, token: &str) {
+        let _ = self.inner.cmd_tx.try_send(
+            crate::engine::EngineCommand::RegisterPushToken {
+                platform: platform.to_string(),
+                token: token.to_string(),
+            },
+        );
     }
 
     /// Register a table for sync.
     pub fn register_table(&self, meta: TableMeta) {
-        self.registry.register(meta);
+        self.inner.registry.register(meta);
     }
 
     /// Start building the sync schema.
-    ///
-    /// Returns a [`SchemaBuilder`] that lets you register multiple entities
-    /// and then apply them all at once with `.sync().await`.
     pub fn schema(&self) -> SchemaBuilder<'_> {
         SchemaBuilder {
             db: self,
@@ -122,15 +353,6 @@ impl WaveSyncDb {
 
     /// Auto-discover entities registered via `#[derive(SyncEntity)]` and build a
     /// [`SchemaBuilder`] populated with all matching entities.
-    ///
-    /// `prefix` is matched against each entity's `module_path!()`. Typically you
-    /// pass your crate name:
-    ///
-    /// ```ignore
-    /// db.get_schema_registry(module_path!().split("::").next().unwrap())
-    ///     .sync()
-    ///     .await?;
-    /// ```
     pub fn get_schema_registry(&self, prefix: &str) -> SchemaBuilder<'_> {
         let mut builder = self.schema();
         let backend = self.get_database_backend();
@@ -168,15 +390,11 @@ impl WaveSyncDb {
     }
 
     /// Create the table (if not exists) and register it for sync, using SeaORM entity metadata.
-    ///
-    /// This replaces the manual pattern of `Schema::create_table_from_entity` +
-    /// `register_table(TableMeta { … })` with a single call.
     pub async fn sync_entity<E>(&self) -> Result<(), DbErr>
     where
         E: EntityTrait,
         <E::Column as std::str::FromStr>::Err: std::fmt::Debug,
     {
-        // 1. Create the table if it doesn't exist
         let backend = self.get_database_backend();
         let schema = Schema::new(backend);
         let create_stmt = schema
@@ -184,10 +402,10 @@ impl WaveSyncDb {
             .if_not_exists()
             .to_owned();
         self.inner
+            .inner
             .execute_unprepared(&create_stmt.to_string(SqliteQueryBuilder))
             .await?;
 
-        // 2. Extract metadata from the entity
         let entity = E::default();
         let table_name = entity.table_name().to_string();
 
@@ -203,11 +421,14 @@ impl WaveSyncDb {
             })
             .unwrap_or_default();
 
-        // 3. Register for sync
+        // Create shadow table
+        crate::shadow::create_shadow_table(&self.inner.inner, &table_name).await?;
+
         self.register_table(TableMeta {
             table_name,
             primary_key_column,
             columns,
+            delete_policy: DeletePolicy::default(),
         });
 
         Ok(())
@@ -215,79 +436,177 @@ impl WaveSyncDb {
 
     /// Broadcast a change notification (used by the engine for remote changes).
     pub fn notify_change(&self, notification: ChangeNotification) {
-        let _ = self.change_tx.send(notification);
+        let _ = self.inner.change_tx.send(notification);
     }
 
-    /// Generate a new HLC timestamp, returning (physical_time, counter).
-    fn next_hlc(&self) -> (u64, u32) {
-        let hlc = self.hlc.lock().unwrap();
-        let ts = hlc.new_timestamp();
-        let raw = ts.get_time().as_u64();
-        // In uhlc, the counter is embedded in the lower 4 bits of the NTP64 timestamp
-        (raw, (raw & 0xF) as u32)
-    }
-
-    /// After a successful write, create and dispatch a sync operation.
-    /// `resolved_sql` must be a fully-resolved SQL string with parameter values
-    /// inlined (no `?` placeholders), so it can be executed on remote nodes.
+    /// After a successful write, create and dispatch column-level CRDT changes.
     fn dispatch_sync(&self, kind: WriteKind, table: &str, resolved_sql: &str) {
         if table.starts_with("_wavesync") {
             return; // Don't sync internal tables
         }
-        if !self.registry.is_registered(table) {
+        if !self.inner.registry.is_registered(table) {
             return; // Don't sync unregistered tables
         }
 
-        let (hlc_time, hlc_counter) = self.next_hlc();
-
-        let pk_column = self.registry.get(table).map(|m| m.primary_key_column);
-        let primary_key = pk_column
-            .as_deref()
-            .map(|pk_col| extract_primary_key(resolved_sql, &kind, pk_col))
-            .unwrap_or_default();
-        let columns = extract_columns(resolved_sql, &kind);
-
-        let op = SyncOperation {
-            op_id: uuid::Uuid::new_v4().as_u128(),
-            hlc_time,
-            hlc_counter,
-            node_id: self.node_id,
-            table: table.to_string(),
-            kind: kind.clone(),
-            primary_key: primary_key.clone(),
-            data: Some(resolved_sql.as_bytes().to_vec()),
-            columns,
+        let pk_column = self
+            .inner
+            .registry
+            .get(table)
+            .map(|m| m.primary_key_column.clone());
+        let Some(pk_col) = pk_column else {
+            return;
         };
 
-        let sync_tx = self.sync_tx.clone();
-        let change_tx = self.change_tx.clone();
+        let parsed = match parse_write_full(resolved_sql, &pk_col) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if parsed.primary_key.is_empty() {
+            return;
+        }
+
+        let site_id = self.inner.site_id;
+        let shared = self.inner.clone();
+        let inner = self.inner.inner.clone();
         let table_owned = table.to_string();
+        let kind_clone = kind.clone();
 
         tokio::spawn(async move {
-            if sync_tx.send(op).await.is_ok() {
-                let _ = change_tx.send(ChangeNotification {
+            // Increment db_version
+            let new_db_version = {
+                let mut ver = shared.db_version.lock().await;
+                *ver += 1;
+                let v = *ver;
+                // Persist
+                if let Err(e) = crate::shadow::set_db_version(&inner, v).await {
+                    log::error!("Failed to persist db_version: {}", e);
+                }
+                v
+            };
+
+            let mut changes = Vec::new();
+
+            match kind_clone {
+                WriteKind::Delete => {
+                    // For deletes, find max col_version for this row and create tombstone
+                    let entries = crate::shadow::get_clock_entries_for_row(
+                        &inner,
+                        &table_owned,
+                        &parsed.primary_key,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                    let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
+                    let tombstone_cv = max_cv + 1;
+
+                    if let Err(e) = crate::shadow::insert_tombstone(
+                        &inner,
+                        &table_owned,
+                        &parsed.primary_key,
+                        tombstone_cv,
+                        new_db_version,
+                        &site_id,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to insert tombstone: {}", e);
+                    }
+
+                    changes.push(ColumnChange {
+                        table: table_owned.clone(),
+                        pk: parsed.primary_key.clone(),
+                        cid: "__deleted".to_string(),
+                        val: None,
+                        site_id,
+                        col_version: tombstone_cv,
+                        cl: tombstone_cv,
+                        seq: 0,
+                    });
+                }
+                WriteKind::Insert | WriteKind::Update => {
+                    // Clear any tombstone for this row (it's alive again)
+                    let _ = crate::shadow::delete_clock_entries(
+                        &inner,
+                        &table_owned,
+                        &parsed.primary_key,
+                    )
+                    .await;
+
+                    for (seq, (col, val)) in parsed.columns.iter().enumerate() {
+                        // Get current col_version and increment
+                        let current_cv = crate::shadow::get_col_version(
+                            &inner,
+                            &table_owned,
+                            &parsed.primary_key,
+                            col,
+                        )
+                        .await
+                        .unwrap_or(0);
+                        let new_cv = current_cv + 1;
+
+                        if let Err(e) = crate::shadow::upsert_clock_entry(
+                            &inner,
+                            &table_owned,
+                            &parsed.primary_key,
+                            col,
+                            new_cv,
+                            new_db_version,
+                            &site_id,
+                            seq as u32,
+                        )
+                        .await
+                        {
+                            log::error!("Failed to upsert clock entry: {}", e);
+                        }
+
+                        changes.push(ColumnChange {
+                            table: table_owned.clone(),
+                            pk: parsed.primary_key.clone(),
+                            cid: col.clone(),
+                            val: Some(val.clone()),
+                            site_id,
+                            col_version: new_cv,
+                            cl: new_cv,
+                            seq: seq as u32,
+                        });
+                    }
+                }
+            }
+
+            let changed_columns: Option<Vec<String>> = if changes.is_empty() {
+                None
+            } else {
+                Some(
+                    changes
+                        .iter()
+                        .filter(|c| c.cid != "__deleted")
+                        .map(|c| c.cid.clone())
+                        .collect(),
+                )
+            };
+
+            let changeset = SyncChangeset {
+                site_id,
+                db_version: new_db_version,
+                changes,
+            };
+
+            if shared.sync_tx.send(changeset).await.is_ok() {
+                let _ = shared.change_tx.send(ChangeNotification {
                     table: table_owned,
-                    kind,
-                    primary_key,
+                    kind: kind_clone,
+                    primary_key: parsed.primary_key,
+                    changed_columns,
                 });
             }
         });
     }
 }
 
-/// Extract the primary key value from a SQL statement.
-///
-/// - For INSERT: finds the PK column in the column list and extracts the corresponding value.
-/// - For UPDATE/DELETE: extracts from the WHERE clause (`WHERE "pk_col" = value`).
-fn extract_primary_key(sql: &str, kind: &WriteKind, pk_column: &str) -> String {
-    match kind {
-        WriteKind::Insert => extract_pk_from_insert(sql, pk_column),
-        WriteKind::Update | WriteKind::Delete => extract_pk_from_where(sql, pk_column),
-    }
-}
-
+/// Extract the primary key value from an INSERT statement.
 fn extract_pk_from_insert(sql: &str, pk_column: &str) -> String {
-    // Find column list between first ( and )
     let col_start = match sql.find('(') {
         Some(i) => i + 1,
         None => return String::new(),
@@ -306,7 +625,6 @@ fn extract_pk_from_insert(sql: &str, pk_column: &str) -> String {
         None => return String::new(),
     };
 
-    // Find VALUES list
     let upper = sql.to_uppercase();
     let values_pos = match upper.find("VALUES") {
         Some(i) => i,
@@ -338,18 +656,15 @@ fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
     let search = after_where.to_ascii_uppercase();
     let pk_upper = pk_column.to_ascii_uppercase();
 
-    // Try quoted form first: "pk_col", then unquoted: pk_col
-    // Use word-boundary matching to avoid substring matches (e.g., "active" matching "id")
     let needle_quoted = format!("\"{}\"", pk_upper);
-    let col_pos = find_whole_word(&search, &needle_quoted)
-        .or_else(|| find_whole_word(&search, &pk_upper));
+    let col_pos =
+        find_whole_word(&search, &needle_quoted).or_else(|| find_whole_word(&search, &pk_upper));
 
     let col_pos = match col_pos {
         Some(i) => i,
         None => return String::new(),
     };
 
-    // Find the = sign after the column name
     let after_col = &after_where[col_pos..];
     let eq_pos = match after_col.find('=') {
         Some(i) => i + 1,
@@ -357,7 +672,6 @@ fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
     };
 
     let value_part = after_col[eq_pos..].trim_start();
-    // Take until whitespace, AND, OR, or end
     let end = value_part
         .find([' ', '\n', '\r'])
         .unwrap_or(value_part.len());
@@ -366,14 +680,12 @@ fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
 }
 
 /// Find `needle` in `haystack` only at word boundaries.
-/// A word boundary is the start/end of the string, or a non-alphanumeric/underscore character.
 fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
         let abs_pos = start + pos;
         let before_ok = abs_pos == 0
-            || !haystack.as_bytes()[abs_pos - 1]
-                .is_ascii_alphanumeric()
+            || !haystack.as_bytes()[abs_pos - 1].is_ascii_alphanumeric()
                 && haystack.as_bytes()[abs_pos - 1] != b'_';
         let after_pos = abs_pos + needle.len();
         let after_ok = after_pos >= haystack.len()
@@ -388,7 +700,6 @@ fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Split a SQL VALUES list respecting single-quoted strings.
-/// e.g., `'hello, world', 42, 'foo'` -> `["'hello, world'", "42", "'foo'"]`
 fn split_sql_values(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0;
@@ -409,10 +720,7 @@ fn split_sql_values(s: &str) -> Vec<&str> {
 }
 
 /// Extract column names from a SQL statement.
-///
-/// - For INSERT: parses the column list from `(col1, col2, ...)` before VALUES.
-/// - For UPDATE: parses column names from `SET col1 = ..., col2 = ...`.
-/// - For DELETE: returns `None`.
+#[cfg(test)]
 fn extract_columns(sql: &str, kind: &WriteKind) -> Option<Vec<String>> {
     match kind {
         WriteKind::Insert => {
@@ -453,7 +761,7 @@ fn extract_columns(sql: &str, kind: &WriteKind) -> Option<Vec<String>> {
 
 impl ConnectionTrait for WaveSyncDb {
     fn get_database_backend(&self) -> DatabaseBackend {
-        self.inner.get_database_backend()
+        self.inner.inner.get_database_backend()
     }
 
     fn execute_raw<'life0, 'async_trait>(
@@ -468,7 +776,7 @@ impl ConnectionTrait for WaveSyncDb {
     {
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
-            let result = self.inner.execute_raw(stmt).await?;
+            let result = self.inner.inner.execute_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
@@ -489,7 +797,7 @@ impl ConnectionTrait for WaveSyncDb {
     {
         let sql_owned = sql.to_string();
         Box::pin(async move {
-            let result = self.inner.execute_unprepared(&sql_owned).await?;
+            let result = self.inner.inner.execute_unprepared(&sql_owned).await?;
             if let Some((kind, table)) = classify_write(&sql_owned) {
                 self.dispatch_sync(kind, &table, &sql_owned);
             }
@@ -511,10 +819,9 @@ impl ConnectionTrait for WaveSyncDb {
         'life0: 'async_trait,
         Self: 'async_trait,
     {
-        // SeaORM uses query_one_raw for INSERT ... RETURNING, so we intercept writes here too
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
-            let result = self.inner.query_one_raw(stmt).await?;
+            let result = self.inner.inner.query_one_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
@@ -536,7 +843,7 @@ impl ConnectionTrait for WaveSyncDb {
     {
         let resolved_sql = stmt.to_string();
         Box::pin(async move {
-            let result = self.inner.query_all_raw(stmt).await?;
+            let result = self.inner.inner.query_all_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
                 self.dispatch_sync(kind, &table, &resolved_sql);
             }
@@ -546,20 +853,6 @@ impl ConnectionTrait for WaveSyncDb {
 }
 
 /// Builder for declaring which entities participate in sync.
-///
-/// Created via [`WaveSyncDb::schema()`]. Collects entity registrations,
-/// then applies them all in [`sync()`](SchemaBuilder::sync).
-///
-/// # Example
-///
-/// ```ignore
-/// db.schema()
-///     .register(task::Entity)
-///     .register(user::Entity)
-///     .register_local(cache::Entity)
-///     .sync()
-///     .await?;
-/// ```
 pub struct SchemaBuilder<'a> {
     db: &'a WaveSyncDb,
     entries: Vec<EntityEntry>,
@@ -573,9 +866,6 @@ struct EntityEntry {
 
 impl<'a> SchemaBuilder<'a> {
     /// Register a SeaORM entity for sync.
-    ///
-    /// The entity's table will be created (if not exists) and registered
-    /// for P2P sync when [`sync()`](SchemaBuilder::sync) is called.
     pub fn register<E>(mut self, _entity: E) -> Self
     where
         E: EntityTrait,
@@ -586,9 +876,6 @@ impl<'a> SchemaBuilder<'a> {
     }
 
     /// Register a SeaORM entity as local-only.
-    ///
-    /// The entity's table will be created (if not exists) but will **not**
-    /// participate in P2P sync.
     pub fn register_local<E>(mut self, _entity: E) -> Self
     where
         E: EntityTrait,
@@ -601,13 +888,20 @@ impl<'a> SchemaBuilder<'a> {
     /// Create all registered tables and register synced ones for P2P replication.
     pub async fn sync(self) -> Result<(), DbErr> {
         for entry in self.entries {
-            self.db.inner.execute_unprepared(&entry.create_sql).await?;
+            self.db
+                .inner
+                .inner
+                .execute_unprepared(&entry.create_sql)
+                .await?;
             if entry.synced {
+                // Create shadow table for synced entities
+                crate::shadow::create_shadow_table(&self.db.inner.inner, &entry.meta.table_name)
+                    .await?;
                 self.db.register_table(entry.meta);
             }
         }
         // Signal the engine that tables are registered and sync can begin
-        self.db.registry_ready.notify_one();
+        self.db.inner.registry_ready.notify_one();
         Ok(())
     }
 
@@ -640,6 +934,7 @@ impl<'a> SchemaBuilder<'a> {
                 table_name,
                 primary_key_column,
                 columns,
+                delete_policy: DeletePolicy::default(),
             },
             synced,
         });
@@ -652,11 +947,16 @@ pub struct WaveSyncDbBuilder {
     node_id: Option<NodeId>,
     relay_server: Option<String>,
     topic: String,
-    eviction_timeout: std::time::Duration,
-    watermark_interval: std::time::Duration,
-    compaction_interval: std::time::Duration,
+    sync_interval: std::time::Duration,
     mdns_query_interval: std::time::Duration,
     mdns_ttl: std::time::Duration,
+    group_key: Option<crate::auth::GroupKey>,
+    bootstrap_peers: Vec<String>,
+    rendezvous_server: Option<String>,
+    rendezvous_discover_interval: std::time::Duration,
+    rendezvous_ttl: u64,
+    ipv6: bool,
+    push_token: Option<(String, String)>,
 }
 
 impl WaveSyncDbBuilder {
@@ -667,11 +967,16 @@ impl WaveSyncDbBuilder {
             node_id: None,
             relay_server: None,
             topic: topic.to_string(),
-            eviction_timeout: defaults.eviction_timeout,
-            watermark_interval: defaults.watermark_interval,
-            compaction_interval: defaults.compaction_interval,
+            sync_interval: defaults.sync_interval,
             mdns_query_interval: defaults.mdns_query_interval,
             mdns_ttl: defaults.mdns_ttl,
+            group_key: None,
+            bootstrap_peers: Vec::new(),
+            rendezvous_server: None,
+            rendezvous_discover_interval: defaults.rendezvous_discover_interval,
+            rendezvous_ttl: defaults.rendezvous_ttl,
+            ipv6: false,
+            push_token: None,
         }
     }
 
@@ -680,23 +985,54 @@ impl WaveSyncDbBuilder {
         self
     }
 
+    /// Configure a relay server for NAT traversal.
+    ///
+    /// The address should include the server's peer ID, e.g.:
+    /// `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
     pub fn with_relay_server(mut self, addr: &str) -> Self {
         self.relay_server = Some(addr.to_string());
         self
     }
 
-    pub fn with_eviction_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.eviction_timeout = timeout;
+    /// Add a static bootstrap peer to dial on startup.
+    ///
+    /// Bootstrap peers are dialed immediately and treated like mDNS-discovered
+    /// peers for gossipsub and version vector sync.
+    pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
+        self.bootstrap_peers.push(addr.to_string());
         self
     }
 
-    pub fn with_watermark_interval(mut self, interval: std::time::Duration) -> Self {
-        self.watermark_interval = interval;
+    /// Configure a rendezvous server for WAN peer discovery.
+    ///
+    /// Peers register under a namespace derived from the passphrase/topic,
+    /// enabling discovery without a public DHT. The address should include
+    /// the server's peer ID, e.g.: `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
+    pub fn with_rendezvous_server(mut self, addr: &str) -> Self {
+        self.rendezvous_server = Some(addr.to_string());
         self
     }
 
-    pub fn with_compaction_interval(mut self, interval: std::time::Duration) -> Self {
-        self.compaction_interval = interval;
+    /// Set the interval for rendezvous discovery queries (default: 60s).
+    pub fn with_rendezvous_discover_interval(mut self, interval: std::time::Duration) -> Self {
+        self.rendezvous_discover_interval = interval;
+        self
+    }
+
+    /// Set the TTL for rendezvous registration in seconds (default: 300s).
+    pub fn with_rendezvous_ttl(mut self, ttl: u64) -> Self {
+        self.rendezvous_ttl = ttl;
+        self
+    }
+
+    /// Enable IPv6 listen addresses in addition to IPv4.
+    pub fn with_ipv6(mut self, enabled: bool) -> Self {
+        self.ipv6 = enabled;
+        self
+    }
+
+    pub fn with_sync_interval(mut self, interval: std::time::Duration) -> Self {
+        self.sync_interval = interval;
         self
     }
 
@@ -710,70 +1046,113 @@ impl WaveSyncDbBuilder {
         self
     }
 
+    pub fn with_passphrase(mut self, passphrase: &str) -> Self {
+        self.group_key = Some(crate::auth::GroupKey::from_passphrase(passphrase));
+        self
+    }
+
+    /// Register a push notification token for mobile wake-up via the relay server.
+    ///
+    /// When connected to a relay, the engine will send a `RegisterToken` request
+    /// so the relay can send silent push notifications when other peers publish changes.
+    /// `platform` should be `"Fcm"` or `"Apns"`.
+    pub fn with_push_token(mut self, platform: &str, token: &str) -> Self {
+        self.push_token = Some((platform.to_string(), token.to_string()));
+        self
+    }
+
     pub async fn build(self) -> Result<WaveSyncDb, DbErr> {
         let opts = ConnectOptions::new(&self.database_url);
         let inner = Database::connect(opts).await?;
 
-        let node_id = self.node_id.unwrap_or_else(|| {
-            let mut id = [0u8; 16];
-            let pid = std::process::id().to_le_bytes();
-            id[..4].copy_from_slice(&pid);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-                .to_le_bytes();
-            id[4..].copy_from_slice(&now[..12]);
-            id
-        });
+        // Create meta table and get/generate persistent site_id
+        crate::shadow::create_meta_table(&inner).await?;
+        let site_id = crate::shadow::get_site_id(&inner).await?;
 
-        let node_u128 = u128::from_le_bytes(node_id);
-        // uhlc::ID requires NonZero, ensure we have a non-zero value
-        let nz =
-            std::num::NonZeroU128::new(node_u128).unwrap_or(std::num::NonZeroU128::new(1).unwrap());
-        let hlc_id = uhlc::ID::from(nz);
-        let hlc = uhlc::HLCBuilder::new().with_id(hlc_id).build();
+        let node_id = self.node_id.unwrap_or(site_id);
 
-        let (sync_tx, sync_rx) = mpsc::channel::<SyncOperation>(256);
+        let db_version = crate::shadow::get_db_version(&inner).await?;
+
+        let (sync_tx, sync_rx) = mpsc::channel::<SyncChangeset>(256);
         let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
 
         let registry = Arc::new(TableRegistry::new());
         let registry_ready = Arc::new(Notify::new());
 
-        // Create the sync log and peers tables
-        crate::sync_log::create_log_table(&inner).await?;
-        crate::peer_tracker::create_peers_table(&inner).await?;
+        // Create peer versions table
+        crate::peer_tracker::create_peer_versions_table(&inner).await?;
 
-        let db = WaveSyncDb {
-            inner: inner.clone(),
-            sync_tx,
-            change_tx: change_tx.clone(),
-            hlc: Arc::new(Mutex::new(hlc)),
-            node_id,
-            registry: registry.clone(),
-            registry_ready: registry_ready.clone(),
-        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<crate::engine::EngineCommand>(4);
+
+        // Parse multiaddrs for WAN config
+        let relay_server = self
+            .relay_server
+            .as_deref()
+            .map(|s| s.parse::<libp2p::Multiaddr>())
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("Invalid relay server address: {e}")))?;
+
+        let rendezvous_server = self
+            .rendezvous_server
+            .as_deref()
+            .map(|s| s.parse::<libp2p::Multiaddr>())
+            .transpose()
+            .map_err(|e| DbErr::Custom(format!("Invalid rendezvous server address: {e}")))?;
+
+        let bootstrap_peers: Vec<libp2p::Multiaddr> = self
+            .bootstrap_peers
+            .iter()
+            .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    log::warn!("Skipping invalid bootstrap peer address '{}': {}", s, e);
+                    None
+                }
+            })
+            .collect();
 
         let engine_config = crate::engine::EngineConfig {
-            eviction_timeout: self.eviction_timeout,
-            watermark_interval: self.watermark_interval,
-            compaction_interval: self.compaction_interval,
+            sync_interval: self.sync_interval,
             mdns_query_interval: self.mdns_query_interval,
             mdns_ttl: self.mdns_ttl,
+            bootstrap_peers,
+            relay_server,
+            rendezvous_server,
+            rendezvous_discover_interval: self.rendezvous_discover_interval,
+            rendezvous_ttl: self.rendezvous_ttl,
+            ipv6: self.ipv6,
+            push_token: self.push_token,
         };
 
         // Start the P2P engine in a background task
-        crate::engine::start_engine(
-            inner,
+        let engine_handle = crate::engine::start_engine(
+            inner.clone(),
             sync_rx,
-            change_tx,
-            registry,
+            change_tx.clone(),
+            registry.clone(),
             node_id,
+            site_id,
             self.topic,
-            self.relay_server,
             engine_config,
-            registry_ready,
+            registry_ready.clone(),
+            cmd_rx,
+            self.group_key,
         );
+
+        let db = WaveSyncDb {
+            inner: Arc::new(WaveSyncDbInner {
+                inner,
+                sync_tx,
+                change_tx,
+                site_id,
+                db_version: Mutex::new(db_version),
+                node_id,
+                registry,
+                registry_ready,
+                cmd_tx,
+                engine_handle: std::sync::Mutex::new(Some(engine_handle)),
+            }),
+        };
 
         Ok(db)
     }
@@ -787,29 +1166,25 @@ mod tests {
 
     #[test]
     fn test_classify_insert_basic() {
-        let result =
-            classify_write(r#"INSERT INTO "tasks" ("id", "name") VALUES ('1', 'foo')"#);
+        let result = classify_write(r#"INSERT INTO "tasks" ("id", "name") VALUES ('1', 'foo')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_insert_or_replace() {
-        let result =
-            classify_write(r#"INSERT OR REPLACE INTO "tasks" ("id") VALUES ('1')"#);
+        let result = classify_write(r#"INSERT OR REPLACE INTO "tasks" ("id") VALUES ('1')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_insert_or_ignore() {
-        let result =
-            classify_write(r#"INSERT OR IGNORE INTO "tasks" ("id") VALUES ('1')"#);
+        let result = classify_write(r#"INSERT OR IGNORE INTO "tasks" ("id") VALUES ('1')"#);
         assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
     }
 
     #[test]
     fn test_classify_update() {
-        let result =
-            classify_write(r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" = '1'"#);
+        let result = classify_write(r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" = '1'"#);
         assert_eq!(result, Some((WriteKind::Update, "tasks".to_string())));
     }
 
@@ -825,30 +1200,142 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    // parse_write_full tests
+
+    #[test]
+    fn test_parse_write_insert() {
+        let sql = r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('abc', 'My Task', 0)"#;
+        let parsed = parse_write_full(sql, "id").unwrap();
+        assert_eq!(parsed.kind, WriteKind::Insert);
+        assert_eq!(parsed.table, "tasks");
+        assert_eq!(parsed.primary_key, "abc");
+        assert_eq!(parsed.columns.len(), 3);
+        assert_eq!(parsed.columns[0].0, "id");
+        assert_eq!(parsed.columns[0].1, serde_json::json!("abc"));
+        assert_eq!(parsed.columns[1].0, "title");
+        assert_eq!(parsed.columns[1].1, serde_json::json!("My Task"));
+        assert_eq!(parsed.columns[2].0, "done");
+        assert_eq!(parsed.columns[2].1, serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_parse_write_update() {
+        let sql = r#"UPDATE "tasks" SET "title" = 'New Title', "done" = 1 WHERE "id" = 'abc'"#;
+        let parsed = parse_write_full(sql, "id").unwrap();
+        assert_eq!(parsed.kind, WriteKind::Update);
+        assert_eq!(parsed.table, "tasks");
+        assert_eq!(parsed.primary_key, "abc");
+        assert_eq!(parsed.columns.len(), 2);
+        assert_eq!(parsed.columns[0].0, "title");
+        assert_eq!(parsed.columns[0].1, serde_json::json!("New Title"));
+        assert_eq!(parsed.columns[1].0, "done");
+        assert_eq!(parsed.columns[1].1, serde_json::json!(1));
+    }
+
+    #[test]
+    fn test_parse_write_delete() {
+        let sql = r#"DELETE FROM "tasks" WHERE "id" = 'abc'"#;
+        let parsed = parse_write_full(sql, "id").unwrap();
+        assert_eq!(parsed.kind, WriteKind::Delete);
+        assert_eq!(parsed.table, "tasks");
+        assert_eq!(parsed.primary_key, "abc");
+        assert!(parsed.columns.is_empty());
+    }
+
+    #[test]
+    fn test_sql_value_to_json_null() {
+        assert_eq!(sql_value_to_json("NULL"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_sql_value_to_json_string() {
+        assert_eq!(
+            sql_value_to_json("'hello'"),
+            serde_json::Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sql_value_to_json_integer() {
+        assert_eq!(sql_value_to_json("42"), serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_sql_value_to_json_bool() {
+        assert_eq!(sql_value_to_json("TRUE"), serde_json::Value::Bool(true));
+        assert_eq!(sql_value_to_json("FALSE"), serde_json::Value::Bool(false));
+    }
+
     // extract_primary_key tests
 
     #[test]
     fn test_extract_pk_from_insert() {
         let sql = r#"INSERT INTO "tasks" ("id", "name") VALUES ('abc-123', 'my task')"#;
-        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
+        let pk = extract_pk_from_insert(sql, "id");
         assert_eq!(pk, "abc-123");
     }
 
     #[test]
-    fn test_extract_pk_from_insert_integer() {
-        let sql = r#"INSERT INTO "tasks" ("id", "name") VALUES (42, 'my task')"#;
-        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
-        assert_eq!(pk, "42");
-    }
-
-    #[test]
-    fn test_extract_pk_from_where() {
+    fn test_extract_pk_from_where_update() {
         let sql = r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" = 'abc-123'"#;
-        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
+        let pk = extract_pk_from_where(sql, "id");
         assert_eq!(pk, "abc-123");
     }
 
-    // extract_columns tests
+    // split_sql_values tests
+
+    #[test]
+    fn test_split_sql_values_with_quotes() {
+        let values = split_sql_values("'hello, world', 42, 'foo'");
+        assert_eq!(values, vec!["'hello, world'", " 42", " 'foo'"]);
+    }
+
+    // classify_write edge cases
+
+    #[test]
+    fn test_classify_leading_whitespace() {
+        let result = classify_write(r#"   INSERT INTO "tasks" ("id") VALUES ('1')"#);
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_multiline_insert() {
+        let result = classify_write("INSERT\n  INTO \"tasks\" (\"id\") VALUES ('1')");
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_backtick_table() {
+        let result = classify_write("INSERT INTO `tasks` (\"id\") VALUES ('1')");
+        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
+    }
+
+    #[test]
+    fn test_classify_update_no_set() {
+        let result = classify_write("UPDATE tasks");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_pk_delete_from_where() {
+        let sql = r#"DELETE FROM "tasks" WHERE "id" = 'abc'"#;
+        let pk = extract_pk_from_where(sql, "id");
+        assert_eq!(pk, "abc");
+    }
+
+    #[test]
+    fn test_extract_pk_insert_no_parens() {
+        let sql = "INSERT INTO tasks";
+        let pk = extract_pk_from_insert(sql, "id");
+        assert_eq!(pk, "");
+    }
+
+    #[test]
+    fn test_extract_pk_insert_no_values() {
+        let sql = r#"INSERT INTO "tasks" ("id")"#;
+        let pk = extract_pk_from_insert(sql, "id");
+        assert_eq!(pk, "");
+    }
 
     #[test]
     fn test_extract_columns_insert() {
@@ -869,96 +1356,6 @@ mod tests {
         let sql = r#"UPDATE "tasks" SET "name" = 'bar', "done" = 1 WHERE "id" = '1'"#;
         let cols = extract_columns(sql, &WriteKind::Update);
         assert_eq!(cols, Some(vec!["name".to_string(), "done".to_string()]));
-    }
-
-    // split_sql_values tests
-
-    #[test]
-    fn test_split_sql_values_with_quotes() {
-        let values = split_sql_values("'hello, world', 42, 'foo'");
-        assert_eq!(values, vec!["'hello, world'", " 42", " 'foo'"]);
-    }
-
-    // classify_write edge cases
-
-    #[test]
-    fn test_classify_leading_whitespace() {
-        let result =
-            classify_write(r#"   INSERT INTO "tasks" ("id") VALUES ('1')"#);
-        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
-    }
-
-    #[test]
-    fn test_classify_multiline_insert() {
-        let result =
-            classify_write("INSERT\n  INTO \"tasks\" (\"id\") VALUES ('1')");
-        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
-    }
-
-    #[test]
-    fn test_classify_backtick_table() {
-        let result =
-            classify_write("INSERT INTO `tasks` (\"id\") VALUES ('1')");
-        assert_eq!(result, Some((WriteKind::Insert, "tasks".to_string())));
-    }
-
-    #[test]
-    fn test_classify_update_no_set() {
-        let result = classify_write("UPDATE tasks");
-        assert_eq!(result, None);
-    }
-
-    // extract_primary_key edge cases
-
-    #[test]
-    fn test_extract_pk_delete_from_where() {
-        let sql = r#"DELETE FROM "tasks" WHERE "id" = 'abc'"#;
-        let pk = extract_primary_key(sql, &WriteKind::Delete, "id");
-        assert_eq!(pk, "abc");
-    }
-
-    #[test]
-    fn test_extract_pk_insert_no_parens() {
-        let sql = "INSERT INTO tasks";
-        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
-        assert_eq!(pk, "");
-    }
-
-    #[test]
-    fn test_extract_pk_insert_no_values() {
-        let sql = r#"INSERT INTO "tasks" ("id")"#;
-        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
-        assert_eq!(pk, "");
-    }
-
-    #[test]
-    fn test_extract_pk_insert_pk_not_found() {
-        let sql = r#"INSERT INTO "tasks" ("name") VALUES ('foo')"#;
-        let pk = extract_primary_key(sql, &WriteKind::Insert, "id");
-        assert_eq!(pk, "");
-    }
-
-    #[test]
-    fn test_extract_pk_where_no_where() {
-        let sql = r#"UPDATE "tasks" SET "name" = 'bar'"#;
-        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
-        assert_eq!(pk, "");
-    }
-
-    #[test]
-    fn test_extract_pk_where_col_not_found() {
-        let sql = r#"UPDATE "tasks" SET "name" = 'bar' WHERE "name" = 'old'"#;
-        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
-        assert_eq!(pk, "");
-    }
-
-    // extract_columns + split_sql_values edge cases
-
-    #[test]
-    fn test_extract_pk_where_no_equals() {
-        let sql = r#"UPDATE "tasks" SET "name" = 'bar' WHERE "id" LIKE 'abc%'"#;
-        let pk = extract_primary_key(sql, &WriteKind::Update, "id");
-        assert_eq!(pk, "");
     }
 
     #[test]

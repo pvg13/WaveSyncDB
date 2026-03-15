@@ -1,7 +1,0 @@
-[package]
-name = "wavesyncdb_dioxus"
-version = "0.2.1"
-edition = "2024"
-
-[dependencies]
-wavesyncdb = { workspace = true, features = ["dioxus"] }

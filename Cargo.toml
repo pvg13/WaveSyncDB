@@ -2,7 +2,7 @@
 members = [
     "wavesyncdb",
     "wavesyncdb_derive",
-    "wavesyncdb_dioxus",
+    "wavesync_relay",
     "examples/*",
 ]
 resolver = "3"
@@ -11,11 +11,9 @@ resolver = "3"
 wavesyncdb = { path = "wavesyncdb", version = "0.3.5" }
 wavesyncdb_derive = { path = "wavesyncdb_derive", version = "0.2.1" }
 sea-orm = { version = "2.0.0-rc", features = ["sqlx-sqlite", "runtime-tokio", "macros"] }
-uhlc = "0.9"
-postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.47", features = ["full"] }
-libp2p = { version = "0.56.0", features = ["gossipsub", "identify", "mdns", "ping", "quic", "request-response", "serde", "tokio", "noise", "yamux", "tcp", "relay", "dcutr", "autonat"] }
+libp2p = { version = "0.56.0", features = ["gossipsub", "identify", "mdns", "ping", "quic", "request-response", "serde", "tokio", "noise", "yamux", "tcp", "relay", "dcutr", "autonat", "rendezvous"] }
 thiserror = "2.0"
 log = "0.4"
 uuid = { version = "1", features = ["v4"] }

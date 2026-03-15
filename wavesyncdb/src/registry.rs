@@ -10,6 +10,8 @@ use std::sync::RwLock;
 
 use sea_orm::DatabaseBackend;
 
+use crate::messages::DeletePolicy;
+
 /// Metadata about a synced table.
 #[derive(Debug, Clone)]
 pub struct TableMeta {
@@ -19,6 +21,8 @@ pub struct TableMeta {
     pub primary_key_column: String,
     /// All column names in the table.
     pub columns: Vec<String>,
+    /// How to resolve delete vs. non-delete conflicts for this table.
+    pub delete_policy: DeletePolicy,
 }
 
 /// Metadata submitted by `#[derive(SyncEntity)]` at link time.
@@ -78,12 +82,14 @@ impl TableRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::DeletePolicy;
 
     fn make_meta(name: &str, pk: &str, cols: &[&str]) -> TableMeta {
         TableMeta {
             table_name: name.to_string(),
             primary_key_column: pk.to_string(),
             columns: cols.iter().map(|c| c.to_string()).collect(),
+            delete_policy: DeletePolicy::default(),
         }
     }
 
