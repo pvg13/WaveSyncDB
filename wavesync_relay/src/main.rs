@@ -13,6 +13,7 @@ use libp2p::{
     rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
+use base64::Engine as _;
 use rand::rngs::OsRng;
 
 use push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
@@ -33,6 +34,15 @@ struct Cli {
     /// If the file does not exist, a new keypair is generated and saved.
     #[arg(long)]
     identity_file: Option<PathBuf>,
+
+    /// Base64-encoded protobuf identity keypair. Overrides --identity-file.
+    /// Generate with: wavesync-relay --generate-identity
+    #[arg(long, env = "IDENTITY_KEYPAIR")]
+    identity_keypair: Option<String>,
+
+    /// Print a new base64-encoded identity keypair and its PeerId, then exit.
+    #[arg(long)]
+    generate_identity: bool,
 
     /// Maximum number of relay circuits (0 = unlimited)
     #[arg(long, default_value_t = 256)]
@@ -113,9 +123,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    let keypair = match &cli.identity_file {
-        Some(path) => load_or_generate_keypair(path),
-        None => identity::Keypair::generate_ed25519(),
+    if cli.generate_identity {
+        let keypair = identity::Keypair::generate_ed25519();
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(keypair.to_protobuf_encoding().expect("Failed to encode keypair"));
+        let peer_id = keypair.public().to_peer_id();
+        println!("IDENTITY_KEYPAIR={b64}");
+        println!("PeerId: {peer_id}");
+        return Ok(());
+    }
+
+    let keypair = if let Some(ref b64) = cli.identity_keypair {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("IDENTITY_KEYPAIR is not valid base64");
+        identity::Keypair::from_protobuf_encoding(&bytes)
+            .expect("IDENTITY_KEYPAIR is not a valid protobuf-encoded keypair")
+    } else if let Some(ref path) = cli.identity_file {
+        load_or_generate_keypair(path)
+    } else {
+        identity::Keypair::generate_ed25519()
     };
 
     let peer_id = keypair.public().to_peer_id();
