@@ -1,0 +1,25 @@
+services:
+  wavesync-relay:
+    build:
+      context: ..
+      dockerfile: wavesync_relay/Dockerfile
+    container_name: wavesync-relay
+    restart: unless-stopped
+    ports:
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
+    volumes:
+      - relay-data:/data
+      # Uncomment and mount your credential files if using push notifications:
+      # - ./fcm-service-account.json:/data/fcm-credentials.json:ro
+      # - ./AuthKey.p8:/data/apns-key.p8:ro
+    environment:
+      PUSH_DB: /data/push_tokens.db
+      # FCM_CREDENTIALS: /data/fcm-credentials.json
+      # APNS_KEY_FILE: /data/apns-key.p8
+      # APNS_KEY_ID: ""
+      # APNS_TEAM_ID: ""
+      # APNS_BUNDLE_ID: ""
+
+volumes:
+  relay-data:
