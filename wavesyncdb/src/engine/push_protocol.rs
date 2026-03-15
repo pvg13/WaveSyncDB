@@ -1,6 +1,6 @@
-//! libp2p request-response codec for version vector sync protocol.
+//! libp2p request-response codec for push notification protocol.
 //!
-//! Uses length-prefixed serde_json serialization for `SyncRequest` / `SyncResponse`.
+//! Uses length-prefixed serde_json serialization for `PushRequest` / `PushResponse`.
 
 use std::io;
 
@@ -8,21 +8,52 @@ use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::StreamProtocol;
 use libp2p::request_response;
+use serde::{Deserialize, Serialize};
 
-use crate::protocol::{SyncRequest, SyncResponse};
+/// Protocol identifier for the push notification protocol.
+pub const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/push/1.0.0");
 
-/// Protocol identifier for the sync protocol.
-pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/2.0.0");
+/// Push notification platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PushPlatform {
+    Fcm,
+    Apns,
+}
 
-/// Codec for serializing/deserializing sync messages.
+/// Request sent to the relay for push notification management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PushRequest {
+    RegisterToken {
+        topic: String,
+        platform: PushPlatform,
+        token: String,
+    },
+    UnregisterToken {
+        topic: String,
+        token: String,
+    },
+    NotifyTopic {
+        topic: String,
+        sender_site_id: String,
+    },
+}
+
+/// Response from the relay for push notification requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PushResponse {
+    Ok,
+    Error { message: String },
+}
+
+/// Codec for serializing/deserializing push notification messages.
 #[derive(Debug, Clone, Default)]
-pub struct SnapshotCodec;
+pub struct PushCodec;
 
 #[async_trait]
-impl request_response::Codec for SnapshotCodec {
+impl request_response::Codec for PushCodec {
     type Protocol = StreamProtocol;
-    type Request = SyncRequest;
-    type Response = SyncResponse;
+    type Request = PushRequest;
+    type Response = PushResponse;
 
     async fn read_request<T>(
         &mut self,
@@ -83,11 +114,11 @@ async fn read_length_prefixed<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<Ve
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Sanity check: reject payloads > 64 MiB
-    if len > 64 * 1024 * 1024 {
+    // Sanity check: reject payloads > 1 MiB (push messages are small)
+    if len > 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("snapshot payload too large: {len} bytes"),
+            format!("push payload too large: {len} bytes"),
         ));
     }
 
@@ -108,43 +139,47 @@ async fn write_length_prefixed<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{SyncRequest, SyncResponse};
     use futures::io::Cursor;
     use libp2p::request_response::Codec as _;
 
     #[tokio::test]
-    async fn test_length_prefixed_roundtrip() {
-        let data = b"hello world";
+    async fn test_codec_request_roundtrip_register() {
+        let mut codec = PushCodec;
+        let protocol = PUSH_PROTOCOL;
+        let req = PushRequest::RegisterToken {
+            topic: "abc123".to_string(),
+            platform: PushPlatform::Fcm,
+            token: "fcm-token-xyz".to_string(),
+        };
         let mut buf = Cursor::new(Vec::new());
-        write_length_prefixed(&mut buf, data).await.unwrap();
+        codec
+            .write_request(&protocol, &mut buf, req.clone())
+            .await
+            .unwrap();
         let written = buf.into_inner();
         let mut reader = Cursor::new(written);
-        let result = read_length_prefixed(&mut reader).await.unwrap();
-        assert_eq!(result, data);
+        let result = codec.read_request(&protocol, &mut reader).await.unwrap();
+        match result {
+            PushRequest::RegisterToken {
+                topic,
+                platform,
+                token,
+            } => {
+                assert_eq!(topic, "abc123");
+                assert_eq!(platform, PushPlatform::Fcm);
+                assert_eq!(token, "fcm-token-xyz");
+            }
+            _ => panic!("Expected RegisterToken"),
+        }
     }
 
     #[tokio::test]
-    async fn test_length_prefixed_rejects_oversized() {
-        let mut buf = Vec::new();
-        let huge_len: u32 = 65 * 1024 * 1024; // > 64 MiB
-        buf.extend_from_slice(&huge_len.to_be_bytes());
-        buf.extend_from_slice(&[0u8; 16]); // some dummy data
-        let mut reader = Cursor::new(buf);
-        let result = read_length_prefixed(&mut reader).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn test_codec_request_roundtrip() {
-        let mut codec = SnapshotCodec;
-        let protocol = SNAPSHOT_PROTOCOL;
-        let req = SyncRequest::VersionVector {
-            my_db_version: 42,
-            your_last_db_version: 10,
-            site_id: [1u8; 16],
-            topic: "test-topic".to_string(),
-            hmac: None,
+    async fn test_codec_request_roundtrip_notify() {
+        let mut codec = PushCodec;
+        let protocol = PUSH_PROTOCOL;
+        let req = PushRequest::NotifyTopic {
+            topic: "topic-hash".to_string(),
+            sender_site_id: "site-abc".to_string(),
         };
         let mut buf = Cursor::new(Vec::new());
         codec.write_request(&protocol, &mut buf, req).await.unwrap();
@@ -152,28 +187,39 @@ mod tests {
         let mut reader = Cursor::new(written);
         let result = codec.read_request(&protocol, &mut reader).await.unwrap();
         match result {
-            SyncRequest::VersionVector {
-                my_db_version,
-                your_last_db_version,
-                ..
+            PushRequest::NotifyTopic {
+                topic,
+                sender_site_id,
             } => {
-                assert_eq!(my_db_version, 42);
-                assert_eq!(your_last_db_version, 10);
+                assert_eq!(topic, "topic-hash");
+                assert_eq!(sender_site_id, "site-abc");
             }
+            _ => panic!("Expected NotifyTopic"),
         }
     }
 
     #[tokio::test]
     async fn test_codec_response_roundtrip() {
-        let mut codec = SnapshotCodec;
-        let protocol = SNAPSHOT_PROTOCOL;
-        let resp = SyncResponse::ChangesetResponse {
-            changes: vec![],
-            my_db_version: 100,
-            your_last_db_version: 50,
-            site_id: [2u8; 16],
-            topic: "test-topic".to_string(),
-            hmac: None,
+        let mut codec = PushCodec;
+        let protocol = PUSH_PROTOCOL;
+        let resp = PushResponse::Ok;
+        let mut buf = Cursor::new(Vec::new());
+        codec
+            .write_response(&protocol, &mut buf, resp)
+            .await
+            .unwrap();
+        let written = buf.into_inner();
+        let mut reader = Cursor::new(written);
+        let result = codec.read_response(&protocol, &mut reader).await.unwrap();
+        assert!(matches!(result, PushResponse::Ok));
+    }
+
+    #[tokio::test]
+    async fn test_codec_response_error_roundtrip() {
+        let mut codec = PushCodec;
+        let protocol = PUSH_PROTOCOL;
+        let resp = PushResponse::Error {
+            message: "token expired".to_string(),
         };
         let mut buf = Cursor::new(Vec::new());
         codec
@@ -184,28 +230,8 @@ mod tests {
         let mut reader = Cursor::new(written);
         let result = codec.read_response(&protocol, &mut reader).await.unwrap();
         match result {
-            SyncResponse::ChangesetResponse {
-                my_db_version,
-                your_last_db_version,
-                ..
-            } => {
-                assert_eq!(my_db_version, 100);
-                assert_eq!(your_last_db_version, 50);
-            }
+            PushResponse::Error { message } => assert_eq!(message, "token expired"),
+            _ => panic!("Expected Error"),
         }
-    }
-
-    #[tokio::test]
-    async fn test_codec_read_request_invalid_data() {
-        let mut codec = SnapshotCodec;
-        let protocol = SNAPSHOT_PROTOCOL;
-        let garbage = vec![0xFF, 0xFE, 0xFD, 0xFC];
-        let mut buf = Cursor::new(Vec::new());
-        write_length_prefixed(&mut buf, &garbage).await.unwrap();
-        let written = buf.into_inner();
-        let mut reader = Cursor::new(written);
-        let result = codec.read_request(&protocol, &mut reader).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

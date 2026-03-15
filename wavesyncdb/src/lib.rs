@@ -5,7 +5,8 @@
 //! WaveSyncDB wraps a SeaORM [`DatabaseConnection`](sea_orm::DatabaseConnection) via
 //! [`WaveSyncDb`], intercepting write operations (INSERT, UPDATE, DELETE) and replicating
 //! them to peers over libp2p gossipsub. Conflicts are resolved automatically using
-//! Last-Write-Wins (LWW) with hybrid logical clocks.
+//! per-column Lamport clocks (CRDTs), allowing concurrent edits to different columns
+//! on the same row to both survive.
 //!
 //! ## Quick start
 //!
@@ -32,22 +33,25 @@
 //! - [`WaveSyncDb`] — connection wrapper that intercepts writes
 //! - [`WaveSyncDbBuilder`] — configures and builds the connection + P2P engine
 //! - [`SchemaBuilder`] — fluent API for registering entities
-//! - [`SyncOperation`] — a serialized write operation sent over the network
+//! - [`SyncChangeset`] — a batch of column-level CRDT changes sent over the network
 //! - [`ChangeNotification`] — lightweight event emitted after every write
 
+pub mod auth;
 pub mod conflict;
 pub mod connection;
 pub mod engine;
-pub mod merkle;
 pub mod messages;
 pub mod peer_tracker;
 pub mod protocol;
 pub mod registry;
-pub mod snapshot;
-pub mod sync_log;
+pub mod shadow;
 
+pub use auth::GroupKey;
 pub use connection::{SchemaBuilder, WaveSyncDb, WaveSyncDbBuilder};
-pub use messages::{ChangeNotification, NodeId, SyncOperation, WriteKind};
+pub use engine::EngineCommand;
+pub use messages::{
+    ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
+};
 pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
 
 // Re-export for use by the #[derive(SyncEntity)] macro

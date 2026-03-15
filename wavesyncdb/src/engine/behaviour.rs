@@ -1,6 +1,9 @@
-use libp2p::{autonat, dcutr, gossipsub, identify, mdns, ping, relay, request_response};
+use libp2p::{
+    autonat, dcutr, gossipsub, identify, mdns, ping, relay, rendezvous, request_response,
+};
 use libp2p_swarm_derive::NetworkBehaviour;
 
+use super::push_protocol::{PUSH_PROTOCOL, PushCodec};
 use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
 
 #[derive(NetworkBehaviour)]
@@ -10,9 +13,11 @@ pub struct WaveSyncBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub snapshot: request_response::Behaviour<SnapshotCodec>,
+    pub push: request_response::Behaviour<PushCodec>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::v2::client::Behaviour,
+    pub rendezvous: rendezvous::client::Behaviour,
 }
 
 impl WaveSyncBehaviour {
@@ -44,8 +49,15 @@ impl WaveSyncBehaviour {
 
         let autonat_behaviour = autonat::v2::client::Behaviour::default();
 
+        let rendezvous_behaviour = rendezvous::client::Behaviour::new(key.clone());
+
         let snapshot_behaviour = request_response::Behaviour::new(
             [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+
+        let push_behaviour = request_response::Behaviour::new(
+            [(PUSH_PROTOCOL, request_response::ProtocolSupport::Full)],
             request_response::Config::default(),
         );
 
@@ -59,9 +71,11 @@ impl WaveSyncBehaviour {
             )
             .unwrap(),
             snapshot: snapshot_behaviour,
+            push: push_behaviour,
             relay_client,
             dcutr: dcutr_behaviour,
             autonat: autonat_behaviour,
+            rendezvous: rendezvous_behaviour,
         }
     }
 }

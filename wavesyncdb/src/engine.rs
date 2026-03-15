@@ -1,66 +1,99 @@
 //! P2P sync engine powered by libp2p.
 //!
 //! The engine runs as a background tokio task, managing a libp2p swarm with:
-//! - **gossipsub** for pub/sub message replication
+//! - **gossipsub** for real-time push of column-level CRDT changesets
 //! - **mDNS** for local peer discovery
 //! - **QUIC + TCP** transports with Noise encryption and Yamux multiplexing
+//! - **request-response** for version vector based catch-up sync
 //! - **relay + dcutr + autonat** for NAT traversal (WIP)
 //!
-//! Local write operations arrive via an mpsc channel from [`WaveSyncDb`](crate::WaveSyncDb),
-//! are logged to [`sync_log`], and published to gossipsub.
-//! Incoming remote operations are checked with [`conflict::should_apply`]
-//! before being applied to the local database.
+//! Local write operations arrive via an mpsc channel from [`WaveSyncDb`](crate::WaveSyncDb)
+//! as [`SyncChangeset`]s and are published to gossipsub.
+//! Incoming remote changesets are applied column-by-column using per-column
+//! Lamport clocks for conflict resolution.
 
 pub(crate) mod behaviour;
+pub(crate) mod push_protocol;
 pub(crate) mod snapshot_protocol;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use behaviour::{WaveSyncBehaviour, WaveSyncBehaviourEvent};
 use libp2p::{
-    SwarmBuilder,
+    Multiaddr, SwarmBuilder, autonat, dcutr,
     futures::StreamExt,
     gossipsub::{self, IdentTopic},
-    identify, identity, mdns, noise, ping, request_response,
+    identify, identity, mdns, noise, ping, relay, rendezvous, request_response,
     swarm::SwarmEvent,
     yamux,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use tokio::sync::{Notify, broadcast, mpsc};
 
+use crate::auth::GroupKey;
 use crate::conflict;
-use crate::merkle::{MerkleTree, RowInfo};
-use crate::messages::{ChangeNotification, NodeId, SyncMessage, SyncOperation, WriteKind};
+use crate::messages::{
+    AuthenticatedMessage, ChangeNotification, ColumnChange, NodeId, SyncChangeset, SyncMessage,
+    WriteKind,
+};
 use crate::peer_tracker;
-use crate::protocol::{RowOpRequest, SyncRequest};
+use crate::protocol::SyncRequest;
 use crate::registry::TableRegistry;
-use crate::sync_log;
+use crate::shadow;
+
+/// Commands sent from the application to the P2P engine.
+#[derive(Debug)]
+pub enum EngineCommand {
+    /// App resumed from background — clear stale peers, restart mDNS, re-sync.
+    Resume,
+    /// Request a full sync from peers (user-triggered).
+    RequestFullSync,
+    /// Register a push notification token with the relay server.
+    RegisterPushToken { platform: String, token: String },
+    /// Graceful shutdown — stop the engine loop.
+    Shutdown,
+}
 
 /// Configuration for the sync engine.
 pub struct EngineConfig {
-    /// How long before a peer is considered stale and evicted (default: 7 days).
-    pub eviction_timeout: Duration,
-    /// How often to broadcast our watermark to peers (default: 5s).
-    pub watermark_interval: Duration,
-    /// How often to run log compaction (default: 5 min).
-    pub compaction_interval: Duration,
+    /// How often to run periodic version vector sync (default: 30s).
+    pub sync_interval: Duration,
     /// How often mDNS sends queries (default: 5s for fast LAN discovery).
     pub mdns_query_interval: Duration,
     /// How long mDNS records stay valid (default: 30s).
     pub mdns_ttl: Duration,
+    /// Static bootstrap peers to dial on startup.
+    pub bootstrap_peers: Vec<Multiaddr>,
+    /// Relay server multiaddr for NAT traversal.
+    pub relay_server: Option<Multiaddr>,
+    /// Rendezvous server multiaddr for WAN peer discovery.
+    pub rendezvous_server: Option<Multiaddr>,
+    /// How often to discover peers via rendezvous (default: 60s).
+    pub rendezvous_discover_interval: Duration,
+    /// TTL for rendezvous registration in seconds (default: 300s).
+    pub rendezvous_ttl: u64,
+    /// Whether to listen on IPv6 in addition to IPv4.
+    pub ipv6: bool,
+    /// Push notification token: (platform, device_token).
+    /// Platform is "Fcm" or "Apns".
+    pub push_token: Option<(String, String)>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            eviction_timeout: Duration::from_secs(7 * 24 * 60 * 60),
-            watermark_interval: Duration::from_secs(5),
-            compaction_interval: Duration::from_secs(300),
+            sync_interval: Duration::from_secs(30),
             mdns_query_interval: Duration::from_secs(5),
             mdns_ttl: Duration::from_secs(30),
+            bootstrap_peers: Vec::new(),
+            relay_server: None,
+            rendezvous_server: None,
+            rendezvous_discover_interval: Duration::from_secs(60),
+            rendezvous_ttl: 300,
+            ipv6: false,
+            push_token: None,
         }
     }
 }
@@ -77,25 +110,20 @@ impl EngineConfig {
 }
 
 /// Start the P2P sync engine in a background tokio task.
-///
-/// Spawns a new tokio task that runs the libp2p swarm event loop. The engine:
-/// - Listens on a random TCP port for incoming connections
-/// - Subscribes to the gossipsub topic for this application
-/// - Reads local [`SyncOperation`]s from `sync_rx` and publishes them
-/// - Receives remote operations from gossipsub and applies them (with LWW conflict resolution)
-/// - Sends [`ChangeNotification`]s on `change_tx` when remote writes are applied
 #[allow(clippy::too_many_arguments)]
 pub fn start_engine(
     db: DatabaseConnection,
-    sync_rx: mpsc::Receiver<SyncOperation>,
+    sync_rx: mpsc::Receiver<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
     node_id: NodeId,
+    site_id: NodeId,
     topic: String,
-    relay_server: Option<String>,
     config: EngineConfig,
     registry_ready: Arc<Notify>,
-) {
+    cmd_rx: mpsc::Receiver<EngineCommand>,
+    group_key: Option<GroupKey>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_engine(
             db,
@@ -103,29 +131,33 @@ pub fn start_engine(
             change_tx,
             registry,
             node_id,
+            site_id,
             topic,
-            relay_server,
             config,
             registry_ready,
+            cmd_rx,
+            group_key,
         )
         .await
         {
             log::error!("Engine error: {}", e);
         }
-    });
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(
     db: DatabaseConnection,
-    mut sync_rx: mpsc::Receiver<SyncOperation>,
+    mut sync_rx: mpsc::Receiver<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
     node_id: NodeId,
+    site_id: NodeId,
     topic_name: String,
-    relay_server: Option<String>,
     config: EngineConfig,
     registry_ready: Arc<Notify>,
+    cmd_rx: mpsc::Receiver<EngineCommand>,
+    group_key: Option<GroupKey>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keypair = identity::Keypair::generate_ed25519();
     let mdns_config = config.mdns_config();
@@ -146,95 +178,78 @@ async fn run_engine(
 
     let local_peer_id = keypair.public().to_peer_id();
 
-    // Check if we need a snapshot (empty sync log = new peer)
-    let initial_max_hlc = sync_log::get_max_hlc(&db).await?;
-    let needs_snapshot = Arc::new(AtomicBool::new(initial_max_hlc.is_none()));
-    let snapshot_retries = Arc::new(AtomicU8::new(0));
+    // Load current db_version
+    let local_db_version = shadow::get_db_version(&db).await?;
 
     let (snapshot_resp_tx, snapshot_resp_rx) = mpsc::channel::<(
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
     )>(8);
 
-    // Build Merkle trees from the sync log
-    let latest_rows = sync_log::get_latest_per_row(&db).await?;
-    let mut merkle_trees: HashMap<String, MerkleTree> = HashMap::new();
-    {
-        let mut grouped: HashMap<String, Vec<RowInfo>> = HashMap::new();
-        for row in latest_rows {
-            let mut nid: NodeId = [0u8; 16];
-            let len = row.node_id.len().min(16);
-            nid[..len].copy_from_slice(&row.node_id[..len]);
-            grouped
-                .entry(row.table_name.clone())
-                .or_default()
-                .push(RowInfo {
-                    primary_key: row.primary_key,
-                    hlc_time: row.hlc_time as u64,
-                    hlc_counter: row.hlc_counter as u32,
-                    node_id: nid,
-                });
-        }
-        for (table_name, rows) in grouped {
-            merkle_trees.insert(
-                table_name.clone(),
-                MerkleTree::build(table_name, rows),
-            );
-        }
-    }
-    log::info!(
-        "Built Merkle trees for {} tables at startup",
-        merkle_trees.len()
-    );
+    let effective_topic = match &group_key {
+        Some(gk) => gk.derive_topic(&topic_name),
+        None => topic_name.clone(),
+    };
 
-    let (merkle_update_tx, merkle_update_rx) = mpsc::channel::<SyncOperation>(256);
-    let (deferred_req_tx, deferred_req_rx) = mpsc::channel::<(libp2p::PeerId, SyncRequest)>(8);
-    let (watermark_tx, watermark_rx) = mpsc::channel::<u64>(8);
-    let (snapshot_retry_tx, snapshot_retry_rx) = mpsc::channel::<bool>(4);
+    // Determine rendezvous namespace (same as effective_topic — already PSK-derived)
+    let rendezvous_namespace = effective_topic.clone();
+
+    let push_token = config.push_token.clone();
 
     let mut engine = EngineRunner {
         swarm,
         peers: HashMap::new(),
-        topic: gossipsub::IdentTopic::new(&topic_name),
+        topic: gossipsub::IdentTopic::new(&effective_topic),
         db,
         change_tx,
         registry,
-        relay_server,
         local_peer_id,
         node_id,
+        site_id,
+        topic_name: effective_topic,
         config,
-        local_watermark: initial_max_hlc.unwrap_or(0),
-        needs_snapshot,
-        snapshot_retries,
+        local_db_version,
+        peer_db_versions: HashMap::new(),
         snapshot_resp_tx,
         snapshot_resp_rx,
-        merkle_trees,
-        merkle_update_tx,
-        merkle_update_rx,
-        deferred_req_tx,
-        deferred_req_rx,
-        pending_requests: HashMap::new(),
-        pending_full_sync: Arc::new(AtomicBool::new(false)),
-        failed_snapshot_peers: HashSet::new(),
-        pending_snapshot_peer: None,
         registry_ready,
         registry_is_ready: false,
-        watermark_tx,
-        watermark_rx,
-        snapshot_retry_tx,
-        snapshot_retry_rx,
+        cmd_rx,
+        group_key,
+        relay_state: RelayState::Disabled,
+        nat_status: NatStatus::Unknown,
+        rendezvous_namespace,
+        rendezvous_cookie: None,
+        rendezvous_registered: false,
+        bootstrap_peers: std::collections::HashSet::new(),
+        rejected_peers: std::collections::HashSet::new(),
+        pending_sync_peers: std::collections::HashSet::new(),
+        push_token,
+        push_registered: false,
     };
 
     engine.run(&mut sync_rx).await
 }
 
-/// Tracks what kind of request an outbound request ID corresponds to.
-#[derive(Debug, Clone, Copy)]
-enum SyncRequestKind {
-    FullSync,
-    MerkleRoots,
-    MerkleTrees,
-    MerkleRowOps,
+/// State machine for relay server connection lifecycle.
+#[derive(Debug)]
+enum RelayState {
+    /// No relay server configured.
+    Disabled,
+    /// Connecting to relay server (with retry count for backoff).
+    Connecting { retry_count: u32 },
+    /// TCP/QUIC connection established with relay peer.
+    Connected { relay_peer_id: libp2p::PeerId },
+    /// Listening on a relay circuit (reservation accepted).
+    Listening { relay_peer_id: libp2p::PeerId },
+}
+
+/// Detected NAT status from AutoNAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NatStatus {
+    Unknown,
+    Public,
+    Private,
 }
 
 struct EngineRunner {
@@ -244,13 +259,14 @@ struct EngineRunner {
     db: DatabaseConnection,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
-    relay_server: Option<String>,
     local_peer_id: libp2p::PeerId,
+    #[allow(dead_code)]
     node_id: NodeId,
+    site_id: NodeId,
+    topic_name: String,
     config: EngineConfig,
-    local_watermark: u64,
-    needs_snapshot: Arc<AtomicBool>,
-    snapshot_retries: Arc<AtomicU8>,
+    local_db_version: u64,
+    peer_db_versions: HashMap<libp2p::PeerId, u64>,
     snapshot_resp_tx: mpsc::Sender<(
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
@@ -259,35 +275,49 @@ struct EngineRunner {
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
     )>,
-    merkle_trees: HashMap<String, MerkleTree>,
-    merkle_update_tx: mpsc::Sender<SyncOperation>,
-    merkle_update_rx: mpsc::Receiver<SyncOperation>,
-    deferred_req_tx: mpsc::Sender<(libp2p::PeerId, SyncRequest)>,
-    deferred_req_rx: mpsc::Receiver<(libp2p::PeerId, SyncRequest)>,
-    pending_requests: HashMap<request_response::OutboundRequestId, SyncRequestKind>,
-    pending_full_sync: Arc<AtomicBool>,
-    /// Peers that returned irrelevant or empty snapshots — skip on retry.
-    failed_snapshot_peers: HashSet<libp2p::PeerId>,
-    /// Which peer is currently handling our FullSync request.
-    pending_snapshot_peer: Option<libp2p::PeerId>,
     registry_ready: Arc<Notify>,
     registry_is_ready: bool,
-    watermark_tx: mpsc::Sender<u64>,
-    watermark_rx: mpsc::Receiver<u64>,
-    snapshot_retry_tx: mpsc::Sender<bool>,
-    snapshot_retry_rx: mpsc::Receiver<bool>,
+    cmd_rx: mpsc::Receiver<EngineCommand>,
+    group_key: Option<GroupKey>,
+    /// Relay connection state machine.
+    relay_state: RelayState,
+    /// Detected NAT status from AutoNAT probes.
+    nat_status: NatStatus,
+    /// Rendezvous namespace for peer discovery.
+    rendezvous_namespace: String,
+    /// Rendezvous discovery pagination cookie.
+    rendezvous_cookie: Option<rendezvous::Cookie>,
+    /// Whether we have an active rendezvous registration.
+    rendezvous_registered: bool,
+    /// Set of bootstrap peer IDs for tracking.
+    bootstrap_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers rejected due to topic mismatch — never re-add via mDNS.
+    rejected_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers with an in-flight sync request — prevents flooding request-response.
+    pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Push notification token to register with relay: (platform, device_token).
+    push_token: Option<(String, String)>,
+    /// Whether push token has been registered with the relay.
+    push_registered: bool,
 }
 
 impl EngineRunner {
     async fn run(
         &mut self,
-        sync_rx: &mut mpsc::Receiver<SyncOperation>,
+        sync_rx: &mut mpsc::Receiver<SyncChangeset>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // IPv4 listen addresses
         self.swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())?;
-
         self.swarm
             .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())?;
+
+        // IPv6 listen addresses (opt-in)
+        if self.config.ipv6 {
+            self.swarm.listen_on("/ip6/::/tcp/0".parse().unwrap())?;
+            self.swarm
+                .listen_on("/ip6/::/udp/0/quic-v1".parse().unwrap())?;
+        }
 
         self.swarm
             .behaviour_mut()
@@ -295,91 +325,165 @@ impl EngineRunner {
             .subscribe(&self.topic)?;
 
         // If a relay server is configured, dial it
-        if let Some(ref relay_addr) = self.relay_server
-            && let Ok(addr) = relay_addr.parse::<libp2p::Multiaddr>()
-        {
-            if let Err(e) = self.swarm.dial(addr) {
+        if let Some(ref relay_addr) = self.config.relay_server.clone() {
+            if let Err(e) = self.swarm.dial(relay_addr.clone()) {
                 log::warn!("Failed to dial relay server {}: {}", relay_addr, e);
             } else {
                 log::info!("Dialing relay server: {}", relay_addr);
+                self.relay_state = RelayState::Connecting { retry_count: 0 };
             }
         }
 
-        let mut compaction_interval = tokio::time::interval(self.config.compaction_interval);
-        let mut watermark_interval = tokio::time::interval(self.config.watermark_interval);
+        // If a rendezvous server is configured, dial it
+        if let Some(ref rendezvous_addr) = self.config.rendezvous_server.clone() {
+            if let Err(e) = self.swarm.dial(rendezvous_addr.clone()) {
+                log::warn!(
+                    "Failed to dial rendezvous server {}: {}",
+                    rendezvous_addr,
+                    e
+                );
+            } else {
+                log::info!("Dialing rendezvous server: {}", rendezvous_addr);
+            }
+        }
+
+        // Dial bootstrap peers
+        for addr in self.config.bootstrap_peers.clone() {
+            // Extract peer ID from the multiaddr if present
+            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
+                self.bootstrap_peers.insert(peer_id);
+            }
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                log::warn!("Failed to dial bootstrap peer {}: {}", addr, e);
+            } else {
+                log::info!("Dialing bootstrap peer: {}", addr);
+            }
+        }
+
+        let mut sync_interval = tokio::time::interval(self.config.sync_interval);
+        let mut rendezvous_interval =
+            tokio::time::interval(self.config.rendezvous_discover_interval);
+        let has_rendezvous = self.config.rendezvous_server.is_some();
+        let registry_deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(registry_deadline);
+
+        // Relay reconnection timer (only active when relay is configured but disconnected)
+        let mut relay_reconnect = tokio::time::interval(Duration::from_secs(30));
+        let has_relay = self.config.relay_server.is_some();
 
         loop {
             tokio::select! {
-                Some(op) = sync_rx.recv() => {
-                    self.handle_local_op(op).await;
+                Some(changeset) = sync_rx.recv() => {
+                    self.handle_local_changeset(changeset).await;
                 },
                 event = self.swarm.select_next_some() => {
-                    self.handle_swarm_event(event);
+                    self.handle_swarm_event(event).await;
                 },
-                _ = compaction_interval.tick() => {
-                    let db = self.db.clone();
-                    let eviction_timeout = self.config.eviction_timeout;
-                    tokio::spawn(async move {
-                        run_compaction(db, eviction_timeout).await;
-                    });
+                _ = sync_interval.tick() => {
+                    // Periodic version vector sync with all known peers
+                    if self.registry_is_ready {
+                        self.sync_all_known_peers().await;
+                    }
                 },
-                _ = watermark_interval.tick() => {
-                    self.broadcast_watermark();
+                _ = rendezvous_interval.tick(), if has_rendezvous => {
+                    self.rendezvous_discover();
+                },
+                _ = relay_reconnect.tick(), if has_relay => {
+                    self.maybe_reconnect_relay();
                 },
                 Some((channel, response)) = self.snapshot_resp_rx.recv() => {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {
-                        log::error!("Failed to send snapshot response: {:?}", resp);
+                        log::error!("Failed to send sync response: {:?}", resp);
                     }
-                },
-                Some(op) = self.merkle_update_rx.recv() => {
-                    self.update_merkle_tree(&op);
-                },
-                Some((peer_id, request)) = self.deferred_req_rx.recv() => {
-                    let req_id = self.swarm.behaviour_mut().snapshot.send_request(&peer_id, request);
-                    self.pending_requests.insert(req_id, SyncRequestKind::MerkleRowOps);
                 },
                 _ = self.registry_ready.notified(), if !self.registry_is_ready => {
                     self.registry_is_ready = true;
                     log::info!("Registry ready, syncing all known peers");
-                    self.sync_all_known_peers();
+                    self.sync_all_known_peers().await;
                 },
-                Some(wm) = self.watermark_rx.recv() => {
-                    self.local_watermark = wm;
-                    self.pending_full_sync.store(false, Ordering::SeqCst);
-                    self.failed_snapshot_peers.clear();
-                    self.pending_snapshot_peer = None;
+                _ = &mut registry_deadline, if !self.registry_is_ready => {
+                    log::error!("Schema registry not ready after 30s — proceeding without sync tables");
+                    self.registry_is_ready = true;
                 },
-                Some(irrelevant) = self.snapshot_retry_rx.recv() => {
-                    // If the snapshot was irrelevant (wrong peer), remember
-                    // that peer so we skip it next time.
-                    if irrelevant
-                        && let Some(failed_peer) = self.pending_snapshot_peer.take()
-                    {
-                        self.failed_snapshot_peers.insert(failed_peer);
+                Some(cmd) = self.cmd_rx.recv() => {
+                    if self.handle_command(cmd).await {
+                        break Ok(());
                     }
-                    log::info!("Snapshot retry requested, syncing all known peers");
-                    self.sync_all_known_peers();
                 },
             }
         }
     }
 
-    async fn handle_local_op(&mut self, op: SyncOperation) {
-        // Update local watermark
-        self.local_watermark = self.local_watermark.max(op.hlc_time);
-
-        // Log the operation to the sync log first
-        if let Err(e) = sync_log::insert_op(&self.db, &op).await {
-            log::error!("Failed to log local sync operation: {}", e);
+    /// Dispatch an engine command received from the application.
+    /// Returns `true` if the engine should shut down.
+    async fn handle_command(&mut self, cmd: EngineCommand) -> bool {
+        match cmd {
+            EngineCommand::Resume => {
+                while let Ok(EngineCommand::Resume) = self.cmd_rx.try_recv() {}
+                self.handle_resume().await;
+                false
+            }
+            EngineCommand::RequestFullSync => {
+                log::info!("Full sync requested by user");
+                // Reset peer versions to trigger full re-sync
+                self.peer_db_versions.clear();
+                self.pending_sync_peers.clear();
+                self.trigger_rediscovery();
+                self.sync_all_known_peers().await;
+                false
+            }
+            EngineCommand::RegisterPushToken { platform, token } => {
+                log::info!("Registering push token (platform: {platform})");
+                self.push_token = Some((platform, token));
+                self.push_registered = false;
+                // If relay is already connected, register immediately
+                if let RelayState::Connected { relay_peer_id }
+                | RelayState::Listening { relay_peer_id } = self.relay_state
+                {
+                    self.maybe_register_push_token(relay_peer_id);
+                }
+                false
+            }
+            EngineCommand::Shutdown => {
+                log::info!("Engine shutdown requested");
+                true
+            }
         }
+    }
 
-        // Update Merkle tree
-        self.update_merkle_tree(&op);
+    async fn handle_resume(&mut self) {
+        log::info!("App resumed — clearing stale peers and re-syncing");
 
-        let msg = SyncMessage::Op(op);
-        match postcard::to_allocvec(&msg) {
+        let connected: std::collections::HashSet<libp2p::PeerId> =
+            self.swarm.connected_peers().cloned().collect();
+        self.peers.retain(|peer_id, _| connected.contains(peer_id));
+        self.pending_sync_peers.clear();
+
+        self.trigger_rediscovery();
+        self.sync_all_known_peers().await;
+    }
+
+    async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
+        // Update local db_version
+        self.local_db_version = self.local_db_version.max(changeset.db_version);
+
+        let msg = SyncMessage::Changeset(changeset);
+        let hmac = match &self.group_key {
+            Some(gk) => {
+                let inner_bytes = match serde_json::to_vec(&msg) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::error!("Failed to serialize changeset: {}", e);
+                        return;
+                    }
+                };
+                Some(gk.mac(&inner_bytes))
+            }
+            None => None,
+        };
+        let wrapper = AuthenticatedMessage { inner: msg, hmac };
+        match serde_json::to_vec(&wrapper) {
             Ok(data) => {
-                // Gossipsub default max message size is ~1 MiB
                 const MAX_GOSSIPSUB_MSG_SIZE: usize = 1024 * 1024;
                 if data.len() > MAX_GOSSIPSUB_MSG_SIZE {
                     log::warn!(
@@ -397,15 +501,19 @@ impl EngineRunner {
                 {
                     log::warn!("Failed to publish to gossipsub: {}", e);
                     self.trigger_rediscovery();
+                    self.sync_all_known_peers().await;
+                } else {
+                    // Notify relay to send push notifications to sleeping mobile peers
+                    self.notify_relay_topic();
                 }
             }
             Err(e) => {
-                log::error!("Failed to serialize operation: {}", e);
+                log::error!("Failed to serialize changeset: {}", e);
             }
         }
     }
 
-    fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 log::info!("Listening on {address:?}");
@@ -438,19 +546,106 @@ impl EngineRunner {
                 self.handle_snapshot(event);
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::RelayClient(event)) => {
-                log::debug!("Relay client event: {:?}", event);
+                self.handle_relay_client(event);
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Dcutr(event)) => {
-                log::debug!("DCUtR event: {:?}", event);
+                self.handle_dcutr(event);
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Autonat(event)) => {
-                log::debug!("AutoNAT event: {:?}", event);
+                self.handle_autonat(event);
+            }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Rendezvous(event)) => {
+                self.handle_rendezvous(event);
+            }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Push(event)) => {
+                self.handle_push_event(event);
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                log::info!("Connection established with {peer_id}");
+
+                // If this is the relay server, transition state
+                if let Some(ref relay_addr) = self.config.relay_server
+                    && let Some(libp2p::multiaddr::Protocol::P2p(relay_peer_id)) =
+                        relay_addr.iter().last()
+                    && peer_id == relay_peer_id
+                {
+                    log::info!("Connected to relay server {peer_id}");
+                    self.relay_state = RelayState::Connected {
+                        relay_peer_id: peer_id,
+                    };
+                    // Listen via relay circuit
+                    let circuit_addr = relay_addr
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
+                        log::warn!("Failed to listen on relay circuit {}: {}", circuit_addr, e);
+                    } else {
+                        log::info!("Listening on relay circuit: {}", circuit_addr);
+                    }
+
+                    // Register push token with relay if configured
+                    self.maybe_register_push_token(peer_id);
+                }
+
+                // If this is a rendezvous server, register + discover
+                if let Some(ref rendezvous_addr) = self.config.rendezvous_server
+                    && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
+                        rendezvous_addr.iter().last()
+                    && peer_id == rv_peer_id
+                {
+                    log::info!("Connected to rendezvous server {peer_id}");
+                    self.rendezvous_register(peer_id);
+                    self.rendezvous_discover();
+                }
+
+                // If this is a bootstrap peer, add to peers and initiate sync
+                if self.bootstrap_peers.contains(&peer_id) {
+                    let addr = endpoint.get_remote_address().clone();
+                    self.peers.insert(peer_id, addr);
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .add_explicit_peer(&peer_id);
+
+                    let db = self.db.clone();
+                    let peer_str = peer_id.to_string();
+                    tokio::spawn(async move {
+                        let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
+                    });
+                }
+
+                if self.peers.contains_key(&peer_id) && self.registry_is_ready {
+                    // Refresh local_db_version in case spawned tasks updated it
+                    self.local_db_version = shadow::get_db_version(&self.db)
+                        .await
+                        .unwrap_or(self.local_db_version);
+                    self.initiate_sync_for_peer(peer_id);
+                }
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                log::debug!("Connection closed with {peer_id}");
+                // If relay server disconnected, update state
+                if let RelayState::Connected { relay_peer_id }
+                | RelayState::Listening { relay_peer_id } = &self.relay_state
+                    && peer_id == *relay_peer_id
+                {
+                    log::warn!("Lost connection to relay server {peer_id}");
+                    self.relay_state = RelayState::Connecting { retry_count: 0 };
+                }
             }
             _ => {}
         }
     }
 
-    fn sync_all_known_peers(&mut self) {
+    async fn sync_all_known_peers(&mut self) {
+        // Refresh local_db_version from DB before syncing, in case spawned tasks
+        // (apply_remote_changeset) have incremented it since we last checked.
+        self.local_db_version = shadow::get_db_version(&self.db)
+            .await
+            .unwrap_or(self.local_db_version);
+
         let peer_ids: Vec<libp2p::PeerId> = self.peers.keys().cloned().collect();
         for peer_id in peer_ids {
             self.initiate_sync_for_peer(peer_id);
@@ -458,50 +653,69 @@ impl EngineRunner {
     }
 
     fn initiate_sync_for_peer(&mut self, peer_id: libp2p::PeerId) {
-        let needs = self.needs_snapshot.load(Ordering::SeqCst);
-        let pending = self.pending_full_sync.load(Ordering::SeqCst);
-
-        if needs && !pending {
-            if self.failed_snapshot_peers.contains(&peer_id) {
-                log::debug!("Skipping previously failed snapshot peer {peer_id}");
-                return;
-            }
-            self.pending_full_sync.store(true, Ordering::SeqCst);
-            self.needs_snapshot.store(false, Ordering::SeqCst);
-            self.pending_snapshot_peer = Some(peer_id);
-            log::info!("Requesting full snapshot from peer {peer_id}");
-            let req_id = self.swarm
-                .behaviour_mut()
-                .snapshot
-                .send_request(&peer_id, SyncRequest::FullSync);
-            self.pending_requests.insert(req_id, SyncRequestKind::FullSync);
-        } else if !needs && self.local_watermark > 0 {
-            log::info!("Requesting Merkle roots from peer {peer_id} for sync");
-            let req_id = self.swarm.behaviour_mut().snapshot.send_request(
-                &peer_id,
-                SyncRequest::MerkleRoots,
-            );
-            self.pending_requests.insert(req_id, SyncRequestKind::MerkleRoots);
-        } else if needs && pending {
-            log::debug!("FullSync already pending, skipping peer {peer_id}");
-        } else {
-            // needs_snapshot=false, local_watermark=0: waiting for watermark after snapshot apply
-            log::debug!("Waiting for watermark update, skipping peer {peer_id}");
+        if self.pending_sync_peers.contains(&peer_id) {
+            return;
         }
+        if self.rejected_peers.contains(&peer_id) {
+            return;
+        }
+
+        let their_last_db_version = self.peer_db_versions.get(&peer_id).copied().unwrap_or(0);
+
+        log::info!(
+            "Requesting version vector sync from peer {peer_id} (their last known version: {their_last_db_version})"
+        );
+
+        let mut req = SyncRequest::VersionVector {
+            my_db_version: self.local_db_version,
+            your_last_db_version: their_last_db_version,
+            site_id: self.site_id,
+            topic: self.topic_name.clone(),
+            hmac: None,
+        };
+
+        if let Some(ref gk) = self.group_key {
+            // Serialize with hmac: None, compute MAC, then set hmac
+            if let Ok(bytes) = serde_json::to_vec(&req) {
+                let tag = gk.mac(&bytes);
+                let SyncRequest::VersionVector { ref mut hmac, .. } = req;
+                *hmac = Some(tag);
+            }
+        }
+
+        let _req_id = self
+            .swarm
+            .behaviour_mut()
+            .snapshot
+            .send_request(&peer_id, req);
+        self.pending_sync_peers.insert(peer_id);
     }
 
     fn handle_mdns(&mut self, event: mdns::Event) {
         match event {
             mdns::Event::Discovered(list) => {
                 for (peer_id, multiaddr) in list {
-                    log::info!("Discovered peer {peer_id} at {multiaddr}");
-                    let is_new = !self.peers.contains_key(&peer_id);
-                    if is_new {
-                        if let Err(e) = self.swarm.dial(multiaddr.clone()) {
-                            log::warn!("Failed to dial discovered peer {peer_id}: {e}");
+                    // Never re-add peers rejected for topic mismatch
+                    if self.rejected_peers.contains(&peer_id) {
+                        continue;
+                    }
+                    // Skip dial and address update if already tracked and connected —
+                    // avoids duplicate dials from multi-address mDNS discovery
+                    // (TCP+QUIC × multiple IPs), but still allow sync initiation below
+                    if self.peers.contains_key(&peer_id) && self.swarm.is_connected(&peer_id) {
+                        if self.registry_is_ready {
+                            self.initiate_sync_for_peer(peer_id);
                         }
-                        // Reset retry counter for each new peer
-                        self.snapshot_retries.store(0, Ordering::SeqCst);
+                        continue;
+                    }
+                    log::info!("Discovered peer {peer_id} at {multiaddr}");
+                    // Dial if not currently connected (handles both new peers and reconnections
+                    // after network disruption where the peer is still in self.peers but the
+                    // TCP/QUIC connection is dead)
+                    if !self.swarm.is_connected(&peer_id)
+                        && let Err(e) = self.swarm.dial(multiaddr.clone())
+                    {
+                        log::warn!("Failed to dial peer {peer_id}: {e}");
                     }
                     self.peers.insert(peer_id, multiaddr);
                     self.swarm
@@ -509,20 +723,14 @@ impl EngineRunner {
                         .gossipsub
                         .add_explicit_peer(&peer_id);
 
-                    // Register peer in tracker (use peer_id bytes as the node identifier)
+                    // Register peer and update last_seen
                     let db = self.db.clone();
                     let peer_str = peer_id.to_string();
-                    let peer_id_bytes = peer_id.to_bytes();
                     tokio::spawn(async move {
-                        if peer_tracker::is_known_peer(&db, &peer_str).await.unwrap_or(false) {
-                            let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
-                        } else {
-                            let _ = peer_tracker::upsert_peer(&db, &peer_str, &peer_id_bytes, 0).await;
-                        }
+                        let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
                     });
 
-                    // Sync decision — every discovery event, not just new peers
-                    if self.registry_is_ready {
+                    if self.registry_is_ready && self.swarm.is_connected(&peer_id) {
                         self.initiate_sync_for_peer(peer_id);
                     }
                 }
@@ -531,6 +739,8 @@ impl EngineRunner {
                 for (peer_id, multiaddr) in list {
                     log::debug!("Expired peer {peer_id} at {multiaddr}");
                     self.peers.remove(&peer_id);
+                    self.peer_db_versions.remove(&peer_id);
+                    self.pending_sync_peers.remove(&peer_id);
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
@@ -552,57 +762,61 @@ impl EngineRunner {
                     message.topic
                 );
 
-                // Try SyncMessage envelope first, fall back to raw SyncOperation
-                let sync_msg: SyncMessage = match postcard::from_bytes::<SyncMessage>(&message.data)
-                {
+                let auth_msg: AuthenticatedMessage = match serde_json::from_slice(&message.data) {
                     Ok(msg) => msg,
-                    Err(_) => {
-                        // Backward compatibility: try raw SyncOperation
-                        match postcard::from_bytes::<SyncOperation>(&message.data) {
-                            Ok(op) => SyncMessage::Op(op),
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to deserialize message from peer {}: {}",
-                                    propagation_source,
-                                    e
-                                );
-                                return;
-                            }
-                        }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to deserialize message from peer {}: {}",
+                            propagation_source,
+                            e
+                        );
+                        return;
                     }
                 };
 
-                match sync_msg {
-                    SyncMessage::Op(op) => {
+                // Verify HMAC if group key is configured
+                if let Some(ref gk) = self.group_key {
+                    let tag = match auth_msg.hmac {
+                        Some(t) => t,
+                        None => {
+                            log::debug!(
+                                "Rejecting unauthenticated gossipsub message from peer {}",
+                                propagation_source
+                            );
+                            return;
+                        }
+                    };
+                    let inner_bytes = match serde_json::to_vec(&auth_msg.inner) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("Failed to re-serialize inner message: {}", e);
+                            return;
+                        }
+                    };
+                    if !gk.verify(&inner_bytes, &tag) {
+                        log::debug!(
+                            "Rejecting gossipsub message with invalid HMAC from peer {}",
+                            propagation_source
+                        );
+                        return;
+                    }
+                }
+
+                match auth_msg.inner {
+                    SyncMessage::Changeset(changeset) => {
                         log::info!(
-                            "Deserialized operation from peer {}: {:?} on table {}",
+                            "Received changeset from peer {} with {} changes at db_version {}",
                             propagation_source,
-                            op.kind,
-                            op.table
+                            changeset.changes.len(),
+                            changeset.db_version,
                         );
 
-                        // Spawn the async DB work on a separate task to avoid
-                        // borrowing self (which contains Swarm, not Sync) across await.
                         let db = self.db.clone();
                         let change_tx = self.change_tx.clone();
                         let registry = self.registry.clone();
-                        let merkle_tx = self.merkle_update_tx.clone();
                         tokio::spawn(async move {
-                            apply_remote_op(db, change_tx, registry, merkle_tx, op).await;
-                        });
-                    }
-                    SyncMessage::Watermark { node_id, hlc_time } => {
-                        log::debug!(
-                            "Received watermark from peer {}: hlc_time={}",
-                            propagation_source,
-                            hlc_time
-                        );
-                        let db = self.db.clone();
-                        let peer_str = propagation_source.to_string();
-                        tokio::spawn(async move {
-                            let _ = peer_tracker::update_watermark(&db, &peer_str, hlc_time).await;
-                            let _ =
-                                peer_tracker::upsert_peer(&db, &peer_str, &node_id, hlc_time).await;
+                            apply_remote_changeset(&db, &change_tx, &registry, &changeset.changes)
+                                .await;
                         });
                     }
                 }
@@ -613,11 +827,234 @@ impl EngineRunner {
         }
     }
 
-    /// Recreate the mDNS behaviour to restart the probe cycle.
-    /// A fresh mDNS behaviour probes at 500ms, doubling until the query interval,
-    /// giving rapid rediscovery when no peers are available.
+    fn handle_relay_client(&mut self, event: relay::client::Event) {
+        match event {
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+                log::info!("Relay reservation accepted by {relay_peer_id}");
+                self.relay_state = RelayState::Listening { relay_peer_id };
+            }
+            _ => {
+                log::debug!("Relay client event: {:?}", event);
+            }
+        }
+    }
+
+    fn handle_dcutr(&mut self, event: dcutr::Event) {
+        let peer = event.remote_peer_id;
+        match event.result {
+            Ok(_) => {
+                log::info!("DCUtR: direct connection upgrade succeeded with {peer}");
+            }
+            Err(error) => {
+                log::debug!("DCUtR: direct connection upgrade failed with {peer}: {error}");
+            }
+        }
+    }
+
+    fn handle_autonat(&mut self, event: autonat::v2::client::Event) {
+        match &event.result {
+            Ok(()) => {
+                log::info!(
+                    "AutoNAT: address {} is reachable (tested by {})",
+                    event.tested_addr,
+                    event.server
+                );
+                self.nat_status = NatStatus::Public;
+            }
+            Err(e) => {
+                log::info!(
+                    "AutoNAT: address {} is NOT reachable (tested by {}): {e}",
+                    event.tested_addr,
+                    event.server
+                );
+                self.nat_status = NatStatus::Private;
+                // If behind NAT and relay is configured but not yet listening, trigger reservation
+                if matches!(self.relay_state, RelayState::Connected { .. })
+                    && let RelayState::Connected { relay_peer_id } = self.relay_state
+                    && let Some(ref relay_addr) = self.config.relay_server
+                {
+                    let circuit_addr = relay_addr
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
+                        log::warn!("Failed to listen on relay circuit: {}", e);
+                    } else {
+                        log::info!(
+                            "NAT detected as private, listening on relay circuit: {}",
+                            circuit_addr
+                        );
+                        self.relay_state = RelayState::Connected { relay_peer_id };
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_rendezvous(&mut self, event: rendezvous::client::Event) {
+        match event {
+            rendezvous::client::Event::Registered {
+                rendezvous_node,
+                ttl,
+                namespace,
+            } => {
+                log::info!(
+                    "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
+                );
+                self.rendezvous_registered = true;
+            }
+            rendezvous::client::Event::RegisterFailed {
+                rendezvous_node,
+                namespace,
+                error,
+            } => {
+                log::warn!(
+                    "Rendezvous registration failed at {rendezvous_node} namespace '{namespace}': {error:?}"
+                );
+                self.rendezvous_registered = false;
+            }
+            rendezvous::client::Event::Discovered {
+                rendezvous_node,
+                registrations,
+                cookie,
+            } => {
+                log::info!(
+                    "Discovered {} peers via rendezvous at {rendezvous_node}",
+                    registrations.len()
+                );
+                self.rendezvous_cookie = Some(cookie);
+
+                for registration in registrations {
+                    let peer_id = registration.record.peer_id();
+                    if peer_id == self.local_peer_id {
+                        continue;
+                    }
+
+                    for addr in registration.record.addresses() {
+                        log::info!("Rendezvous discovered peer {peer_id} at {addr}");
+                        if !self.swarm.is_connected(&peer_id)
+                            && let Err(e) = self.swarm.dial(addr.clone())
+                        {
+                            log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
+                        }
+                        self.peers.insert(peer_id, addr.clone());
+                        self.swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .add_explicit_peer(&peer_id);
+
+                        let db = self.db.clone();
+                        let peer_str = peer_id.to_string();
+                        tokio::spawn(async move {
+                            let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
+                        });
+
+                        if self.registry_is_ready && self.swarm.is_connected(&peer_id) {
+                            self.initiate_sync_for_peer(peer_id);
+                        }
+                    }
+                }
+            }
+            rendezvous::client::Event::DiscoverFailed {
+                rendezvous_node,
+                namespace,
+                error,
+            } => {
+                log::warn!(
+                    "Rendezvous discovery failed at {rendezvous_node} namespace {namespace:?}: {error:?}"
+                );
+            }
+            rendezvous::client::Event::Expired { peer } => {
+                log::debug!("Rendezvous registration expired for peer {peer}");
+            }
+        }
+    }
+
+    /// Register with the rendezvous server.
+    fn rendezvous_register(&mut self, server_peer_id: libp2p::PeerId) {
+        let namespace = match rendezvous::Namespace::new(self.rendezvous_namespace.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                log::error!("Invalid rendezvous namespace: {e:?}");
+                return;
+            }
+        };
+
+        match self.swarm.behaviour_mut().rendezvous.register(
+            namespace,
+            server_peer_id,
+            Some(self.config.rendezvous_ttl),
+        ) {
+            Ok(()) => {
+                log::info!("Sent rendezvous registration to {server_peer_id}");
+            }
+            Err(e) => {
+                log::warn!("Failed to send rendezvous registration: {e}");
+            }
+        }
+    }
+
+    /// Discover peers from the rendezvous server.
+    fn rendezvous_discover(&mut self) {
+        let server_peer_id = match &self.config.rendezvous_server {
+            Some(addr) => match addr.iter().last() {
+                Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => peer_id,
+                _ => {
+                    log::debug!("Rendezvous server address has no peer ID, skipping discover");
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        if !self.swarm.is_connected(&server_peer_id) {
+            log::debug!("Not connected to rendezvous server, skipping discover");
+            return;
+        }
+
+        let namespace = match rendezvous::Namespace::new(self.rendezvous_namespace.clone()) {
+            Ok(ns) => ns,
+            Err(e) => {
+                log::error!("Invalid rendezvous namespace: {e:?}");
+                return;
+            }
+        };
+
+        // Re-register if our registration has expired
+        if !self.rendezvous_registered {
+            self.rendezvous_register(server_peer_id);
+        }
+
+        self.swarm.behaviour_mut().rendezvous.discover(
+            Some(namespace),
+            self.rendezvous_cookie.clone(),
+            None,
+            server_peer_id,
+        );
+    }
+
+    /// Attempt to reconnect to the relay server if disconnected.
+    fn maybe_reconnect_relay(&mut self) {
+        match &self.relay_state {
+            RelayState::Connecting { retry_count } => {
+                if let Some(ref relay_addr) = self.config.relay_server {
+                    let count = *retry_count;
+                    log::info!("Attempting relay reconnection (attempt {})", count + 1);
+                    if let Err(e) = self.swarm.dial(relay_addr.clone()) {
+                        log::warn!("Failed to redial relay server: {}", e);
+                    }
+                    self.relay_state = RelayState::Connecting {
+                        retry_count: count + 1,
+                    };
+                }
+            }
+            RelayState::Disabled | RelayState::Connected { .. } | RelayState::Listening { .. } => {
+                // No action needed
+            }
+        }
+    }
+
     fn trigger_rediscovery(&mut self) {
-        log::info!("No peers available, triggering mDNS rediscovery");
+        log::info!("Triggering mDNS rediscovery");
         match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
             Ok(new_mdns) => {
                 self.swarm.behaviour_mut().mdns = new_mdns;
@@ -635,477 +1072,604 @@ impl EngineRunner {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    log::info!("Received snapshot request from peer {peer}: {request:?}");
+                    log::info!("Received sync request from peer {peer}: {request:?}");
 
                     match request {
-                        SyncRequest::MerkleRoots => {
-                            // Respond directly — no async DB needed
-                            let roots: Vec<_> = self.merkle_trees.values().map(|t| t.root()).collect();
-                            let current_hlc = self.local_watermark;
-                            let resp = crate::protocol::SyncResponse::MerkleRootsResponse {
-                                roots,
-                                current_hlc,
-                            };
-                            if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, resp) {
-                                log::error!("Failed to send MerkleRootsResponse: {:?}", resp);
+                        SyncRequest::VersionVector {
+                            my_db_version,
+                            your_last_db_version,
+                            site_id: peer_site_id,
+                            topic: peer_topic,
+                            hmac: req_hmac,
+                        } => {
+                            // Verify HMAC if group key is configured
+                            if let Some(ref gk) = self.group_key {
+                                let tag = match req_hmac {
+                                    Some(t) => t,
+                                    None => {
+                                        log::debug!(
+                                            "Rejecting unauthenticated sync request from peer {peer}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                // Re-serialize with hmac: None for verification
+                                let verify_req = SyncRequest::VersionVector {
+                                    my_db_version,
+                                    your_last_db_version,
+                                    site_id: peer_site_id,
+                                    topic: peer_topic.clone(),
+                                    hmac: None,
+                                };
+                                if let Ok(bytes) = serde_json::to_vec(&verify_req)
+                                    && !gk.verify(&bytes, &tag)
+                                {
+                                    log::debug!(
+                                        "Rejecting sync request with invalid HMAC from peer {peer}"
+                                    );
+                                    return;
+                                }
                             }
-                        }
-                        SyncRequest::MerkleTrees { table_names } => {
-                            let trees: Vec<_> = table_names
-                                .iter()
-                                .filter_map(|name| self.merkle_trees.get(name).cloned())
-                                .collect();
-                            let resp = crate::protocol::SyncResponse::MerkleTreesResponse { trees };
-                            if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, resp) {
-                                log::error!("Failed to send MerkleTreesResponse: {:?}", resp);
+
+                            // Reject requests from peers on a different topic
+                            if !peer_topic.is_empty() && peer_topic != self.topic_name {
+                                log::debug!(
+                                    "Ignoring sync request from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
+                                    self.topic_name
+                                );
+                                // Permanently reject this peer so mDNS won't re-add it
+                                self.rejected_peers.insert(peer);
+                                self.pending_sync_peers.remove(&peer);
+                                self.peers.remove(&peer);
+                                self.peer_db_versions.remove(&peer);
+                                self.swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .remove_explicit_peer(&peer);
+                                return;
                             }
-                        }
-                        SyncRequest::MerkleRowOps { requests, initiator_ops } => {
+
+                            // Update our knowledge of this peer's version
+                            self.peer_db_versions.insert(peer, my_db_version);
+
+                            // Spawn async task to query changes and respond
                             let db = self.db.clone();
+                            let registry = self.registry.clone();
                             let resp_tx = self.snapshot_resp_tx.clone();
+                            let local_db_version = self.local_db_version;
+                            let local_site_id = self.site_id;
                             let change_tx = self.change_tx.clone();
-                            let registry = self.registry.clone();
-                            let merkle_tx = self.merkle_update_tx.clone();
-                            tokio::spawn(async move {
-                                let mut ops = Vec::new();
-                                for req in &requests {
-                                    match sync_log::get_latest_for_row(&db, &req.table_name, &req.primary_key).await {
-                                        Ok(Some(op)) => ops.push(op),
-                                        Ok(None) => {}
-                                        Err(e) => log::error!("Failed to get op for {}/{}: {}", req.table_name, req.primary_key, e),
-                                    }
-                                }
+                            let topic_name = self.topic_name.clone();
+                            let group_key = self.group_key.clone();
 
-                                // Apply the initiator's ops via LWW (bidirectional sync)
-                                for op in initiator_ops {
-                                    apply_remote_op(
-                                        db.clone(),
-                                        change_tx.clone(),
-                                        registry.clone(),
-                                        merkle_tx.clone(),
-                                        op,
-                                    ).await;
-                                }
-
-                                let resp = crate::protocol::SyncResponse::MerkleRowOpsResponse { ops };
-                                if let Err(e) = resp_tx.send((channel, resp)).await {
-                                    log::error!("Failed to queue MerkleRowOpsResponse: {}", e);
-                                }
-                            });
-                        }
-                        SyncRequest::FullSync => {
-                            let db = self.db.clone();
-                            let registry = self.registry.clone();
-                            let resp_tx = self.snapshot_resp_tx.clone();
                             tokio::spawn(async move {
-                                let current_hlc =
-                                    sync_log::get_max_hlc(&db).await.ok().flatten().unwrap_or(0);
-                                match crate::snapshot::generate_snapshot(&db, &registry, current_hlc).await {
-                                    Ok(resp) => {
-                                        if let Err(e) = resp_tx.send((channel, resp)).await {
-                                            log::error!("Failed to queue snapshot response: {}", e);
-                                        }
-                                    }
+                                // Get changes since the peer's last known version of us
+                                let changes = match shadow::get_changes_since(
+                                    &db,
+                                    &registry,
+                                    your_last_db_version,
+                                )
+                                .await
+                                {
+                                    Ok(c) => c,
                                     Err(e) => {
-                                        log::error!("Failed to generate snapshot: {}", e);
+                                        log::error!(
+                                            "Failed to get changes since {}: {}",
+                                            your_last_db_version,
+                                            e
+                                        );
+                                        Vec::new()
                                     }
+                                };
+
+                                let mut resp = crate::protocol::SyncResponse::ChangesetResponse {
+                                    changes,
+                                    my_db_version: local_db_version,
+                                    your_last_db_version: my_db_version,
+                                    site_id: local_site_id,
+                                    topic: topic_name,
+                                    hmac: None,
+                                };
+
+                                // Sign response if group key is configured
+                                if let Some(ref gk) = group_key
+                                    && let Ok(bytes) = serde_json::to_vec(&resp)
+                                {
+                                    let tag = gk.mac(&bytes);
+                                    let crate::protocol::SyncResponse::ChangesetResponse {
+                                        ref mut hmac,
+                                        ..
+                                    } = resp;
+                                    *hmac = Some(tag);
                                 }
+
+                                if let Err(e) = resp_tx.send((channel, resp)).await {
+                                    log::error!("Failed to queue sync response: {}", e);
+                                }
+
+                                // Also persist peer version
+                                let _ = peer_tracker::upsert_peer_version(
+                                    &db,
+                                    &peer.to_string(),
+                                    &peer_site_id,
+                                    my_db_version,
+                                )
+                                .await;
+
+                                let _ = change_tx; // keep alive
                             });
                         }
                     }
                 }
-                request_response::Message::Response { request_id, response } => {
-                    log::info!("Received snapshot response from peer {peer}");
-                    self.pending_requests.remove(&request_id);
+                request_response::Message::Response { response, .. } => {
+                    self.pending_sync_peers.remove(&peer);
+                    log::info!("Received sync response from peer {peer}");
+
                     match response {
-                        crate::protocol::SyncResponse::FullSnapshot {
-                            tables,
-                            current_hlc,
-                            ..
+                        crate::protocol::SyncResponse::ChangesetResponse {
+                            changes,
+                            my_db_version,
+                            your_last_db_version,
+                            site_id: peer_site_id,
+                            topic: peer_topic,
+                            hmac: resp_hmac,
                         } => {
-                            if tables.is_empty() {
-                                log::warn!(
-                                    "Received empty snapshot from peer {peer}, will retry"
-                                );
-                                self.needs_snapshot.store(true, Ordering::SeqCst);
-                                self.pending_full_sync.store(false, Ordering::SeqCst);
-                                self.snapshot_retries.fetch_add(1, Ordering::SeqCst);
-                                return;
-                            }
-
-                            let db = self.db.clone();
-                            let registry = self.registry.clone();
-                            let change_tx = self.change_tx.clone();
-                            let peer_str = peer.to_string();
-                            let node_id = self.node_id;
-                            let needs_snapshot = self.needs_snapshot.clone();
-                            let pending_full_sync = self.pending_full_sync.clone();
-                            let snapshot_retries = self.snapshot_retries.clone();
-                            let watermark_tx = self.watermark_tx.clone();
-                            let retry_tx = self.snapshot_retry_tx.clone();
-                            tokio::spawn(async move {
-                                match crate::snapshot::apply_snapshot(&db, &registry, &tables)
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        log::info!(
-                                            "Snapshot applied successfully, {} tables",
-                                            tables.len()
-                                        );
-                                        snapshot_retries.store(0, Ordering::SeqCst);
-                                        let _ = peer_tracker::upsert_peer(
-                                            &db,
-                                            &peer_str,
-                                            &node_id,
-                                            current_hlc,
-                                        )
-                                        .await;
-                                        // Update watermark only after successful application
-                                        let _ = watermark_tx.send(current_hlc).await;
-                                        for table in &tables {
-                                            let _ = change_tx.send(ChangeNotification {
-                                                table: table.table_name.clone(),
-                                                kind: crate::messages::WriteKind::Insert,
-                                                primary_key: String::new(),
-                                            });
-                                        }
-                                    }
-                                    Ok(false) => {
-                                        // Snapshot had no relevant data (wrong peer or empty tables).
-                                        // Retry with a different peer.
-                                        log::warn!("Snapshot had no relevant data, will retry");
-                                        needs_snapshot.store(true, Ordering::SeqCst);
-                                        pending_full_sync.store(false, Ordering::SeqCst);
-                                        snapshot_retries.fetch_add(1, Ordering::SeqCst);
-                                        // true = irrelevant peer, skip it on next retry
-                                        let _ = retry_tx.send(true).await;
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to apply snapshot: {}", e);
-                                        needs_snapshot.store(true, Ordering::SeqCst);
-                                        pending_full_sync.store(false, Ordering::SeqCst);
-                                        snapshot_retries.fetch_add(1, Ordering::SeqCst);
-                                        // false = transient error, can retry same peer
-                                        let _ = retry_tx.send(false).await;
-                                    }
-                                }
-                            });
-                        }
-                        crate::protocol::SyncResponse::MerkleRootsResponse {
-                            roots,
-                            current_hlc,
-                        } => {
-                            // Compare roots — find tables that differ
-                            let mut differing_tables = Vec::new();
-                            for remote_root in &roots {
-                                match self.merkle_trees.get(&remote_root.table_name) {
-                                    Some(local_tree) => {
-                                        if local_tree.root_hash() != remote_root.root_hash {
-                                            differing_tables.push(remote_root.table_name.clone());
-                                        }
-                                    }
+                            // Verify HMAC if group key is configured
+                            if let Some(ref gk) = self.group_key {
+                                let tag = match resp_hmac {
+                                    Some(t) => t,
                                     None => {
-                                        // We don't have this table at all
-                                        differing_tables.push(remote_root.table_name.clone());
+                                        log::debug!(
+                                            "Rejecting unauthenticated sync response from peer {peer}"
+                                        );
+                                        return;
                                     }
-                                }
-                            }
-                            // Also check tables we have but remote doesn't
-                            for local_name in self.merkle_trees.keys() {
-                                if !roots.iter().any(|r| &r.table_name == local_name)
-                                    && !differing_tables.contains(local_name)
-                                {
-                                    differing_tables.push(local_name.clone());
-                                }
-                            }
-
-                            if differing_tables.is_empty() {
-                                log::info!("Merkle sync with peer {peer}: all tables match");
-                                self.local_watermark = self.local_watermark.max(current_hlc);
-                            } else {
-                                log::info!(
-                                    "Merkle sync with peer {peer}: {} tables differ, requesting trees",
-                                    differing_tables.len()
-                                );
-                                let req_id = self.swarm.behaviour_mut().snapshot.send_request(
-                                    &peer,
-                                    SyncRequest::MerkleTrees {
-                                        table_names: differing_tables,
-                                    },
-                                );
-                                self.pending_requests.insert(req_id, SyncRequestKind::MerkleTrees);
-                            }
-                        }
-                        crate::protocol::SyncResponse::MerkleTreesResponse { trees } => {
-                            let mut row_requests: Vec<RowOpRequest> = Vec::new();
-                            for remote_tree in &trees {
-                                let differing_pks = match self.merkle_trees.get(&remote_tree.table_name) {
-                                    Some(local_tree) => MerkleTree::diff(local_tree, remote_tree),
-                                    None => remote_tree.keys.clone(),
                                 };
-                                for pk in differing_pks {
-                                    row_requests.push(RowOpRequest {
-                                        table_name: remote_tree.table_name.clone(),
-                                        primary_key: pk,
-                                    });
+                                let verify_resp =
+                                    crate::protocol::SyncResponse::ChangesetResponse {
+                                        changes: changes.clone(),
+                                        my_db_version,
+                                        your_last_db_version,
+                                        site_id: peer_site_id,
+                                        topic: peer_topic.clone(),
+                                        hmac: None,
+                                    };
+                                if let Ok(bytes) = serde_json::to_vec(&verify_resp)
+                                    && !gk.verify(&bytes, &tag)
+                                {
+                                    log::debug!(
+                                        "Rejecting sync response with invalid HMAC from peer {peer}"
+                                    );
+                                    return;
                                 }
                             }
 
-                            if row_requests.is_empty() {
-                                log::info!("Merkle tree diff with peer {peer}: no differing rows");
-                            } else {
-                                log::info!(
-                                    "Merkle tree diff with peer {peer}: {} rows differ, requesting ops",
-                                    row_requests.len()
+                            // Ignore responses from peers on a different topic
+                            if !peer_topic.is_empty() && peer_topic != self.topic_name {
+                                log::debug!(
+                                    "Ignoring sync response from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
+                                    self.topic_name
                                 );
-                                // Async lookup local ops for differing rows, then send via deferred channel
-                                let db = self.db.clone();
-                                let deferred_tx = self.deferred_req_tx.clone();
-                                tokio::spawn(async move {
-                                    let mut initiator_ops = Vec::new();
-                                    for req in &row_requests {
-                                        match sync_log::get_latest_for_row(&db, &req.table_name, &req.primary_key).await {
-                                            Ok(Some(op)) => initiator_ops.push(op),
-                                            Ok(None) => {}
-                                            Err(e) => log::error!("Failed to get local op for {}/{}: {}", req.table_name, req.primary_key, e),
-                                        }
-                                    }
-                                    let request = SyncRequest::MerkleRowOps {
-                                        requests: row_requests,
-                                        initiator_ops,
-                                    };
-                                    if let Err(e) = deferred_tx.send((peer, request)).await {
-                                        log::error!("Failed to queue deferred MerkleRowOps request: {}", e);
-                                    }
-                                });
-                            }
-                        }
-                        crate::protocol::SyncResponse::MerkleRowOpsResponse { ops } => {
-                            if ops.is_empty() {
-                                log::info!("Merkle row ops from peer {peer}: nothing to apply");
+                                // Permanently reject this peer so mDNS won't re-add it
+                                self.rejected_peers.insert(peer);
+                                self.pending_sync_peers.remove(&peer);
+                                self.peers.remove(&peer);
+                                self.peer_db_versions.remove(&peer);
+                                self.swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .remove_explicit_peer(&peer);
                                 return;
                             }
 
-                            log::info!(
-                                "Received {} Merkle row ops from peer {peer}",
-                                ops.len()
-                            );
+                            // Update our knowledge of this peer's version
+                            self.peer_db_versions.insert(peer, my_db_version);
 
-                            let db = self.db.clone();
-                            let change_tx = self.change_tx.clone();
-                            let registry = self.registry.clone();
-                            let merkle_tx = self.merkle_update_tx.clone();
-                            tokio::spawn(async move {
-                                for op in ops {
-                                    apply_remote_op(
-                                        db.clone(),
-                                        change_tx.clone(),
-                                        registry.clone(),
-                                        merkle_tx.clone(),
-                                        op,
+                            if changes.is_empty() {
+                                log::info!(
+                                    "Version vector sync with peer {peer}: already up to date"
+                                );
+                            } else {
+                                log::info!(
+                                    "Received {} changes from peer {peer} (their db_version: {})",
+                                    changes.len(),
+                                    my_db_version,
+                                );
+
+                                let db = self.db.clone();
+                                let change_tx = self.change_tx.clone();
+                                let registry = self.registry.clone();
+                                let peer_str = peer.to_string();
+                                tokio::spawn(async move {
+                                    apply_remote_changeset(&db, &change_tx, &registry, &changes)
+                                        .await;
+
+                                    // Persist peer version
+                                    let _ = peer_tracker::upsert_peer_version(
+                                        &db,
+                                        &peer_str,
+                                        &peer_site_id,
+                                        my_db_version,
                                     )
                                     .await;
-                                }
-                            });
+                                });
+                            }
+
+                            // Update local db_version with Lamport semantics
+                            if my_db_version > self.local_db_version {
+                                self.local_db_version = my_db_version;
+                                let db = self.db.clone();
+                                let ver = my_db_version;
+                                tokio::spawn(async move {
+                                    let _ = shadow::set_db_version(&db, ver).await;
+                                });
+                            }
                         }
                     }
                 }
             },
-            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
-                log::warn!("Snapshot request to {peer} failed: {error}");
-                match self.pending_requests.remove(&request_id) {
-                    Some(SyncRequestKind::FullSync) => {
-                        self.needs_snapshot.store(true, Ordering::SeqCst);
-                        self.pending_full_sync.store(false, Ordering::SeqCst);
-                        self.snapshot_retries.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => {
-                        // Merkle failures retry naturally on next mDNS cycle
-                    }
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                self.pending_sync_peers.remove(&peer);
+                log::warn!("Sync request to {peer} failed: {error}");
+                // Connection might be dead — re-dial if we know the peer's address
+                if let Some(addr) = self.peers.get(&peer).cloned()
+                    && !self.swarm.is_connected(&peer)
+                {
+                    log::info!("Re-dialing {peer} after outbound failure");
+                    let _ = self.swarm.dial(addr);
                 }
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
-                log::warn!("Snapshot inbound from {peer} failed: {error}");
+                log::warn!("Sync inbound from {peer} failed: {error}");
             }
             _ => {}
         }
     }
 
-    fn update_merkle_tree(&mut self, op: &SyncOperation) {
-        let tree = self.merkle_trees.entry(op.table.clone()).or_insert_with(|| {
-            MerkleTree::build(op.table.clone(), vec![])
-        });
-        match op.kind {
-            WriteKind::Delete => {
-                tree.remove_leaf(&op.primary_key);
+    fn handle_push_event(
+        &mut self,
+        event: request_response::Event<push_protocol::PushRequest, push_protocol::PushResponse>,
+    ) {
+        match event {
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                ..
+            } => match response {
+                push_protocol::PushResponse::Ok => {
+                    log::debug!("Push request acknowledged by relay");
+                }
+                push_protocol::PushResponse::Error { message } => {
+                    log::warn!("Push request error from relay: {message}");
+                }
+            },
+            request_response::Event::OutboundFailure { error, .. } => {
+                log::warn!("Push request failed: {error}");
             }
-            WriteKind::Insert | WriteKind::Update => {
-                tree.update_leaf(
-                    &op.primary_key,
-                    op.hlc_time,
-                    op.hlc_counter,
-                    &op.node_id,
-                );
-            }
+            _ => {}
         }
     }
 
-    fn broadcast_watermark(&mut self) {
-        let msg = SyncMessage::Watermark {
-            node_id: self.node_id,
-            hlc_time: self.local_watermark,
+    /// Register push token with the relay server if we have one and are connected.
+    fn maybe_register_push_token(&mut self, relay_peer_id: libp2p::PeerId) {
+        if self.push_registered {
+            return;
+        }
+        let (platform, token) = match &self.push_token {
+            Some(pt) => pt.clone(),
+            None => return,
         };
-        match postcard::to_allocvec(&msg) {
-            Ok(data) => {
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(self.topic.clone(), data)
+
+        let push_platform = match platform.as_str() {
+            "Fcm" => push_protocol::PushPlatform::Fcm,
+            "Apns" => push_protocol::PushPlatform::Apns,
+            other => {
+                log::warn!("Unknown push platform: {other}");
+                return;
+            }
+        };
+
+        let req = push_protocol::PushRequest::RegisterToken {
+            topic: self.topic_name.clone(),
+            platform: push_platform,
+            token,
+        };
+
+        self.swarm
+            .behaviour_mut()
+            .push
+            .send_request(&relay_peer_id, req);
+        self.push_registered = true;
+        log::info!("Sent push token registration to relay {relay_peer_id}");
+    }
+
+    /// Send a NotifyTopic request to the relay after successful gossipsub publish.
+    fn notify_relay_topic(&mut self) {
+        let relay_peer_id = match &self.relay_state {
+            RelayState::Connected { relay_peer_id } | RelayState::Listening { relay_peer_id } => {
+                *relay_peer_id
+            }
+            _ => return,
+        };
+
+        let req = push_protocol::PushRequest::NotifyTopic {
+            topic: self.topic_name.clone(),
+            sender_site_id: self
+                .site_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        };
+
+        self.swarm
+            .behaviour_mut()
+            .push
+            .send_request(&relay_peer_id, req);
+    }
+}
+
+/// Apply a set of remote column changes to the local database.
+async fn apply_remote_changeset(
+    db: &DatabaseConnection,
+    change_tx: &broadcast::Sender<ChangeNotification>,
+    registry: &TableRegistry,
+    changes: &[ColumnChange],
+) {
+    // Increment local db_version once for the batch of remote changes
+    let local_db_version = match shadow::increment_db_version(db).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Failed to increment db_version: {e}");
+            return;
+        }
+    };
+
+    // Group changes by (table, pk) for efficient processing
+    let mut grouped: HashMap<(&str, &str), Vec<&ColumnChange>> = HashMap::new();
+    for change in changes {
+        grouped
+            .entry((&change.table, &change.pk))
+            .or_default()
+            .push(change);
+    }
+
+    for ((table, pk), row_changes) in &grouped {
+        let meta = match registry.get(table) {
+            Some(m) => m,
+            None => {
+                log::warn!("Rejecting remote changes for unregistered table: {}", table);
+                continue;
+            }
+        };
+
+        let mut any_applied = false;
+        let mut changed_columns = Vec::new();
+        let mut is_delete = false;
+
+        // Check for delete first
+        let delete_change = row_changes.iter().find(|c| c.cid == "__deleted");
+        if let Some(change) = delete_change {
+            let local_entries = shadow::get_clock_entries_for_row(db, table, pk)
+                .await
+                .unwrap_or_default();
+            let local_max_cv = local_entries
+                .iter()
+                .map(|e| e.col_version)
+                .max()
+                .unwrap_or(0);
+
+            if conflict::should_apply_delete(change.cl, local_max_cv, &meta.delete_policy) {
+                let delete_sql = format!(
+                    "DELETE FROM \"{}\" WHERE \"{}\" = $1",
+                    table, meta.primary_key_column
+                );
+                if let Err(e) = db
+                    .execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        &delete_sql,
+                        [pk.to_string().into()],
+                    ))
+                    .await
                 {
-                    log::debug!("Failed to publish watermark: {}", e);
+                    log::error!("Failed to delete row {}/{}: {}", table, pk, e);
+                    continue;
+                }
+
+                let _ = shadow::delete_clock_entries(db, table, pk).await;
+                let _ = shadow::insert_tombstone(
+                    db,
+                    table,
+                    pk,
+                    change.col_version,
+                    local_db_version,
+                    &change.site_id,
+                )
+                .await;
+
+                any_applied = true;
+                is_delete = true;
+            }
+        } else {
+            // Collect winning columns
+            let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
+            let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
+
+            for change in row_changes {
+                let local_cv = shadow::get_col_version(db, table, pk, &change.cid)
+                    .await
+                    .unwrap_or(0);
+
+                let remote_val_bytes = serde_json::to_vec(&change.val).unwrap_or_default();
+                let remote_site = change.site_id;
+
+                let should_apply = local_cv == 0
+                    || conflict::should_apply_column(
+                        change.col_version,
+                        &remote_val_bytes,
+                        &remote_site,
+                        local_cv,
+                        &[], // empty = lose tiebreak (remote wins on equal cv)
+                        &[0u8; 16],
+                    );
+
+                if should_apply {
+                    winning_columns
+                        .push((change.cid.clone(), json_to_sea_value(change.val.as_ref())));
+                    changed_columns.push(change.cid.clone());
+
+                    // Update shadow table
+                    let _ = shadow::upsert_clock_entry(
+                        db,
+                        table,
+                        pk,
+                        &change.cid,
+                        change.col_version,
+                        local_db_version,
+                        &remote_site,
+                        change.seq,
+                    )
+                    .await;
                 }
             }
-            Err(e) => {
-                log::error!("Failed to serialize watermark: {}", e);
+
+            if !winning_columns.is_empty() {
+                if exists {
+                    // UPDATE each winning column
+                    for (col, val) in &winning_columns {
+                        let update_sql = format!(
+                            "UPDATE \"{}\" SET \"{}\" = $1 WHERE \"{}\" = $2",
+                            table, col, meta.primary_key_column
+                        );
+                        if let Err(e) = db
+                            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                                sea_orm::DatabaseBackend::Sqlite,
+                                &update_sql,
+                                [val.clone(), pk.to_string().into()],
+                            ))
+                            .await
+                        {
+                            log::error!("Failed to update column {}/{}/{}: {}", table, pk, col, e);
+                        }
+                    }
+                    any_applied = true;
+                } else {
+                    // INSERT OR IGNORE — silently skips if row was created by a concurrent task
+                    let mut col_names = vec![format!("\"{}\"", meta.primary_key_column)];
+                    let mut values: Vec<sea_orm::Value> = vec![pk.to_string().into()];
+
+                    for (col, val) in &winning_columns {
+                        if *col != meta.primary_key_column {
+                            col_names.push(format!("\"{}\"", col));
+                            values.push(val.clone());
+                        }
+                    }
+
+                    let placeholders: Vec<String> =
+                        (1..=values.len()).map(|i| format!("${}", i)).collect();
+
+                    let insert_sql = format!(
+                        "INSERT OR IGNORE INTO \"{}\" ({}) VALUES ({})",
+                        table,
+                        col_names.join(", "),
+                        placeholders.join(", ")
+                    );
+
+                    let _ = db
+                        .execute_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            &insert_sql,
+                            values,
+                        ))
+                        .await;
+
+                    // UPDATE each winning column individually — works whether INSERT
+                    // succeeded or was ignored due to concurrent insert
+                    for (col, val) in &winning_columns {
+                        if *col != meta.primary_key_column {
+                            let update_sql = format!(
+                                "UPDATE \"{}\" SET \"{}\" = $1 WHERE \"{}\" = $2",
+                                table, col, meta.primary_key_column
+                            );
+                            if let Err(e) = db
+                                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                                    sea_orm::DatabaseBackend::Sqlite,
+                                    &update_sql,
+                                    [val.clone(), pk.to_string().into()],
+                                ))
+                                .await
+                            {
+                                log::error!(
+                                    "Failed to update column {}/{}/{}: {}",
+                                    table,
+                                    pk,
+                                    col,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    any_applied = true;
+                }
             }
+        }
+
+        if any_applied {
+            let kind = if is_delete {
+                WriteKind::Delete
+            } else {
+                WriteKind::Insert
+            };
+            let _ = change_tx.send(ChangeNotification {
+                table: table.to_string(),
+                kind,
+                primary_key: pk.to_string(),
+                changed_columns: if changed_columns.is_empty() {
+                    None
+                } else {
+                    Some(changed_columns)
+                },
+            });
         }
     }
 }
 
-async fn apply_remote_op(
-    db: DatabaseConnection,
-    change_tx: broadcast::Sender<ChangeNotification>,
-    registry: Arc<TableRegistry>,
-    merkle_update_tx: mpsc::Sender<SyncOperation>,
-    op: SyncOperation,
-) {
-    // Reject ops for unregistered tables
-    if !registry.is_registered(&op.table) {
-        log::warn!(
-            "Rejecting remote op for unregistered table: {}",
-            op.table
-        );
-        return;
-    }
+/// Check if a row exists in a table.
+async fn row_exists(db: &DatabaseConnection, table: &str, pk_col: &str, pk: &str) -> bool {
+    let sql = format!(
+        "SELECT 1 FROM \"{}\" WHERE \"{}\" = $1 LIMIT 1",
+        table, pk_col
+    );
+    db.query_one_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        &sql,
+        [pk.into()],
+    ))
+    .await
+    .ok()
+    .flatten()
+    .is_some()
+}
 
-    // Check LWW conflict resolution
-    let local_latest = sync_log::get_latest_for_row(&db, &op.table, &op.primary_key)
-        .await
-        .ok()
-        .flatten();
-
-    if !conflict::should_apply(&op, local_latest.as_ref()) {
-        log::debug!(
-            "Skipping remote op (LWW): table={} pk={}",
-            op.table,
-            op.primary_key
-        );
-        return;
-    }
-
-    // Apply the operation to the local database
-    let Some(ref sql_bytes) = op.data else {
-        log::warn!(
-            "Skipping remote op with no data: table={} pk={}",
-            op.table,
-            op.primary_key
-        );
-        return;
-    };
-    let Ok(sql) = std::str::from_utf8(sql_bytes) else {
-        log::warn!(
-            "Skipping remote op with invalid UTF-8 data: table={} pk={}",
-            op.table,
-            op.primary_key
-        );
-        return;
-    };
-
-    // Reject multi-statement SQL (potential injection)
-    if sql.contains(';') {
-        log::warn!(
-            "Rejecting remote op with multi-statement SQL: table={} pk={}",
-            op.table,
-            op.primary_key
-        );
-        return;
-    }
-
-    // Strip RETURNING clause — remote nodes don't need it and it can cause
-    // issues with execute_unprepared which doesn't return query results.
-    let clean_sql = strip_returning(sql);
-
-    // Use INSERT OR REPLACE for inserts to handle potential PK conflicts
-    // between nodes (e.g., both nodes generating the same auto-increment ID).
-    let final_sql = if op.kind == crate::messages::WriteKind::Insert {
-        if clean_sql.contains("OR REPLACE") {
-            clean_sql
-        } else if clean_sql.contains("OR IGNORE") {
-            clean_sql.replacen("INSERT OR IGNORE INTO", "INSERT OR REPLACE INTO", 1)
-        } else {
-            clean_sql.replacen("INSERT INTO", "INSERT OR REPLACE INTO", 1)
-        }
-    } else {
-        clean_sql
-    };
-
-    // Validate that the SQL matches the declared operation kind and table
-    match crate::connection::classify_write(&final_sql) {
-        Some((kind, table)) => {
-            if kind != op.kind || table != op.table {
-                log::warn!(
-                    "Rejecting remote op: SQL kind/table ({:?}/{}) doesn't match declared ({:?}/{})",
-                    kind, table, op.kind, op.table
-                );
-                return;
+/// Convert a JSON value to a SeaORM value for parameterized queries.
+fn json_to_sea_value(v: Option<&serde_json::Value>) -> sea_orm::Value {
+    match v {
+        None | Some(serde_json::Value::Null) => sea_orm::Value::String(None),
+        Some(serde_json::Value::Bool(b)) => sea_orm::Value::Int(Some(if *b { 1 } else { 0 })),
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                sea_orm::Value::BigInt(Some(i))
+            } else if let Some(f) = n.as_f64() {
+                sea_orm::Value::Double(Some(f))
+            } else {
+                sea_orm::Value::String(Some(n.to_string()))
             }
         }
-        None => {
-            log::warn!(
-                "Rejecting remote op: SQL could not be classified: table={} pk={}",
-                op.table,
-                op.primary_key
-            );
-            return;
-        }
+        Some(serde_json::Value::String(s)) => sea_orm::Value::String(Some(s.clone())),
+        Some(other) => sea_orm::Value::String(Some(other.to_string())),
     }
-
-    match db.execute_unprepared(&final_sql).await {
-        Ok(_) => {
-            log::info!(
-                "Applied remote op: table={} pk={}",
-                op.table,
-                op.primary_key
-            );
-        }
-        Err(e) => {
-            log::error!("Failed to apply remote op: {}", e);
-            return;
-        }
-    }
-
-    // Log the operation
-    if let Err(e) = sync_log::insert_op(&db, &op).await {
-        log::error!("Failed to log sync operation: {}", e);
-    }
-
-    // Update Merkle tree via channel back to engine loop
-    if let Err(e) = merkle_update_tx.send(op.clone()).await {
-        log::error!("Failed to send merkle update: {}", e);
-    }
-
-    // Notify change listeners
-    let _ = change_tx.send(ChangeNotification {
-        table: op.table.clone(),
-        kind: op.kind.clone(),
-        primary_key: op.primary_key.clone(),
-    });
 }
 
 /// Strip the RETURNING clause from a SQL statement.
-/// e.g., `INSERT INTO "tasks" (...) VALUES (...) RETURNING "id"` becomes
-///        `INSERT INTO "tasks" (...) VALUES (...)`
+#[cfg(test)]
 fn strip_returning(sql: &str) -> String {
     if let Some(pos) = sql.to_ascii_uppercase().rfind(" RETURNING ") {
         sql[..pos].to_string()
@@ -1114,104 +1678,37 @@ fn strip_returning(sql: &str) -> String {
     }
 }
 
-async fn run_compaction(db: DatabaseConnection, eviction_timeout: Duration) {
-    let eviction_secs = eviction_timeout.as_secs();
-
-    // Evict stale peers
-    match peer_tracker::evict_stale_peers(&db, eviction_secs).await {
-        Ok(evicted) => {
-            if !evicted.is_empty() {
-                log::info!("Evicted stale peers: {:?}", evicted);
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to evict stale peers: {}", e);
-        }
-    }
-
-    // Get minimum watermark across active peers
-    let min_wm = match peer_tracker::get_min_watermark(&db).await {
-        Ok(wm) => wm,
-        Err(e) => {
-            log::error!("Failed to get min watermark: {}", e);
-            return;
-        }
-    };
-
-    let cutoff = if let Some(min_wm) = min_wm {
-        if min_wm > 0 {
-            min_wm
-        } else {
-            return; // All peers at watermark 0, nothing safe to compact
-        }
-    } else {
-        // No active peers — use safety fallback (7 days from latest HLC)
-        match sync_log::get_max_hlc(&db).await {
-            Ok(Some(max_hlc)) => {
-                let seven_days_ns: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
-                max_hlc.saturating_sub(seven_days_ns)
-            }
-            _ => return, // Nothing in log or error — skip compaction
-        }
-    };
-
-    match sync_log::compact(&db, cutoff).await {
-        Ok(result) => {
-            log::info!("Sync log compaction complete: {:?}", result);
-        }
-        Err(e) => {
-            log::error!("Sync log compaction failed: {}", e);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::{ChangeNotification, WriteKind};
-    use crate::registry::{TableMeta, TableRegistry};
-    use crate::messages::SyncOperation;
+    use crate::messages::ColumnChange;
+    use crate::registry::TableMeta;
     use sea_orm::Database;
     use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::sync::broadcast;
-
-    fn make_merkle_tx() -> mpsc::Sender<SyncOperation> {
-        let (tx, _rx) = mpsc::channel::<SyncOperation>(16);
-        tx
-    }
 
     async fn setup_engine_test_db() -> (sea_orm::DatabaseConnection, Arc<TableRegistry>) {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::sync_log::create_log_table(&db).await.unwrap();
-        crate::peer_tracker::create_peers_table(&db).await.unwrap();
+        crate::shadow::create_meta_table(&db).await.unwrap();
+        crate::peer_tracker::create_peer_versions_table(&db)
+            .await
+            .unwrap();
         db.execute_unprepared(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0)"
         ).await.unwrap();
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
         let registry = Arc::new(TableRegistry::new());
         registry.register(TableMeta {
             table_name: "tasks".to_string(),
             primary_key_column: "id".to_string(),
             columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
         });
         (db, registry)
     }
 
-    fn make_remote_op(table: &str, kind: WriteKind, pk: &str, sql: &str, hlc_time: u64) -> SyncOperation {
-        SyncOperation {
-            op_id: uuid::Uuid::new_v4().as_u128(),
-            hlc_time,
-            hlc_counter: 0,
-            node_id: [2u8; 16],
-            table: table.to_string(),
-            kind,
-            primary_key: pk.to_string(),
-            data: Some(sql.as_bytes().to_vec()),
-            columns: None,
-        }
-    }
-
-    // ── strip_returning tests ──────────────────────────────────────────
+    // ── strip_returning tests ──
 
     #[test]
     fn test_strip_returning_with_clause() {
@@ -1238,22 +1735,25 @@ mod tests {
         );
     }
 
-    // ── apply_remote_op tests ──────────────────────────────────────────
+    // ── apply_remote_changeset tests ──
 
     #[tokio::test]
-    async fn test_apply_remote_op_unregistered_table() {
+    async fn test_apply_remote_changeset_unregistered_table() {
         let (db, registry) = setup_engine_test_db().await;
         let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
 
-        let op = make_remote_op(
-            "unknown",
-            WriteKind::Insert,
-            "1",
-            r#"INSERT INTO "unknown" ("id") VALUES ('1')"#,
-            100,
-        );
+        let changes = vec![ColumnChange {
+            table: "unknown".to_string(),
+            pk: "1".to_string(),
+            cid: "col".to_string(),
+            val: Some(serde_json::json!("value")),
+            site_id: [2u8; 16],
+            col_version: 1,
+            cl: 1,
+            seq: 0,
+        }];
 
-        apply_remote_op(db, tx, registry, make_merkle_tx(), op).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
         assert!(
             rx.try_recv().is_err(),
             "Should not receive notification for unregistered table"
@@ -1261,127 +1761,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_apply_remote_op_lww_rejects_older() {
+    async fn test_apply_remote_changeset_insert() {
         let (db, registry) = setup_engine_test_db().await;
         let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
 
-        // Insert a newer op into the sync log first
-        let newer_op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "pk-1",
-            r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('pk-1', 'First', 0)"#,
-            200,
-        );
-        sync_log::insert_op(&db, &newer_op).await.unwrap();
+        let changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "test-1".to_string(),
+                cid: "id".to_string(),
+                val: Some(serde_json::json!("test-1")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "test-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Test Task")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "test-1".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(0)),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 2,
+            },
+        ];
 
-        // Now try to apply an older op for the same row
-        let older_op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "pk-1",
-            r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('pk-1', 'Older', 0)"#,
-            100,
-        );
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
 
-        apply_remote_op(db, tx, registry, make_merkle_tx(), older_op).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "Older op should be rejected by LWW"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_no_data() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let mut op = make_remote_op("tasks", WriteKind::Insert, "1", "", 100);
-        op.data = None;
-
-        apply_remote_op(db, tx, registry, make_merkle_tx(), op).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "Should not receive notification when data is None"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_invalid_utf8() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let mut op = make_remote_op("tasks", WriteKind::Insert, "1", "", 100);
-        op.data = Some(vec![0xFF, 0xFE]);
-
-        apply_remote_op(db, tx, registry, make_merkle_tx(), op).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "Should not receive notification for invalid UTF-8"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_multi_statement_sql() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "1",
-            r#"INSERT INTO "tasks" ("id") VALUES ('1'); DROP TABLE tasks"#,
-            100,
-        );
-
-        apply_remote_op(db, tx, registry, make_merkle_tx(), op).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "Should not receive notification for multi-statement SQL"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_sql_kind_mismatch() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "1",
-            r#"UPDATE "tasks" SET "title" = 'Hacked' WHERE "id" = '1'"#,
-            100,
-        );
-
-        apply_remote_op(db, tx, registry, make_merkle_tx(), op).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "Should not receive notification when SQL kind mismatches declared kind"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_success_insert() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "test-1",
-            r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('test-1', 'Test Task', 0)"#,
-            100,
-        );
-
-        apply_remote_op(db.clone(), tx, registry, make_merkle_tx(), op).await;
-
-        // Should receive a notification
         let notif = rx.try_recv().expect("Expected a ChangeNotification");
         assert_eq!(notif.table, "tasks");
         assert_eq!(notif.primary_key, "test-1");
 
-        // Row should exist in the database
+        // Verify row exists
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Sqlite,
@@ -1392,166 +1815,85 @@ mod tests {
             .expect("Row should exist");
         let title: String = result.try_get_by_index(0).unwrap();
         assert_eq!(title, "Test Task");
-
-        // Sync log entry should exist
-        let ops = sync_log::get_ops_since(&db, 0).await.unwrap();
-        assert!(
-            ops.iter().any(|o| o.primary_key == "test-1"),
-            "Sync log should contain the op"
-        );
     }
 
     #[tokio::test]
-    async fn test_apply_remote_op_converts_insert_to_or_replace() {
+    async fn test_apply_remote_changeset_delete() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
+
+        // Insert a row first
+        db.execute_unprepared("INSERT INTO tasks VALUES ('del-1', 'To Delete', 0)")
+            .await
+            .unwrap();
+
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "del-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [2u8; 16],
+            col_version: 10,
+            cl: 10,
+            seq: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        let notif = rx.try_recv().expect("Expected a ChangeNotification");
+        assert_eq!(notif.table, "tasks");
+        assert_eq!(notif.primary_key, "del-1");
+
+        // Verify row is deleted
+        let result = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) as cnt FROM tasks WHERE id = 'del-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let count: i32 = result.try_get("", "cnt").unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_column_conflict_higher_version_wins() {
         let (db, registry) = setup_engine_test_db().await;
         let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
 
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "conv-1",
-            r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('conv-1', 'Converted', 0)"#,
-            100,
-        );
-
-        apply_remote_op(db.clone(), tx, registry, make_merkle_tx(), op).await;
-
-        // Verify the row was inserted
-        let result = db
-            .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT title FROM tasks WHERE id = 'conv-1'".to_string(),
-            ))
+        // Insert initial data
+        db.execute_unprepared("INSERT INTO tasks VALUES ('c-1', 'Original', 0)")
             .await
-            .unwrap()
-            .expect("Row should exist after INSERT → OR REPLACE conversion");
-        let title: String = result.try_get_by_index(0).unwrap();
-        assert_eq!(title, "Converted");
-    }
+            .unwrap();
+        // Set local clock entry with version 5
+        crate::shadow::upsert_clock_entry(&db, "tasks", "c-1", "title", 5, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
 
-    #[tokio::test]
-    async fn test_apply_remote_op_preserves_or_replace() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
+        // Remote change with higher version (10) should win
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "c-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("Remote Winner")),
+            site_id: [2u8; 16],
+            col_version: 10,
+            cl: 10,
+            seq: 0,
+        }];
 
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "repl-1",
-            r#"INSERT OR REPLACE INTO "tasks" ("id", "title", "done") VALUES ('repl-1', 'Replaced', 0)"#,
-            100,
-        );
-
-        apply_remote_op(db.clone(), tx, registry, make_merkle_tx(), op).await;
-
-        let notif = rx.try_recv().expect("Expected a ChangeNotification");
-        assert_eq!(notif.table, "tasks");
-        assert_eq!(notif.primary_key, "repl-1");
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Sqlite,
-                "SELECT title FROM tasks WHERE id = 'repl-1'".to_string(),
+                "SELECT title FROM tasks WHERE id = 'c-1'".to_string(),
             ))
             .await
             .unwrap()
-            .expect("Row should exist");
+            .unwrap();
         let title: String = result.try_get_by_index(0).unwrap();
-        assert_eq!(title, "Replaced");
-    }
-
-    #[tokio::test]
-    async fn test_apply_remote_op_converts_or_ignore() {
-        let (db, registry) = setup_engine_test_db().await;
-        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
-
-        let op = make_remote_op(
-            "tasks",
-            WriteKind::Insert,
-            "ign-1",
-            r#"INSERT OR IGNORE INTO "tasks" ("id", "title", "done") VALUES ('ign-1', 'Was Ignore', 0)"#,
-            100,
-        );
-
-        apply_remote_op(db.clone(), tx, registry, make_merkle_tx(), op).await;
-
-        let notif = rx.try_recv().expect("Expected a ChangeNotification");
-        assert_eq!(notif.table, "tasks");
-        assert_eq!(notif.primary_key, "ign-1");
-
-        let result = db
-            .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT title FROM tasks WHERE id = 'ign-1'".to_string(),
-            ))
-            .await
-            .unwrap()
-            .expect("Row should exist after OR IGNORE → OR REPLACE conversion");
-        let title: String = result.try_get_by_index(0).unwrap();
-        assert_eq!(title, "Was Ignore");
-    }
-
-    // ── run_compaction tests ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_run_compaction_with_peers() {
-        let (db, _registry) = setup_engine_test_db().await;
-
-        // Add a peer with watermark=200
-        peer_tracker::upsert_peer(&db, "peer-1", &[1u8; 16], 200).await.unwrap();
-
-        // Add sync log ops at different HLC times
-        let op100 = make_remote_op("tasks", WriteKind::Insert, "a", "sql", 100);
-        let op150 = make_remote_op("tasks", WriteKind::Insert, "b", "sql", 150);
-        let op300 = make_remote_op("tasks", WriteKind::Insert, "c", "sql", 300);
-        sync_log::insert_op(&db, &op100).await.unwrap();
-        sync_log::insert_op(&db, &op150).await.unwrap();
-        sync_log::insert_op(&db, &op300).await.unwrap();
-
-        run_compaction(db.clone(), Duration::from_secs(7 * 24 * 3600)).await;
-
-        let remaining = sync_log::get_ops_since(&db, 0).await.unwrap();
-        // Only op at hlc_time=300 should remain (100 and 150 are below cutoff=200)
-        assert_eq!(remaining.len(), 1, "Expected only 1 op remaining, got {}", remaining.len());
-        assert_eq!(remaining[0].hlc_time, 300);
-    }
-
-    #[tokio::test]
-    async fn test_run_compaction_no_peers_fallback() {
-        let (db, _registry) = setup_engine_test_db().await;
-
-        // No peers added — fallback to max_hlc - 7 days
-        let op100 = make_remote_op("tasks", WriteKind::Insert, "a", "sql", 100);
-        let op200 = make_remote_op("tasks", WriteKind::Insert, "b", "sql", 200);
-        let op300 = make_remote_op("tasks", WriteKind::Insert, "c", "sql", 300);
-        sync_log::insert_op(&db, &op100).await.unwrap();
-        sync_log::insert_op(&db, &op200).await.unwrap();
-        sync_log::insert_op(&db, &op300).await.unwrap();
-
-        run_compaction(db.clone(), Duration::from_secs(7 * 24 * 3600)).await;
-
-        // 7 days in nanoseconds is huge (~6e14), max_hlc is 300, saturating_sub → cutoff=0
-        // So nothing should be compacted (compact deletes where hlc_time < cutoff, cutoff=0 means nothing)
-        let remaining = sync_log::get_ops_since(&db, 0).await.unwrap();
-        assert_eq!(remaining.len(), 3, "No ops should be compacted with fallback, got {}", remaining.len());
-    }
-
-    #[tokio::test]
-    async fn test_run_compaction_all_zero_watermark() {
-        let (db, _registry) = setup_engine_test_db().await;
-
-        // Add a peer with watermark=0
-        peer_tracker::upsert_peer(&db, "peer-zero", &[3u8; 16], 0).await.unwrap();
-
-        let op100 = make_remote_op("tasks", WriteKind::Insert, "a", "sql", 100);
-        let op200 = make_remote_op("tasks", WriteKind::Insert, "b", "sql", 200);
-        sync_log::insert_op(&db, &op100).await.unwrap();
-        sync_log::insert_op(&db, &op200).await.unwrap();
-
-        run_compaction(db.clone(), Duration::from_secs(7 * 24 * 3600)).await;
-
-        // Watermark=0 means early return — nothing compacted
-        let remaining = sync_log::get_ops_since(&db, 0).await.unwrap();
-        assert_eq!(remaining.len(), 2, "No ops should be compacted when watermark is 0, got {}", remaining.len());
+        assert_eq!(title, "Remote Winner");
     }
 }

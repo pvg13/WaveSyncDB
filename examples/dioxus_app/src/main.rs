@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
-use wavesyncdb::WaveSyncDbBuilder;
 use wavesyncdb::dioxus::{use_synced_table, use_wavesync, use_wavesync_provider};
+use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
 
 use dioxus::prelude::*;
 
@@ -24,7 +24,7 @@ const STYLE: &str = r#"
     .empty { color: #999; font-style: italic; }
 "#;
 
-static DB_REF: OnceLock<&'static wavesyncdb::WaveSyncDb> = OnceLock::new();
+static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -40,12 +40,11 @@ fn main() {
         .expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
-    let db: &'static wavesyncdb::WaveSyncDb = rt.block_on(async {
+    let db = rt.block_on(async {
         let db = WaveSyncDbBuilder::new("sqlite::memory:", "dioxus-tasks")
             .build()
             .await
             .expect("Failed to create WaveSyncDb");
-        let db: &'static wavesyncdb::WaveSyncDb = Box::leak(Box::new(db));
         db.get_schema_registry(module_path!().split("::").next().unwrap())
             .sync()
             .await
@@ -53,16 +52,14 @@ fn main() {
         db
     });
 
-    if DB_REF.set(db).is_err() {
-        panic!("DB already initialized");
-    }
+    DB.set(db).expect("DB already initialized");
     dioxus::launch(App);
 }
 
 #[allow(non_snake_case)]
 fn App() -> Element {
-    let db = *DB_REF.get().expect("DB not initialized");
-    use_wavesync_provider(db);
+    let db = DB.get().expect("DB not initialized");
+    use_wavesync_provider(db.clone());
 
     rsx! {
         style { {STYLE} }
@@ -84,6 +81,7 @@ fn AddTaskForm() -> Element {
             return;
         }
         input.set(String::new());
+        let db = db.clone();
         spawn(async move {
             let new_task = task::ActiveModel {
                 id: Set(Uuid::new_v4().to_string()),
@@ -91,7 +89,7 @@ fn AddTaskForm() -> Element {
                 completed: Set(false),
                 ..Default::default()
             };
-            if let Err(e) = new_task.insert(db).await {
+            if let Err(e) = new_task.insert(&db).await {
                 log::error!("Failed to insert task: {}", e);
             }
         });
@@ -134,15 +132,17 @@ fn TaskItem(task: task::Model) -> Element {
     let completed = task.completed;
 
     let toggle_id = id.clone();
+    let db2 = db.clone();
     let toggle = move |_| {
         let id = toggle_id.clone();
+        let db = db2.clone();
         spawn(async move {
             let active = task::ActiveModel {
                 id: Set(id),
                 completed: Set(!completed),
                 ..Default::default()
             };
-            if let Err(e) = active.update(db).await {
+            if let Err(e) = active.update(&db).await {
                 log::error!("Failed to toggle task: {}", e);
             }
         });
@@ -151,8 +151,9 @@ fn TaskItem(task: task::Model) -> Element {
     let delete_id = id.clone();
     let delete = move |_| {
         let id = delete_id.clone();
+        let db = db.clone();
         spawn(async move {
-            if let Err(e) = task::Entity::delete_by_id(id).exec(db).await {
+            if let Err(e) = task::Entity::delete_by_id(id).exec(&db).await {
                 log::error!("Failed to delete task: {}", e);
             }
         });

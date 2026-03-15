@@ -1,73 +1,100 @@
-//! Peer tracking for watermark-based log compaction.
+//! Peer version tracking for db_version-based sync.
 //!
-//! Maintains a `_wavesync_peers` table that tracks known peers, their last-seen
-//! timestamps, and their sync watermarks (the HLC time up to which they have
-//! received all operations). The minimum watermark across all active peers
-//! determines the safe compaction cutoff.
+//! Maintains a `_wavesync_peer_versions` table that tracks known peers and
+//! their last-known `db_version`. This allows efficient incremental sync:
+//! when a peer reconnects, we only send changes since their last known version.
+
+use std::collections::HashMap;
 
 use sea_orm::{ConnectionTrait, DbErr, ExecResult, FromQueryResult, Statement};
 
-/// Create the `_wavesync_peers` table if it does not already exist.
-pub async fn create_peers_table(db: &impl ConnectionTrait) -> Result<ExecResult, DbErr> {
+use crate::messages::NodeId;
+
+/// Create the `_wavesync_peer_versions` table if it does not already exist.
+pub async fn create_peer_versions_table(db: &impl ConnectionTrait) -> Result<ExecResult, DbErr> {
     db.execute_unprepared(
-        "CREATE TABLE IF NOT EXISTS _wavesync_peers (
+        "CREATE TABLE IF NOT EXISTS _wavesync_peer_versions (
             peer_id     TEXT PRIMARY KEY,
-            node_id     BLOB,
-            watermark   INTEGER NOT NULL DEFAULT 0,
-            last_seen   INTEGER NOT NULL,
-            evicted     INTEGER NOT NULL DEFAULT 0
+            site_id     BLOB,
+            db_version  INTEGER NOT NULL DEFAULT 0,
+            last_seen   INTEGER NOT NULL
         )",
     )
     .await
 }
 
-/// Insert or update a peer record.
-pub async fn upsert_peer(
+/// Insert or update a peer's version information.
+pub async fn upsert_peer_version(
     db: &impl ConnectionTrait,
     peer_id: &str,
-    node_id: &[u8],
-    watermark: u64,
+    site_id: &NodeId,
+    db_version: u64,
 ) -> Result<ExecResult, DbErr> {
     let now = now_secs();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
-        "INSERT INTO _wavesync_peers (peer_id, node_id, watermark, last_seen, evicted)
-         VALUES ($1, $2, $3, $4, 0)
+        "INSERT INTO _wavesync_peer_versions (peer_id, site_id, db_version, last_seen)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT(peer_id) DO UPDATE SET
-            node_id = excluded.node_id,
-            watermark = excluded.watermark,
-            last_seen = excluded.last_seen,
-            evicted = 0",
+            site_id = excluded.site_id,
+            db_version = excluded.db_version,
+            last_seen = excluded.last_seen",
         [
             peer_id.into(),
-            node_id.to_vec().into(),
-            (watermark as i64).into(),
+            site_id.to_vec().into(),
+            (db_version as i64).into(),
             (now as i64).into(),
         ],
     ))
     .await
 }
 
-/// Update a peer's watermark and last_seen timestamp.
-pub async fn update_watermark(
+/// Get the last known db_version for a specific peer.
+pub async fn get_peer_version(
     db: &impl ConnectionTrait,
     peer_id: &str,
-    watermark: u64,
-) -> Result<ExecResult, DbErr> {
-    let now = now_secs();
-    db.execute_raw(Statement::from_sql_and_values(
+) -> Result<Option<u64>, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct VersionRow {
+        db_version: i64,
+    }
+
+    let row = VersionRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
-        "UPDATE _wavesync_peers SET watermark = $1, last_seen = $2 WHERE peer_id = $3",
-        [
-            (watermark as i64).into(),
-            (now as i64).into(),
-            peer_id.into(),
-        ],
+        "SELECT db_version FROM _wavesync_peer_versions WHERE peer_id = $1",
+        [peer_id.into()],
     ))
-    .await
+    .one(db)
+    .await?;
+
+    Ok(row.map(|r| r.db_version as u64))
 }
 
-/// Update a peer's last_seen timestamp.
+/// Get all peer versions as a map.
+pub async fn get_all_peer_versions(
+    db: &impl ConnectionTrait,
+) -> Result<HashMap<String, u64>, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct PeerVersionRow {
+        peer_id: String,
+        db_version: i64,
+    }
+
+    let rows = PeerVersionRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT peer_id, db_version FROM _wavesync_peer_versions",
+        [],
+    ))
+    .all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.peer_id, r.db_version as u64))
+        .collect())
+}
+
+/// Update the last_seen timestamp for a peer.
 pub async fn update_last_seen(
     db: &impl ConnectionTrait,
     peer_id: &str,
@@ -75,89 +102,8 @@ pub async fn update_last_seen(
     let now = now_secs();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
-        "UPDATE _wavesync_peers SET last_seen = $1 WHERE peer_id = $2",
+        "UPDATE _wavesync_peer_versions SET last_seen = $1 WHERE peer_id = $2",
         [(now as i64).into(), peer_id.into()],
-    ))
-    .await
-}
-
-#[derive(Debug, FromQueryResult)]
-struct MinWatermark {
-    min_wm: Option<i64>,
-}
-
-/// Get the minimum watermark across all non-evicted peers.
-pub async fn get_min_watermark(db: &impl ConnectionTrait) -> Result<Option<u64>, DbErr> {
-    let row = MinWatermark::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Sqlite,
-        "SELECT MIN(watermark) as min_wm FROM _wavesync_peers WHERE evicted = 0",
-        [],
-    ))
-    .one(db)
-    .await?;
-
-    Ok(row.and_then(|r| r.min_wm).map(|v| v as u64))
-}
-
-#[derive(Debug, FromQueryResult)]
-struct PeerIdRow {
-    peer_id: String,
-}
-
-/// Mark peers not seen in `timeout_secs` as evicted. Returns evicted peer IDs.
-pub async fn evict_stale_peers(
-    db: &impl ConnectionTrait,
-    timeout_secs: u64,
-) -> Result<Vec<String>, DbErr> {
-    let cutoff = now_secs().saturating_sub(timeout_secs);
-
-    // Find peers to evict
-    let rows = PeerIdRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Sqlite,
-        "SELECT peer_id FROM _wavesync_peers WHERE evicted = 0 AND last_seen < $1",
-        [(cutoff as i64).into()],
-    ))
-    .all(db)
-    .await?;
-
-    let evicted: Vec<String> = rows.into_iter().map(|r| r.peer_id).collect();
-
-    if !evicted.is_empty() {
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE _wavesync_peers SET evicted = 1 WHERE evicted = 0 AND last_seen < $1",
-            [(cutoff as i64).into()],
-        ))
-        .await?;
-    }
-
-    Ok(evicted)
-}
-
-#[derive(Debug, FromQueryResult)]
-struct CountRow {
-    cnt: i64,
-}
-
-/// Check whether a peer exists and is not evicted.
-pub async fn is_known_peer(db: &impl ConnectionTrait, peer_id: &str) -> Result<bool, DbErr> {
-    let row = CountRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Sqlite,
-        "SELECT COUNT(*) as cnt FROM _wavesync_peers WHERE peer_id = $1 AND evicted = 0",
-        [peer_id.into()],
-    ))
-    .one(db)
-    .await?;
-
-    Ok(row.is_some_and(|r| r.cnt > 0))
-}
-
-/// Hard delete a peer record (for rejoining evicted peers).
-pub async fn remove_peer(db: &impl ConnectionTrait, peer_id: &str) -> Result<ExecResult, DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Sqlite,
-        "DELETE FROM _wavesync_peers WHERE peer_id = $1",
-        [peer_id.into()],
     ))
     .await
 }
@@ -176,115 +122,70 @@ mod tests {
 
     async fn setup_db() -> sea_orm::DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        create_peers_table(&db).await.unwrap();
+        create_peer_versions_table(&db).await.unwrap();
         db
     }
 
     #[tokio::test]
-    async fn test_upsert_and_query_peer() {
+    async fn test_upsert_and_get_peer_version() {
         let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 100).await.unwrap();
-        assert!(is_known_peer(&db, "peer-1").await.unwrap());
-        assert!(!is_known_peer(&db, "peer-2").await.unwrap());
+        let site_id = [1u8; 16];
+        upsert_peer_version(&db, "peer-1", &site_id, 42)
+            .await
+            .unwrap();
+        let version = get_peer_version(&db, "peer-1").await.unwrap();
+        assert_eq!(version, Some(42));
     }
 
     #[tokio::test]
-    async fn test_min_watermark() {
+    async fn test_get_peer_version_missing() {
         let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 100).await.unwrap();
-        upsert_peer(&db, "peer-2", &[2u8; 16], 50).await.unwrap();
-        upsert_peer(&db, "peer-3", &[3u8; 16], 200).await.unwrap();
-        let min = get_min_watermark(&db).await.unwrap();
-        assert_eq!(min, Some(50));
+        let version = get_peer_version(&db, "nonexistent").await.unwrap();
+        assert_eq!(version, None);
     }
 
     #[tokio::test]
-    async fn test_min_watermark_excludes_evicted() {
+    async fn test_upsert_updates_version() {
         let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 10).await.unwrap();
-        upsert_peer(&db, "peer-2", &[2u8; 16], 100).await.unwrap();
-        // Evict peer-1 by setting last_seen far in the past
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE _wavesync_peers SET last_seen = 0 WHERE peer_id = $1",
-            ["peer-1".into()],
-        ))
-        .await
-        .unwrap();
-        evict_stale_peers(&db, 1).await.unwrap();
-        let min = get_min_watermark(&db).await.unwrap();
-        assert_eq!(min, Some(100));
+        let site_id = [1u8; 16];
+        upsert_peer_version(&db, "peer-1", &site_id, 10)
+            .await
+            .unwrap();
+        upsert_peer_version(&db, "peer-1", &site_id, 50)
+            .await
+            .unwrap();
+        let version = get_peer_version(&db, "peer-1").await.unwrap();
+        assert_eq!(version, Some(50));
     }
 
     #[tokio::test]
-    async fn test_no_peers_returns_none() {
+    async fn test_get_all_peer_versions() {
         let db = setup_db().await;
-        let min = get_min_watermark(&db).await.unwrap();
-        assert_eq!(min, None);
-    }
+        let site_a = [1u8; 16];
+        let site_b = [2u8; 16];
+        upsert_peer_version(&db, "peer-1", &site_a, 10)
+            .await
+            .unwrap();
+        upsert_peer_version(&db, "peer-2", &site_b, 20)
+            .await
+            .unwrap();
 
-    #[tokio::test]
-    async fn test_update_watermark() {
-        let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 50).await.unwrap();
-        update_watermark(&db, "peer-1", 200).await.unwrap();
-        let min = get_min_watermark(&db).await.unwrap();
-        assert_eq!(min, Some(200));
-    }
-
-    #[tokio::test]
-    async fn test_remove_peer() {
-        let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 50).await.unwrap();
-        remove_peer(&db, "peer-1").await.unwrap();
-        assert!(!is_known_peer(&db, "peer-1").await.unwrap());
+        let versions = get_all_peer_versions(&db).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions["peer-1"], 10);
+        assert_eq!(versions["peer-2"], 20);
     }
 
     #[tokio::test]
     async fn test_update_last_seen() {
         let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 100).await.unwrap();
+        let site_id = [1u8; 16];
+        upsert_peer_version(&db, "peer-1", &site_id, 42)
+            .await
+            .unwrap();
         update_last_seen(&db, "peer-1").await.unwrap();
-        assert!(is_known_peer(&db, "peer-1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_is_known_peer_evicted() {
-        let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 100).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE _wavesync_peers SET last_seen = 0 WHERE peer_id = $1",
-            ["peer-1".into()],
-        ))
-        .await
-        .unwrap();
-        evict_stale_peers(&db, 1).await.unwrap();
-        assert!(!is_known_peer(&db, "peer-1").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_evict_stale_peers_returns_ids() {
-        let db = setup_db().await;
-        upsert_peer(&db, "peer-1", &[1u8; 16], 100).await.unwrap();
-        upsert_peer(&db, "peer-2", &[2u8; 16], 200).await.unwrap();
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE _wavesync_peers SET last_seen = 0 WHERE peer_id = $1",
-            ["peer-1".into()],
-        ))
-        .await
-        .unwrap();
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            "UPDATE _wavesync_peers SET last_seen = 0 WHERE peer_id = $1",
-            ["peer-2".into()],
-        ))
-        .await
-        .unwrap();
-        let evicted = evict_stale_peers(&db, 1).await.unwrap();
-        assert!(evicted.contains(&"peer-1".to_string()));
-        assert!(evicted.contains(&"peer-2".to_string()));
-        assert_eq!(evicted.len(), 2);
+        // Just verify it doesn't error; timestamp is wall-clock
+        let version = get_peer_version(&db, "peer-1").await.unwrap();
+        assert_eq!(version, Some(42));
     }
 }

@@ -15,14 +15,6 @@ use proc_macro::TokenStream;
 /// keyed by the entity's `module_path!()`. When you call
 /// `db.get_schema_registry("my_crate")`, it iterates all registered entities
 /// whose module path starts with `"my_crate"` and adds them to the schema builder.
-///
-/// This means entities in different crates are naturally namespaced — pass your
-/// crate name (or `module_path!().split("::").next().unwrap()`) to discover only
-/// your own entities.
-///
-/// **Note:** `SyncEntity` must be used alongside `DeriveEntityModel`. It reads
-/// the entity's `table_name`, columns, and primary key from SeaORM's generated
-/// `Entity`, `Column`, and `PrimaryKey` types.
 #[proc_macro_derive(SyncEntity)]
 pub fn derive_sync_entity(_input: TokenStream) -> TokenStream {
     quote::quote! {
@@ -53,6 +45,7 @@ pub fn derive_sync_entity(_input: TokenStream) -> TokenStream {
                         table_name,
                         primary_key_column,
                         columns,
+                        delete_policy: wavesyncdb::DeletePolicy::DeleteWins,
                     })
                 },
             }
