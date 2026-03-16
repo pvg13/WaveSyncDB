@@ -530,8 +530,8 @@ impl EngineRunner {
         // Relay reconnection timer (only active when relay is configured but disconnected)
         // Use interval_at to avoid immediate first tick causing a duplicate dial
         let mut relay_reconnect = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(30),
-            Duration::from_secs(30),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         let has_relay = self.config.relay_server.is_some();
 
@@ -738,14 +738,14 @@ impl EngineRunner {
                     }
                 } else {
                     // Non-circuit address (new network interface) — reconnect relay if needed
-                    if matches!(self.relay_state, RelayState::Connecting { .. }) {
-                        if let Some(ref relay_addr) = self.config.relay_server {
-                            log::info!(
-                                "New listen address detected, attempting relay reconnection"
-                            );
-                            if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                                log::warn!("Relay redial on new address failed: {e}");
-                            }
+                    if matches!(self.relay_state, RelayState::Connecting { .. })
+                        && let Some(ref relay_addr) = self.config.relay_server
+                    {
+                        log::info!(
+                            "New listen address detected, attempting relay reconnection"
+                        );
+                        if let Err(e) = self.swarm.dial(relay_addr.clone()) {
+                            log::warn!("Relay redial on new address failed: {e}");
                         }
                     }
                 }
@@ -813,21 +813,31 @@ impl EngineRunner {
                         ),
                     );
                     self.update_network_status();
-                    // Relay circuit listen is deferred until AutoNAT detects private NAT,
-                    // to avoid a premature reservation failure killing gossipsub protocols.
+
+                    // Eagerly listen on relay circuit — AutoNAT v2 probes timeout on mobile
+                    // (server can't dial back through NAT), so we cannot wait for NAT detection.
+                    let circuit_addr = relay_addr
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                    if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
+                        log::warn!("Failed to listen on relay circuit: {e}");
+                    } else {
+                        log::info!("Listening on relay circuit (eager): {circuit_addr}");
+                    }
 
                     // Register push token with relay if configured
                     self.maybe_register_push_token(peer_id);
                 }
 
-                // If this is a rendezvous server, register + discover
+                // If this is a rendezvous server, discover peers
+                // Don't register yet — no external addresses available until relay circuit arrives.
+                // Registration will happen in NewListenAddr when circuit address is added.
                 if let Some(ref rendezvous_addr) = self.config.rendezvous_server
                     && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
                         rendezvous_addr.iter().last()
                     && peer_id == rv_peer_id
                 {
                     log::info!("Connected to rendezvous server {peer_id}");
-                    self.rendezvous_register(peer_id);
                     self.rendezvous_discover();
                 }
 
@@ -866,14 +876,20 @@ impl EngineRunner {
                     self.initiate_sync_for_peer(peer_id);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                log::debug!("Connection closed with {peer_id}");
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
+                log::debug!("Connection closed with {peer_id} ({num_established} remaining)");
 
                 // Clean pending_sync_peers so the peer can be re-synced on reconnect
                 self.pending_sync_peers.remove(&peer_id);
 
-                // If relay server disconnected, update state
-                if let RelayState::Connected { relay_peer_id }
+                // Only act on relay/rendezvous disconnect when ALL connections are gone
+                if num_established > 0 {
+                    // Still have active connections to this peer — nothing to do
+                } else if let RelayState::Connected { relay_peer_id }
                 | RelayState::Listening { relay_peer_id } = &self.relay_state
                     && peer_id == *relay_peer_id
                 {
@@ -912,7 +928,8 @@ impl EngineRunner {
                 }
 
                 // If rendezvous server disconnected (and is different from relay)
-                if let Some(ref rv_addr) = self.config.rendezvous_server
+                if num_established == 0
+                    && let Some(ref rv_addr) = self.config.rendezvous_server
                     && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
                         rv_addr.iter().last()
                     && peer_id == rv_peer_id
@@ -935,10 +952,9 @@ impl EngineRunner {
                 if let Err(ref e) = reason {
                     log::warn!("Listener closed with error: {e}");
                 }
-                // If relay was in Listening state, reset to Connected so the next
-                // AutoNAT probe can re-trigger the reservation
+                // If relay was in Listening state, reset to Connected and re-request circuit
                 if let RelayState::Listening { relay_peer_id } = self.relay_state {
-                    log::warn!("Relay listener closed, resetting to Connected state");
+                    log::warn!("Relay listener closed, re-requesting circuit reservation");
                     self.relay_state = RelayState::Connected { relay_peer_id };
                     self.emit_network_event(
                         crate::network_status::NetworkEvent::RelayStatusChanged(
@@ -946,6 +962,15 @@ impl EngineRunner {
                         ),
                     );
                     self.update_network_status();
+                    // Re-request immediately (don't wait for AutoNAT)
+                    if let Some(ref relay_addr) = self.config.relay_server {
+                        let circuit_addr = relay_addr
+                            .clone()
+                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        if let Err(e) = self.swarm.listen_on(circuit_addr) {
+                            log::warn!("Failed to re-listen on relay circuit: {e}");
+                        }
+                    }
                 }
                 // Re-subscribe to gossipsub topic to restore protocol advertisement
                 // in case the listener closure removed it
@@ -1239,24 +1264,9 @@ impl EngineRunner {
                     );
                     self.update_network_status();
                 }
-                // If behind NAT and relay is configured but not yet listening, trigger reservation
-                if matches!(self.relay_state, RelayState::Connected { .. })
-                    && let RelayState::Connected { relay_peer_id } = self.relay_state
-                    && let Some(ref relay_addr) = self.config.relay_server
-                {
-                    let circuit_addr = relay_addr
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                    if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
-                        log::warn!("Failed to listen on relay circuit: {}", e);
-                    } else {
-                        log::info!(
-                            "NAT detected as private, listening on relay circuit: {}",
-                            circuit_addr
-                        );
-                        self.relay_state = RelayState::Connected { relay_peer_id };
-                    }
-                }
+                // Relay circuit is now requested eagerly on ConnectionEstablished,
+                // so we no longer trigger it from AutoNAT. NAT status is still tracked
+                // above for NetworkStatus reporting.
             }
         }
     }
@@ -1378,7 +1388,7 @@ impl EngineRunner {
         match self.swarm.behaviour_mut().rendezvous.register(
             namespace,
             server_peer_id,
-            Some(self.config.rendezvous_ttl),
+            None, // Let server assign default TTL (server MIN_TTL=7200s)
         ) {
             Ok(()) => {
                 log::info!("Sent rendezvous registration to {server_peer_id}");
@@ -1415,9 +1425,11 @@ impl EngineRunner {
             }
         };
 
-        // Always re-register: handles TTL expiry (server forgets after rendezvous_ttl)
-        // and stale rendezvous_registered state after silent disconnects
-        self.rendezvous_register(server_peer_id);
+        // Re-register if we have external addresses (avoids NoExternalAddresses error).
+        // Handles TTL expiry and stale state after silent disconnects.
+        if self.swarm.external_addresses().count() > 0 {
+            self.rendezvous_register(server_peer_id);
+        }
 
         self.swarm.behaviour_mut().rendezvous.discover(
             Some(namespace),
@@ -1433,9 +1445,14 @@ impl EngineRunner {
             RelayState::Connecting { retry_count } => {
                 if let Some(ref relay_addr) = self.config.relay_server {
                     let count = *retry_count;
-                    log::info!("Attempting relay reconnection (attempt {})", count + 1);
-                    if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                        log::warn!("Failed to redial relay server: {}", e);
+                    // Exponential backoff via tick-skipping: dial every 2^min(count,3) ticks
+                    // With 5s base interval: 5s, 10s, 20s, 40s, 40s, 40s...
+                    let skip = 1u32 << count.min(3); // 1, 2, 4, 8, 8, 8...
+                    if count % skip == 0 {
+                        log::info!("Attempting relay reconnection (attempt {})", count + 1);
+                        if let Err(e) = self.swarm.dial(relay_addr.clone()) {
+                            log::warn!("Failed to redial relay server: {}", e);
+                        }
                     }
                     self.relay_state = RelayState::Connecting {
                         retry_count: count + 1,
