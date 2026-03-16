@@ -108,3 +108,150 @@ pub struct ChangeNotification {
     /// Which columns were changed (if known).
     pub changed_columns: Option<Vec<String>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_column_change_roundtrip_json() {
+        let change = ColumnChange {
+            table: "tasks".to_string(),
+            pk: "pk-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("Hello")),
+            site_id: [1u8; 16],
+            col_version: 5,
+            cl: 5,
+            seq: 0,
+        };
+        let json = serde_json::to_string(&change).unwrap();
+        let deserialized: ColumnChange = serde_json::from_str(&json).unwrap();
+        assert_eq!(change, deserialized);
+    }
+
+    #[test]
+    fn test_sync_changeset_roundtrip_json() {
+        let changeset = SyncChangeset {
+            site_id: [2u8; 16],
+            db_version: 42,
+            changes: vec![
+                ColumnChange {
+                    table: "tasks".to_string(),
+                    pk: "pk-1".to_string(),
+                    cid: "title".to_string(),
+                    val: Some(serde_json::json!("First")),
+                    site_id: [2u8; 16],
+                    col_version: 1,
+                    cl: 1,
+                    seq: 0,
+                },
+                ColumnChange {
+                    table: "tasks".to_string(),
+                    pk: "pk-1".to_string(),
+                    cid: "done".to_string(),
+                    val: Some(serde_json::json!(false)),
+                    site_id: [2u8; 16],
+                    col_version: 1,
+                    cl: 1,
+                    seq: 1,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&changeset).unwrap();
+        let deserialized: SyncChangeset = serde_json::from_str(&json).unwrap();
+        assert_eq!(changeset, deserialized);
+    }
+
+    #[test]
+    fn test_authenticated_message_roundtrip_json() {
+        let msg = AuthenticatedMessage {
+            inner: SyncMessage::Changeset(SyncChangeset {
+                site_id: [3u8; 16],
+                db_version: 1,
+                changes: vec![],
+            }),
+            hmac: Some([0xAB; 32]),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: AuthenticatedMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.hmac, Some([0xAB; 32]));
+    }
+
+    #[test]
+    fn test_authenticated_message_hmac_none_default() {
+        // Simulate old message without hmac field
+        let json = r#"{"inner":{"Changeset":{"site_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"db_version":1,"changes":[]}}}"#;
+        let msg: AuthenticatedMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.hmac, None);
+    }
+
+    #[test]
+    fn test_write_kind_variants_serialize() {
+        let insert_json = serde_json::to_string(&WriteKind::Insert).unwrap();
+        let update_json = serde_json::to_string(&WriteKind::Update).unwrap();
+        let delete_json = serde_json::to_string(&WriteKind::Delete).unwrap();
+        assert_eq!(insert_json, "\"Insert\"");
+        assert_eq!(update_json, "\"Update\"");
+        assert_eq!(delete_json, "\"Delete\"");
+    }
+
+    #[test]
+    fn test_delete_policy_default() {
+        assert_eq!(DeletePolicy::default(), DeletePolicy::DeleteWins);
+    }
+
+    #[test]
+    fn test_column_change_deleted_sentinel() {
+        let change = ColumnChange {
+            table: "tasks".to_string(),
+            pk: "pk-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [1u8; 16],
+            col_version: 3,
+            cl: 3,
+            seq: 0,
+        };
+        assert_eq!(change.cid, "__deleted");
+        assert!(change.val.is_none());
+    }
+
+    #[test]
+    fn test_sync_message_changeset_envelope() {
+        let msg = SyncMessage::Changeset(SyncChangeset {
+            site_id: [4u8; 16],
+            db_version: 10,
+            changes: vec![],
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: SyncMessage = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SyncMessage::Changeset(cs) => {
+                assert_eq!(cs.db_version, 10);
+                assert_eq!(cs.site_id, [4u8; 16]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_change_notification_clone() {
+        let notif = ChangeNotification {
+            table: "tasks".to_string(),
+            kind: WriteKind::Insert,
+            primary_key: "pk-1".to_string(),
+            changed_columns: Some(vec!["title".to_string()]),
+        };
+        let cloned = notif.clone();
+        assert_eq!(format!("{:?}", notif), format!("{:?}", cloned));
+    }
+
+    #[test]
+    fn test_node_id_serializes_as_array() {
+        let id: NodeId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]");
+        let deserialized: NodeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+    }
+}

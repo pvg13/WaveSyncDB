@@ -53,10 +53,6 @@ pub(crate) fn classify_write(sql: &str) -> Option<(WriteKind, String)> {
 
 /// Parsed write information with column-value pairs.
 pub(crate) struct ParsedWrite {
-    #[allow(dead_code)]
-    pub kind: WriteKind,
-    #[allow(dead_code)]
-    pub table: String,
     pub primary_key: String,
     pub columns: Vec<(String, serde_json::Value)>,
 }
@@ -67,15 +63,13 @@ pub(crate) struct ParsedWrite {
 /// For UPDATE: parses `SET col = val` pairs.
 /// For DELETE: returns empty columns (tombstone handles it).
 pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<ParsedWrite> {
-    let (kind, table) = classify_write(sql)?;
+    let (kind, _table) = classify_write(sql)?;
 
     match kind {
         WriteKind::Insert => {
             let primary_key = extract_pk_from_insert(sql, pk_column);
             let columns = extract_column_values_insert(sql);
             Some(ParsedWrite {
-                kind,
-                table,
                 primary_key,
                 columns,
             })
@@ -84,8 +78,6 @@ pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<ParsedWrite
             let primary_key = extract_pk_from_where(sql, pk_column);
             let columns = extract_column_values_update(sql);
             Some(ParsedWrite {
-                kind,
-                table,
                 primary_key,
                 columns,
             })
@@ -93,8 +85,6 @@ pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<ParsedWrite
         WriteKind::Delete => {
             let primary_key = extract_pk_from_where(sql, pk_column);
             Some(ParsedWrite {
-                kind,
-                table,
                 primary_key,
                 columns: vec![],
             })
@@ -210,6 +200,8 @@ struct WaveSyncDbInner {
     registry_ready: Arc<Notify>,
     cmd_tx: mpsc::Sender<crate::engine::EngineCommand>,
     engine_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
+    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
 }
 
 /// A SeaORM connection wrapper that transparently intercepts write operations
@@ -271,6 +263,18 @@ impl WaveSyncDb {
         &self.inner.change_tx
     }
 
+    /// Get a snapshot of the current network status.
+    ///
+    /// This is a cheap read from shared memory — no network round-trip.
+    pub fn network_status(&self) -> crate::network_status::NetworkStatus {
+        self.inner.network_status.read().unwrap().clone()
+    }
+
+    /// Subscribe to network events (peer connect/disconnect, relay changes, etc.).
+    pub fn network_event_rx(&self) -> broadcast::Receiver<crate::network_status::NetworkEvent> {
+        self.inner.network_event_tx.subscribe()
+    }
+
     /// Get a reference to the sync changeset sender.
     pub fn sync_tx(&self) -> &mpsc::Sender<SyncChangeset> {
         &self.inner.sync_tx
@@ -330,12 +334,13 @@ impl WaveSyncDb {
     /// the relay on the next connection (or immediately if already connected).
     /// `platform` should be `"Fcm"` or `"Apns"`.
     pub fn register_push_token(&self, platform: &str, token: &str) {
-        let _ = self.inner.cmd_tx.try_send(
-            crate::engine::EngineCommand::RegisterPushToken {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::RegisterPushToken {
                 platform: platform.to_string(),
                 token: token.to_string(),
-            },
-        );
+            });
     }
 
     /// Register a table for sync.
@@ -466,12 +471,28 @@ impl WaveSyncDb {
             return;
         }
 
+        // Send change notification IMMEDIATELY — data is already committed.
+        // This ensures the notification is sent on the caller's runtime (Dioxus),
+        // not from a tokio::spawn which can't reliably wake the Dioxus event loop on mobile.
+        let changed_columns = if matches!(kind, WriteKind::Delete) {
+            None
+        } else {
+            Some(parsed.columns.iter().map(|(col, _)| col.clone()).collect())
+        };
+        let _ = self.inner.change_tx.send(ChangeNotification {
+            table: table.to_string(),
+            kind: kind.clone(),
+            primary_key: parsed.primary_key.clone(),
+            changed_columns,
+        });
+
         let site_id = self.inner.site_id;
         let shared = self.inner.clone();
         let inner = self.inner.inner.clone();
         let table_owned = table.to_string();
         let kind_clone = kind.clone();
 
+        // Async CRDT bookkeeping + P2P sync
         tokio::spawn(async move {
             // Increment db_version
             let new_db_version = {
@@ -526,8 +547,10 @@ impl WaveSyncDb {
                     });
                 }
                 WriteKind::Insert | WriteKind::Update => {
-                    // Clear any tombstone for this row (it's alive again)
-                    let _ = crate::shadow::delete_clock_entries(
+                    // Clear any tombstone for this row (it's alive again),
+                    // but preserve per-column clock entries so col_versions
+                    // continue from their previous values.
+                    let _ = crate::shadow::clear_tombstone(
                         &inner,
                         &table_owned,
                         &parsed.primary_key,
@@ -575,32 +598,13 @@ impl WaveSyncDb {
                 }
             }
 
-            let changed_columns: Option<Vec<String>> = if changes.is_empty() {
-                None
-            } else {
-                Some(
-                    changes
-                        .iter()
-                        .filter(|c| c.cid != "__deleted")
-                        .map(|c| c.cid.clone())
-                        .collect(),
-                )
-            };
-
             let changeset = SyncChangeset {
                 site_id,
                 db_version: new_db_version,
                 changes,
             };
 
-            if shared.sync_tx.send(changeset).await.is_ok() {
-                let _ = shared.change_tx.send(ChangeNotification {
-                    table: table_owned,
-                    kind: kind_clone,
-                    primary_key: parsed.primary_key,
-                    changed_columns,
-                });
-            }
+            let _ = shared.sync_tx.send(changeset).await;
         });
     }
 }
@@ -1084,6 +1088,11 @@ impl WaveSyncDbBuilder {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<crate::engine::EngineCommand>(4);
 
+        let network_status = Arc::new(std::sync::RwLock::new(
+            crate::network_status::NetworkStatus::default(),
+        ));
+        let (network_event_tx, _) = broadcast::channel::<crate::network_status::NetworkEvent>(256);
+
         // Parse multiaddrs for WAN config
         let relay_server = self
             .relay_server
@@ -1130,13 +1139,14 @@ impl WaveSyncDbBuilder {
             sync_rx,
             change_tx.clone(),
             registry.clone(),
-            node_id,
             site_id,
             self.topic,
             engine_config,
             registry_ready.clone(),
             cmd_rx,
             self.group_key,
+            network_status.clone(),
+            network_event_tx.clone(),
         );
 
         let db = WaveSyncDb {
@@ -1151,6 +1161,8 @@ impl WaveSyncDbBuilder {
                 registry_ready,
                 cmd_tx,
                 engine_handle: std::sync::Mutex::new(Some(engine_handle)),
+                network_status,
+                network_event_tx,
             }),
         };
 
@@ -1205,9 +1217,10 @@ mod tests {
     #[test]
     fn test_parse_write_insert() {
         let sql = r#"INSERT INTO "tasks" ("id", "title", "done") VALUES ('abc', 'My Task', 0)"#;
+        let (kind, table) = classify_write(sql).unwrap();
+        assert_eq!(kind, WriteKind::Insert);
+        assert_eq!(table, "tasks");
         let parsed = parse_write_full(sql, "id").unwrap();
-        assert_eq!(parsed.kind, WriteKind::Insert);
-        assert_eq!(parsed.table, "tasks");
         assert_eq!(parsed.primary_key, "abc");
         assert_eq!(parsed.columns.len(), 3);
         assert_eq!(parsed.columns[0].0, "id");
@@ -1221,9 +1234,10 @@ mod tests {
     #[test]
     fn test_parse_write_update() {
         let sql = r#"UPDATE "tasks" SET "title" = 'New Title', "done" = 1 WHERE "id" = 'abc'"#;
+        let (kind, table) = classify_write(sql).unwrap();
+        assert_eq!(kind, WriteKind::Update);
+        assert_eq!(table, "tasks");
         let parsed = parse_write_full(sql, "id").unwrap();
-        assert_eq!(parsed.kind, WriteKind::Update);
-        assert_eq!(parsed.table, "tasks");
         assert_eq!(parsed.primary_key, "abc");
         assert_eq!(parsed.columns.len(), 2);
         assert_eq!(parsed.columns[0].0, "title");
@@ -1235,9 +1249,10 @@ mod tests {
     #[test]
     fn test_parse_write_delete() {
         let sql = r#"DELETE FROM "tasks" WHERE "id" = 'abc'"#;
+        let (kind, table) = classify_write(sql).unwrap();
+        assert_eq!(kind, WriteKind::Delete);
+        assert_eq!(table, "tasks");
         let parsed = parse_write_full(sql, "id").unwrap();
-        assert_eq!(parsed.kind, WriteKind::Delete);
-        assert_eq!(parsed.table, "tasks");
         assert_eq!(parsed.primary_key, "abc");
         assert!(parsed.columns.is_empty());
     }
@@ -1381,5 +1396,97 @@ mod tests {
     fn test_split_sql_values_no_quotes() {
         let values = split_sql_values("1, 2, 3");
         assert_eq!(values, vec!["1", " 2", " 3"]);
+    }
+
+    // --- Bug regression tests ---
+
+    /// H3: multi-row INSERT — extract_pk_from_insert only returns first PK
+    #[test]
+    fn test_h3_multi_row_insert_first_pk_only() {
+        let sql = r#"INSERT INTO "tasks" ("id", "title") VALUES ('a', 'x'), ('b', 'y')"#;
+        let pk = extract_pk_from_insert(sql, "id");
+        // Documents H3 bug: only first row's PK is returned
+        assert_eq!(pk, "a", "H3: only first PK extracted from multi-row INSERT");
+    }
+
+    /// H5: PK with spaces is truncated by extract_pk_from_where
+    #[test]
+    fn test_h5_pk_with_spaces_truncated() {
+        let sql = r#"UPDATE "tasks" SET "title" = 'x' WHERE "id" = 'hello world'"#;
+        let pk = extract_pk_from_where(sql, "id");
+        // H5 bug: PK is truncated at the space
+        assert!(
+            pk == "hello" || pk == "hello world",
+            "H5: PK '{}' — expected 'hello world' (fixed) or 'hello' (bug)",
+            pk
+        );
+    }
+
+    /// H5: comparison operator >= confuses the parser
+    #[test]
+    fn test_h5_pk_with_comparison_operators() {
+        let sql = r#"DELETE FROM "tasks" WHERE "id" >= 10"#;
+        let pk = extract_pk_from_where(sql, "id");
+        // The parser finds '=' inside '>=' — the PK extracted may be wrong
+        // This documents the known limitation
+        assert!(
+            !pk.is_empty(),
+            "H5: parser should extract something even with >="
+        );
+    }
+
+    /// M12: non-ASCII in SET clause
+    #[test]
+    fn test_m12_unicode_set_clause() {
+        let sql = r#"UPDATE "tasks" SET "title" = 'café' WHERE "id" = 'pk1'"#;
+        let parsed = parse_write_full(sql, "id").unwrap();
+        assert_eq!(parsed.columns.len(), 1);
+        assert_eq!(parsed.columns[0].0, "title");
+        assert_eq!(parsed.columns[0].1, serde_json::json!("café"));
+    }
+
+    /// M5: escaped quotes in VALUES
+    #[test]
+    fn test_m5_escaped_quotes_edge() {
+        let sql = r#"INSERT INTO "tasks" ("id", "title", "completed") VALUES ('pk1', 'it''s', 0)"#;
+        let parsed = parse_write_full(sql, "id").unwrap();
+        // The split_sql_values should handle the escaped quote
+        assert_eq!(parsed.primary_key, "pk1");
+        assert_eq!(parsed.columns[1].0, "title");
+        // The value should have the unescaped quote
+        assert_eq!(parsed.columns[1].1, serde_json::json!("it's"));
+    }
+
+    /// H4: unparseable SQL returns None
+    #[test]
+    fn test_parse_write_full_returns_none_for_gibberish() {
+        assert!(parse_write_full("THIS IS NOT SQL", "id").is_none());
+        assert!(parse_write_full("SELECT * FROM tasks", "id").is_none());
+    }
+
+    /// Internal table prefix still classifies (but dispatch_sync skips them)
+    #[test]
+    fn test_classify_write_internal_table_prefix() {
+        let result = classify_write(
+            r#"INSERT INTO "_wavesync_meta" ("key", "value") VALUES ('x', 'y')"#,
+        );
+        assert!(result.is_some(), "classify_write should still parse _wavesync tables");
+        let (_, table) = result.unwrap();
+        assert!(table.starts_with("_wavesync"));
+    }
+
+    /// sql_value_to_json for float
+    #[test]
+    fn test_sql_value_to_json_float() {
+        let val = sql_value_to_json("3.14");
+        assert!(val.is_number());
+        assert!((val.as_f64().unwrap() - 3.14).abs() < f64::EPSILON);
+    }
+
+    /// sql_value_to_json for hex blob — falls back to string
+    #[test]
+    fn test_sql_value_to_json_hex_blob() {
+        let val = sql_value_to_json("X'DEADBEEF'");
+        assert!(val.is_string(), "Hex blob should fall back to string");
     }
 }

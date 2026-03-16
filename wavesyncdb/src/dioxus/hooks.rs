@@ -10,7 +10,7 @@ use std::future::Future;
 use dioxus::prelude::*;
 use sea_orm::{DbErr, EntityTrait, FromQueryResult};
 
-use crate::{WaveSyncDb, WaveSyncDbBuilder};
+use crate::{NetworkStatus, WaveSyncDb, WaveSyncDbBuilder};
 
 // ---------------------------------------------------------------------------
 // Context providers
@@ -190,6 +190,46 @@ impl InitDb {
 }
 
 // ---------------------------------------------------------------------------
+// Network status hook
+// ---------------------------------------------------------------------------
+
+/// Reactive signal containing the current [`NetworkStatus`].
+///
+/// Subscribes to the event channel eagerly, then reads the initial snapshot,
+/// ensuring no [`NetworkEvent::EngineStarted`](crate::NetworkEvent) is missed
+/// (important on mobile where the engine task may not have run yet at first render).
+/// Refreshes whenever any [`NetworkEvent`](crate::NetworkEvent) is received.
+pub fn use_network_status(db: WaveSyncDb) -> Signal<NetworkStatus> {
+    // Subscribe BEFORE reading the snapshot so we never miss EngineStarted.
+    // Use a Signal<bool> just to trigger the initial re-read inside the effect.
+    let mut signal = use_signal(|| db.network_status());
+
+    use_effect(move || {
+        // Create the subscription inside the effect but immediately re-read
+        // the snapshot to catch any events that fired before this point.
+        let mut rx = db.network_event_rx();
+        let db = db.clone();
+        signal.set(db.network_status());
+        spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(_) => {
+                        signal.set(db.network_status());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Snapshot is always fresh
+                        signal.set(db.network_status());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    });
+
+    signal
+}
+
+// ---------------------------------------------------------------------------
 // Reactive table/row hooks
 // ---------------------------------------------------------------------------
 
@@ -276,12 +316,14 @@ pub fn use_app_resume(db: WaveSyncDb, foreground: Signal<bool>) {
 
     use_effect(move || {
         let is_fg = *foreground.read();
-        let was_fg = *was_foreground.read();
+        let was_fg = *was_foreground.peek(); // peek() — don't subscribe
 
-        if is_fg && !was_fg {
-            db.resume();
+        if is_fg != was_fg {
+            was_foreground.set(is_fg);
+            if is_fg && !was_fg {
+                db.resume();
+            }
         }
-        was_foreground.set(is_fg);
     });
 }
 

@@ -49,3 +49,100 @@ pub enum SyncResponse {
         hmac: Option<[u8; 32]>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_request_version_vector_roundtrip() {
+        let req = SyncRequest::VersionVector {
+            my_db_version: 10,
+            your_last_db_version: 5,
+            site_id: [1u8; 16],
+            topic: "my-topic".to_string(),
+            hmac: Some([0xAB; 32]),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: SyncRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SyncRequest::VersionVector {
+                my_db_version,
+                your_last_db_version,
+                topic,
+                hmac,
+                ..
+            } => {
+                assert_eq!(my_db_version, 10);
+                assert_eq!(your_last_db_version, 5);
+                assert_eq!(topic, "my-topic");
+                assert_eq!(hmac, Some([0xAB; 32]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_sync_response_changeset_response_roundtrip() {
+        let resp = SyncResponse::ChangesetResponse {
+            changes: vec![ColumnChange {
+                table: "tasks".to_string(),
+                pk: "pk-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Hello")),
+                site_id: [2u8; 16],
+                col_version: 3,
+                cl: 3,
+                seq: 0,
+            }],
+            my_db_version: 20,
+            your_last_db_version: 10,
+            site_id: [2u8; 16],
+            topic: "test".to_string(),
+            hmac: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: SyncResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SyncResponse::ChangesetResponse {
+                changes,
+                my_db_version,
+                ..
+            } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(my_db_version, 20);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sync_request_missing_topic_defaults() {
+        // Simulate old-format request without topic/hmac fields (N5)
+        let json = r#"{"VersionVector":{"my_db_version":5,"your_last_db_version":0,"site_id":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}}"#;
+        let req: SyncRequest = serde_json::from_str(json).unwrap();
+        match req {
+            SyncRequest::VersionVector { topic, hmac, .. } => {
+                assert_eq!(topic, "", "Missing topic should default to empty string");
+                assert_eq!(hmac, None, "Missing hmac should default to None");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sync_response_empty_changes() {
+        let resp = SyncResponse::ChangesetResponse {
+            changes: vec![],
+            my_db_version: 0,
+            your_last_db_version: 0,
+            site_id: [0u8; 16],
+            topic: String::new(),
+            hmac: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: SyncResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SyncResponse::ChangesetResponse { changes, .. } => {
+                assert!(changes.is_empty());
+            }
+        }
+    }
+}

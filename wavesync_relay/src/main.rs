@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use clap::Parser;
 use libp2p::{
     Multiaddr, SwarmBuilder, futures::StreamExt, identify, identity, noise, ping, relay,
     rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
-use base64::Engine as _;
 use rand::rngs::OsRng;
 
 use push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
@@ -125,8 +125,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.generate_identity {
         let keypair = identity::Keypair::generate_ed25519();
-        let b64 = base64::engine::general_purpose::STANDARD
-            .encode(keypair.to_protobuf_encoding().expect("Failed to encode keypair"));
+        let b64 = base64::engine::general_purpose::STANDARD.encode(
+            keypair
+                .to_protobuf_encoding()
+                .expect("Failed to encode keypair"),
+        );
         let peer_id = keypair.public().to_peer_id();
         println!("IDENTITY_KEYPAIR={b64}");
         println!("PeerId: {peer_id}");
@@ -240,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 push: push_behaviour,
             }
         })?
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
 
     let listen_addr: Multiaddr = cli.listen_addr.parse()?;

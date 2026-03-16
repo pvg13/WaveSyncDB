@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use behaviour::{WaveSyncBehaviour, WaveSyncBehaviourEvent};
+use futures::FutureExt;
 use libp2p::{
-    Multiaddr, SwarmBuilder, autonat, dcutr,
+    Multiaddr, SwarmBuilder, autonat, dcutr, dns,
     futures::StreamExt,
     gossipsub::{self, IdentTopic},
     identify, identity, mdns, noise, ping, relay, rendezvous, request_response,
@@ -30,6 +31,7 @@ use libp2p::{
     yamux,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection};
+use std::panic::AssertUnwindSafe;
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::auth::GroupKey;
@@ -116,33 +118,115 @@ pub fn start_engine(
     sync_rx: mpsc::Receiver<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
-    node_id: NodeId,
     site_id: NodeId,
     topic: String,
     config: EngineConfig,
     registry_ready: Arc<Notify>,
     cmd_rx: mpsc::Receiver<EngineCommand>,
     group_key: Option<GroupKey>,
+    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
+    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_engine(
+        let event_tx = network_event_tx.clone();
+        let result = AssertUnwindSafe(run_engine(
             db,
             sync_rx,
             change_tx,
             registry,
-            node_id,
             site_id,
             topic,
             config,
             registry_ready,
             cmd_rx,
             group_key,
-        )
-        .await
-        {
-            log::error!("Engine error: {}", e);
+            network_status,
+            network_event_tx,
+        ))
+        .catch_unwind()
+        .await;
+
+        match result {
+            Ok(Ok(())) => log::info!("Engine shut down cleanly"),
+            Ok(Err(e)) => {
+                let reason = format!("{e}");
+                log::error!("Engine error: {reason}");
+                let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed {
+                    reason,
+                });
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                log::error!("Engine panicked: {msg}");
+                let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed {
+                    reason: format!("panic: {msg}"),
+                });
+            }
         }
     })
+}
+
+/// Build the libp2p swarm with DNS resolution.
+///
+/// Tries system DNS first (`/etc/resolv.conf`). If that fails (e.g. on Android
+/// where `/etc/resolv.conf` does not exist), falls back to Google public DNS
+/// via `dns::ResolverConfig::google()`.
+fn build_swarm(
+    keypair: identity::Keypair,
+    mdns_config: mdns::Config,
+) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    // Try system DNS first (reads /etc/resolv.conf — works on desktop/server)
+    let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_tcp(
+            Default::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_dns();
+
+    match system_result {
+        Ok(builder) => {
+            let mdns_cfg = mdns_config;
+            Ok(builder
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build())
+        }
+        Err(e) => {
+            log::warn!(
+                "System DNS resolver failed (expected on Android): {e}. \
+                 Falling back to Google public DNS."
+            );
+            let mdns_cfg = mdns_config;
+            Ok(SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_tcp(
+                    Default::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_quic()
+                .with_dns_config(
+                    dns::ResolverConfig::google(),
+                    dns::ResolverOpts::default(),
+                )
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+                .build())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,30 +235,19 @@ async fn run_engine(
     mut sync_rx: mpsc::Receiver<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
-    node_id: NodeId,
     site_id: NodeId,
     topic_name: String,
     config: EngineConfig,
     registry_ready: Arc<Notify>,
     cmd_rx: mpsc::Receiver<EngineCommand>,
     group_key: Option<GroupKey>,
+    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
+    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keypair = identity::Keypair::generate_ed25519();
     let mdns_config = config.mdns_config();
 
-    let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_tcp(
-            Default::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_quic()
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(move |key, relay_client| {
-            WaveSyncBehaviour::new(key, relay_client, mdns_config.clone())
-        })?
-        .build();
+    let swarm = build_swarm(keypair.clone(), mdns_config)?;
 
     let local_peer_id = keypair.public().to_peer_id();
 
@@ -204,7 +277,6 @@ async fn run_engine(
         change_tx,
         registry,
         local_peer_id,
-        node_id,
         site_id,
         topic_name: effective_topic,
         config,
@@ -226,7 +298,14 @@ async fn run_engine(
         pending_sync_peers: std::collections::HashSet::new(),
         push_token,
         push_registered: false,
+        network_status,
+        network_event_tx,
+        resume_sync_deadline: None,
     };
+
+    // Set initial network status with local_peer_id and topic
+    engine.update_network_status();
+    engine.emit_network_event(crate::network_status::NetworkEvent::EngineStarted);
 
     engine.run(&mut sync_rx).await
 }
@@ -260,8 +339,6 @@ struct EngineRunner {
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
     local_peer_id: libp2p::PeerId,
-    #[allow(dead_code)]
-    node_id: NodeId,
     site_id: NodeId,
     topic_name: String,
     config: EngineConfig,
@@ -299,24 +376,87 @@ struct EngineRunner {
     push_token: Option<(String, String)>,
     /// Whether push token has been registered with the relay.
     push_registered: bool,
+    /// Shared network status snapshot, read by consumers.
+    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
+    /// Broadcast sender for network events.
+    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+    /// Optional deadline for a post-resume sync retry (gives mDNS/rendezvous time to rediscover).
+    resume_sync_deadline: Option<tokio::time::Instant>,
 }
 
 impl EngineRunner {
+    /// Rebuild the full network status snapshot from internal state.
+    fn update_network_status(&self) {
+        use crate::network_status as ns;
+
+        let connected_peers = self
+            .peers
+            .iter()
+            .map(|(peer_id, addr)| ns::PeerInfo {
+                peer_id: ns::PeerId(peer_id.to_string()),
+                address: addr.to_string(),
+                db_version: self.peer_db_versions.get(peer_id).copied(),
+                is_bootstrap: self.bootstrap_peers.contains(peer_id),
+                is_group_member: !self.rejected_peers.contains(peer_id),
+            })
+            .collect();
+
+        let relay_status = match &self.relay_state {
+            RelayState::Disabled => ns::RelayStatus::Disabled,
+            RelayState::Connecting { .. } => ns::RelayStatus::Connecting,
+            RelayState::Connected { .. } => ns::RelayStatus::Connected,
+            RelayState::Listening { .. } => ns::RelayStatus::Listening,
+        };
+
+        let nat_status = match self.nat_status {
+            NatStatus::Unknown => ns::NatStatus::Unknown,
+            NatStatus::Public => ns::NatStatus::Public,
+            NatStatus::Private => ns::NatStatus::Private,
+        };
+
+        let status = ns::NetworkStatus {
+            local_peer_id: ns::PeerId(self.local_peer_id.to_string()),
+            connected_peers,
+            topic: self.topic_name.clone(),
+            relay_status,
+            nat_status,
+            rendezvous_registered: self.rendezvous_registered,
+            push_registered: self.push_registered,
+            local_db_version: self.local_db_version,
+            registry_ready: self.registry_is_ready,
+        };
+
+        *self.network_status.write().unwrap() = status;
+    }
+
+    /// Emit a network event on the broadcast channel, ignoring no-receiver errors.
+    fn emit_network_event(&self, event: crate::network_status::NetworkEvent) {
+        let _ = self.network_event_tx.send(event);
+    }
+
     async fn run(
         &mut self,
         sync_rx: &mut mpsc::Receiver<SyncChangeset>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // IPv4 listen addresses
+        // IPv4 listen addresses — TCP is required, QUIC is best-effort
         self.swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())?;
-        self.swarm
-            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())?;
+        if let Err(e) = self
+            .swarm
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+        {
+            log::warn!("QUIC IPv4 listen failed (non-fatal, TCP still active): {e}");
+        }
 
-        // IPv6 listen addresses (opt-in)
+        // IPv6 listen addresses (opt-in) — TCP is required, QUIC is best-effort
         if self.config.ipv6 {
             self.swarm.listen_on("/ip6/::/tcp/0".parse().unwrap())?;
-            self.swarm
-                .listen_on("/ip6/::/udp/0/quic-v1".parse().unwrap())?;
+            if let Err(e) = self
+                .swarm
+                .listen_on("/ip6/::/udp/0/quic-v1".parse().unwrap())
+            {
+                log::warn!("QUIC IPv6 listen failed (non-fatal, TCP still active): {e}");
+            }
         }
 
         self.swarm
@@ -331,12 +471,32 @@ impl EngineRunner {
             } else {
                 log::info!("Dialing relay server: {}", relay_addr);
                 self.relay_state = RelayState::Connecting { retry_count: 0 };
+                self.emit_network_event(
+                    crate::network_status::NetworkEvent::RelayStatusChanged(
+                        crate::network_status::RelayStatus::Connecting,
+                    ),
+                );
+                self.update_network_status();
             }
         }
 
-        // If a rendezvous server is configured, dial it
+        // If a rendezvous server is configured, dial it (unless already dialing as relay)
         if let Some(ref rendezvous_addr) = self.config.rendezvous_server.clone() {
-            if let Err(e) = self.swarm.dial(rendezvous_addr.clone()) {
+            let already_dialing = self.config.relay_server.as_ref().is_some_and(|relay_addr| {
+                let relay_peer = relay_addr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                    _ => None,
+                });
+                let rv_peer = rendezvous_addr.iter().find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::P2p(id) => Some(id),
+                    _ => None,
+                });
+                relay_peer.is_some() && relay_peer == rv_peer
+            });
+
+            if already_dialing {
+                log::info!("Rendezvous server is same peer as relay — skipping duplicate dial");
+            } else if let Err(e) = self.swarm.dial(rendezvous_addr.clone()) {
                 log::warn!(
                     "Failed to dial rendezvous server {}: {}",
                     rendezvous_addr,
@@ -368,7 +528,11 @@ impl EngineRunner {
         tokio::pin!(registry_deadline);
 
         // Relay reconnection timer (only active when relay is configured but disconnected)
-        let mut relay_reconnect = tokio::time::interval(Duration::from_secs(30));
+        // Use interval_at to avoid immediate first tick causing a duplicate dial
+        let mut relay_reconnect = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
         let has_relay = self.config.relay_server.is_some();
 
         loop {
@@ -398,12 +562,27 @@ impl EngineRunner {
                 },
                 _ = self.registry_ready.notified(), if !self.registry_is_ready => {
                     self.registry_is_ready = true;
+                    self.update_network_status();
                     log::info!("Registry ready, syncing all known peers");
                     self.sync_all_known_peers().await;
                 },
                 _ = &mut registry_deadline, if !self.registry_is_ready => {
                     log::error!("Schema registry not ready after 30s — proceeding without sync tables");
                     self.registry_is_ready = true;
+                    self.update_network_status();
+                },
+                _ = async {
+                    match self.resume_sync_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.resume_sync_deadline.is_some() => {
+                    log::info!("Post-resume sync retry");
+                    self.resume_sync_deadline = None;
+                    self.pending_sync_peers.clear();
+                    if self.registry_is_ready {
+                        self.sync_all_known_peers().await;
+                    }
                 },
                 Some(cmd) = self.cmd_rx.recv() => {
                     if self.handle_command(cmd).await {
@@ -429,7 +608,15 @@ impl EngineRunner {
                 self.peer_db_versions.clear();
                 self.pending_sync_peers.clear();
                 self.trigger_rediscovery();
+                if self.config.relay_server.is_some() {
+                    self.maybe_reconnect_relay();
+                }
+                if self.config.rendezvous_server.is_some() {
+                    self.rendezvous_discover();
+                }
                 self.sync_all_known_peers().await;
+                self.resume_sync_deadline =
+                    Some(tokio::time::Instant::now() + Duration::from_secs(2));
                 false
             }
             EngineCommand::RegisterPushToken { platform, token } => {
@@ -452,20 +639,36 @@ impl EngineRunner {
     }
 
     async fn handle_resume(&mut self) {
-        log::info!("App resumed — clearing stale peers and re-syncing");
+        log::info!("App resumed — triggering rediscovery and sync");
 
-        let connected: std::collections::HashSet<libp2p::PeerId> =
-            self.swarm.connected_peers().cloned().collect();
-        self.peers.retain(|peer_id, _| connected.contains(peer_id));
+        // Clear pending sync to allow fresh requests
         self.pending_sync_peers.clear();
 
+        // 1. Trigger mDNS rediscovery (LAN)
         self.trigger_rediscovery();
+
+        // 2. WAN: reconnect relay if disconnected
+        if self.config.relay_server.is_some() {
+            self.maybe_reconnect_relay();
+        }
+
+        // 3. WAN: trigger rendezvous rediscovery
+        if self.config.rendezvous_server.is_some() {
+            self.rendezvous_discover();
+        }
+
+        // 4. Sync with any peers still connected (may be none — that's OK)
         self.sync_all_known_peers().await;
+
+        // 5. Schedule a delayed retry to catch peers rediscovered via mDNS/rendezvous
+        self.resume_sync_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_secs(2));
     }
 
     async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
         // Update local db_version
         self.local_db_version = self.local_db_version.max(changeset.db_version);
+        self.update_network_status();
 
         let msg = SyncMessage::Changeset(changeset);
         let hmac = match &self.group_key {
@@ -517,6 +720,35 @@ impl EngineRunner {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 log::info!("Listening on {address:?}");
+                // If this is a relay circuit address, add it as external so
+                // rendezvous and identify advertise it to remote peers
+                if address
+                    .iter()
+                    .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                {
+                    self.swarm.add_external_address(address.clone());
+                    log::info!("Added relay circuit as external address: {address}");
+                    // Re-register with rendezvous so the new circuit address is advertised
+                    if let Some(ref rv_addr) = self.config.rendezvous_server
+                        && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
+                            rv_addr.iter().last()
+                        && self.swarm.is_connected(&rv_peer_id)
+                    {
+                        self.rendezvous_register(rv_peer_id);
+                    }
+                } else {
+                    // Non-circuit address (new network interface) — reconnect relay if needed
+                    if matches!(self.relay_state, RelayState::Connecting { .. }) {
+                        if let Some(ref relay_addr) = self.config.relay_server {
+                            log::info!(
+                                "New listen address detected, attempting relay reconnection"
+                            );
+                            if let Err(e) = self.swarm.dial(relay_addr.clone()) {
+                                log::warn!("Relay redial on new address failed: {e}");
+                            }
+                        }
+                    }
+                }
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(identify::Event::Sent {
                 peer_id,
@@ -575,15 +807,14 @@ impl EngineRunner {
                     self.relay_state = RelayState::Connected {
                         relay_peer_id: peer_id,
                     };
-                    // Listen via relay circuit
-                    let circuit_addr = relay_addr
-                        .clone()
-                        .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                    if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
-                        log::warn!("Failed to listen on relay circuit {}: {}", circuit_addr, e);
-                    } else {
-                        log::info!("Listening on relay circuit: {}", circuit_addr);
-                    }
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::RelayStatusChanged(
+                            crate::network_status::RelayStatus::Connected,
+                        ),
+                    );
+                    self.update_network_status();
+                    // Relay circuit listen is deferred until AutoNAT detects private NAT,
+                    // to avoid a premature reservation failure killing gossipsub protocols.
 
                     // Register push token with relay if configured
                     self.maybe_register_push_token(peer_id);
@@ -603,11 +834,22 @@ impl EngineRunner {
                 // If this is a bootstrap peer, add to peers and initiate sync
                 if self.bootstrap_peers.contains(&peer_id) {
                     let addr = endpoint.get_remote_address().clone();
-                    self.peers.insert(peer_id, addr);
+                    self.peers.insert(peer_id, addr.clone());
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .add_explicit_peer(&peer_id);
+
+                    self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
+                        crate::network_status::PeerInfo {
+                            peer_id: crate::network_status::PeerId(peer_id.to_string()),
+                            address: addr.to_string(),
+                            db_version: None,
+                            is_bootstrap: true,
+                            is_group_member: true,
+                        },
+                    ));
+                    self.update_network_status();
 
                     let db = self.db.clone();
                     let peer_str = peer_id.to_string();
@@ -626,6 +868,10 @@ impl EngineRunner {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 log::debug!("Connection closed with {peer_id}");
+
+                // Clean pending_sync_peers so the peer can be re-synced on reconnect
+                self.pending_sync_peers.remove(&peer_id);
+
                 // If relay server disconnected, update state
                 if let RelayState::Connected { relay_peer_id }
                 | RelayState::Listening { relay_peer_id } = &self.relay_state
@@ -633,7 +879,93 @@ impl EngineRunner {
                 {
                     log::warn!("Lost connection to relay server {peer_id}");
                     self.relay_state = RelayState::Connecting { retry_count: 0 };
+                    // Reset push registration — server lost our token
+                    self.push_registered = false;
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::RelayStatusChanged(
+                            crate::network_status::RelayStatus::Connecting,
+                        ),
+                    );
+                    // If relay also serves rendezvous, reset that too
+                    if let Some(ref rv_addr) = self.config.rendezvous_server
+                        && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
+                            rv_addr.iter().last()
+                        && peer_id == rv_peer_id
+                    {
+                        log::warn!("Rendezvous server also disconnected (same as relay)");
+                        self.rendezvous_registered = false;
+                        self.emit_network_event(
+                            crate::network_status::NetworkEvent::RendezvousStatusChanged {
+                                registered: false,
+                            },
+                        );
+                    }
+                    self.update_network_status();
+
+                    // Attempt immediate reconnection (timer is fallback if this fails)
+                    if let Some(ref relay_addr) = self.config.relay_server {
+                        log::info!("Attempting immediate relay reconnection");
+                        if let Err(e) = self.swarm.dial(relay_addr.clone()) {
+                            log::warn!("Immediate relay redial failed: {e}");
+                        }
+                    }
                 }
+
+                // If rendezvous server disconnected (and is different from relay)
+                if let Some(ref rv_addr) = self.config.rendezvous_server
+                    && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
+                        rv_addr.iter().last()
+                    && peer_id == rv_peer_id
+                    && !matches!(&self.relay_state, RelayState::Connecting { .. })
+                {
+                    // Only reset if we didn't already handle it above (relay == rendezvous case)
+                    if self.rendezvous_registered {
+                        log::warn!("Lost connection to rendezvous server {peer_id}");
+                        self.rendezvous_registered = false;
+                        self.emit_network_event(
+                            crate::network_status::NetworkEvent::RendezvousStatusChanged {
+                                registered: false,
+                            },
+                        );
+                        self.update_network_status();
+                    }
+                }
+            }
+            SwarmEvent::ListenerClosed { reason, .. } => {
+                if let Err(ref e) = reason {
+                    log::warn!("Listener closed with error: {e}");
+                }
+                // If relay was in Listening state, reset to Connected so the next
+                // AutoNAT probe can re-trigger the reservation
+                if let RelayState::Listening { relay_peer_id } = self.relay_state {
+                    log::warn!("Relay listener closed, resetting to Connected state");
+                    self.relay_state = RelayState::Connected { relay_peer_id };
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::RelayStatusChanged(
+                            crate::network_status::RelayStatus::Connected,
+                        ),
+                    );
+                    self.update_network_status();
+                }
+                // Re-subscribe to gossipsub topic to restore protocol advertisement
+                // in case the listener closure removed it
+                if let Err(e) =
+                    self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic)
+                {
+                    log::warn!("Failed to re-subscribe gossipsub topic: {e}");
+                }
+            }
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                log::warn!("Listen address expired: {address}");
+                // Re-subscribe gossipsub to restore protocol advertisement
+                if let Err(e) =
+                    self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic)
+                {
+                    log::warn!("Failed to re-subscribe gossipsub topic: {e}");
+                }
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                log::warn!("Outgoing connection error to {peer_id:?}: {error}");
             }
             _ => {}
         }
@@ -717,11 +1049,22 @@ impl EngineRunner {
                     {
                         log::warn!("Failed to dial peer {peer_id}: {e}");
                     }
-                    self.peers.insert(peer_id, multiaddr);
+                    self.peers.insert(peer_id, multiaddr.clone());
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .add_explicit_peer(&peer_id);
+
+                    self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
+                        crate::network_status::PeerInfo {
+                            peer_id: crate::network_status::PeerId(peer_id.to_string()),
+                            address: multiaddr.to_string(),
+                            db_version: self.peer_db_versions.get(&peer_id).copied(),
+                            is_bootstrap: self.bootstrap_peers.contains(&peer_id),
+                            is_group_member: true,
+                        },
+                    ));
+                    self.update_network_status();
 
                     // Register peer and update last_seen
                     let db = self.db.clone();
@@ -745,6 +1088,10 @@ impl EngineRunner {
                         .behaviour_mut()
                         .gossipsub
                         .remove_explicit_peer(&peer_id);
+                    self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
+                        crate::network_status::PeerId(peer_id.to_string()),
+                    ));
+                    self.update_network_status();
                 }
             }
         }
@@ -832,6 +1179,12 @@ impl EngineRunner {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
                 log::info!("Relay reservation accepted by {relay_peer_id}");
                 self.relay_state = RelayState::Listening { relay_peer_id };
+                self.emit_network_event(
+                    crate::network_status::NetworkEvent::RelayStatusChanged(
+                        crate::network_status::RelayStatus::Listening,
+                    ),
+                );
+                self.update_network_status();
             }
             _ => {
                 log::debug!("Relay client event: {:?}", event);
@@ -859,7 +1212,16 @@ impl EngineRunner {
                     event.tested_addr,
                     event.server
                 );
+                let changed = self.nat_status != NatStatus::Public;
                 self.nat_status = NatStatus::Public;
+                if changed {
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::NatStatusChanged(
+                            crate::network_status::NatStatus::Public,
+                        ),
+                    );
+                    self.update_network_status();
+                }
             }
             Err(e) => {
                 log::info!(
@@ -867,7 +1229,16 @@ impl EngineRunner {
                     event.tested_addr,
                     event.server
                 );
+                let changed = self.nat_status != NatStatus::Private;
                 self.nat_status = NatStatus::Private;
+                if changed {
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::NatStatusChanged(
+                            crate::network_status::NatStatus::Private,
+                        ),
+                    );
+                    self.update_network_status();
+                }
                 // If behind NAT and relay is configured but not yet listening, trigger reservation
                 if matches!(self.relay_state, RelayState::Connected { .. })
                     && let RelayState::Connected { relay_peer_id } = self.relay_state
@@ -901,6 +1272,12 @@ impl EngineRunner {
                     "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
                 );
                 self.rendezvous_registered = true;
+                self.emit_network_event(
+                    crate::network_status::NetworkEvent::RendezvousStatusChanged {
+                        registered: true,
+                    },
+                );
+                self.update_network_status();
             }
             rendezvous::client::Event::RegisterFailed {
                 rendezvous_node,
@@ -911,6 +1288,12 @@ impl EngineRunner {
                     "Rendezvous registration failed at {rendezvous_node} namespace '{namespace}': {error:?}"
                 );
                 self.rendezvous_registered = false;
+                self.emit_network_event(
+                    crate::network_status::NetworkEvent::RendezvousStatusChanged {
+                        registered: false,
+                    },
+                );
+                self.update_network_status();
             }
             rendezvous::client::Event::Discovered {
                 rendezvous_node,
@@ -941,6 +1324,19 @@ impl EngineRunner {
                             .behaviour_mut()
                             .gossipsub
                             .add_explicit_peer(&peer_id);
+
+                        self.emit_network_event(
+                            crate::network_status::NetworkEvent::PeerConnected(
+                                crate::network_status::PeerInfo {
+                                    peer_id: crate::network_status::PeerId(peer_id.to_string()),
+                                    address: addr.to_string(),
+                                    db_version: None,
+                                    is_bootstrap: false,
+                                    is_group_member: true,
+                                },
+                            ),
+                        );
+                        self.update_network_status();
 
                         let db = self.db.clone();
                         let peer_str = peer_id.to_string();
@@ -1019,10 +1415,9 @@ impl EngineRunner {
             }
         };
 
-        // Re-register if our registration has expired
-        if !self.rendezvous_registered {
-            self.rendezvous_register(server_peer_id);
-        }
+        // Always re-register: handles TTL expiry (server forgets after rendezvous_ttl)
+        // and stale rendezvous_registered state after silent disconnects
+        self.rendezvous_register(server_peer_id);
 
         self.swarm.behaviour_mut().rendezvous.discover(
             Some(namespace),
@@ -1057,9 +1452,10 @@ impl EngineRunner {
         log::info!("Triggering mDNS rediscovery");
         match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
             Ok(new_mdns) => {
-                self.swarm.behaviour_mut().mdns = new_mdns;
+                self.swarm.behaviour_mut().mdns =
+                    libp2p::swarm::behaviour::toggle::Toggle::from(Some(new_mdns));
             }
-            Err(e) => log::error!("Failed to restart mDNS: {e}"),
+            Err(e) => log::warn!("mDNS unavailable during rediscovery: {e}"),
         }
     }
 
@@ -1126,11 +1522,24 @@ impl EngineRunner {
                                     .behaviour_mut()
                                     .gossipsub
                                     .remove_explicit_peer(&peer);
+                                self.emit_network_event(
+                                    crate::network_status::NetworkEvent::PeerRejected(
+                                        crate::network_status::PeerId(peer.to_string()),
+                                    ),
+                                );
+                                self.update_network_status();
                                 return;
                             }
 
                             // Update our knowledge of this peer's version
                             self.peer_db_versions.insert(peer, my_db_version);
+                            self.emit_network_event(
+                                crate::network_status::NetworkEvent::PeerSynced {
+                                    peer_id: crate::network_status::PeerId(peer.to_string()),
+                                    db_version: my_db_version,
+                                },
+                            );
+                            self.update_network_status();
 
                             // Spawn async task to query changes and respond
                             let db = self.db.clone();
@@ -1259,16 +1668,44 @@ impl EngineRunner {
                                     .behaviour_mut()
                                     .gossipsub
                                     .remove_explicit_peer(&peer);
+                                self.emit_network_event(
+                                    crate::network_status::NetworkEvent::PeerRejected(
+                                        crate::network_status::PeerId(peer.to_string()),
+                                    ),
+                                );
+                                self.update_network_status();
                                 return;
                             }
 
                             // Update our knowledge of this peer's version
                             self.peer_db_versions.insert(peer, my_db_version);
+                            self.emit_network_event(
+                                crate::network_status::NetworkEvent::PeerSynced {
+                                    peer_id: crate::network_status::PeerId(peer.to_string()),
+                                    db_version: my_db_version,
+                                },
+                            );
+                            self.update_network_status();
+
+                            // Update local db_version with Lamport semantics
+                            let lamport_bump = if my_db_version > self.local_db_version {
+                                self.local_db_version = my_db_version;
+                                true
+                            } else {
+                                false
+                            };
 
                             if changes.is_empty() {
                                 log::info!(
                                     "Version vector sync with peer {peer}: already up to date"
                                 );
+                                // Still need to persist the Lamport bump even if no changes
+                                if lamport_bump {
+                                    let db = self.db.clone();
+                                    tokio::spawn(async move {
+                                        let _ = shadow::set_db_version(&db, my_db_version).await;
+                                    });
+                                }
                             } else {
                                 log::info!(
                                     "Received {} changes from peer {peer} (their db_version: {})",
@@ -1281,6 +1718,12 @@ impl EngineRunner {
                                 let registry = self.registry.clone();
                                 let peer_str = peer.to_string();
                                 tokio::spawn(async move {
+                                    // Persist Lamport bump BEFORE applying changes so
+                                    // increment_db_version reads the adjusted base value.
+                                    if lamport_bump {
+                                        let _ = shadow::set_db_version(&db, my_db_version).await;
+                                    }
+
                                     apply_remote_changeset(&db, &change_tx, &registry, &changes)
                                         .await;
 
@@ -1292,16 +1735,6 @@ impl EngineRunner {
                                         my_db_version,
                                     )
                                     .await;
-                                });
-                            }
-
-                            // Update local db_version with Lamport semantics
-                            if my_db_version > self.local_db_version {
-                                self.local_db_version = my_db_version;
-                                let db = self.db.clone();
-                                let ver = my_db_version;
-                                tokio::spawn(async move {
-                                    let _ = shadow::set_db_version(&db, ver).await;
                                 });
                             }
                         }
@@ -1379,6 +1812,7 @@ impl EngineRunner {
             .push
             .send_request(&relay_peer_id, req);
         self.push_registered = true;
+        self.update_network_status();
         log::info!("Sent push token registration to relay {relay_peer_id}");
     }
 
@@ -1895,5 +2329,350 @@ mod tests {
             .unwrap();
         let title: String = result.try_get_by_index(0).unwrap();
         assert_eq!(title, "Remote Winner");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_lower_version_loses() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        // Insert initial data and set local clock high
+        db.execute_unprepared("INSERT INTO tasks VALUES ('lv-1', 'Local', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db, "tasks", "lv-1", "title", 10, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Remote change with LOWER version (3) should lose
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "lv-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("Remote Loser")),
+            site_id: [2u8; 16],
+            col_version: 3,
+            cl: 3,
+            seq: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        let result = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'lv-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title: String = result.try_get_by_index(0).unwrap();
+        assert_eq!(title, "Local", "Lower version remote should not overwrite local");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_different_columns_both_survive() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        // Insert initial data
+        db.execute_unprepared("INSERT INTO tasks VALUES ('dc-1', 'Original', 0)")
+            .await
+            .unwrap();
+        // Set local clock for title only
+        crate::shadow::upsert_clock_entry(&db, "tasks", "dc-1", "title", 1, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Remote changes: higher version for title, and a new column "done"
+        let changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "dc-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Remote Title")),
+                site_id: [2u8; 16],
+                col_version: 5,
+                cl: 5,
+                seq: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "dc-1".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(1)),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+            },
+        ];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        let result = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title, done FROM tasks WHERE id = 'dc-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title: String = result.try_get_by_index(0).unwrap();
+        let done: i32 = result.try_get_by_index(1).unwrap();
+        assert_eq!(title, "Remote Title");
+        assert_eq!(done, 1, "Both columns should be updated");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_delete_lower_cl_rejected() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
+
+        db.execute_unprepared("INSERT INTO tasks VALUES ('dlcl-1', 'Keep Me', 0)")
+            .await
+            .unwrap();
+        // Set a high local clock
+        crate::shadow::upsert_clock_entry(&db, "tasks", "dlcl-1", "title", 10, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Remote delete with low causal length — should be rejected
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "dlcl-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [2u8; 16],
+            col_version: 3,
+            cl: 3,
+            seq: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        // Row should still exist
+        let exists = row_exists(&db, "tasks", "id", "dlcl-1").await;
+        assert!(exists, "Row should NOT be deleted when remote cl < local max cv");
+        assert!(rx.try_recv().is_err(), "No notification for rejected delete");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_delete_wins_on_tie() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        db.execute_unprepared("INSERT INTO tasks VALUES ('dw-1', 'Tie Delete', 0)")
+            .await
+            .unwrap();
+        // Set local clock to 5
+        crate::shadow::upsert_clock_entry(&db, "tasks", "dw-1", "title", 5, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Remote delete with cl=5 (tie) — DeleteWins policy (default)
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "dw-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [2u8; 16],
+            col_version: 5,
+            cl: 5,
+            seq: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        let exists = row_exists(&db, "tasks", "id", "dw-1").await;
+        assert!(!exists, "DeleteWins: tie should delete the row");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_add_wins_on_tie() {
+        let (db, _) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        // Register with AddWins policy
+        let registry = Arc::new(TableRegistry::new());
+        registry.register(TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::AddWins,
+        });
+
+        db.execute_unprepared("INSERT INTO tasks VALUES ('aw-1', 'Tie Keep', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db, "tasks", "aw-1", "title", 5, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Remote delete with cl=5 (tie) — AddWins policy
+        let changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "aw-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [2u8; 16],
+            col_version: 5,
+            cl: 5,
+            seq: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        let exists = row_exists(&db, "tasks", "id", "aw-1").await;
+        assert!(exists, "AddWins: tie should keep the row");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_insert_after_delete() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        // Insert then delete locally
+        db.execute_unprepared("INSERT INTO tasks VALUES ('iad-1', 'Deleted', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db, "tasks", "iad-1", "title", 1, 1, &[1u8; 16], 0)
+            .await
+            .unwrap();
+
+        // Apply remote delete
+        let delete_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "iad-1".to_string(),
+            cid: "__deleted".to_string(),
+            val: None,
+            site_id: [2u8; 16],
+            col_version: 5,
+            cl: 5,
+            seq: 0,
+        }];
+        apply_remote_changeset(&db, &tx, &registry, &delete_changes).await;
+        assert!(!row_exists(&db, "tasks", "id", "iad-1").await);
+
+        // Now apply remote insert with higher versions (N3 regression)
+        let insert_changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "iad-1".to_string(),
+                cid: "id".to_string(),
+                val: Some(serde_json::json!("iad-1")),
+                site_id: [3u8; 16],
+                col_version: 10,
+                cl: 10,
+                seq: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "iad-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Reinserted")),
+                site_id: [3u8; 16],
+                col_version: 10,
+                cl: 10,
+                seq: 1,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "iad-1".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(0)),
+                site_id: [3u8; 16],
+                col_version: 10,
+                cl: 10,
+                seq: 2,
+            },
+        ];
+        apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
+
+        assert!(row_exists(&db, "tasks", "id", "iad-1").await, "Row should reappear after re-insert");
+        let result = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'iad-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title: String = result.try_get_by_index(0).unwrap();
+        assert_eq!(title, "Reinserted");
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_multiple_rows() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        let changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-1".to_string(),
+                cid: "id".to_string(),
+                val: Some(serde_json::json!("mr-1")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Row 1")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-1".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(0)),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 2,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-2".to_string(),
+                cid: "id".to_string(),
+                val: Some(serde_json::json!("mr-2")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-2".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Row 2")),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "mr-2".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(1)),
+                site_id: [2u8; 16],
+                col_version: 1,
+                cl: 1,
+                seq: 2,
+            },
+        ];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        assert!(row_exists(&db, "tasks", "id", "mr-1").await);
+        assert!(row_exists(&db, "tasks", "id", "mr-2").await);
     }
 }

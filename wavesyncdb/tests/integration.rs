@@ -1,35 +1,12 @@
-use std::future::Future;
-use std::time::{Duration, Instant};
+mod common;
+
+use std::time::Duration;
 
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::WaveSyncDbBuilder;
 
-// Define a Task entity using standard SeaORM
-mod task {
-    use sea_orm::entity::prelude::*;
-
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
-    #[sea_orm(table_name = "tasks")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: String,
-        pub title: String,
-        pub completed: bool,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-/// Generate a unique temp file SQLite URI.
-fn mem_db(name: &str) -> String {
-    let unique = Uuid::new_v4().simple().to_string();
-    let path = std::env::temp_dir().join(format!("wavesync_test_{name}_{unique}.db"));
-    format!("sqlite:{}?mode=rwc", path.display())
-}
+use common::{assert_eventually, make_node_id, mem_db, task};
 
 #[tokio::test]
 async fn test_wavesyncdb_basic_crud() {
@@ -148,47 +125,16 @@ async fn test_wavesyncdb_change_notifications() {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for P2P integration tests
+// P2P integration tests
 // ---------------------------------------------------------------------------
 
-fn make_node_id(seed: u8) -> [u8; 16] {
-    let mut id = [0u8; 16];
-    id[0] = seed;
-    id[15] = 1;
-    id
-}
-
-async fn assert_eventually<F, Fut>(desc: &str, timeout: Duration, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let start = Instant::now();
-    let mut interval = Duration::from_millis(50);
-    loop {
-        if check().await {
-            return;
-        }
-        if start.elapsed() > timeout {
-            panic!("Timed out ({}s) waiting for: {}", timeout.as_secs(), desc);
-        }
-        tokio::time::sleep(interval).await;
-        interval = (interval * 2).min(Duration::from_millis(500));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Test 1: A fresh peer receives changes from an established peer.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_fresh_peer_receives_snapshot() {
     let _ = env_logger::try_init();
     let topic = format!("test-snapshot-{}", Uuid::new_v4());
-    // Each peer needs its own unique DB name
     let db_b_url = mem_db("snap_b");
     let db_a_url = mem_db("snap_a");
 
-    // Peer B — the established node with data
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(2))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -205,7 +151,6 @@ async fn test_fresh_peer_receives_snapshot() {
         .await
         .expect("Failed to sync schema on Peer B");
 
-    // Insert 2 tasks on Peer B
     let id1 = Uuid::new_v4().to_string();
     let id2 = Uuid::new_v4().to_string();
     task::ActiveModel {
@@ -227,10 +172,8 @@ async fn test_fresh_peer_receives_snapshot() {
     .await
     .expect("Insert task 2");
 
-    // Wait for shadow table entries to be populated
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Peer A — fresh node, should receive data via version vector sync
     let peer_a = WaveSyncDbBuilder::new(&db_a_url, &topic)
         .with_node_id(make_node_id(1))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -247,7 +190,6 @@ async fn test_fresh_peer_receives_snapshot() {
         .await
         .expect("Failed to sync schema on Peer A");
 
-    // Assert that Peer A eventually has both tasks
     let timeout = Duration::from_secs(15);
     assert_eventually("Peer A has 2 tasks", timeout, || async {
         let count = task::Entity::find()
@@ -259,7 +201,6 @@ async fn test_fresh_peer_receives_snapshot() {
     })
     .await;
 
-    // Verify content
     let tasks = task::Entity::find()
         .all(&peer_a)
         .await
@@ -269,9 +210,6 @@ async fn test_fresh_peer_receives_snapshot() {
     assert!(titles.contains(&"Task Two"), "Missing 'Task Two'");
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: An offline peer receives updates on reconnect.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_offline_peer_receives_updates_on_reconnect() {
     let _ = env_logger::try_init();
@@ -281,7 +219,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
     let db_a1_url = mem_db("recon_a1");
     let db_a2_url = mem_db("recon_a2");
 
-    // Peer B — persistent node
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(10))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -298,7 +235,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
         .await
         .expect("Failed to sync schema on Peer B");
 
-    // Peer A1 — first instance
     let peer_a1 = WaveSyncDbBuilder::new(&db_a1_url, &topic)
         .with_node_id(make_node_id(11))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -315,7 +251,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
         .await
         .expect("Failed to sync schema on Peer A1");
 
-    // B inserts task "before-offline"
     task::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         title: Set("before-offline".into()),
@@ -326,7 +261,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
     .await
     .expect("Insert before-offline");
 
-    // Wait for A1 to receive it
     assert_eventually("A1 has before-offline task", timeout, || async {
         task::Entity::find()
             .all(&peer_a1)
@@ -337,11 +271,9 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
     })
     .await;
 
-    // Drop A1 to simulate going offline
     drop(peer_a1);
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // B inserts task "while-offline"
     task::ActiveModel {
         id: Set(Uuid::new_v4().to_string()),
         title: Set("while-offline".into()),
@@ -354,7 +286,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Peer A2 — new instance with fresh DB
     let peer_a2 = WaveSyncDbBuilder::new(&db_a2_url, &topic)
         .with_node_id(make_node_id(12))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -371,7 +302,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
         .await
         .expect("Failed to sync schema on Peer A2");
 
-    // A2 should eventually have BOTH tasks
     assert_eventually("A2 has both tasks", timeout, || async {
         task::Entity::find()
             .all(&peer_a2)
@@ -394,9 +324,6 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
     assert!(titles.contains(&"while-offline"), "Missing 'while-offline'");
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: registry_ready fires before mDNS discovery, sync still works.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_registry_ready_fires_before_discovery() {
     let _ = env_logger::try_init();
@@ -405,7 +332,6 @@ async fn test_registry_ready_fires_before_discovery() {
     let db_b_url = mem_db("reg_b");
     let db_a_url = mem_db("reg_a");
 
-    // Peer B — already established with data
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(20))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -434,7 +360,6 @@ async fn test_registry_ready_fires_before_discovery() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Peer A — sync immediately after build
     let peer_a = WaveSyncDbBuilder::new(&db_a_url, &topic)
         .with_node_id(make_node_id(21))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -468,9 +393,6 @@ async fn test_registry_ready_fires_before_discovery() {
     assert_eq!(tasks[0].title, "registry-test");
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: Two peers with matching passphrase sync successfully.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_sync_with_matching_passphrase() {
     let _ = env_logger::try_init();
@@ -543,9 +465,6 @@ async fn test_sync_with_matching_passphrase() {
     assert_eq!(tasks[0].title, "auth-task");
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: Two peers with mismatched passphrases do NOT sync.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_sync_with_mismatched_passphrase() {
     let _ = env_logger::try_init();
@@ -599,7 +518,6 @@ async fn test_sync_with_mismatched_passphrase() {
         .await
         .expect("Failed to sync schema on Peer A");
 
-    // Wait a reasonable time — data should NOT appear
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     let count = task::Entity::find()
@@ -613,9 +531,6 @@ async fn test_sync_with_mismatched_passphrase() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test 6: One peer with passphrase and one without do NOT sync.
-// ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_sync_one_passphrase_one_not() {
     let _ = env_logger::try_init();
@@ -623,7 +538,6 @@ async fn test_sync_one_passphrase_one_not() {
     let db_b_url = mem_db("auth_mixed_b");
     let db_a_url = mem_db("auth_mixed_a");
 
-    // Peer B — with passphrase
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(50))
         .with_passphrase("my-secret")
@@ -653,7 +567,6 @@ async fn test_sync_one_passphrase_one_not() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Peer A — without passphrase
     let peer_a = WaveSyncDbBuilder::new(&db_a_url, &topic)
         .with_node_id(make_node_id(51))
         .with_mdns_query_interval(Duration::from_millis(100))
@@ -670,7 +583,6 @@ async fn test_sync_one_passphrase_one_not() {
         .await
         .expect("Failed to sync schema on Peer A");
 
-    // Wait a reasonable time — data should NOT appear
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     let count = task::Entity::find()
@@ -682,4 +594,244 @@ async fn test_sync_one_passphrase_one_not() {
         count, 0,
         "Peer A (no passphrase) should NOT have received data from Peer B (with passphrase)"
     );
+}
+
+#[tokio::test]
+async fn test_same_db_reconnection_sync() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-samedb-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+    let db_mobile_url = mem_db("samedb_mobile");
+    let db_desktop_url = mem_db("samedb_desktop");
+
+    // --- Phase 1: Both peers online, initial sync ---
+    let mobile = WaveSyncDbBuilder::new(&db_mobile_url, &topic)
+        .with_node_id(make_node_id(60))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Mobile");
+
+    mobile
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Mobile");
+
+    let desktop = WaveSyncDbBuilder::new(&db_desktop_url, &topic)
+        .with_node_id(make_node_id(61))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Desktop");
+
+    desktop
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Desktop");
+
+    let id_initial = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(id_initial.clone()),
+        title: Set("initial-task".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&mobile)
+    .await
+    .expect("Insert initial-task");
+
+    assert_eventually("Desktop has initial-task", timeout, || async {
+        task::Entity::find()
+            .all(&desktop)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
+            == 1
+    })
+    .await;
+
+    // --- Phase 2: Mobile goes offline ---
+    drop(mobile);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let id_offline = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(id_offline.clone()),
+        title: Set("while-mobile-offline".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&desktop)
+    .await
+    .expect("Insert while-mobile-offline");
+
+    // --- Phase 3: Desktop goes offline too ---
+    drop(desktop);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // --- Phase 4: Both come back with SAME DBs ---
+    let mobile2 = WaveSyncDbBuilder::new(&db_mobile_url, &topic)
+        .with_node_id(make_node_id(62))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Mobile2");
+
+    mobile2
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Mobile2");
+
+    let desktop2 = WaveSyncDbBuilder::new(&db_desktop_url, &topic)
+        .with_node_id(make_node_id(63))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Desktop2");
+
+    desktop2
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Desktop2");
+
+    assert_eventually("Mobile2 has both tasks", timeout, || async {
+        task::Entity::find()
+            .all(&mobile2)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
+            == 2
+    })
+    .await;
+
+    let tasks = task::Entity::find()
+        .all(&mobile2)
+        .await
+        .expect("Failed to query Mobile2");
+    let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+    assert!(titles.contains(&"initial-task"), "Missing 'initial-task'");
+    assert!(
+        titles.contains(&"while-mobile-offline"),
+        "Missing 'while-mobile-offline'"
+    );
+
+    let desktop_tasks = task::Entity::find()
+        .all(&desktop2)
+        .await
+        .expect("Failed to query Desktop2");
+    assert_eq!(desktop_tasks.len(), 2, "Desktop2 should have both tasks");
+}
+
+#[tokio::test]
+async fn test_resume_sync() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-resume-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+    let db_a_url = mem_db("resume_a");
+    let db_b_url = mem_db("resume_b");
+
+    // Create peers A and B
+    let peer_a = WaveSyncDbBuilder::new(&db_a_url, &topic)
+        .with_node_id(make_node_id(70))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Peer A");
+
+    peer_a
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Peer A");
+
+    let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
+        .with_node_id(make_node_id(71))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create Peer B");
+
+    peer_b
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema on Peer B");
+
+    // Verify initial connectivity: insert on A, wait for B
+    let id_initial = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(id_initial.clone()),
+        title: Set("initial".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&peer_a)
+    .await
+    .expect("Insert initial");
+
+    assert_eventually("B has initial task", timeout, || async {
+        task::Entity::find()
+            .all(&peer_b)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
+            == 1
+    })
+    .await;
+
+    // Simulate B going to background and coming back — call resume()
+    peer_b.resume();
+
+    // Insert a new task on A after B resumed
+    let id_after = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(id_after.clone()),
+        title: Set("after-resume".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&peer_a)
+    .await
+    .expect("Insert after-resume");
+
+    // B should receive the new task via the resume sync path
+    assert_eventually("B has both tasks after resume", timeout, || async {
+        task::Entity::find()
+            .all(&peer_b)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0)
+            == 2
+    })
+    .await;
+
+    let tasks = task::Entity::find()
+        .all(&peer_b)
+        .await
+        .expect("Failed to query Peer B");
+    let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+    assert!(titles.contains(&"initial"), "Missing 'initial'");
+    assert!(titles.contains(&"after-resume"), "Missing 'after-resume'");
 }

@@ -1,5 +1,6 @@
 use libp2p::{
     autonat, dcutr, gossipsub, identify, mdns, ping, relay, rendezvous, request_response,
+    swarm::behaviour::toggle::Toggle,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 
@@ -10,7 +11,7 @@ use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
 pub struct WaveSyncBehaviour {
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub gossipsub: gossipsub::Behaviour,
     pub snapshot: request_response::Behaviour<SnapshotCodec>,
     pub push: request_response::Behaviour<PushCodec>,
@@ -35,7 +36,13 @@ impl WaveSyncBehaviour {
 
         let peer_id = key.public().to_peer_id();
 
-        let mdns_behaviour = mdns::tokio::Behaviour::new(mdns_config, peer_id).unwrap();
+        let mdns_behaviour = match mdns::tokio::Behaviour::new(mdns_config, peer_id) {
+            Ok(mdns) => Toggle::from(Some(mdns)),
+            Err(e) => {
+                log::warn!("mDNS unavailable: {e}");
+                Toggle::from(None)
+            }
+        };
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(std::time::Duration::from_secs(1))

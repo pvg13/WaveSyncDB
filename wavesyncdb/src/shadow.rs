@@ -294,14 +294,12 @@ pub async fn get_changes_since(
             pk: String,
             cid: String,
             col_version: i64,
-            #[allow(dead_code)]
-            db_version: i64,
             seq: i32,
             site_id: Vec<u8>,
         }
 
         let sql = format!(
-            "SELECT pk, cid, col_version, db_version, seq, site_id FROM \"{}\" WHERE db_version > $1 ORDER BY db_version, seq",
+            "SELECT pk, cid, col_version, seq, site_id FROM \"{}\" WHERE db_version > $1 ORDER BY db_version, seq",
             shadow_name
         );
 
@@ -386,6 +384,30 @@ pub async fn insert_tombstone(
         site_id,
         0,
     )
+    .await
+}
+
+/// Remove just the `__deleted` tombstone sentinel for a row.
+///
+/// Used when a row is re-inserted or updated after deletion — preserves
+/// per-column clock entries so that CRDT col_versions continue from their
+/// previous values instead of resetting to 0.
+pub async fn clear_tombstone(
+    db: &impl ConnectionTrait,
+    table: &str,
+    pk: &str,
+) -> Result<ExecResult, DbErr> {
+    let shadow_name = format!("_wavesync_{}_clock", table);
+    let sql = format!(
+        "DELETE FROM \"{}\" WHERE pk = $1 AND cid = '__deleted'",
+        shadow_name
+    );
+
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        [pk.into()],
+    ))
     .await
 }
 
@@ -598,6 +620,49 @@ mod tests {
             .await
             .unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_tombstone_preserves_column_clocks() {
+        let db = setup_with_shadow().await;
+        let site_id = [1u8; 16];
+
+        // Set up column clock entries
+        upsert_clock_entry(&db, "tasks", "pk1", "title", 5, 1, &site_id, 0)
+            .await
+            .unwrap();
+        upsert_clock_entry(&db, "tasks", "pk1", "done", 3, 1, &site_id, 1)
+            .await
+            .unwrap();
+
+        // Add a tombstone (simulating a DELETE)
+        insert_tombstone(&db, "tasks", "pk1", 6, 2, &site_id)
+            .await
+            .unwrap();
+
+        let entries = get_clock_entries_for_row(&db, "tasks", "pk1")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 3); // title + done + __deleted
+
+        // Clear only the tombstone (simulating a re-INSERT)
+        clear_tombstone(&db, "tasks", "pk1").await.unwrap();
+
+        let entries = get_clock_entries_for_row(&db, "tasks", "pk1")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2); // title + done preserved
+        assert!(entries.iter().all(|e| e.cid != "__deleted"));
+        assert_eq!(
+            entries.iter().find(|e| e.cid == "title").unwrap().col_version,
+            5,
+            "col_version for title should be preserved"
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.cid == "done").unwrap().col_version,
+            3,
+            "col_version for done should be preserved"
+        );
     }
 
     #[tokio::test]

@@ -69,7 +69,7 @@ struct Cli {
     #[arg(long, default_value_t = 15)]
     discover_interval: u64,
 
-    /// Push notification token (format: "Fcm:<token>" or "Apns:<token>")
+    /// Push notification token (format: "Fcm:`<token>`" or "Apns:`<token>`")
     #[arg(long)]
     push_token: Option<String>,
 }
@@ -90,12 +90,12 @@ fn menu() {
 
 #[tokio::main]
 pub async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .filter_module("libp2p_gossipsub", log::LevelFilter::Warn)
-        .filter_module("libp2p_autonat", log::LevelFilter::Warn)
-        .filter_module("libp2p_mdns", log::LevelFilter::Warn)
-        .filter_module("libp2p_swarm", log::LevelFilter::Warn)
-        .init();
+    let mut log_builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    for (module, level) in wavesyncdb::recommended_log_filters() {
+        log_builder.filter_module(module, level);
+    }
+    log_builder.init();
 
     let cli = Cli::parse();
 

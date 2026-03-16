@@ -41,6 +41,7 @@ pub mod conflict;
 pub mod connection;
 pub mod engine;
 pub mod messages;
+pub mod network_status;
 pub mod peer_tracker;
 pub mod protocol;
 pub mod registry;
@@ -52,7 +53,42 @@ pub use engine::EngineCommand;
 pub use messages::{
     ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
 };
+pub use network_status::{
+    NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus,
+};
 pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
+
+/// Returns recommended log module filter tuples for silencing noisy dependencies.
+///
+/// Usage with `env_logger`:
+/// ```rust,no_run
+/// let mut builder = env_logger::Builder::from_env(
+///     env_logger::Env::default().default_filter_or("info")
+/// );
+/// for (module, level) in wavesyncdb::recommended_log_filters() {
+///     builder.filter_module(module, level);
+/// }
+/// builder.init();
+/// ```
+pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
+    vec![
+        ("hickory_resolver", log::LevelFilter::Warn),
+        ("hickory_proto", log::LevelFilter::Warn),
+        ("libp2p_gossipsub", log::LevelFilter::Warn),
+        ("libp2p_autonat", log::LevelFilter::Warn),
+        ("libp2p_mdns", log::LevelFilter::Warn),
+        ("libp2p_swarm", log::LevelFilter::Warn),
+        ("libp2p_dns", log::LevelFilter::Warn),
+        ("libp2p_tcp", log::LevelFilter::Warn),
+        ("libp2p_core", log::LevelFilter::Warn),
+        ("libp2p_noise", log::LevelFilter::Warn),
+        ("libp2p_quic", log::LevelFilter::Warn),
+        ("libp2p_relay", log::LevelFilter::Warn),
+        ("libp2p_identify", log::LevelFilter::Warn),
+        ("multistream_select", log::LevelFilter::Warn),
+        ("netlink_proto", log::LevelFilter::Warn),
+    ]
+}
 
 // Re-export for use by the #[derive(SyncEntity)] macro
 pub use inventory::submit as register_sync_entity;

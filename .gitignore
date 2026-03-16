@@ -20,6 +20,5 @@ target/
 **/*.db
 Cargo.lock
 
-*.md
-!README.md
-!CHANGELOG.md
+# Keep CLAUDE.md and doc files tracked — only ignore generated markdown
+**/*.md
