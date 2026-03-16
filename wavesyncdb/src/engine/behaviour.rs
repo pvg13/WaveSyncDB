@@ -1,6 +1,6 @@
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, mdns, ping, relay, rendezvous, request_response,
-    swarm::behaviour::toggle::Toggle,
+    autonat, connection_limits, dcutr, gossipsub, identify, mdns, ping, relay, rendezvous,
+    request_response, swarm::behaviour::toggle::Toggle,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 
@@ -9,6 +9,7 @@ use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
 
 #[derive(NetworkBehaviour)]
 pub struct WaveSyncBehaviour {
+    pub connection_limits: connection_limits::Behaviour,
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
@@ -68,7 +69,11 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
+        let conn_limits = connection_limits::ConnectionLimits::default()
+            .with_max_established_per_peer(Some(1));
+
         Self {
+            connection_limits: connection_limits::Behaviour::new(conn_limits),
             ping: ping_behaviour,
             identify: identify_behaviour,
             mdns: mdns_behaviour,

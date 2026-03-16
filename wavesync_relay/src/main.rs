@@ -10,8 +10,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use clap::Parser;
 use libp2p::{
-    Multiaddr, SwarmBuilder, futures::StreamExt, identify, identity, noise, ping, relay,
-    rendezvous, request_response, swarm::SwarmEvent, yamux,
+    Multiaddr, SwarmBuilder, connection_limits, futures::StreamExt, identify, identity, noise, ping,
+    relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 use rand::rngs::OsRng;
@@ -48,12 +48,12 @@ struct Cli {
     #[arg(long, default_value_t = 256)]
     max_circuits: usize,
 
-    /// Maximum circuit duration in seconds (default: 120)
-    #[arg(long, default_value_t = 120)]
+    /// Maximum circuit duration in seconds (default: 3600 = 1 hour)
+    #[arg(long, default_value_t = 3600)]
     max_circuit_duration: u64,
 
-    /// Maximum bytes per circuit (default: 64 KiB)
-    #[arg(long, default_value_t = 65536)]
+    /// Maximum bytes per circuit (0 = unlimited, default: unlimited)
+    #[arg(long, default_value_t = 0)]
     max_circuit_bytes: u64,
 
     /// Path to the push token SQLite database (enables push notifications)
@@ -87,10 +87,16 @@ struct Cli {
     /// Push notification debounce window in seconds (default: 5)
     #[arg(long, default_value_t = 5)]
     push_debounce_secs: u64,
+
+    /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
+    /// Required when running behind NAT or in Docker.
+    #[arg(long, env = "EXTERNAL_ADDRESS")]
+    external_address: Vec<String>,
 }
 
 #[derive(NetworkBehaviour)]
 struct RelayServerBehaviour {
+    connection_limits: connection_limits::Behaviour,
     relay: relay::Behaviour,
     rendezvous: rendezvous::server::Behaviour,
     identify: identify::Behaviour,
@@ -232,10 +238,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 request_response::Config::default(),
             );
 
+            let conn_limits = connection_limits::ConnectionLimits::default()
+                .with_max_pending_outgoing(Some(8))
+                .with_max_established_outgoing(Some(16));
+
             RelayServerBehaviour {
+                connection_limits: connection_limits::Behaviour::new(conn_limits),
                 relay: relay::Behaviour::new(key.public().to_peer_id(), relay_config),
                 rendezvous: rendezvous::server::Behaviour::new(
-                    rendezvous::server::Config::default(),
+                    rendezvous::server::Config::default()
+                        .with_min_ttl(120), // Allow 2-minute TTL for mobile clients
                 ),
                 identify,
                 ping: ping::Behaviour::default(),
@@ -245,6 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
         .build();
+
+    for ext_addr_str in &cli.external_address {
+        let ext_addr: Multiaddr = ext_addr_str.parse()?;
+        swarm.add_external_address(ext_addr.clone());
+        log::info!("Advertising external address: {ext_addr}");
+    }
 
     let listen_addr: Multiaddr = cli.listen_addr.parse()?;
     swarm.listen_on(listen_addr.clone())?;
@@ -294,6 +312,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(resp) = swarm.behaviour_mut().push.send_response(channel, response) {
                     log::error!("Failed to send push response: {:?}", resp);
                 }
+            }
+            SwarmEvent::IncomingConnectionError {
+                local_addr,
+                send_back_addr,
+                error,
+                ..
+            } => {
+                log::warn!(
+                    "Incoming connection error from {send_back_addr} on {local_addr}: {error}"
+                );
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                log::warn!(
+                    "Outgoing connection error to {peer_id:?}: {error}"
+                );
+            }
+            SwarmEvent::ListenerError { listener_id, error } => {
+                log::error!("Listener {listener_id:?} error: {error}");
+            }
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                reason,
+                ..
+            } => {
+                log::error!("Listener {listener_id:?} closed: {reason:?}");
             }
             _ => {}
         }
