@@ -1,7 +1,10 @@
 [package]
 name = "wavesyncdb_derive"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Proc macro for WaveSyncDB: #[derive(SyncEntity)] auto-registers SeaORM entities for P2P sync"
+repository = "https://github.com/pvg13/WaveSyncDB"
 
 [lib]
 proc-macro = true

@@ -5,10 +5,8 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 /// A registered push token entry.
 #[derive(Debug, Clone)]
 pub struct PushToken {
-    pub topic: String,
     pub platform: String,
     pub token: String,
-    pub peer_id: String,
 }
 
 /// Async wrapper around an sqlx SQLite pool for push token storage.
@@ -79,41 +77,18 @@ impl PushStore {
 
     /// Get all tokens registered for a given topic.
     pub async fn get_tokens_for_topic(&self, topic: &str) -> Result<Vec<PushToken>, sqlx::Error> {
-        let rows =
-            sqlx::query("SELECT topic, platform, token, peer_id FROM push_tokens WHERE topic = ?1")
-                .bind(topic)
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query("SELECT platform, token FROM push_tokens WHERE topic = ?1")
+            .bind(topic)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .iter()
             .map(|row| PushToken {
-                topic: row.get("topic"),
                 platform: row.get("platform"),
                 token: row.get("token"),
-                peer_id: row.get("peer_id"),
             })
             .collect())
-    }
-
-    /// Remove all tokens registered by a specific peer.
-    pub async fn remove_tokens_for_peer(&self, peer_id: &str) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM push_tokens WHERE peer_id = ?1")
-            .bind(peer_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Remove tokens older than `max_age_secs` seconds.
-    pub async fn cleanup_stale(&self, max_age_secs: u64) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM push_tokens WHERE registered_at < (strftime('%s', 'now') - ?1)",
-        )
-        .bind(max_age_secs as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
     }
 
     /// Remove a specific token across all topics (used when push provider reports invalid).
@@ -171,30 +146,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remove_tokens_for_peer() {
-        let store = mem_store().await;
-        store
-            .register_token("t1", "Fcm", "tok1", "peer-1")
-            .await
-            .unwrap();
-        store
-            .register_token("t2", "Fcm", "tok2", "peer-1")
-            .await
-            .unwrap();
-        store
-            .register_token("t1", "Apns", "tok3", "peer-2")
-            .await
-            .unwrap();
-
-        let removed = store.remove_tokens_for_peer("peer-1").await.unwrap();
-        assert_eq!(removed, 2);
-
-        let tokens = store.get_tokens_for_topic("t1").await.unwrap();
-        assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].peer_id, "peer-2");
-    }
-
-    #[tokio::test]
     async fn test_upsert_on_duplicate() {
         let store = mem_store().await;
         store
@@ -208,7 +159,6 @@ mod tests {
             .unwrap();
         let tokens = store.get_tokens_for_topic("topic1").await.unwrap();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].peer_id, "peer-2");
     }
 
     #[tokio::test]
