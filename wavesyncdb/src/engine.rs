@@ -868,7 +868,12 @@ impl EngineRunner {
                     });
                 }
 
-                if self.peers.contains_key(&peer_id) && self.registry_is_ready {
+                if self.registry_is_ready && !self.rejected_peers.contains(&peer_id) {
+                    // Ensure reconnecting peer is tracked for future periodic syncs
+                    // (may have been removed by mDNS Expired or never added for inbound connections)
+                    self.peers
+                        .entry(peer_id)
+                        .or_insert_with(|| endpoint.get_remote_address().clone());
                     // Refresh local_db_version in case spawned tasks updated it
                     self.local_db_version = shadow::get_db_version(&self.db)
                         .await
@@ -1945,22 +1950,38 @@ async fn apply_remote_changeset(
             let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
 
             for change in row_changes {
-                let local_cv = shadow::get_col_version(db, table, pk, &change.cid)
-                    .await
-                    .unwrap_or(0);
+                let (local_cv, local_site) =
+                    shadow::get_col_version_with_site(db, table, pk, &change.cid)
+                        .await
+                        .unwrap_or((0, [0u8; 16]));
 
                 let remote_val_bytes = serde_json::to_vec(&change.val).unwrap_or_default();
                 let remote_site = change.site_id;
 
-                let should_apply = local_cv == 0
-                    || conflict::should_apply_column(
+                let should_apply = if local_cv == 0 {
+                    true
+                } else if change.col_version != local_cv {
+                    // Clear winner by version — no need to fetch local value
+                    change.col_version > local_cv
+                } else {
+                    // Tied col_version — need local value bytes for deterministic tiebreak
+                    let local_val_bytes = get_local_value_bytes(
+                        db,
+                        table,
+                        &meta.primary_key_column,
+                        pk,
+                        &change.cid,
+                    )
+                    .await;
+                    conflict::should_apply_column(
                         change.col_version,
                         &remote_val_bytes,
                         &remote_site,
                         local_cv,
-                        &[], // empty = lose tiebreak (remote wins on equal cv)
-                        &[0u8; 16],
-                    );
+                        &local_val_bytes,
+                        &local_site,
+                    )
+                };
 
                 if should_apply {
                     winning_columns
@@ -2119,6 +2140,41 @@ fn json_to_sea_value(v: Option<&serde_json::Value>) -> sea_orm::Value {
     }
 }
 
+/// Fetch the current value of a column as JSON-serialized bytes for conflict tiebreaking.
+async fn get_local_value_bytes(
+    db: &DatabaseConnection,
+    table: &str,
+    pk_col: &str,
+    pk: &str,
+    cid: &str,
+) -> Vec<u8> {
+    let sql = format!(
+        "SELECT json_object('v', \"{}\") as json_val FROM \"{}\" WHERE \"{}\" = $1",
+        cid, table, pk_col
+    );
+    let result = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            &sql,
+            [pk.into()],
+        ))
+        .await
+        .ok()
+        .flatten();
+
+    match result {
+        Some(qr) => {
+            let raw: Option<String> = qr.try_get("", "json_val").ok();
+            let val = raw.and_then(|s| {
+                let obj: serde_json::Value = serde_json::from_str(&s).ok()?;
+                Some(obj.get("v")?.clone())
+            });
+            serde_json::to_vec(&val).unwrap_or_default()
+        }
+        None => serde_json::to_vec(&Option::<serde_json::Value>::None).unwrap_or_default(),
+    }
+}
+
 /// Strip the RETURNING clause from a SQL statement.
 #[cfg(test)]
 fn strip_returning(sql: &str) -> String {
@@ -2202,6 +2258,7 @@ mod tests {
             col_version: 1,
             cl: 1,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2226,6 +2283,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 0,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2236,6 +2294,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 1,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2246,6 +2305,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 2,
+                db_version: 0,
             },
         ];
 
@@ -2287,6 +2347,7 @@ mod tests {
             col_version: 10,
             cl: 10,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2332,6 +2393,7 @@ mod tests {
             col_version: 10,
             cl: 10,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2371,6 +2433,7 @@ mod tests {
             col_version: 3,
             cl: 3,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2412,6 +2475,7 @@ mod tests {
                 col_version: 5,
                 cl: 5,
                 seq: 0,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2422,6 +2486,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 1,
+                db_version: 0,
             },
         ];
 
@@ -2464,6 +2529,7 @@ mod tests {
             col_version: 3,
             cl: 3,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2497,6 +2563,7 @@ mod tests {
             col_version: 5,
             cl: 5,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2536,6 +2603,7 @@ mod tests {
             col_version: 5,
             cl: 5,
             seq: 0,
+            db_version: 0,
         }];
 
         apply_remote_changeset(&db, &tx, &registry, &changes).await;
@@ -2567,6 +2635,7 @@ mod tests {
             col_version: 5,
             cl: 5,
             seq: 0,
+            db_version: 0,
         }];
         apply_remote_changeset(&db, &tx, &registry, &delete_changes).await;
         assert!(!row_exists(&db, "tasks", "id", "iad-1").await);
@@ -2582,6 +2651,7 @@ mod tests {
                 col_version: 10,
                 cl: 10,
                 seq: 0,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2592,6 +2662,7 @@ mod tests {
                 col_version: 10,
                 cl: 10,
                 seq: 1,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2602,6 +2673,7 @@ mod tests {
                 col_version: 10,
                 cl: 10,
                 seq: 2,
+                db_version: 0,
             },
         ];
         apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
@@ -2634,6 +2706,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 0,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2644,6 +2717,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 1,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2654,6 +2728,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 2,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2664,6 +2739,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 0,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2674,6 +2750,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 1,
+                db_version: 0,
             },
             ColumnChange {
                 table: "tasks".to_string(),
@@ -2684,6 +2761,7 @@ mod tests {
                 col_version: 1,
                 cl: 1,
                 seq: 2,
+                db_version: 0,
             },
         ];
 
@@ -2691,5 +2769,215 @@ mod tests {
 
         assert!(row_exists(&db, "tasks", "id", "mr-1").await);
         assert!(row_exists(&db, "tasks", "id", "mr-2").await);
+    }
+
+    #[tokio::test]
+    async fn test_convergence_tied_col_version() {
+        // Two peers insert the same PK offline, both at col_version=1.
+        // Deterministic tiebreaker must produce the same winner on both sides.
+        let site_a: crate::messages::NodeId = [1u8; 16];
+        let site_b: crate::messages::NodeId = [2u8; 16]; // B > A
+
+        // Simulate Peer A's DB: has A's data locally, receives B's data
+        let (db_a, registry_a) = setup_engine_test_db().await;
+        let (tx_a, _rx_a) = broadcast::channel::<ChangeNotification>(16);
+
+        // A wrote locally: title="A-value"
+        db_a.execute_unprepared("INSERT INTO tasks VALUES ('tied-1', 'A-value', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_a, "tasks", "tied-1", "id", 1, 1, &site_a, 0)
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_a, "tasks", "tied-1", "title", 1, 1, &site_a, 1)
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_a, "tasks", "tied-1", "done", 1, 1, &site_a, 2)
+            .await
+            .unwrap();
+
+        // B's changes arrive at A (same col_version=1, different value)
+        let b_changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "tied-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("B-value")),
+                site_id: site_b,
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+                db_version: 0,
+            },
+        ];
+        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes).await;
+
+        // Simulate Peer B's DB: has B's data locally, receives A's data
+        let (db_b, registry_b) = setup_engine_test_db().await;
+        let (tx_b, _rx_b) = broadcast::channel::<ChangeNotification>(16);
+
+        // B wrote locally: title="B-value"
+        db_b.execute_unprepared("INSERT INTO tasks VALUES ('tied-1', 'B-value', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_b, "tasks", "tied-1", "id", 1, 1, &site_b, 0)
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_b, "tasks", "tied-1", "title", 1, 1, &site_b, 1)
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_b, "tasks", "tied-1", "done", 1, 1, &site_b, 2)
+            .await
+            .unwrap();
+
+        // A's changes arrive at B
+        let a_changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "tied-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("A-value")),
+                site_id: site_a,
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+                db_version: 0,
+            },
+        ];
+        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes).await;
+
+        // Both peers should converge to the same value
+        let result_a = db_a
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'tied-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title_a: String = result_a.try_get_by_index(0).unwrap();
+
+        let result_b = db_b
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'tied-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title_b: String = result_b.try_get_by_index(0).unwrap();
+
+        assert_eq!(
+            title_a, title_b,
+            "Both peers must converge to the same value (got A='{}', B='{}')",
+            title_a, title_b
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convergence_offline_diverged_updates() {
+        // Two peers update the same column offline (different col_versions).
+        // Higher col_version must win deterministically.
+        let site_a: crate::messages::NodeId = [1u8; 16];
+        let site_b: crate::messages::NodeId = [2u8; 16];
+
+        // Peer A: updated title twice (col_version=3)
+        let (db_a, registry_a) = setup_engine_test_db().await;
+        let (tx_a, _rx_a) = broadcast::channel::<ChangeNotification>(16);
+
+        db_a.execute_unprepared("INSERT INTO tasks VALUES ('div-1', 'A-latest', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_a, "tasks", "div-1", "title", 3, 3, &site_a, 0)
+            .await
+            .unwrap();
+
+        // Peer B: updated title once (col_version=2)
+        let (db_b, registry_b) = setup_engine_test_db().await;
+        let (tx_b, _rx_b) = broadcast::channel::<ChangeNotification>(16);
+
+        db_b.execute_unprepared("INSERT INTO tasks VALUES ('div-1', 'B-latest', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db_b, "tasks", "div-1", "title", 2, 2, &site_b, 0)
+            .await
+            .unwrap();
+
+        // B's changes arrive at A (col_version=2 < 3, should lose)
+        let b_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "div-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("B-latest")),
+            site_id: site_b,
+            col_version: 2,
+            cl: 2,
+            seq: 0,
+            db_version: 0,
+        }];
+        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes).await;
+
+        // A's changes arrive at B (col_version=3 > 2, should win)
+        let a_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "div-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("A-latest")),
+            site_id: site_a,
+            col_version: 3,
+            cl: 3,
+            seq: 0,
+            db_version: 0,
+        }];
+        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes).await;
+
+        // Both should converge to A-latest (higher col_version)
+        let result_a = db_a
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'div-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title_a: String = result_a.try_get_by_index(0).unwrap();
+
+        let result_b = db_b
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'div-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title_b: String = result_b.try_get_by_index(0).unwrap();
+
+        assert_eq!(title_a, "A-latest", "A should keep its value (higher cv)");
+        assert_eq!(title_b, "A-latest", "B should accept A's value (higher cv)");
+        assert_eq!(title_a, title_b, "Both peers must converge");
+    }
+
+    #[tokio::test]
+    async fn test_get_col_version_with_site() {
+        let (db, _registry) = setup_engine_test_db().await;
+        let site_id = [42u8; 16];
+
+        // No entry yet
+        let (cv, sid) = crate::shadow::get_col_version_with_site(&db, "tasks", "pk1", "title")
+            .await
+            .unwrap();
+        assert_eq!(cv, 0);
+        assert_eq!(sid, [0u8; 16]);
+
+        // Insert a clock entry
+        crate::shadow::upsert_clock_entry(&db, "tasks", "pk1", "title", 5, 1, &site_id, 0)
+            .await
+            .unwrap();
+
+        let (cv, sid) = crate::shadow::get_col_version_with_site(&db, "tasks", "pk1", "title")
+            .await
+            .unwrap();
+        assert_eq!(cv, 5);
+        assert_eq!(sid, site_id);
     }
 }
