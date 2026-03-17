@@ -5,7 +5,7 @@ use std::time::Duration;
 use uuid::Uuid;
 use wavesyncdb::WaveSyncDbBuilder;
 
-use common::{assert_eventually, mem_db};
+use common::{assert_eventually, make_peer, mem_db};
 use common::task;
 
 // ---------------------------------------------------------------------------
@@ -281,4 +281,54 @@ async fn test_m12_update_with_unicode_column_values() {
         .unwrap()
         .unwrap();
     assert_eq!(found.title, "café ñ 日本語");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: out-of-order changeset delivery (UPDATE before INSERT)
+// INSERT then rapid UPDATE should converge on peer B without workarounds.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_out_of_order_insert_update_convergence() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-ooo-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let url_a = mem_db("ooo_a");
+    let url_b = mem_db("ooo_b");
+
+    let peer_a = make_peer(&url_a, &topic, 180).await;
+    let peer_b = make_peer(&url_b, &topic, 181).await;
+
+    // Wait for peer discovery
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A: INSERT then immediately UPDATE (no waiting for propagation)
+    let pk = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(pk.clone()),
+        title: Set("original".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&peer_a)
+    .await
+    .unwrap();
+
+    peer_a
+        .execute_unprepared(&format!(
+            "UPDATE \"tasks\" SET \"title\" = 'updated' WHERE \"id\" = '{pk}'"
+        ))
+        .await
+        .unwrap();
+
+    // B should converge to the updated value
+    assert_eventually("B has updated row", timeout, || async {
+        task::Entity::find_by_id(pk.clone())
+            .one(&peer_b)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.title == "updated")
+    })
+    .await;
 }
