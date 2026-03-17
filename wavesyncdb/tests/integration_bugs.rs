@@ -1,10 +1,11 @@
 mod common;
 
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, FromQueryResult, Set};
+use std::time::Duration;
 use uuid::Uuid;
 use wavesyncdb::WaveSyncDbBuilder;
 
-use common::mem_db;
+use common::{assert_eventually, mem_db};
 use common::task;
 
 // ---------------------------------------------------------------------------

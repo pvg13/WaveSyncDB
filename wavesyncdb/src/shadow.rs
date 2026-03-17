@@ -191,6 +191,44 @@ pub async fn get_col_version(
     Ok(row.map(|r| r.col_version as u64).unwrap_or(0))
 }
 
+/// Get the current col_version and site_id for a specific column of a row.
+pub async fn get_col_version_with_site(
+    db: &impl ConnectionTrait,
+    table: &str,
+    pk: &str,
+    cid: &str,
+) -> Result<(u64, NodeId), DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct VersionSiteRow {
+        col_version: i64,
+        site_id: Vec<u8>,
+    }
+
+    let shadow_name = format!("_wavesync_{}_clock", table);
+    let sql = format!(
+        "SELECT col_version, site_id FROM \"{}\" WHERE pk = $1 AND cid = $2",
+        shadow_name
+    );
+
+    let row = VersionSiteRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        [pk.into(), cid.into()],
+    ))
+    .one(db)
+    .await?;
+
+    match row {
+        Some(r) => {
+            let mut site_id: NodeId = [0u8; 16];
+            let len = r.site_id.len().min(16);
+            site_id[..len].copy_from_slice(&r.site_id[..len]);
+            Ok((r.col_version as u64, site_id))
+        }
+        None => Ok((0, [0u8; 16])),
+    }
+}
+
 /// Insert or replace a clock entry in the shadow table.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_clock_entry(
@@ -294,12 +332,13 @@ pub async fn get_changes_since(
             pk: String,
             cid: String,
             col_version: i64,
+            db_version: i64,
             seq: i32,
             site_id: Vec<u8>,
         }
 
         let sql = format!(
-            "SELECT pk, cid, col_version, seq, site_id FROM \"{}\" WHERE db_version > $1 ORDER BY db_version, seq",
+            "SELECT pk, cid, col_version, db_version, seq, site_id FROM \"{}\" WHERE db_version > $1 ORDER BY db_version, seq",
             shadow_name
         );
 
@@ -341,6 +380,12 @@ pub async fn get_changes_since(
                 }
             };
 
+            // Skip non-delete entries where the row was concurrently deleted.
+            // The __deleted tombstone handles the delete correctly.
+            if val.is_none() && row.cid != "__deleted" {
+                continue;
+            }
+
             let mut site_id: NodeId = [0u8; 16];
             let len = row.site_id.len().min(16);
             site_id[..len].copy_from_slice(&row.site_id[..len]);
@@ -354,13 +399,13 @@ pub async fn get_changes_since(
                 col_version: row.col_version as u64,
                 cl: row.col_version as u64, // causal length = col_version for non-deletes
                 seq: row.seq as u32,
+                db_version: row.db_version as u64,
             });
         }
     }
 
-    // Sort by (db_version from the clock entry, seq)
-    // Note: db_version is embedded in ColumnChange indirectly via the query ordering
-    all_changes.sort_by_key(|c| (c.col_version, c.seq));
+    // Sort by (db_version, seq) for correct causal ordering across tables
+    all_changes.sort_by_key(|c| (c.db_version, c.seq));
 
     Ok(all_changes)
 }

@@ -544,6 +544,7 @@ impl WaveSyncDb {
                         col_version: tombstone_cv,
                         cl: tombstone_cv,
                         seq: 0,
+                        db_version: new_db_version,
                     });
                 }
                 WriteKind::Insert | WriteKind::Update => {
@@ -593,6 +594,7 @@ impl WaveSyncDb {
                             col_version: new_cv,
                             cl: new_cv,
                             seq: seq as u32,
+                            db_version: new_db_version,
                         });
                     }
                 }

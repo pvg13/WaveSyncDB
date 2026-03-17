@@ -93,6 +93,7 @@ mod tests {
                 col_version: 3,
                 cl: 3,
                 seq: 0,
+                db_version: 0,
             }],
             my_db_version: 20,
             your_last_db_version: 10,

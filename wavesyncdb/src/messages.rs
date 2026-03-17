@@ -56,6 +56,10 @@ pub struct ColumnChange {
     pub cl: u64,
     /// Ordering within a single `db_version` batch.
     pub seq: u32,
+    /// The db_version at which this change was created.
+    /// Used for correct ordering in `get_changes_since`.
+    #[serde(default)]
+    pub db_version: u64,
 }
 
 /// A batch of column-level changes from a single write operation.
@@ -124,6 +128,7 @@ mod tests {
             col_version: 5,
             cl: 5,
             seq: 0,
+            db_version: 0,
         };
         let json = serde_json::to_string(&change).unwrap();
         let deserialized: ColumnChange = serde_json::from_str(&json).unwrap();
@@ -145,6 +150,7 @@ mod tests {
                     col_version: 1,
                     cl: 1,
                     seq: 0,
+                    db_version: 0,
                 },
                 ColumnChange {
                     table: "tasks".to_string(),
@@ -155,6 +161,7 @@ mod tests {
                     col_version: 1,
                     cl: 1,
                     seq: 1,
+                    db_version: 0,
                 },
             ],
         };
@@ -212,6 +219,7 @@ mod tests {
             col_version: 3,
             cl: 3,
             seq: 0,
+            db_version: 0,
         };
         assert_eq!(change.cid, "__deleted");
         assert!(change.val.is_none());
