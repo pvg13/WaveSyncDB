@@ -1553,8 +1553,12 @@ impl EngineRunner {
                                 return;
                             }
 
-                            // Update our knowledge of this peer's version
-                            self.peer_db_versions.insert(peer, my_db_version);
+                            // NOTE: Do NOT update peer_db_versions here. The peer's
+                            // reported db_version tells us what THEY have, but we haven't
+                            // received their data yet. peer_db_versions is only updated in
+                            // the response handler where we actually receive and process
+                            // changes. Updating here would cause us to skip changes in the
+                            // next sync request (your_last_db_version would be too high).
                             self.emit_network_event(
                                 crate::network_status::NetworkEvent::PeerSynced {
                                     peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -1948,6 +1952,8 @@ async fn apply_remote_changeset(
             // Collect winning columns
             let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
             let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
+            let mut pending_shadow_updates: Vec<(String, u64, crate::messages::NodeId, u32)> =
+                Vec::new();
 
             for change in row_changes {
                 let (local_cv, local_site) =
@@ -1988,18 +1994,13 @@ async fn apply_remote_changeset(
                         .push((change.cid.clone(), json_to_sea_value(change.val.as_ref())));
                     changed_columns.push(change.cid.clone());
 
-                    // Update shadow table
-                    let _ = shadow::upsert_clock_entry(
-                        db,
-                        table,
-                        pk,
-                        &change.cid,
+                    // Defer shadow write until after DB write succeeds
+                    pending_shadow_updates.push((
+                        change.cid.clone(),
                         change.col_version,
-                        local_db_version,
-                        &remote_site,
+                        remote_site,
                         change.seq,
-                    )
-                    .await;
+                    ));
                 }
             }
 
@@ -2021,6 +2022,20 @@ async fn apply_remote_changeset(
                         {
                             log::error!("Failed to update column {}/{}/{}: {}", table, pk, col, e);
                         }
+                    }
+                    // Row existed — flush shadow writes
+                    for (cid, cv, site, seq) in &pending_shadow_updates {
+                        let _ = shadow::upsert_clock_entry(
+                            db,
+                            table,
+                            pk,
+                            cid,
+                            *cv,
+                            local_db_version,
+                            site,
+                            *seq,
+                        )
+                        .await;
                     }
                     any_applied = true;
                 } else {
@@ -2079,7 +2094,32 @@ async fn apply_remote_changeset(
                             }
                         }
                     }
-                    any_applied = true;
+
+                    // Verify INSERT actually created the row before writing shadow
+                    if row_exists(db, table, &meta.primary_key_column, pk).await {
+                        for (cid, cv, site, seq) in &pending_shadow_updates {
+                            let _ = shadow::upsert_clock_entry(
+                                db,
+                                table,
+                                pk,
+                                cid,
+                                *cv,
+                                local_db_version,
+                                site,
+                                *seq,
+                            )
+                            .await;
+                        }
+                        any_applied = true;
+                    } else {
+                        log::debug!(
+                            "Row {}/{} not created (likely missing NOT NULL columns from \
+                             out-of-order delivery), deferring shadow updates",
+                            table,
+                            pk
+                        );
+                        // Shadow stays clean — next sync cycle or full INSERT will succeed
+                    }
                 }
             }
         }
@@ -2955,6 +2995,143 @@ mod tests {
         assert_eq!(title_a, "A-latest", "A should keep its value (higher cv)");
         assert_eq!(title_b, "A-latest", "B should accept A's value (higher cv)");
         assert_eq!(title_a, title_b, "Both peers must converge");
+    }
+
+    async fn setup_engine_test_db_no_defaults() -> (sea_orm::DatabaseConnection, Arc<TableRegistry>)
+    {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::shadow::create_meta_table(&db).await.unwrap();
+        crate::peer_tracker::create_peer_versions_table(&db)
+            .await
+            .unwrap();
+        // No DEFAULT on any NOT NULL column — INSERT missing columns will fail
+        db.execute_unprepared(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL)",
+        )
+        .await
+        .unwrap();
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
+        let registry = Arc::new(TableRegistry::new());
+        registry.register(TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+        (db, registry)
+    }
+
+    #[tokio::test]
+    async fn test_apply_remote_changeset_out_of_order_update_before_insert() {
+        // UPDATE arrives for a non-existent row → shadow must stay clean.
+        // Then INSERT arrives → row is created with all columns, shadow populated.
+        let (db, registry) = setup_engine_test_db_no_defaults().await;
+        let (tx, mut rx) = broadcast::channel::<ChangeNotification>(16);
+        let site = [2u8; 16];
+
+        // Step 1: Send UPDATE for non-existent row (only "title" column, cv=2)
+        let update_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "ooo-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("Updated Title")),
+            site_id: site,
+            col_version: 2,
+            cl: 2,
+            seq: 0,
+            db_version: 0,
+        }];
+        apply_remote_changeset(&db, &tx, &registry, &update_changes).await;
+
+        // Row should NOT exist
+        assert!(
+            !row_exists(&db, "tasks", "id", "ooo-1").await,
+            "Row should not exist after out-of-order UPDATE"
+        );
+
+        // Shadow should be clean (no entries for this row)
+        let (cv, _) =
+            crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
+                .await
+                .unwrap();
+        assert_eq!(cv, 0, "Shadow should be clean after failed INSERT");
+
+        // No notification should have been sent
+        assert!(
+            rx.try_recv().is_err(),
+            "No notification expected for failed out-of-order UPDATE"
+        );
+
+        // Step 2: Send full INSERT (all columns, cv=1)
+        let insert_changes = vec![
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "ooo-1".to_string(),
+                cid: "id".to_string(),
+                val: Some(serde_json::json!("ooo-1")),
+                site_id: site,
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+                db_version: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "ooo-1".to_string(),
+                cid: "title".to_string(),
+                val: Some(serde_json::json!("Original Title")),
+                site_id: site,
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+                db_version: 0,
+            },
+            ColumnChange {
+                table: "tasks".to_string(),
+                pk: "ooo-1".to_string(),
+                cid: "done".to_string(),
+                val: Some(serde_json::json!(0)),
+                site_id: site,
+                col_version: 1,
+                cl: 1,
+                seq: 2,
+                db_version: 0,
+            },
+        ];
+        apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
+
+        // Row should now exist with INSERT's values (shadow was clean, so cv=1 wins)
+        assert!(
+            row_exists(&db, "tasks", "id", "ooo-1").await,
+            "Row should exist after INSERT"
+        );
+
+        let result = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'ooo-1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .expect("Row should exist");
+        let title: String = result.try_get_by_index(0).unwrap();
+        assert_eq!(
+            title, "Original Title",
+            "INSERT's value should win since shadow was clean"
+        );
+
+        // Shadow should now be populated with cv=1
+        let (cv, _) =
+            crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
+                .await
+                .unwrap();
+        assert_eq!(cv, 1, "Shadow should have cv=1 from the INSERT");
+
+        // Notification should have been sent for the INSERT
+        let notif = rx.try_recv().expect("Expected notification for INSERT");
+        assert_eq!(notif.primary_key, "ooo-1");
     }
 
     #[tokio::test]

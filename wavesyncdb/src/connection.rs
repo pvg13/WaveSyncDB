@@ -348,6 +348,15 @@ impl WaveSyncDb {
         self.inner.registry.register(meta);
     }
 
+    /// Signal the engine that all tables have been registered and sync can begin.
+    ///
+    /// This is called automatically by [`SchemaBuilder::sync()`]. You only need
+    /// to call it manually when registering tables via [`register_table()`](Self::register_table)
+    /// without using the schema builder.
+    pub fn registry_ready(&self) {
+        self.inner.registry_ready.notify_one();
+    }
+
     /// Start building the sync schema.
     pub fn schema(&self) -> SchemaBuilder<'_> {
         SchemaBuilder {
