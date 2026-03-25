@@ -217,7 +217,7 @@ pub struct WaveSyncDb {
 impl Drop for WaveSyncDbInner {
     fn drop(&mut self) {
         // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk between tests)
-        if let Some(handle) = self.engine_handle.lock().unwrap().take() {
+        if let Some(handle) = self.engine_handle.lock().ok().and_then(|mut h| h.take()) {
             handle.abort();
         }
     }
@@ -293,7 +293,13 @@ impl WaveSyncDb {
             .send(crate::engine::EngineCommand::Shutdown)
             .await;
 
-        let handle = { self.inner.engine_handle.lock().unwrap().take() };
+        let handle = {
+            self.inner
+                .engine_handle
+                .lock()
+                .ok()
+                .and_then(|mut h| h.take())
+        };
         if let Some(handle) = handle {
             let _ = handle.await;
         }

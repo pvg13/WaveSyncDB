@@ -408,7 +408,10 @@ impl EngineRunner {
             .map(|(peer_id, addr)| ns::PeerInfo {
                 peer_id: ns::PeerId(peer_id.to_string()),
                 address: addr.to_string(),
-                db_version: self.peer_db_versions.get(peer_id).copied()
+                db_version: self
+                    .peer_db_versions
+                    .get(peer_id)
+                    .copied()
                     .or_else(|| self.peer_reported_versions.get(peer_id).copied()),
                 is_bootstrap: self.bootstrap_peers.contains(peer_id),
                 is_group_member: !self.rejected_peers.contains(peer_id),
@@ -1008,11 +1011,9 @@ impl EngineRunner {
                     && self.peers.remove(&pid).is_some()
                 {
                     self.pending_sync_peers.remove(&pid);
-                    self.emit_network_event(
-                        crate::network_status::NetworkEvent::PeerDisconnected(
-                            crate::network_status::PeerId(pid.to_string()),
-                        ),
-                    );
+                    self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
+                        crate::network_status::PeerId(pid.to_string()),
+                    ));
                     self.update_network_status();
                 }
             }
