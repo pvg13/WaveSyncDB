@@ -1,8 +1,6 @@
 services:
   wavesync-relay:
-    build:
-      context: ..
-      dockerfile: wavesync_relay/Dockerfile
+    image: ghcr.io/pvg13/wavesync-relay:latest
     container_name: wavesync-relay
     restart: unless-stopped
     ports:
