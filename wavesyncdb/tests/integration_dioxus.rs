@@ -17,18 +17,12 @@ async fn test_change_rx_table_filter_pattern() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     // Create another table (unregistered)
-    db.execute_unprepared(
-        "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, body TEXT)",
-    )
-    .await
-    .unwrap();
+    db.execute_unprepared("CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, body TEXT)")
+        .await
+        .unwrap();
 
     let mut rx = db.change_rx();
     let target_table = "tasks";
@@ -76,11 +70,7 @@ async fn test_change_rx_lagged_triggers_requery() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 

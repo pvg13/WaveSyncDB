@@ -27,12 +27,7 @@ async fn test_update_propagation() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(101))
@@ -42,12 +37,7 @@ async fn test_update_propagation() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // A inserts
     let id = Uuid::new_v4().to_string();
@@ -108,12 +98,7 @@ async fn test_delete_propagation() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(103))
@@ -123,12 +108,7 @@ async fn test_delete_propagation() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // A inserts
     let id = Uuid::new_v4().to_string();
@@ -190,12 +170,7 @@ async fn test_concurrent_same_column_higher_version_wins() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(105))
@@ -205,12 +180,7 @@ async fn test_concurrent_same_column_higher_version_wins() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // A inserts, B receives
     let id = Uuid::new_v4().to_string();
@@ -280,12 +250,7 @@ async fn test_concurrent_different_columns_both_survive() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(107))
@@ -295,12 +260,7 @@ async fn test_concurrent_different_columns_both_survive() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // A inserts, B receives
     let id = Uuid::new_v4().to_string();
@@ -356,10 +316,7 @@ async fn test_concurrent_different_columns_both_survive() {
             .flatten();
         match (a_task, b_task) {
             (Some(a), Some(b)) => {
-                a.title == "A-title"
-                    && a.completed
-                    && b.title == "A-title"
-                    && b.completed
+                a.title == "A-title" && a.completed && b.title == "A-title" && b.completed
             }
             _ => false,
         }
@@ -386,12 +343,7 @@ async fn test_bidirectional_sync() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(109))
@@ -401,12 +353,7 @@ async fn test_bidirectional_sync() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for peers to discover each other
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -475,11 +422,7 @@ async fn test_three_peer_convergence() {
             .build()
             .await
             .unwrap();
-        peer.schema()
-            .register(task::Entity)
-            .sync()
-            .await
-            .unwrap();
+        peer.schema().register(task::Entity).sync().await.unwrap();
         peers.push(peer);
     }
 
@@ -533,12 +476,7 @@ async fn test_delete_then_reinsert_same_pk() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(114))
@@ -548,12 +486,7 @@ async fn test_delete_then_reinsert_same_pk() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     let pk = "reinsert-pk";
 

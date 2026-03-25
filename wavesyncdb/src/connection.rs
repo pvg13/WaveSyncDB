@@ -502,18 +502,18 @@ impl WaveSyncDb {
         let kind_clone = kind.clone();
 
         // Async CRDT bookkeeping + P2P sync
+        // The db_version lock is held for the entire operation to serialize
+        // shadow reads/writes. Without this, two rapid writes (INSERT then UPDATE)
+        // can race: the UPDATE task reads shadow before INSERT's task writes it,
+        // producing incorrect col_versions and out-of-order changeset delivery.
         tokio::spawn(async move {
-            // Increment db_version
-            let new_db_version = {
-                let mut ver = shared.db_version.lock().await;
-                *ver += 1;
-                let v = *ver;
-                // Persist
-                if let Err(e) = crate::shadow::set_db_version(&inner, v).await {
-                    log::error!("Failed to persist db_version: {}", e);
-                }
-                v
-            };
+            let mut ver = shared.db_version.lock().await;
+            *ver += 1;
+            let new_db_version = *ver;
+            // Persist
+            if let Err(e) = crate::shadow::set_db_version(&inner, new_db_version).await {
+                log::error!("Failed to persist db_version: {}", e);
+            }
 
             let mut changes = Vec::new();
 
@@ -560,12 +560,9 @@ impl WaveSyncDb {
                     // Clear any tombstone for this row (it's alive again),
                     // but preserve per-column clock entries so col_versions
                     // continue from their previous values.
-                    let _ = crate::shadow::clear_tombstone(
-                        &inner,
-                        &table_owned,
-                        &parsed.primary_key,
-                    )
-                    .await;
+                    let _ =
+                        crate::shadow::clear_tombstone(&inner, &table_owned, &parsed.primary_key)
+                            .await;
 
                     for (seq, (col, val)) in parsed.columns.iter().enumerate() {
                         // Get current col_version and increment
@@ -616,6 +613,7 @@ impl WaveSyncDb {
             };
 
             let _ = shared.sync_tx.send(changeset).await;
+            drop(ver); // Release lock after changeset is sent
         });
     }
 }
@@ -1012,7 +1010,7 @@ impl WaveSyncDbBuilder {
     /// Add a static bootstrap peer to dial on startup.
     ///
     /// Bootstrap peers are dialed immediately and treated like mDNS-discovered
-    /// peers for gossipsub and version vector sync.
+    /// peers for sync.
     pub fn with_bootstrap_peer(mut self, addr: &str) -> Self {
         self.bootstrap_peers.push(addr.to_string());
         self
@@ -1478,10 +1476,12 @@ mod tests {
     /// Internal table prefix still classifies (but dispatch_sync skips them)
     #[test]
     fn test_classify_write_internal_table_prefix() {
-        let result = classify_write(
-            r#"INSERT INTO "_wavesync_meta" ("key", "value") VALUES ('x', 'y')"#,
+        let result =
+            classify_write(r#"INSERT INTO "_wavesync_meta" ("key", "value") VALUES ('x', 'y')"#);
+        assert!(
+            result.is_some(),
+            "classify_write should still parse _wavesync tables"
         );
-        assert!(result.is_some(), "classify_write should still parse _wavesync tables");
         let (_, table) = result.unwrap();
         assert!(table.starts_with("_wavesync"));
     }

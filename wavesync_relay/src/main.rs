@@ -10,8 +10,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use clap::Parser;
 use libp2p::{
-    Multiaddr, SwarmBuilder, connection_limits, futures::StreamExt, identify, identity, noise, ping,
-    relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
+    Multiaddr, SwarmBuilder, connection_limits, futures::StreamExt, identify, identity, noise,
+    ping, relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 use rand::rngs::OsRng;
@@ -246,8 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection_limits: connection_limits::Behaviour::new(conn_limits),
                 relay: relay::Behaviour::new(key.public().to_peer_id(), relay_config),
                 rendezvous: rendezvous::server::Behaviour::new(
-                    rendezvous::server::Config::default()
-                        .with_min_ttl(120), // Allow 2-minute TTL for mobile clients
+                    rendezvous::server::Config::default().with_min_ttl(120), // Allow 2-minute TTL for mobile clients
                 ),
                 identify,
                 ping: ping::Behaviour::default(),
@@ -255,7 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 push: push_behaviour,
             }
         })?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+        .with_swarm_config(|cfg| {
+            cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+        })
         .build();
 
     for ext_addr_str in &cli.external_address {
@@ -324,9 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                log::warn!(
-                    "Outgoing connection error to {peer_id:?}: {error}"
-                );
+                log::warn!("Outgoing connection error to {peer_id:?}: {error}");
             }
             SwarmEvent::ListenerError { listener_id, error } => {
                 log::error!("Listener {listener_id:?} error: {error}");

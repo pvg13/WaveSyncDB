@@ -1,6 +1,6 @@
 //! Core sync message types exchanged between nodes.
 //!
-//! These types are serialized with [`serde_json`] for gossipsub transport and stored
+//! These types are serialized with [`serde_json`] for request-response transport and stored
 //! in shadow tables for conflict resolution.
 
 use serde::{Deserialize, Serialize};
@@ -64,8 +64,8 @@ pub struct ColumnChange {
 
 /// A batch of column-level changes from a single write operation.
 ///
-/// Produced by `WaveSyncDb` when it intercepts a write, then published
-/// to gossipsub and used for version vector sync.
+/// Produced by `WaveSyncDb` when it intercepts a write, then pushed
+/// to peers via request-response and used for version vector sync.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SyncChangeset {
     /// The originating node's ID.
@@ -74,27 +74,6 @@ pub struct SyncChangeset {
     pub db_version: u64,
     /// Individual column changes in this batch.
     pub changes: Vec<ColumnChange>,
-}
-
-/// Tagged envelope for gossipsub messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SyncMessage {
-    /// A changeset containing column-level CRDT changes.
-    Changeset(SyncChangeset),
-}
-
-/// Authenticated wrapper for gossipsub messages.
-///
-/// When a `GroupKey` is configured, the `hmac` field carries a BLAKE3-keyed MAC
-/// over the serialized `inner` message. Peers without the matching key cannot
-/// forge or verify messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthenticatedMessage {
-    /// The wrapped sync message.
-    pub inner: SyncMessage,
-    /// HMAC tag (present when group authentication is enabled).
-    #[serde(default)]
-    pub hmac: Option<[u8; 32]>,
 }
 
 /// Lightweight notification emitted after every local or remote write.
@@ -171,29 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn test_authenticated_message_roundtrip_json() {
-        let msg = AuthenticatedMessage {
-            inner: SyncMessage::Changeset(SyncChangeset {
-                site_id: [3u8; 16],
-                db_version: 1,
-                changes: vec![],
-            }),
-            hmac: Some([0xAB; 32]),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: AuthenticatedMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.hmac, Some([0xAB; 32]));
-    }
-
-    #[test]
-    fn test_authenticated_message_hmac_none_default() {
-        // Simulate old message without hmac field
-        let json = r#"{"inner":{"Changeset":{"site_id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"db_version":1,"changes":[]}}}"#;
-        let msg: AuthenticatedMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.hmac, None);
-    }
-
-    #[test]
     fn test_write_kind_variants_serialize() {
         let insert_json = serde_json::to_string(&WriteKind::Insert).unwrap();
         let update_json = serde_json::to_string(&WriteKind::Update).unwrap();
@@ -223,23 +179,6 @@ mod tests {
         };
         assert_eq!(change.cid, "__deleted");
         assert!(change.val.is_none());
-    }
-
-    #[test]
-    fn test_sync_message_changeset_envelope() {
-        let msg = SyncMessage::Changeset(SyncChangeset {
-            site_id: [4u8; 16],
-            db_version: 10,
-            changes: vec![],
-        });
-        let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: SyncMessage = serde_json::from_str(&json).unwrap();
-        match deserialized {
-            SyncMessage::Changeset(cs) => {
-                assert_eq!(cs.db_version, 10);
-                assert_eq!(cs.site_id, [4u8; 16]);
-            }
-        }
     }
 
     #[test]

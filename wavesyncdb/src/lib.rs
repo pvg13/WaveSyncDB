@@ -4,7 +4,7 @@
 //!
 //! WaveSyncDB wraps a SeaORM [`DatabaseConnection`](sea_orm::DatabaseConnection) via
 //! [`WaveSyncDb`], intercepting write operations (INSERT, UPDATE, DELETE) and replicating
-//! them to peers over libp2p gossipsub. Conflicts are resolved automatically using
+//! them to peers over libp2p request-response. Conflicts are resolved automatically using
 //! per-column Lamport clocks (CRDTs), allowing concurrent edits to different columns
 //! on the same row to both survive.
 //!
@@ -53,9 +53,7 @@ pub use engine::EngineCommand;
 pub use messages::{
     ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
 };
-pub use network_status::{
-    NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus,
-};
+pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
 pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
 
 /// Returns recommended log module filter tuples for silencing noisy dependencies.
@@ -74,7 +72,6 @@ pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
     vec![
         ("hickory_resolver", log::LevelFilter::Warn),
         ("hickory_proto", log::LevelFilter::Warn),
-        ("libp2p_gossipsub", log::LevelFilter::Warn),
         ("libp2p_autonat", log::LevelFilter::Warn),
         ("libp2p_mdns", log::LevelFilter::Warn),
         ("libp2p_swarm", log::LevelFilter::Warn),

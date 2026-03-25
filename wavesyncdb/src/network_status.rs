@@ -67,7 +67,7 @@ pub struct NetworkStatus {
     pub local_peer_id: PeerId,
     /// All currently connected peers.
     pub connected_peers: Vec<PeerInfo>,
-    /// The gossipsub topic (effective, after PSK derivation).
+    /// The sync topic (effective, after PSK derivation).
     pub topic: String,
     /// Relay connection status.
     pub relay_status: RelayStatus,

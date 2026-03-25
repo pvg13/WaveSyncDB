@@ -699,12 +699,20 @@ mod tests {
         assert_eq!(entries.len(), 2); // title + done preserved
         assert!(entries.iter().all(|e| e.cid != "__deleted"));
         assert_eq!(
-            entries.iter().find(|e| e.cid == "title").unwrap().col_version,
+            entries
+                .iter()
+                .find(|e| e.cid == "title")
+                .unwrap()
+                .col_version,
             5,
             "col_version for title should be preserved"
         );
         assert_eq!(
-            entries.iter().find(|e| e.cid == "done").unwrap().col_version,
+            entries
+                .iter()
+                .find(|e| e.cid == "done")
+                .unwrap()
+                .col_version,
             3,
             "col_version for done should be preserved"
         );
