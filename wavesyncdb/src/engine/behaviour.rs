@@ -1,6 +1,6 @@
 use libp2p::{
-    autonat, connection_limits, dcutr, gossipsub, identify, mdns, ping, relay, rendezvous,
-    request_response, swarm::behaviour::toggle::Toggle,
+    autonat, connection_limits, dcutr, identify, mdns, ping, relay, rendezvous, request_response,
+    swarm::behaviour::toggle::Toggle,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 
@@ -13,7 +13,6 @@ pub struct WaveSyncBehaviour {
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
-    pub gossipsub: gossipsub::Behaviour,
     pub snapshot: request_response::Behaviour<SnapshotCodec>,
     pub push: request_response::Behaviour<PushCodec>,
     pub relay_client: relay::client::Behaviour,
@@ -45,14 +44,6 @@ impl WaveSyncBehaviour {
             }
         };
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(std::time::Duration::from_secs(1))
-            .mesh_n(3)
-            .mesh_n_low(1)
-            .mesh_n_high(6)
-            .build()
-            .expect("Valid gossipsub config");
-
         let dcutr_behaviour = dcutr::Behaviour::new(peer_id);
 
         let autonat_behaviour = autonat::v2::client::Behaviour::default();
@@ -69,19 +60,14 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
-        let conn_limits = connection_limits::ConnectionLimits::default()
-            .with_max_established_per_peer(Some(1));
+        let conn_limits =
+            connection_limits::ConnectionLimits::default().with_max_established_per_peer(Some(1));
 
         Self {
             connection_limits: connection_limits::Behaviour::new(conn_limits),
             ping: ping_behaviour,
             identify: identify_behaviour,
             mdns: mdns_behaviour,
-            gossipsub: gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )
-            .unwrap(),
             snapshot: snapshot_behaviour,
             push: push_behaviour,
             relay_client,

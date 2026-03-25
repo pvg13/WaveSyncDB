@@ -28,7 +28,6 @@ static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .filter_module("libp2p_gossipsub", log::LevelFilter::Warn)
         .filter_module("libp2p_autonat", log::LevelFilter::Warn)
         .filter_module("libp2p_mdns", log::LevelFilter::Warn)
         .filter_module("libp2p_swarm", log::LevelFilter::Warn)

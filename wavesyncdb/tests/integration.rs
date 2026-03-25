@@ -1382,12 +1382,7 @@ async fn test_slow_peer_catches_up() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 

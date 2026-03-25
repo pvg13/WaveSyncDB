@@ -16,11 +16,7 @@ async fn test_notification_on_insert() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 
@@ -51,11 +47,7 @@ async fn test_notification_on_update() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let id = Uuid::new_v4().to_string();
     let inserted = task::ActiveModel {
@@ -89,11 +81,7 @@ async fn test_notification_on_delete() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let id = Uuid::new_v4().to_string();
     task::ActiveModel {
@@ -129,11 +117,7 @@ async fn test_notification_table_filtering() {
         .await
         .unwrap();
     // Register tasks but NOT another table
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     // Create an unregistered table manually
     db.execute_unprepared(
@@ -164,11 +148,7 @@ async fn test_notification_changed_columns_insert() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 
@@ -184,9 +164,19 @@ async fn test_notification_changed_columns_insert() {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let notif = rx.try_recv().unwrap();
-    let cols = notif.changed_columns.expect("INSERT should have changed_columns");
-    assert!(cols.contains(&"id".to_string()), "Should contain 'id': {:?}", cols);
-    assert!(cols.contains(&"title".to_string()), "Should contain 'title': {:?}", cols);
+    let cols = notif
+        .changed_columns
+        .expect("INSERT should have changed_columns");
+    assert!(
+        cols.contains(&"id".to_string()),
+        "Should contain 'id': {:?}",
+        cols
+    );
+    assert!(
+        cols.contains(&"title".to_string()),
+        "Should contain 'title': {:?}",
+        cols
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -198,11 +188,7 @@ async fn test_notification_changed_columns_update() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     task::ActiveModel {
         id: Set("pk2".to_string()),
@@ -223,9 +209,19 @@ async fn test_notification_changed_columns_update() {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let notif = rx.try_recv().unwrap();
-    let cols = notif.changed_columns.expect("UPDATE should have changed_columns");
-    assert!(cols.contains(&"title".to_string()), "Should contain 'title': {:?}", cols);
-    assert!(!cols.contains(&"id".to_string()), "Should NOT contain 'id': {:?}", cols);
+    let cols = notif
+        .changed_columns
+        .expect("UPDATE should have changed_columns");
+    assert!(
+        cols.contains(&"title".to_string()),
+        "Should contain 'title': {:?}",
+        cols
+    );
+    assert!(
+        !cols.contains(&"id".to_string()),
+        "Should NOT contain 'id': {:?}",
+        cols
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,11 +233,7 @@ async fn test_notification_changed_columns_none_delete() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     task::ActiveModel {
         id: Set("pk3".to_string()),
@@ -277,11 +269,7 @@ async fn test_multiple_receivers() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx1 = db.change_rx();
     let mut rx2 = db.change_rx();
@@ -313,11 +301,7 @@ async fn test_receiver_closed_on_drop() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 

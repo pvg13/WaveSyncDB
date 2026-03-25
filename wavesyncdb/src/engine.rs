@@ -1,14 +1,13 @@
 //! P2P sync engine powered by libp2p.
 //!
 //! The engine runs as a background tokio task, managing a libp2p swarm with:
-//! - **gossipsub** for real-time push of column-level CRDT changesets
+//! - **request-response** for real-time push (fan-out) and version vector catch-up sync
 //! - **mDNS** for local peer discovery
 //! - **QUIC + TCP** transports with Noise encryption and Yamux multiplexing
-//! - **request-response** for version vector based catch-up sync
 //! - **relay + dcutr + autonat** for NAT traversal (WIP)
 //!
 //! Local write operations arrive via an mpsc channel from [`WaveSyncDb`](crate::WaveSyncDb)
-//! as [`SyncChangeset`]s and are published to gossipsub.
+//! as [`SyncChangeset`]s and are pushed to all connected peers via request-response.
 //! Incoming remote changesets are applied column-by-column using per-column
 //! Lamport clocks for conflict resolution.
 
@@ -23,12 +22,8 @@ use std::time::Duration;
 use behaviour::{WaveSyncBehaviour, WaveSyncBehaviourEvent};
 use futures::FutureExt;
 use libp2p::{
-    Multiaddr, SwarmBuilder, autonat, dcutr, dns,
-    futures::StreamExt,
-    gossipsub::{self, IdentTopic},
-    identify, identity, mdns, noise, ping, relay, rendezvous, request_response,
-    swarm::SwarmEvent,
-    yamux,
+    Multiaddr, SwarmBuilder, autonat, dcutr, dns, futures::StreamExt, identify, identity, mdns,
+    noise, ping, relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use std::panic::AssertUnwindSafe;
@@ -36,10 +31,7 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::auth::GroupKey;
 use crate::conflict;
-use crate::messages::{
-    AuthenticatedMessage, ChangeNotification, ColumnChange, NodeId, SyncChangeset, SyncMessage,
-    WriteKind,
-};
+use crate::messages::{ChangeNotification, ColumnChange, NodeId, SyncChangeset, WriteKind};
 use crate::peer_tracker;
 use crate::protocol::SyncRequest;
 use crate::registry::TableRegistry;
@@ -151,9 +143,7 @@ pub fn start_engine(
             Ok(Err(e)) => {
                 let reason = format!("{e}");
                 log::error!("Engine error: {reason}");
-                let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed {
-                    reason,
-                });
+                let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed { reason });
             }
             Err(panic) => {
                 let msg = panic
@@ -215,10 +205,7 @@ fn build_swarm(
                     yamux::Config::default,
                 )?
                 .with_quic()
-                .with_dns_config(
-                    dns::ResolverConfig::google(),
-                    dns::ResolverOpts::default(),
-                )
+                .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
                 .with_behaviour(move |key, relay_client| {
                     WaveSyncBehaviour::new(key, relay_client, mdns_cfg)
@@ -259,6 +246,8 @@ async fn run_engine(
         crate::protocol::SyncResponse,
     )>(8);
 
+    let (remote_changeset_tx, remote_changeset_rx) = mpsc::channel::<Vec<ColumnChange>>(32);
+
     let effective_topic = match &group_key {
         Some(gk) => gk.derive_topic(&topic_name),
         None => topic_name.clone(),
@@ -269,10 +258,23 @@ async fn run_engine(
 
     let push_token = config.push_token.clone();
 
+    // Collect infrastructure peer IDs (relay + rendezvous) so they are excluded
+    // from self.peers, peer counts, and sync fan-out.
+    let mut infrastructure_peers = std::collections::HashSet::new();
+    if let Some(ref addr) = config.relay_server
+        && let Some(libp2p::multiaddr::Protocol::P2p(pid)) = addr.iter().last()
+    {
+        infrastructure_peers.insert(pid);
+    }
+    if let Some(ref addr) = config.rendezvous_server
+        && let Some(libp2p::multiaddr::Protocol::P2p(pid)) = addr.iter().last()
+    {
+        infrastructure_peers.insert(pid);
+    }
+
     let mut engine = EngineRunner {
         swarm,
         peers: HashMap::new(),
-        topic: gossipsub::IdentTopic::new(&effective_topic),
         db,
         change_tx,
         registry,
@@ -282,8 +284,11 @@ async fn run_engine(
         config,
         local_db_version,
         peer_db_versions: HashMap::new(),
+        peer_reported_versions: HashMap::new(),
         snapshot_resp_tx,
         snapshot_resp_rx,
+        remote_changeset_tx,
+        remote_changeset_rx,
         registry_ready,
         registry_is_ready: false,
         cmd_rx,
@@ -295,6 +300,7 @@ async fn run_engine(
         rendezvous_registered: false,
         bootstrap_peers: std::collections::HashSet::new(),
         rejected_peers: std::collections::HashSet::new(),
+        infrastructure_peers,
         pending_sync_peers: std::collections::HashSet::new(),
         push_token,
         push_registered: false,
@@ -334,7 +340,6 @@ enum NatStatus {
 struct EngineRunner {
     swarm: libp2p::Swarm<WaveSyncBehaviour>,
     peers: HashMap<libp2p::PeerId, libp2p::Multiaddr>,
-    topic: IdentTopic,
     db: DatabaseConnection,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
@@ -344,6 +349,8 @@ struct EngineRunner {
     config: EngineConfig,
     local_db_version: u64,
     peer_db_versions: HashMap<libp2p::PeerId, u64>,
+    /// Display-only peer versions from incoming requests (NOT used for sync decisions).
+    peer_reported_versions: HashMap<libp2p::PeerId, u64>,
     snapshot_resp_tx: mpsc::Sender<(
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
@@ -352,6 +359,9 @@ struct EngineRunner {
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
     )>,
+    /// Channel for queuing remote changesets to be applied sequentially.
+    remote_changeset_tx: mpsc::Sender<Vec<ColumnChange>>,
+    remote_changeset_rx: mpsc::Receiver<Vec<ColumnChange>>,
     registry_ready: Arc<Notify>,
     registry_is_ready: bool,
     cmd_rx: mpsc::Receiver<EngineCommand>,
@@ -370,6 +380,8 @@ struct EngineRunner {
     bootstrap_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers rejected due to topic mismatch — never re-add via mDNS.
     rejected_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Infrastructure peers (relay, rendezvous) — excluded from peer count and sync fan-out.
+    infrastructure_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers with an in-flight sync request — prevents flooding request-response.
     pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Push notification token to register with relay: (platform, device_token).
@@ -392,10 +404,12 @@ impl EngineRunner {
         let connected_peers = self
             .peers
             .iter()
+            .filter(|(peer_id, _)| !self.infrastructure_peers.contains(peer_id))
             .map(|(peer_id, addr)| ns::PeerInfo {
                 peer_id: ns::PeerId(peer_id.to_string()),
                 address: addr.to_string(),
-                db_version: self.peer_db_versions.get(peer_id).copied(),
+                db_version: self.peer_db_versions.get(peer_id).copied()
+                    .or_else(|| self.peer_reported_versions.get(peer_id).copied()),
                 is_bootstrap: self.bootstrap_peers.contains(peer_id),
                 is_group_member: !self.rejected_peers.contains(peer_id),
             })
@@ -459,11 +473,6 @@ impl EngineRunner {
             }
         }
 
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&self.topic)?;
-
         // If a relay server is configured, dial it
         if let Some(ref relay_addr) = self.config.relay_server.clone() {
             if let Err(e) = self.swarm.dial(relay_addr.clone()) {
@@ -471,11 +480,9 @@ impl EngineRunner {
             } else {
                 log::info!("Dialing relay server: {}", relay_addr);
                 self.relay_state = RelayState::Connecting { retry_count: 0 };
-                self.emit_network_event(
-                    crate::network_status::NetworkEvent::RelayStatusChanged(
-                        crate::network_status::RelayStatus::Connecting,
-                    ),
-                );
+                self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+                    crate::network_status::RelayStatus::Connecting,
+                ));
                 self.update_network_status();
             }
         }
@@ -560,6 +567,9 @@ impl EngineRunner {
                         log::error!("Failed to send sync response: {:?}", resp);
                     }
                 },
+                Some(changes) = self.remote_changeset_rx.recv() => {
+                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &changes).await;
+                },
                 _ = self.registry_ready.notified(), if !self.registry_is_ready => {
                     self.registry_is_ready = true;
                     self.update_network_status();
@@ -606,6 +616,7 @@ impl EngineRunner {
                 log::info!("Full sync requested by user");
                 // Reset peer versions to trigger full re-sync
                 self.peer_db_versions.clear();
+                self.peer_reported_versions.clear();
                 self.pending_sync_peers.clear();
                 self.trigger_rediscovery();
                 if self.config.relay_server.is_some() {
@@ -661,8 +672,7 @@ impl EngineRunner {
         self.sync_all_known_peers().await;
 
         // 5. Schedule a delayed retry to catch peers rediscovered via mDNS/rendezvous
-        self.resume_sync_deadline =
-            Some(tokio::time::Instant::now() + Duration::from_secs(2));
+        self.resume_sync_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
     }
 
     async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
@@ -670,50 +680,52 @@ impl EngineRunner {
         self.local_db_version = self.local_db_version.max(changeset.db_version);
         self.update_network_status();
 
-        let msg = SyncMessage::Changeset(changeset);
-        let hmac = match &self.group_key {
-            Some(gk) => {
-                let inner_bytes = match serde_json::to_vec(&msg) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::error!("Failed to serialize changeset: {}", e);
-                        return;
-                    }
-                };
-                Some(gk.mac(&inner_bytes))
-            }
-            None => None,
-        };
-        let wrapper = AuthenticatedMessage { inner: msg, hmac };
-        match serde_json::to_vec(&wrapper) {
-            Ok(data) => {
-                const MAX_GOSSIPSUB_MSG_SIZE: usize = 1024 * 1024;
-                if data.len() > MAX_GOSSIPSUB_MSG_SIZE {
-                    log::warn!(
-                        "Dropping oversized gossipsub message ({} bytes, max {})",
-                        data.len(),
-                        MAX_GOSSIPSUB_MSG_SIZE
-                    );
-                    return;
-                }
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .publish(self.topic.clone(), data)
-                {
-                    log::warn!("Failed to publish to gossipsub: {}", e);
-                    self.trigger_rediscovery();
-                    self.sync_all_known_peers().await;
-                } else {
-                    // Notify relay to send push notifications to sleeping mobile peers
-                    self.notify_relay_topic();
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to serialize changeset: {}", e);
-            }
+        // Fan-out: push changeset to all connected peers via request-response
+        let peer_ids: Vec<libp2p::PeerId> = self
+            .peers
+            .keys()
+            .filter(|p| !self.rejected_peers.contains(p))
+            .filter(|p| !self.infrastructure_peers.contains(p))
+            .cloned()
+            .collect();
+
+        if peer_ids.is_empty() {
+            log::debug!("No peers to push changeset to");
+            return;
         }
+
+        for peer_id in &peer_ids {
+            let mut req = SyncRequest::Push {
+                changeset: changeset.clone(),
+                topic: self.topic_name.clone(),
+                hmac: None,
+            };
+
+            if let Some(ref gk) = self.group_key {
+                // Serialize with hmac: None, compute MAC, then set hmac
+                if let Ok(bytes) = serde_json::to_vec(&req) {
+                    let tag = gk.mac(&bytes);
+                    let SyncRequest::Push { ref mut hmac, .. } = req else {
+                        unreachable!()
+                    };
+                    *hmac = Some(tag);
+                }
+            }
+
+            self.swarm
+                .behaviour_mut()
+                .snapshot
+                .send_request(peer_id, req);
+        }
+
+        log::info!(
+            "Pushed changeset (db_version={}) to {} peers",
+            changeset.db_version,
+            peer_ids.len()
+        );
+
+        // Notify relay to send push notifications to sleeping mobile peers
+        self.notify_relay_topic();
     }
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
@@ -741,9 +753,7 @@ impl EngineRunner {
                     if matches!(self.relay_state, RelayState::Connecting { .. })
                         && let Some(ref relay_addr) = self.config.relay_server
                     {
-                        log::info!(
-                            "New listen address detected, attempting relay reconnection"
-                        );
+                        log::info!("New listen address detected, attempting relay reconnection");
                         if let Err(e) = self.swarm.dial(relay_addr.clone()) {
                             log::warn!("Relay redial on new address failed: {e}");
                         }
@@ -770,9 +780,6 @@ impl EngineRunner {
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mdns(event)) => {
                 self.handle_mdns(event);
-            }
-            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Gossipsub(event)) => {
-                self.handle_gossipsub(event);
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Snapshot(event)) => {
                 self.handle_snapshot(event);
@@ -804,6 +811,7 @@ impl EngineRunner {
                     && peer_id == relay_peer_id
                 {
                     log::info!("Connected to relay server {peer_id}");
+                    self.infrastructure_peers.insert(peer_id);
                     self.relay_state = RelayState::Connected {
                         relay_peer_id: peer_id,
                     };
@@ -838,6 +846,7 @@ impl EngineRunner {
                     && peer_id == rv_peer_id
                 {
                     log::info!("Connected to rendezvous server {peer_id}");
+                    self.infrastructure_peers.insert(peer_id);
                     self.rendezvous_discover();
                 }
 
@@ -845,10 +854,6 @@ impl EngineRunner {
                 if self.bootstrap_peers.contains(&peer_id) {
                     let addr = endpoint.get_remote_address().clone();
                     self.peers.insert(peer_id, addr.clone());
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .add_explicit_peer(&peer_id);
 
                     self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
                         crate::network_status::PeerInfo {
@@ -868,7 +873,10 @@ impl EngineRunner {
                     });
                 }
 
-                if self.registry_is_ready && !self.rejected_peers.contains(&peer_id) {
+                if self.registry_is_ready
+                    && !self.rejected_peers.contains(&peer_id)
+                    && !self.infrastructure_peers.contains(&peer_id)
+                {
                     // Ensure reconnecting peer is tracked for future periodic syncs
                     // (may have been removed by mDNS Expired or never added for inbound connections)
                     self.peers
@@ -952,6 +960,18 @@ impl EngineRunner {
                         self.update_network_status();
                     }
                 }
+
+                // When a non-infrastructure peer fully disconnects and has sync history,
+                // immediately try rendezvous discovery to find them via WAN
+                if num_established == 0
+                    && !self.infrastructure_peers.contains(&peer_id)
+                    && self.peer_db_versions.contains_key(&peer_id)
+                {
+                    log::info!(
+                        "Peer {peer_id} disconnected with sync history, triggering rendezvous discover"
+                    );
+                    self.rendezvous_discover();
+                }
             }
             SwarmEvent::ListenerClosed { reason, .. } => {
                 if let Err(ref e) = reason {
@@ -977,25 +997,24 @@ impl EngineRunner {
                         }
                     }
                 }
-                // Re-subscribe to gossipsub topic to restore protocol advertisement
-                // in case the listener closure removed it
-                if let Err(e) =
-                    self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic)
-                {
-                    log::warn!("Failed to re-subscribe gossipsub topic: {e}");
-                }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 log::warn!("Listen address expired: {address}");
-                // Re-subscribe gossipsub to restore protocol advertisement
-                if let Err(e) =
-                    self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic)
-                {
-                    log::warn!("Failed to re-subscribe gossipsub topic: {e}");
-                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 log::warn!("Outgoing connection error to {peer_id:?}: {error}");
+                if let Some(pid) = peer_id
+                    && !self.swarm.is_connected(&pid)
+                    && self.peers.remove(&pid).is_some()
+                {
+                    self.pending_sync_peers.remove(&pid);
+                    self.emit_network_event(
+                        crate::network_status::NetworkEvent::PeerDisconnected(
+                            crate::network_status::PeerId(pid.to_string()),
+                        ),
+                    );
+                    self.update_network_status();
+                }
             }
             _ => {}
         }
@@ -1008,7 +1027,12 @@ impl EngineRunner {
             .await
             .unwrap_or(self.local_db_version);
 
-        let peer_ids: Vec<libp2p::PeerId> = self.peers.keys().cloned().collect();
+        let peer_ids: Vec<libp2p::PeerId> = self
+            .peers
+            .keys()
+            .filter(|p| !self.infrastructure_peers.contains(p))
+            .cloned()
+            .collect();
         for peer_id in peer_ids {
             self.initiate_sync_for_peer(peer_id);
         }
@@ -1019,6 +1043,9 @@ impl EngineRunner {
             return;
         }
         if self.rejected_peers.contains(&peer_id) {
+            return;
+        }
+        if self.infrastructure_peers.contains(&peer_id) {
             return;
         }
 
@@ -1040,8 +1067,9 @@ impl EngineRunner {
             // Serialize with hmac: None, compute MAC, then set hmac
             if let Ok(bytes) = serde_json::to_vec(&req) {
                 let tag = gk.mac(&bytes);
-                let SyncRequest::VersionVector { ref mut hmac, .. } = req;
-                *hmac = Some(tag);
+                if let SyncRequest::VersionVector { ref mut hmac, .. } = req {
+                    *hmac = Some(tag);
+                }
             }
         }
 
@@ -1080,10 +1108,6 @@ impl EngineRunner {
                         log::warn!("Failed to dial peer {peer_id}: {e}");
                     }
                     self.peers.insert(peer_id, multiaddr.clone());
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .add_explicit_peer(&peer_id);
 
                     self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
                         crate::network_status::PeerInfo {
@@ -1112,12 +1136,7 @@ impl EngineRunner {
                 for (peer_id, multiaddr) in list {
                     log::debug!("Expired peer {peer_id} at {multiaddr}");
                     self.peers.remove(&peer_id);
-                    self.peer_db_versions.remove(&peer_id);
                     self.pending_sync_peers.remove(&peer_id);
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer_id);
                     self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
                         crate::network_status::PeerId(peer_id.to_string()),
                     ));
@@ -1127,93 +1146,14 @@ impl EngineRunner {
         }
     }
 
-    fn handle_gossipsub(&mut self, event: gossipsub::Event) {
-        match event {
-            gossipsub::Event::Message {
-                propagation_source,
-                message_id,
-                message,
-            } => {
-                log::info!(
-                    "Received message on topic {} from peer {propagation_source:?}: {message_id:?}",
-                    message.topic
-                );
-
-                let auth_msg: AuthenticatedMessage = match serde_json::from_slice(&message.data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to deserialize message from peer {}: {}",
-                            propagation_source,
-                            e
-                        );
-                        return;
-                    }
-                };
-
-                // Verify HMAC if group key is configured
-                if let Some(ref gk) = self.group_key {
-                    let tag = match auth_msg.hmac {
-                        Some(t) => t,
-                        None => {
-                            log::debug!(
-                                "Rejecting unauthenticated gossipsub message from peer {}",
-                                propagation_source
-                            );
-                            return;
-                        }
-                    };
-                    let inner_bytes = match serde_json::to_vec(&auth_msg.inner) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            log::error!("Failed to re-serialize inner message: {}", e);
-                            return;
-                        }
-                    };
-                    if !gk.verify(&inner_bytes, &tag) {
-                        log::debug!(
-                            "Rejecting gossipsub message with invalid HMAC from peer {}",
-                            propagation_source
-                        );
-                        return;
-                    }
-                }
-
-                match auth_msg.inner {
-                    SyncMessage::Changeset(changeset) => {
-                        log::info!(
-                            "Received changeset from peer {} with {} changes at db_version {}",
-                            propagation_source,
-                            changeset.changes.len(),
-                            changeset.db_version,
-                        );
-
-                        let db = self.db.clone();
-                        let change_tx = self.change_tx.clone();
-                        let registry = self.registry.clone();
-                        tokio::spawn(async move {
-                            apply_remote_changeset(&db, &change_tx, &registry, &changeset.changes)
-                                .await;
-                        });
-                    }
-                }
-            }
-            _ => {
-                log::debug!("Other gossipsub event: {:?}", event);
-            }
-        }
-    }
-
     fn handle_relay_client(&mut self, event: relay::client::Event) {
         match event {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
                 log::info!("Relay reservation accepted by {relay_peer_id}");
                 self.relay_state = RelayState::Listening { relay_peer_id };
-                self.emit_network_event(
-                    crate::network_status::NetworkEvent::RelayStatusChanged(
-                        crate::network_status::RelayStatus::Listening,
-                    ),
-                );
+                self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+                    crate::network_status::RelayStatus::Listening,
+                ));
                 self.update_network_status();
             }
             _ => {
@@ -1245,11 +1185,9 @@ impl EngineRunner {
                 let changed = self.nat_status != NatStatus::Public;
                 self.nat_status = NatStatus::Public;
                 if changed {
-                    self.emit_network_event(
-                        crate::network_status::NetworkEvent::NatStatusChanged(
-                            crate::network_status::NatStatus::Public,
-                        ),
-                    );
+                    self.emit_network_event(crate::network_status::NetworkEvent::NatStatusChanged(
+                        crate::network_status::NatStatus::Public,
+                    ));
                     self.update_network_status();
                 }
             }
@@ -1262,11 +1200,9 @@ impl EngineRunner {
                 let changed = self.nat_status != NatStatus::Private;
                 self.nat_status = NatStatus::Private;
                 if changed {
-                    self.emit_network_event(
-                        crate::network_status::NetworkEvent::NatStatusChanged(
-                            crate::network_status::NatStatus::Private,
-                        ),
-                    );
+                    self.emit_network_event(crate::network_status::NetworkEvent::NatStatusChanged(
+                        crate::network_status::NatStatus::Private,
+                    ));
                     self.update_network_status();
                 }
                 // Relay circuit is now requested eagerly on ConnectionEstablished,
@@ -1329,37 +1265,11 @@ impl EngineRunner {
 
                     for addr in registration.record.addresses() {
                         log::info!("Rendezvous discovered peer {peer_id} at {addr}");
-                        if !self.swarm.is_connected(&peer_id)
-                            && let Err(e) = self.swarm.dial(addr.clone())
-                        {
-                            log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
-                        }
-                        self.peers.insert(peer_id, addr.clone());
-                        self.swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .add_explicit_peer(&peer_id);
-
-                        self.emit_network_event(
-                            crate::network_status::NetworkEvent::PeerConnected(
-                                crate::network_status::PeerInfo {
-                                    peer_id: crate::network_status::PeerId(peer_id.to_string()),
-                                    address: addr.to_string(),
-                                    db_version: None,
-                                    is_bootstrap: false,
-                                    is_group_member: true,
-                                },
-                            ),
-                        );
-                        self.update_network_status();
-
-                        let db = self.db.clone();
-                        let peer_str = peer_id.to_string();
-                        tokio::spawn(async move {
-                            let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
-                        });
-
-                        if self.registry_is_ready && self.swarm.is_connected(&peer_id) {
+                        if !self.swarm.is_connected(&peer_id) {
+                            if let Err(e) = self.swarm.dial(addr.clone()) {
+                                log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
+                            }
+                        } else if self.registry_is_ready {
                             self.initiate_sync_for_peer(peer_id);
                         }
                     }
@@ -1540,10 +1450,7 @@ impl EngineRunner {
                                 self.pending_sync_peers.remove(&peer);
                                 self.peers.remove(&peer);
                                 self.peer_db_versions.remove(&peer);
-                                self.swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .remove_explicit_peer(&peer);
+                                self.peer_reported_versions.remove(&peer);
                                 self.emit_network_event(
                                     crate::network_status::NetworkEvent::PeerRejected(
                                         crate::network_status::PeerId(peer.to_string()),
@@ -1559,6 +1466,11 @@ impl EngineRunner {
                             // the response handler where we actually receive and process
                             // changes. Updating here would cause us to skip changes in the
                             // next sync request (your_last_db_version would be too high).
+                            //
+                            // However, track in peer_reported_versions for display purposes.
+                            let reported = self.peer_reported_versions.entry(peer).or_insert(0);
+                            *reported = (*reported).max(my_db_version);
+
                             self.emit_network_event(
                                 crate::network_status::NetworkEvent::PeerSynced {
                                     peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -1611,11 +1523,13 @@ impl EngineRunner {
                                     && let Ok(bytes) = serde_json::to_vec(&resp)
                                 {
                                     let tag = gk.mac(&bytes);
-                                    let crate::protocol::SyncResponse::ChangesetResponse {
+                                    if let crate::protocol::SyncResponse::ChangesetResponse {
                                         ref mut hmac,
                                         ..
-                                    } = resp;
-                                    *hmac = Some(tag);
+                                    } = resp
+                                    {
+                                        *hmac = Some(tag);
+                                    }
                                 }
 
                                 if let Err(e) = resp_tx.send((channel, resp)).await {
@@ -1633,6 +1547,84 @@ impl EngineRunner {
 
                                 let _ = change_tx; // keep alive
                             });
+                        }
+                        SyncRequest::Push {
+                            changeset,
+                            topic: peer_topic,
+                            hmac: req_hmac,
+                        } => {
+                            // Verify HMAC if group key is configured
+                            if let Some(ref gk) = self.group_key {
+                                let tag = match req_hmac {
+                                    Some(t) => t,
+                                    None => {
+                                        log::debug!(
+                                            "Rejecting unauthenticated push from peer {peer}"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let verify_req = SyncRequest::Push {
+                                    changeset: changeset.clone(),
+                                    topic: peer_topic.clone(),
+                                    hmac: None,
+                                };
+                                if let Ok(bytes) = serde_json::to_vec(&verify_req)
+                                    && !gk.verify(&bytes, &tag)
+                                {
+                                    log::debug!(
+                                        "Rejecting push with invalid HMAC from peer {peer}"
+                                    );
+                                    return;
+                                }
+                            }
+
+                            // Reject pushes from peers on a different topic
+                            if !peer_topic.is_empty() && peer_topic != self.topic_name {
+                                log::debug!(
+                                    "Ignoring push from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
+                                    self.topic_name
+                                );
+                                self.rejected_peers.insert(peer);
+                                self.peers.remove(&peer);
+                                self.peer_db_versions.remove(&peer);
+                                self.peer_reported_versions.remove(&peer);
+                                self.emit_network_event(
+                                    crate::network_status::NetworkEvent::PeerRejected(
+                                        crate::network_status::PeerId(peer.to_string()),
+                                    ),
+                                );
+                                self.update_network_status();
+                                return;
+                            }
+
+                            // Track peer's db_version (use max to avoid overwriting with stale values)
+                            let entry = self.peer_db_versions.entry(peer).or_insert(0);
+                            *entry = (*entry).max(changeset.db_version);
+                            let reported = self.peer_reported_versions.entry(peer).or_insert(0);
+                            *reported = (*reported).max(changeset.db_version);
+
+                            log::info!(
+                                "Received push from peer {peer} with {} changes at db_version {}",
+                                changeset.changes.len(),
+                                changeset.db_version,
+                            );
+
+                            // Send PushAck immediately via response channel
+                            let resp_tx = self.snapshot_resp_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = resp_tx
+                                    .send((channel, crate::protocol::SyncResponse::PushAck))
+                                    .await
+                                {
+                                    log::error!("Failed to send PushAck: {e}");
+                                }
+                            });
+
+                            // Queue changeset for sequential application in the main loop
+                            if let Err(e) = self.remote_changeset_tx.try_send(changeset.changes) {
+                                log::warn!("Remote changeset queue full, dropping push: {e}");
+                            }
                         }
                     }
                 }
@@ -1690,10 +1682,7 @@ impl EngineRunner {
                                 self.pending_sync_peers.remove(&peer);
                                 self.peers.remove(&peer);
                                 self.peer_db_versions.remove(&peer);
-                                self.swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .remove_explicit_peer(&peer);
+                                self.peer_reported_versions.remove(&peer);
                                 self.emit_network_event(
                                     crate::network_status::NetworkEvent::PeerRejected(
                                         crate::network_status::PeerId(peer.to_string()),
@@ -1705,6 +1694,8 @@ impl EngineRunner {
 
                             // Update our knowledge of this peer's version
                             self.peer_db_versions.insert(peer, my_db_version);
+                            let reported = self.peer_reported_versions.entry(peer).or_insert(0);
+                            *reported = (*reported).max(my_db_version);
                             self.emit_network_event(
                                 crate::network_status::NetworkEvent::PeerSynced {
                                     peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -1739,9 +1730,9 @@ impl EngineRunner {
                                     my_db_version,
                                 );
 
+                                // Persist Lamport bump and peer version in a spawned task,
+                                // but queue changeset for sequential application in main loop.
                                 let db = self.db.clone();
-                                let change_tx = self.change_tx.clone();
-                                let registry = self.registry.clone();
                                 let peer_str = peer.to_string();
                                 tokio::spawn(async move {
                                     // Persist Lamport bump BEFORE applying changes so
@@ -1749,9 +1740,6 @@ impl EngineRunner {
                                     if lamport_bump {
                                         let _ = shadow::set_db_version(&db, my_db_version).await;
                                     }
-
-                                    apply_remote_changeset(&db, &change_tx, &registry, &changes)
-                                        .await;
 
                                     // Persist peer version
                                     let _ = peer_tracker::upsert_peer_version(
@@ -1762,7 +1750,16 @@ impl EngineRunner {
                                     )
                                     .await;
                                 });
+
+                                if let Err(e) = self.remote_changeset_tx.try_send(changes) {
+                                    log::warn!(
+                                        "Remote changeset queue full, dropping sync response: {e}"
+                                    );
+                                }
                             }
+                        }
+                        crate::protocol::SyncResponse::PushAck => {
+                            log::debug!("Received PushAck from peer {peer}");
                         }
                     }
                 }
@@ -1842,7 +1839,7 @@ impl EngineRunner {
         log::info!("Sent push token registration to relay {relay_peer_id}");
     }
 
-    /// Send a NotifyTopic request to the relay after successful gossipsub publish.
+    /// Send a NotifyTopic request to the relay after pushing changesets to peers.
     fn notify_relay_topic(&mut self) {
         let relay_peer_id = match &self.relay_state {
             RelayState::Connected { relay_peer_id } | RelayState::Listening { relay_peer_id } => {
@@ -1971,14 +1968,9 @@ async fn apply_remote_changeset(
                     change.col_version > local_cv
                 } else {
                     // Tied col_version — need local value bytes for deterministic tiebreak
-                    let local_val_bytes = get_local_value_bytes(
-                        db,
-                        table,
-                        &meta.primary_key_column,
-                        pk,
-                        &change.cid,
-                    )
-                    .await;
+                    let local_val_bytes =
+                        get_local_value_bytes(db, table, &meta.primary_key_column, pk, &change.cid)
+                            .await;
                     conflict::should_apply_column(
                         change.col_version,
                         &remote_val_bytes,
@@ -2487,7 +2479,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let title: String = result.try_get_by_index(0).unwrap();
-        assert_eq!(title, "Local", "Lower version remote should not overwrite local");
+        assert_eq!(
+            title, "Local",
+            "Lower version remote should not overwrite local"
+        );
     }
 
     #[tokio::test]
@@ -2576,8 +2571,14 @@ mod tests {
 
         // Row should still exist
         let exists = row_exists(&db, "tasks", "id", "dlcl-1").await;
-        assert!(exists, "Row should NOT be deleted when remote cl < local max cv");
-        assert!(rx.try_recv().is_err(), "No notification for rejected delete");
+        assert!(
+            exists,
+            "Row should NOT be deleted when remote cl < local max cv"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "No notification for rejected delete"
+        );
     }
 
     #[tokio::test]
@@ -2718,7 +2719,10 @@ mod tests {
         ];
         apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
 
-        assert!(row_exists(&db, "tasks", "id", "iad-1").await, "Row should reappear after re-insert");
+        assert!(
+            row_exists(&db, "tasks", "id", "iad-1").await,
+            "Row should reappear after re-insert"
+        );
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Sqlite,
@@ -2837,19 +2841,17 @@ mod tests {
             .unwrap();
 
         // B's changes arrive at A (same col_version=1, different value)
-        let b_changes = vec![
-            ColumnChange {
-                table: "tasks".to_string(),
-                pk: "tied-1".to_string(),
-                cid: "title".to_string(),
-                val: Some(serde_json::json!("B-value")),
-                site_id: site_b,
-                col_version: 1,
-                cl: 1,
-                seq: 1,
-                db_version: 0,
-            },
-        ];
+        let b_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "tied-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("B-value")),
+            site_id: site_b,
+            col_version: 1,
+            cl: 1,
+            seq: 1,
+            db_version: 0,
+        }];
         apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes).await;
 
         // Simulate Peer B's DB: has B's data locally, receives A's data
@@ -2871,19 +2873,17 @@ mod tests {
             .unwrap();
 
         // A's changes arrive at B
-        let a_changes = vec![
-            ColumnChange {
-                table: "tasks".to_string(),
-                pk: "tied-1".to_string(),
-                cid: "title".to_string(),
-                val: Some(serde_json::json!("A-value")),
-                site_id: site_a,
-                col_version: 1,
-                cl: 1,
-                seq: 1,
-                db_version: 0,
-            },
-        ];
+        let a_changes = vec![ColumnChange {
+            table: "tasks".to_string(),
+            pk: "tied-1".to_string(),
+            cid: "title".to_string(),
+            val: Some(serde_json::json!("A-value")),
+            site_id: site_a,
+            col_version: 1,
+            cl: 1,
+            seq: 1,
+            db_version: 0,
+        }];
         apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes).await;
 
         // Both peers should converge to the same value
@@ -3052,10 +3052,9 @@ mod tests {
         );
 
         // Shadow should be clean (no entries for this row)
-        let (cv, _) =
-            crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
-                .await
-                .unwrap();
+        let (cv, _) = crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
+            .await
+            .unwrap();
         assert_eq!(cv, 0, "Shadow should be clean after failed INSERT");
 
         // No notification should have been sent
@@ -3123,10 +3122,9 @@ mod tests {
         );
 
         // Shadow should now be populated with cv=1
-        let (cv, _) =
-            crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
-                .await
-                .unwrap();
+        let (cv, _) = crate::shadow::get_col_version_with_site(&db, "tasks", "ooo-1", "title")
+            .await
+            .unwrap();
         assert_eq!(cv, 1, "Shadow should have cv=1 from the INSERT");
 
         // Notification should have been sent for the INSERT

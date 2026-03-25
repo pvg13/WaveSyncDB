@@ -12,7 +12,7 @@ use libp2p::request_response;
 use crate::protocol::{SyncRequest, SyncResponse};
 
 /// Protocol identifier for the sync protocol.
-pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/2.0.0");
+pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/3.0.0");
 
 /// Codec for serializing/deserializing sync messages.
 #[derive(Debug, Clone, Default)]
@@ -160,6 +160,7 @@ mod tests {
                 assert_eq!(my_db_version, 42);
                 assert_eq!(your_last_db_version, 10);
             }
+            _ => panic!("Expected VersionVector"),
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
                 assert_eq!(my_db_version, 100);
                 assert_eq!(your_last_db_version, 50);
             }
+            _ => panic!("Expected ChangesetResponse"),
         }
     }
 

@@ -5,8 +5,8 @@ use std::time::Duration;
 use uuid::Uuid;
 use wavesyncdb::WaveSyncDbBuilder;
 
-use common::{assert_eventually, make_peer, mem_db};
 use common::task;
+use common::{assert_eventually, make_peer, mem_db};
 
 // ---------------------------------------------------------------------------
 // H3 regression: multi-row INSERT only syncs first PK
@@ -17,11 +17,7 @@ async fn test_h3_multi_row_insert_sync() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 
@@ -61,11 +57,7 @@ async fn test_h5_update_pk_with_spaces() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let pk = "hello world";
 
@@ -112,11 +104,7 @@ async fn test_h7_broadcast_overflow() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let mut rx = db.change_rx();
 
@@ -161,11 +149,7 @@ async fn test_n3_delete_reinsert_preserves_col_version() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let pk = "n3-pk";
 
@@ -239,11 +223,7 @@ async fn test_m12_update_with_unicode_column_values() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     let pk = "m12-pk";
     task::ActiveModel {

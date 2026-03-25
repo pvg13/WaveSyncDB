@@ -1,15 +1,15 @@
 //! Peer group authentication via PSK-derived topic isolation and HMAC verification.
 //!
 //! Two layers, both derived from a single user-supplied passphrase:
-//! 1. **Gossipsub topic isolation** — derive topic name from BLAKE3 hash so different
+//! 1. **Topic isolation** — derive topic name from BLAKE3 hash so different
 //!    passphrases yield different topics and peers never see each other's messages.
-//! 2. **HMAC on all messages** — gossipsub payloads and request-response messages carry
-//!    a BLAKE3-keyed MAC. Peers without the PSK cannot forge or inject valid messages.
+//! 2. **HMAC on all messages** — request-response messages carry a BLAKE3-keyed MAC.
+//!    Peers without the PSK cannot forge or inject valid messages.
 
 /// A group authentication key derived from a user-supplied passphrase.
 ///
 /// All peers sharing the same passphrase will derive the same `GroupKey`,
-/// enabling them to join the same gossipsub topic and verify each other's messages.
+/// enabling them to join the same sync topic and verify each other's messages.
 #[derive(Clone)]
 pub struct GroupKey([u8; 32]);
 
@@ -20,10 +20,10 @@ impl GroupKey {
         Self(key)
     }
 
-    /// Derive a gossipsub topic name from the user topic and this group key.
+    /// Derive a sync topic name from the user topic and this group key.
     ///
     /// Different passphrases produce different topic names, providing topic-level
-    /// isolation so peers in different groups never see each other's gossipsub messages.
+    /// isolation so peers in different groups never see each other's messages.
     pub fn derive_topic(&self, user_topic: &str) -> String {
         let mut hasher = blake3::Hasher::new_derive_key("wavesyncdb-topic-v1");
         hasher.update(user_topic.as_bytes());

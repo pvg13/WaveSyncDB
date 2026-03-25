@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::messages::{ColumnChange, NodeId};
+use crate::messages::{ColumnChange, NodeId, SyncChangeset};
 
 /// A sync request sent by a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,8 +19,18 @@ pub enum SyncRequest {
         your_last_db_version: u64,
         /// The requesting peer's site_id.
         site_id: NodeId,
-        /// The gossipsub topic name — requests with a mismatched topic are rejected.
+        /// The sync topic name — requests with a mismatched topic are rejected.
         #[serde(default)]
+        topic: String,
+        /// HMAC tag for group authentication (present when a passphrase is configured).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
+    /// Push a changeset directly to a peer (fan-out from local writes).
+    Push {
+        /// The changeset to apply.
+        changeset: SyncChangeset,
+        /// The sync topic name — requests with a mismatched topic are rejected.
         topic: String,
         /// HMAC tag for group authentication (present when a passphrase is configured).
         #[serde(default)]
@@ -41,13 +51,15 @@ pub enum SyncResponse {
         your_last_db_version: u64,
         /// The responder's site_id.
         site_id: NodeId,
-        /// The gossipsub topic name — responses with a mismatched topic are ignored.
+        /// The sync topic name — responses with a mismatched topic are ignored.
         #[serde(default)]
         topic: String,
         /// HMAC tag for group authentication (present when a passphrase is configured).
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
+    /// Acknowledgement for a [`SyncRequest::Push`].
+    PushAck,
 }
 
 #[cfg(test)]
@@ -78,6 +90,7 @@ mod tests {
                 assert_eq!(topic, "my-topic");
                 assert_eq!(hmac, Some([0xAB; 32]));
             }
+            _ => panic!("Expected VersionVector"),
         }
     }
 
@@ -112,6 +125,7 @@ mod tests {
                 assert_eq!(changes.len(), 1);
                 assert_eq!(my_db_version, 20);
             }
+            _ => panic!("Expected ChangesetResponse"),
         }
     }
 
@@ -125,6 +139,7 @@ mod tests {
                 assert_eq!(topic, "", "Missing topic should default to empty string");
                 assert_eq!(hmac, None, "Missing hmac should default to None");
             }
+            _ => panic!("Expected VersionVector"),
         }
     }
 
@@ -144,6 +159,43 @@ mod tests {
             SyncResponse::ChangesetResponse { changes, .. } => {
                 assert!(changes.is_empty());
             }
+            _ => panic!("Expected ChangesetResponse"),
         }
+    }
+
+    #[test]
+    fn test_sync_request_push_roundtrip() {
+        use crate::messages::SyncChangeset;
+        let req = SyncRequest::Push {
+            changeset: SyncChangeset {
+                site_id: [5u8; 16],
+                db_version: 7,
+                changes: vec![],
+            },
+            topic: "push-topic".to_string(),
+            hmac: Some([0xCD; 32]),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: SyncRequest = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            SyncRequest::Push {
+                changeset,
+                topic,
+                hmac,
+            } => {
+                assert_eq!(changeset.db_version, 7);
+                assert_eq!(topic, "push-topic");
+                assert_eq!(hmac, Some([0xCD; 32]));
+            }
+            _ => panic!("Expected Push"),
+        }
+    }
+
+    #[test]
+    fn test_sync_response_push_ack_roundtrip() {
+        let resp = SyncResponse::PushAck;
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: SyncResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, SyncResponse::PushAck));
     }
 }
