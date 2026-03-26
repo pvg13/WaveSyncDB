@@ -330,6 +330,7 @@ async fn run_engine(
         keypair,
         nat_assumption_deadline: None,
         circuit_accepted_at: None,
+        circuit_retry_count: 0,
     };
 
     // Set initial network status with local_peer_id and topic
@@ -346,8 +347,11 @@ enum RelayState {
     Disabled,
     /// Connecting to relay server (with retry count for backoff).
     Connecting { retry_count: u32 },
-    /// TCP/QUIC connection established with relay peer.
-    Connected { relay_peer_id: libp2p::PeerId },
+    /// TCP/QUIC connection established with relay peer but circuit not yet reserved.
+    Connected {
+        relay_peer_id: libp2p::PeerId,
+        connected_at: tokio::time::Instant,
+    },
     /// Listening on a relay circuit (reservation accepted).
     Listening { relay_peer_id: libp2p::PeerId },
 }
@@ -426,6 +430,8 @@ struct EngineRunner {
     nat_assumption_deadline: Option<tokio::time::Instant>,
     /// When the current relay circuit reservation was accepted (for proactive renewal).
     circuit_accepted_at: Option<tokio::time::Instant>,
+    /// Number of circuit reservation retries while stuck in `Connected` state.
+    circuit_retry_count: u32,
 }
 
 impl EngineRunner {
@@ -718,7 +724,7 @@ impl EngineRunner {
                 self.push_token = Some((platform, token));
                 self.push_registered = false;
                 // If relay is already connected, register immediately
-                if let RelayState::Connected { relay_peer_id }
+                if let RelayState::Connected { relay_peer_id, .. }
                 | RelayState::Listening { relay_peer_id } = self.relay_state
                 {
                     self.maybe_register_push_token(relay_peer_id);
@@ -735,14 +741,18 @@ impl EngineRunner {
     async fn handle_resume(&mut self) {
         log::info!("App resumed — triggering rediscovery and sync");
 
-        // Clear pending sync to allow fresh requests
+        // Clear version maps so the next sync requests all changes since the
+        // last *persisted* peer version, not stale in-memory values that may
+        // have drifted during a network transition.
+        self.peer_db_versions.clear();
+        self.peer_reported_versions.clear();
         self.pending_sync_peers.clear();
 
         // Force-disconnect relay — the TCP socket is likely dead on the old
         // network interface. ConnectionClosed handler will reset relay_state
         // and trigger reconnect.
-        if let RelayState::Connected { relay_peer_id } | RelayState::Listening { relay_peer_id } =
-            self.relay_state
+        if let RelayState::Connected { relay_peer_id, .. }
+        | RelayState::Listening { relay_peer_id } = self.relay_state
         {
             log::info!("Resume: disconnecting relay {relay_peer_id} for clean reconnection");
             let _ = self.swarm.disconnect_peer_id(relay_peer_id);
@@ -881,7 +891,7 @@ impl EngineRunner {
                     // connection, triggering ConnectionClosed → reconnect.
                     if matches!(
                         &self.relay_state,
-                        RelayState::Connected { relay_peer_id }
+                        RelayState::Connected { relay_peer_id, .. }
                         | RelayState::Listening { relay_peer_id }
                         if peer == *relay_peer_id
                     ) {
@@ -931,8 +941,10 @@ impl EngineRunner {
                 {
                     log::info!("Connected to relay server {peer_id}");
                     self.infrastructure_peers.insert(peer_id);
+                    self.circuit_retry_count = 0;
                     self.relay_state = RelayState::Connected {
                         relay_peer_id: peer_id,
+                        connected_at: tokio::time::Instant::now(),
                     };
                     self.emit_network_event(
                         crate::network_status::NetworkEvent::RelayStatusChanged(
@@ -1030,7 +1042,7 @@ impl EngineRunner {
                 // Only act on relay/rendezvous disconnect when ALL connections are gone
                 if num_established > 0 {
                     // Still have active connections to this peer — nothing to do
-                } else if let RelayState::Connected { relay_peer_id }
+                } else if let RelayState::Connected { relay_peer_id, .. }
                 | RelayState::Listening { relay_peer_id } = &self.relay_state
                     && peer_id == *relay_peer_id
                 {
@@ -1109,7 +1121,11 @@ impl EngineRunner {
                 // If relay was in Listening state, reset to Connected and re-request circuit
                 if let RelayState::Listening { relay_peer_id } = self.relay_state {
                     log::warn!("Relay listener closed, re-requesting circuit reservation");
-                    self.relay_state = RelayState::Connected { relay_peer_id };
+                    self.circuit_retry_count = 0;
+                    self.relay_state = RelayState::Connected {
+                        relay_peer_id,
+                        connected_at: tokio::time::Instant::now(),
+                    };
                     self.emit_network_event(
                         crate::network_status::NetworkEvent::RelayStatusChanged(
                             crate::network_status::RelayStatus::Connected,
@@ -1278,6 +1294,7 @@ impl EngineRunner {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
                 log::info!("Relay reservation accepted by {relay_peer_id}");
                 self.relay_state = RelayState::Listening { relay_peer_id };
+                self.circuit_retry_count = 0;
                 self.circuit_accepted_at = Some(tokio::time::Instant::now());
                 self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
                     crate::network_status::RelayStatus::Listening,
@@ -1285,7 +1302,7 @@ impl EngineRunner {
                 self.update_network_status();
             }
             _ => {
-                log::debug!("Relay client event: {:?}", event);
+                log::info!("Relay client event (non-acceptance): {:?}", event);
             }
         }
     }
@@ -1504,7 +1521,45 @@ impl EngineRunner {
                     };
                 }
             }
-            RelayState::Disabled | RelayState::Connected { .. } | RelayState::Listening { .. } => {
+            RelayState::Connected {
+                relay_peer_id,
+                connected_at,
+            } => {
+                // Circuit reservation hasn't completed — retry if stuck for >5s
+                if connected_at.elapsed() > Duration::from_secs(5) {
+                    self.circuit_retry_count += 1;
+                    if self.circuit_retry_count >= 3 {
+                        log::warn!(
+                            "Circuit reservation failed {} times, forcing full relay reconnect",
+                            self.circuit_retry_count
+                        );
+                        let pid = *relay_peer_id;
+                        self.circuit_retry_count = 0;
+                        let _ = self.swarm.disconnect_peer_id(pid);
+                        // ConnectionClosed handler will reset to Connecting and trigger full reconnect
+                    } else {
+                        log::info!(
+                            "Relay stuck in Connected for >5s, retrying circuit reservation (attempt {})",
+                            self.circuit_retry_count
+                        );
+                        if let Some(ref relay_addr) = self.config.relay_server {
+                            let circuit_addr = relay_addr
+                                .clone()
+                                .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                            if let Err(e) = self.swarm.listen_on(circuit_addr) {
+                                log::warn!("Retry listen_on relay circuit failed: {e}");
+                            }
+                        }
+                        // Reset connected_at to space out retries
+                        let pid = *relay_peer_id;
+                        self.relay_state = RelayState::Connected {
+                            relay_peer_id: pid,
+                            connected_at: tokio::time::Instant::now(),
+                        };
+                    }
+                }
+            }
+            RelayState::Disabled | RelayState::Listening { .. } => {
                 // No action needed
             }
         }
@@ -2050,9 +2105,8 @@ impl EngineRunner {
     /// Send a NotifyTopic request to the relay after pushing changesets to peers.
     fn notify_relay_topic(&mut self) {
         let relay_peer_id = match &self.relay_state {
-            RelayState::Connected { relay_peer_id } | RelayState::Listening { relay_peer_id } => {
-                *relay_peer_id
-            }
+            RelayState::Connected { relay_peer_id, .. }
+            | RelayState::Listening { relay_peer_id } => *relay_peer_id,
             _ => return,
         };
 
