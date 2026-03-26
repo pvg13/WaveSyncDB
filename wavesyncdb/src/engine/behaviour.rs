@@ -1,9 +1,14 @@
+use std::time::Duration;
+
 use libp2p::{
     autonat, connection_limits, dcutr, identify, mdns, ping, relay, rendezvous, request_response,
     swarm::behaviour::toggle::Toggle,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 
+use super::auth_protocol::{
+    AUTH_CHALLENGE_PROTOCOL, AUTH_RESULT_PROTOCOL, AuthChallengeCodec, AuthResultCodec,
+};
 use super::push_protocol::{PUSH_PROTOCOL, PushCodec};
 use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
 
@@ -19,6 +24,8 @@ pub struct WaveSyncBehaviour {
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::v2::client::Behaviour,
     pub rendezvous: rendezvous::client::Behaviour,
+    pub auth: request_response::Behaviour<AuthChallengeCodec>,
+    pub auth_result: request_response::Behaviour<AuthResultCodec>,
 }
 
 impl WaveSyncBehaviour {
@@ -26,13 +33,15 @@ impl WaveSyncBehaviour {
         key: &libp2p::identity::Keypair,
         relay_client: relay::client::Behaviour,
         mdns_config: mdns::Config,
+        keep_alive_interval: Duration,
     ) -> Self {
         let identify_behaviour = identify::Behaviour::new(identify::Config::new(
             "/wavesync/2.0.0".into(),
             key.public(),
         ));
 
-        let ping_behaviour = ping::Behaviour::default();
+        let ping_behaviour =
+            ping::Behaviour::new(ping::Config::new().with_interval(keep_alive_interval));
 
         let peer_id = key.public().to_peer_id();
 
@@ -60,6 +69,22 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
+        let auth_behaviour = request_response::Behaviour::new(
+            [(
+                AUTH_CHALLENGE_PROTOCOL,
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
+        let auth_result_behaviour = request_response::Behaviour::new(
+            [(
+                AUTH_RESULT_PROTOCOL,
+                request_response::ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         let conn_limits =
             connection_limits::ConnectionLimits::default().with_max_established_per_peer(Some(1));
 
@@ -74,6 +99,8 @@ impl WaveSyncBehaviour {
             dcutr: dcutr_behaviour,
             autonat: autonat_behaviour,
             rendezvous: rendezvous_behaviour,
+            auth: auth_behaviour,
+            auth_result: auth_result_behaviour,
         }
     }
 }

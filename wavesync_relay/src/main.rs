@@ -92,6 +92,12 @@ struct Cli {
     /// Required when running behind NAT or in Docker.
     #[arg(long, env = "EXTERNAL_ADDRESS")]
     external_address: Vec<String>,
+
+    /// Idle connection timeout in seconds (default: 300).
+    /// Must be longer than the client keep-alive interval to prevent premature
+    /// disconnects. 300s works with the default 90s client ping interval.
+    #[arg(long, default_value_t = 300)]
+    idle_connection_timeout: u64,
 }
 
 #[derive(NetworkBehaviour)]
@@ -249,13 +255,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rendezvous::server::Config::default().with_min_ttl(120), // Allow 2-minute TTL for mobile clients
                 ),
                 identify,
-                ping: ping::Behaviour::default(),
+                ping: ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(90)),
+                ),
                 autonat: libp2p::autonat::v2::server::Behaviour::new(OsRng),
                 push: push_behaviour,
             }
         })?
         .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+            cfg.with_idle_connection_timeout(Duration::from_secs(cli.idle_connection_timeout))
         })
         .build();
 

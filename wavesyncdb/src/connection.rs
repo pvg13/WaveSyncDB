@@ -325,6 +325,18 @@ impl WaveSyncDb {
             .try_send(crate::engine::EngineCommand::Resume);
     }
 
+    /// Notify the engine that the network interface changed (e.g., WiFi to cellular).
+    ///
+    /// This force-disconnects all connections (including the relay) and
+    /// re-establishes them on the new network interface. More aggressive than
+    /// `resume()` — use when you know the network path has changed.
+    pub fn network_transition(&self) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::NetworkTransition);
+    }
+
     /// Request a full sync from connected peers.
     pub fn request_full_sync(&self) {
         let _ = self
@@ -976,6 +988,9 @@ pub struct WaveSyncDbBuilder {
     rendezvous_ttl: u64,
     ipv6: bool,
     push_token: Option<(String, String)>,
+    api_key: Option<String>,
+    keep_alive_interval: std::time::Duration,
+    circuit_max_duration: std::time::Duration,
 }
 
 impl WaveSyncDbBuilder {
@@ -996,6 +1011,9 @@ impl WaveSyncDbBuilder {
             rendezvous_ttl: defaults.rendezvous_ttl,
             ipv6: false,
             push_token: None,
+            api_key: None,
+            keep_alive_interval: defaults.keep_alive_interval,
+            circuit_max_duration: defaults.circuit_max_duration,
         }
     }
 
@@ -1010,6 +1028,17 @@ impl WaveSyncDbBuilder {
     /// `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
     pub fn with_relay_server(mut self, addr: &str) -> Self {
         self.relay_server = Some(addr.to_string());
+        self
+    }
+
+    /// Connect to WaveSync Cloud managed relay.
+    ///
+    /// `addr`: full multiaddr including peer ID, e.g.
+    ///   `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
+    /// `api_key`: raw API key from WaveSync Cloud, e.g. `"wsc_live_xxx"`
+    pub fn managed_relay(mut self, addr: &str, api_key: &str) -> Self {
+        self.relay_server = Some(addr.to_string());
+        self.api_key = Some(api_key.to_string());
         self
     }
 
@@ -1080,6 +1109,25 @@ impl WaveSyncDbBuilder {
         self
     }
 
+    /// Set the ping keep-alive interval (default: 90s).
+    ///
+    /// This should be shorter than the shortest CGNAT mapping timeout in the
+    /// network path (typically 2–5 min for UDP). Keeping connections alive
+    /// prevents CGNAT from silently dropping relay circuits.
+    pub fn with_keep_alive_interval(mut self, interval: std::time::Duration) -> Self {
+        self.keep_alive_interval = interval;
+        self
+    }
+
+    /// Set the maximum relay circuit duration (default: 3600s).
+    ///
+    /// Must match the relay server's `--max-circuit-duration` setting.
+    /// The engine proactively renews the circuit at 80% of this duration.
+    pub fn with_circuit_max_duration(mut self, duration: std::time::Duration) -> Self {
+        self.circuit_max_duration = duration;
+        self
+    }
+
     pub async fn build(self) -> Result<WaveSyncDb, DbErr> {
         let opts = ConnectOptions::new(&self.database_url);
         let inner = Database::connect(opts).await?;
@@ -1146,6 +1194,9 @@ impl WaveSyncDbBuilder {
             rendezvous_ttl: self.rendezvous_ttl,
             ipv6: self.ipv6,
             push_token: self.push_token,
+            api_key: self.api_key,
+            keep_alive_interval: self.keep_alive_interval,
+            circuit_max_duration: self.circuit_max_duration,
         };
 
         // Start the P2P engine in a background task

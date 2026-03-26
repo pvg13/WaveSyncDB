@@ -11,6 +11,7 @@
 //! Incoming remote changesets are applied column-by-column using per-column
 //! Lamport clocks for conflict resolution.
 
+pub(crate) mod auth_protocol;
 pub(crate) mod behaviour;
 pub(crate) mod push_protocol;
 pub(crate) mod snapshot_protocol;
@@ -42,6 +43,9 @@ use crate::shadow;
 pub enum EngineCommand {
     /// App resumed from background — clear stale peers, restart mDNS, re-sync.
     Resume,
+    /// Network interface changed (WiFi ↔ cellular) — force-disconnect all
+    /// connections and re-establish on the new interface.
+    NetworkTransition,
     /// Request a full sync from peers (user-triggered).
     RequestFullSync,
     /// Register a push notification token with the relay server.
@@ -73,6 +77,14 @@ pub struct EngineConfig {
     /// Push notification token: (platform, device_token).
     /// Platform is "Fcm" or "Apns".
     pub push_token: Option<(String, String)>,
+    /// API key for managed relay authentication.
+    pub api_key: Option<String>,
+    /// Interval for libp2p ping keep-alives (default: 90s).
+    /// Must be shorter than CGNAT mapping timeouts (typically 2–5 min for UDP).
+    pub keep_alive_interval: Duration,
+    /// Maximum relay circuit duration the server allows (default: 3600s).
+    /// The engine proactively renews at 80% of this duration.
+    pub circuit_max_duration: Duration,
 }
 
 impl Default for EngineConfig {
@@ -88,6 +100,9 @@ impl Default for EngineConfig {
             rendezvous_ttl: 300,
             ipv6: false,
             push_token: None,
+            api_key: None,
+            keep_alive_interval: Duration::from_secs(90),
+            circuit_max_duration: Duration::from_secs(3600),
         }
     }
 }
@@ -168,6 +183,7 @@ pub fn start_engine(
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: mdns::Config,
+    keep_alive_interval: Duration,
 ) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     // Try system DNS first (reads /etc/resolv.conf — works on desktop/server)
     let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
@@ -183,12 +199,13 @@ fn build_swarm(
     match system_result {
         Ok(builder) => {
             let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
             Ok(builder
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
                 .with_behaviour(move |key, relay_client| {
-                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg)
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
                 })?
-                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
                 .build())
         }
         Err(e) => {
@@ -197,6 +214,7 @@ fn build_swarm(
                  Falling back to Google public DNS."
             );
             let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
             Ok(SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
                 .with_tcp(
@@ -208,9 +226,9 @@ fn build_swarm(
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
                 .with_behaviour(move |key, relay_client| {
-                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg)
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
                 })?
-                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
                 .build())
         }
     }
@@ -234,7 +252,7 @@ async fn run_engine(
     let keypair = identity::Keypair::generate_ed25519();
     let mdns_config = config.mdns_config();
 
-    let swarm = build_swarm(keypair.clone(), mdns_config)?;
+    let swarm = build_swarm(keypair.clone(), mdns_config, config.keep_alive_interval)?;
 
     let local_peer_id = keypair.public().to_peer_id();
 
@@ -257,6 +275,7 @@ async fn run_engine(
     let rendezvous_namespace = effective_topic.clone();
 
     let push_token = config.push_token.clone();
+    let api_key = config.api_key.clone();
 
     // Collect infrastructure peer IDs (relay + rendezvous) so they are excluded
     // from self.peers, peer counts, and sync fan-out.
@@ -307,6 +326,10 @@ async fn run_engine(
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
+        api_key,
+        keypair,
+        nat_assumption_deadline: None,
+        circuit_accepted_at: None,
     };
 
     // Set initial network status with local_peer_id and topic
@@ -394,6 +417,15 @@ struct EngineRunner {
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     /// Optional deadline for a post-resume sync retry (gives mDNS/rendezvous time to rediscover).
     resume_sync_deadline: Option<tokio::time::Instant>,
+    /// API key for managed relay authentication.
+    api_key: Option<String>,
+    /// Keypair used for signing auth challenges (same identity as the swarm).
+    keypair: identity::Keypair,
+    /// Deadline after which we assume Private NAT if AutoNAT hasn't completed
+    /// and the relay is connected. `None` once resolved or if no relay configured.
+    nat_assumption_deadline: Option<tokio::time::Instant>,
+    /// When the current relay circuit reservation was accepted (for proactive renewal).
+    circuit_accepted_at: Option<tokio::time::Instant>,
 }
 
 impl EngineRunner {
@@ -597,6 +629,47 @@ impl EngineRunner {
                         self.sync_all_known_peers().await;
                     }
                 },
+                _ = async {
+                    match self.nat_assumption_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.nat_assumption_deadline.is_some() => {
+                    self.nat_assumption_deadline = None;
+                    if self.nat_status == NatStatus::Unknown
+                        && matches!(self.relay_state, RelayState::Connected { .. } | RelayState::Listening { .. })
+                    {
+                        log::info!("AutoNAT timeout — relay connected, assuming Private NAT");
+                        self.nat_status = NatStatus::Private;
+                        self.emit_network_event(
+                            crate::network_status::NetworkEvent::NatStatusChanged(
+                                crate::network_status::NatStatus::Private,
+                            ),
+                        );
+                        self.update_network_status();
+                    }
+                },
+                _ = async {
+                    match self.circuit_accepted_at {
+                        Some(at) => {
+                            let renew_after = self.config.circuit_max_duration.mul_f64(0.8);
+                            tokio::time::sleep_until(at + renew_after).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                }, if self.circuit_accepted_at.is_some()
+                    && matches!(self.relay_state, RelayState::Listening { .. }) => {
+                    log::info!("Proactively renewing relay circuit (80% of max duration)");
+                    self.circuit_accepted_at = None;
+                    if let Some(ref relay_addr) = self.config.relay_server {
+                        let circuit_addr = relay_addr
+                            .clone()
+                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        if let Err(e) = self.swarm.listen_on(circuit_addr) {
+                            log::warn!("Failed to renew relay circuit: {e}");
+                        }
+                    }
+                },
                 Some(cmd) = self.cmd_rx.recv() => {
                     if self.handle_command(cmd).await {
                         break Ok(());
@@ -612,6 +685,13 @@ impl EngineRunner {
         match cmd {
             EngineCommand::Resume => {
                 while let Ok(EngineCommand::Resume) = self.cmd_rx.try_recv() {}
+                self.handle_resume().await;
+                false
+            }
+            EngineCommand::NetworkTransition => {
+                // Drain duplicate NetworkTransition commands
+                while let Ok(EngineCommand::NetworkTransition) = self.cmd_rx.try_recv() {}
+                log::info!("Network transition detected — force-disconnecting all peers");
                 self.handle_resume().await;
                 false
             }
@@ -657,6 +737,22 @@ impl EngineRunner {
 
         // Clear pending sync to allow fresh requests
         self.pending_sync_peers.clear();
+
+        // Force-disconnect relay — the TCP socket is likely dead on the old
+        // network interface. ConnectionClosed handler will reset relay_state
+        // and trigger reconnect.
+        if let RelayState::Connected { relay_peer_id } | RelayState::Listening { relay_peer_id } =
+            self.relay_state
+        {
+            log::info!("Resume: disconnecting relay {relay_peer_id} for clean reconnection");
+            let _ = self.swarm.disconnect_peer_id(relay_peer_id);
+        }
+
+        // Force-disconnect all non-infrastructure peers (likely dead sockets)
+        let stale: Vec<_> = self.peers.keys().cloned().collect();
+        for pid in stale {
+            let _ = self.swarm.disconnect_peer_id(pid);
+        }
 
         // 1. Trigger mDNS rediscovery (LAN)
         self.trigger_rediscovery();
@@ -779,7 +875,21 @@ impl EngineRunner {
                 connection,
                 result,
             })) => {
-                log::debug!("Ping event with {peer:?} over {connection:?}: {result:?}");
+                if let Err(ref e) = result {
+                    log::warn!("Ping failed for {peer:?} over {connection:?}: {e}");
+                    // If relay ping fails, log prominently — libp2p will close the
+                    // connection, triggering ConnectionClosed → reconnect.
+                    if matches!(
+                        &self.relay_state,
+                        RelayState::Connected { relay_peer_id }
+                        | RelayState::Listening { relay_peer_id }
+                        if peer == *relay_peer_id
+                    ) {
+                        log::warn!("Ping to relay server failed — connection will be closed");
+                    }
+                } else {
+                    log::debug!("Ping event with {peer:?} over {connection:?}: {result:?}");
+                }
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mdns(event)) => {
                 self.handle_mdns(event);
@@ -801,6 +911,12 @@ impl EngineRunner {
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Push(event)) => {
                 self.handle_push_event(event);
+            }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Auth(event)) => {
+                self.handle_auth_challenge(event);
+            }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::AuthResult(event)) => {
+                self.handle_auth_result(event);
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
@@ -834,6 +950,15 @@ impl EngineRunner {
                         log::warn!("Failed to listen on relay circuit: {e}");
                     } else {
                         log::info!("Listening on relay circuit (eager): {circuit_addr}");
+                    }
+
+                    // Start NAT assumption timer: if AutoNAT hasn't completed
+                    // after 30s (common on mobile CGNAT), assume Private.
+                    if self.nat_status == NatStatus::Unknown
+                        && self.nat_assumption_deadline.is_none()
+                    {
+                        self.nat_assumption_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(30));
                     }
 
                     // Register push token with relay if configured
@@ -911,6 +1036,7 @@ impl EngineRunner {
                 {
                     log::warn!("Lost connection to relay server {peer_id}");
                     self.relay_state = RelayState::Connecting { retry_count: 0 };
+                    self.circuit_accepted_at = None;
                     // Reset push registration — server lost our token
                     self.push_registered = false;
                     self.emit_network_event(
@@ -1152,6 +1278,7 @@ impl EngineRunner {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
                 log::info!("Relay reservation accepted by {relay_peer_id}");
                 self.relay_state = RelayState::Listening { relay_peer_id };
+                self.circuit_accepted_at = Some(tokio::time::Instant::now());
                 self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
                     crate::network_status::RelayStatus::Listening,
                 ));
@@ -1176,6 +1303,8 @@ impl EngineRunner {
     }
 
     fn handle_autonat(&mut self, event: autonat::v2::client::Event) {
+        // AutoNAT completed — cancel the assumption timer (real result takes precedence)
+        self.nat_assumption_deadline = None;
         match &event.result {
             Ok(()) => {
                 log::info!(
@@ -1803,6 +1932,84 @@ impl EngineRunner {
                 log::warn!("Push request failed: {error}");
             }
             _ => {}
+        }
+    }
+
+    fn handle_auth_challenge(
+        &mut self,
+        event: request_response::Event<auth_protocol::AuthChallenge, auth_protocol::AuthResponse>,
+    ) {
+        use request_response::{Event, Message};
+        if let Event::Message {
+            peer,
+            message: Message::Request {
+                request, channel, ..
+            },
+            ..
+        } = event
+        {
+            let api_key = match &self.api_key {
+                Some(k) => k.clone(),
+                None => {
+                    log::warn!("Received auth challenge from {peer} but no API key configured");
+                    return;
+                }
+            };
+
+            let nonce_sig = match self.keypair.sign(&request.nonce) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    log::error!("Failed to sign auth nonce: {e}");
+                    return;
+                }
+            };
+
+            let response = auth_protocol::AuthResponse { api_key, nonce_sig };
+            if let Err(e) = self
+                .swarm
+                .behaviour_mut()
+                .auth
+                .send_response(channel, response)
+            {
+                log::error!("Failed to send auth response to relay {peer}: {e:?}");
+            } else {
+                log::info!("Auth response sent to relay {peer}");
+            }
+        }
+    }
+
+    fn handle_auth_result(
+        &mut self,
+        event: request_response::Event<auth_protocol::AuthResult, ()>,
+    ) {
+        use request_response::{Event, Message};
+        if let Event::Message {
+            peer,
+            message: Message::Request {
+                request, channel, ..
+            },
+            ..
+        } = event
+        {
+            // Ack immediately
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .auth_result
+                .send_response(channel, ());
+
+            if request.accepted {
+                log::info!("Relay {peer} accepted auth — managed relay active");
+                self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+                    crate::network_status::RelayStatus::Connected,
+                ));
+            } else {
+                let reason = request.reason.as_deref().unwrap_or("invalid API key");
+                log::warn!("Relay {peer} rejected auth: {reason}");
+                self.emit_network_event(crate::network_status::NetworkEvent::EngineFailed {
+                    reason: format!("Relay auth rejected: {reason}"),
+                });
+            }
         }
     }
 
