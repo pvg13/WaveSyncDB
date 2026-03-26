@@ -267,6 +267,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
+    if cli.external_address.is_empty() {
+        log::warn!(
+            "No --external-address configured! Relay circuit reservations will respond \
+             with NoAddressesInReservation for clients behind NAT. \
+             Set --external-address /ip4/<public-ip>/tcp/4001"
+        );
+    }
     for ext_addr_str in &cli.external_address {
         let ext_addr: Multiaddr = ext_addr_str.parse()?;
         swarm.add_external_address(ext_addr.clone());

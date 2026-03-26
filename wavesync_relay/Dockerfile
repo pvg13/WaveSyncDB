@@ -29,11 +29,16 @@ VOLUME /data
 
 EXPOSE 4001/tcp 4001/udp
 
-# Environment variables (all optional):
+# Environment variables:
+#   EXTERNAL_ADDRESS    - REQUIRED: public address to advertise to clients
+#                         e.g., /ip4/77.37.125.212/tcp/4001
+#                         Without this, clients get NoAddressesInReservation and
+#                         WAN sync is broken. In Coolify, set this in Environment Variables.
+#
 #   IDENTITY_KEYPAIR    - base64-encoded protobuf keypair (overrides --identity-file)
 #                         Generate with: wavesync-relay --generate-identity
 #
-# Push notification environment variables:
+# Push notification environment variables (all optional):
 #   PUSH_DB             - path to push token SQLite DB (e.g., /data/push_tokens.db)
 #   FCM_CREDENTIALS     - path to FCM service account JSON file
 #   APNS_KEY_FILE       - path to APNs .p8 key file

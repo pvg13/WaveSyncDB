@@ -964,6 +964,27 @@ impl EngineRunner {
                         log::info!("Listening on relay circuit (eager): {circuit_addr}");
                     }
 
+                    // Manually add circuit address as external — NewListenAddr may
+                    // never fire if the relay responds with NoAddressesInReservation
+                    // (relay server missing --external-address). This ensures we can
+                    // still register with rendezvous and be discoverable.
+                    let my_circuit_addr = relay_addr
+                        .clone()
+                        .with(libp2p::multiaddr::Protocol::P2pCircuit)
+                        .with(libp2p::multiaddr::Protocol::P2p(self.local_peer_id));
+                    self.swarm.add_external_address(my_circuit_addr.clone());
+                    log::info!("Added circuit address as external: {my_circuit_addr}");
+
+                    // Register with rendezvous immediately — don't wait for
+                    // NewListenAddr which may not fire on misconfigured relays.
+                    if let Some(ref rv_addr) = self.config.rendezvous_server
+                        && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
+                            rv_addr.iter().last()
+                        && self.swarm.is_connected(&rv_peer_id)
+                    {
+                        self.rendezvous_register(rv_peer_id);
+                    }
+
                     // Start NAT assumption timer: if AutoNAT hasn't completed
                     // after 30s (common on mobile CGNAT), assume Private.
                     if self.nat_status == NatStatus::Unknown
@@ -1116,7 +1137,16 @@ impl EngineRunner {
             }
             SwarmEvent::ListenerClosed { reason, .. } => {
                 if let Err(ref e) = reason {
-                    log::warn!("Listener closed with error: {e}");
+                    let err_str = format!("{e:?}");
+                    if err_str.contains("NoAddressesInReservation") {
+                        log::error!(
+                            "Relay circuit failed: NoAddressesInReservation. \
+                             The relay server needs --external-address configured. \
+                             Peers can still discover via rendezvous fallback."
+                        );
+                    } else {
+                        log::warn!("Listener closed with error: {e}");
+                    }
                 }
                 // If relay was in Listening state, reset to Connected and re-request circuit
                 if let RelayState::Listening { relay_peer_id } = self.relay_state {
