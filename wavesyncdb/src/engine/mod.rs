@@ -23,7 +23,7 @@ pub(crate) mod sync_handler;
 
 use sync_handler::apply_remote_changeset;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -333,6 +333,8 @@ async fn run_engine(
         peer_identities: HashMap::new(),
         infrastructure_peers,
         pending_sync_peers: std::collections::HashSet::new(),
+        dialing_peers: std::collections::HashSet::new(),
+        pending_rendezvous_dials: std::collections::VecDeque::new(),
         push_token,
         push_registered: false,
         network_status,
@@ -423,6 +425,10 @@ struct EngineRunner {
     pub(crate) infrastructure_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers with an in-flight sync request — prevents flooding request-response.
     pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
+    pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
+    pub(crate) pending_rendezvous_dials: std::collections::VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
     pub(crate) push_token: Option<(String, String)>,
     /// Whether push token has been registered with the relay.
@@ -544,6 +550,9 @@ impl EngineRunner {
                 .unwrap_or(self.local_db_version);
             self.initiate_sync_for_peer(peer_id);
         }
+
+        self.dialing_peers.remove(&peer_id);
+        self.drain_pending_rendezvous_dials();
     }
 
     /// Set up relay circuit, external address, rendezvous registration, NAT timer.
@@ -1114,18 +1123,21 @@ impl EngineRunner {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 log::warn!("Outgoing connection error to {peer_id:?}: {error}");
-                if let Some(pid) = peer_id
-                    && !self.swarm.is_connected(&pid)
-                    && self.peers.remove(&pid).is_some()
-                {
-                    self.pending_sync_peers.remove(&pid);
-                    self.verified_peers.remove(&pid);
-                    self.peer_identities.remove(&pid);
-                    self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
-                        crate::network_status::PeerId(pid.to_string()),
-                    ));
-                    self.update_network_status();
+                if let Some(pid) = peer_id {
+                    self.dialing_peers.remove(&pid);
+                    if !self.swarm.is_connected(&pid)
+                        && self.peers.remove(&pid).is_some()
+                    {
+                        self.pending_sync_peers.remove(&pid);
+                        self.verified_peers.remove(&pid);
+                        self.peer_identities.remove(&pid);
+                        self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
+                            crate::network_status::PeerId(pid.to_string()),
+                        ));
+                        self.update_network_status();
+                    }
                 }
+                self.drain_pending_rendezvous_dials();
             }
             _ => {}
         }
