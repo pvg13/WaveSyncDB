@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Maximum number of rendezvous-discovered peers dialed concurrently.
+/// Remaining peers are queued and drained as connections complete or fail.
+const MAX_CONCURRENT_RENDEZVOUS_DIALS: usize = 5;
+
 impl EngineRunner {
     pub(super) fn handle_relay_client(&mut self, event: relay::client::Event) {
         match event {
@@ -118,22 +122,46 @@ impl EngineRunner {
                 );
                 self.rendezvous_cookie = Some(cookie);
 
+                // Collect one address per peer, skip ineligible
+                let mut to_dial: Vec<(libp2p::PeerId, libp2p::Multiaddr)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
                 for registration in registrations {
                     let peer_id = registration.record.peer_id();
-                    if peer_id == self.local_peer_id {
+                    if peer_id == self.local_peer_id
+                        || self.dialing_peers.contains(&peer_id)
+                        || self.rejected_peers.contains(&peer_id)
+                        || !seen.insert(peer_id)
+                    {
                         continue;
                     }
-
-                    for addr in registration.record.addresses() {
-                        log::info!("Rendezvous discovered peer {peer_id} at {addr}");
-                        if !self.swarm.is_connected(&peer_id) {
-                            if let Err(e) = self.swarm.dial(addr.clone()) {
-                                log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
-                            }
-                        } else if self.registry_is_ready {
+                    if self.swarm.is_connected(&peer_id) {
+                        if self.registry_is_ready {
                             self.initiate_sync_for_peer(peer_id);
                         }
+                        continue;
                     }
+                    // Take first address for this peer
+                    if let Some(addr) = registration.record.addresses().first() {
+                        to_dial.push((peer_id, addr.clone()));
+                    }
+                }
+
+                // Dial up to MAX immediately, queue the rest
+                let immediate = to_dial.len().min(MAX_CONCURRENT_RENDEZVOUS_DIALS);
+                for (peer_id, addr) in to_dial.drain(..immediate) {
+                    log::info!("Rendezvous dialing peer {peer_id} at {addr}");
+                    if let Err(e) = self.swarm.dial(addr) {
+                        log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
+                    } else {
+                        self.dialing_peers.insert(peer_id);
+                    }
+                }
+                if !to_dial.is_empty() {
+                    log::info!(
+                        "Queued {} rendezvous peers for rate-limited dialing",
+                        to_dial.len()
+                    );
+                    self.pending_rendezvous_dials.extend(to_dial);
                 }
             }
             rendezvous::client::Event::DiscoverFailed {
@@ -335,5 +363,24 @@ impl EngineRunner {
             .behaviour_mut()
             .push
             .send_request(&relay_peer_id, req);
+    }
+
+    /// Pop peers from the rendezvous dial queue until we hit the concurrency limit
+    /// or the queue is empty. Called after each connection completes or fails.
+    pub(super) fn drain_pending_rendezvous_dials(&mut self) {
+        while self.dialing_peers.len() < MAX_CONCURRENT_RENDEZVOUS_DIALS {
+            let Some((peer_id, addr)) = self.pending_rendezvous_dials.pop_front() else {
+                break;
+            };
+            if self.swarm.is_connected(&peer_id) || self.dialing_peers.contains(&peer_id) {
+                continue;
+            }
+            log::info!("Rendezvous dialing queued peer {peer_id} at {addr}");
+            if let Err(e) = self.swarm.dial(addr) {
+                log::warn!("Failed to dial queued rendezvous peer {peer_id}: {e}");
+            } else {
+                self.dialing_peers.insert(peer_id);
+            }
+        }
     }
 }

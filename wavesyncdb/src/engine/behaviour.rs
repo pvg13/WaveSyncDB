@@ -85,8 +85,9 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
-        let conn_limits =
-            connection_limits::ConnectionLimits::default().with_max_established_per_peer(Some(1));
+        let conn_limits = connection_limits::ConnectionLimits::default()
+            .with_max_established_per_peer(Some(1))
+            .with_max_pending_outgoing(Some(10));
 
         Self {
             connection_limits: connection_limits::Behaviour::new(conn_limits),

@@ -25,6 +25,8 @@ impl EngineRunner {
                 self.peer_db_versions.clear();
                 self.peer_reported_versions.clear();
                 self.pending_sync_peers.clear();
+                self.dialing_peers.clear();
+                self.pending_rendezvous_dials.clear();
                 self.trigger_rediscovery();
                 if self.config.relay_server.is_some() {
                     self.maybe_reconnect_relay();
@@ -72,6 +74,8 @@ impl EngineRunner {
         self.peer_db_versions.clear();
         self.peer_reported_versions.clear();
         self.pending_sync_peers.clear();
+        self.dialing_peers.clear();
+        self.pending_rendezvous_dials.clear();
 
         // Force-disconnect relay — the TCP socket is likely dead on the old
         // network interface. ConnectionClosed handler will reset relay_state
