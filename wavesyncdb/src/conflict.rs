@@ -32,7 +32,7 @@ pub fn should_apply_column(
             match remote_val.cmp(local_val) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Less => false,
-                std::cmp::Ordering::Equal => remote_site_id > local_site_id,
+                std::cmp::Ordering::Equal => remote_site_id.0 > local_site_id.0,
             }
         }
     }
@@ -62,8 +62,8 @@ pub fn should_apply_delete(
 mod tests {
     use super::*;
 
-    const SITE_A: NodeId = [1u8; 16];
-    const SITE_B: NodeId = [2u8; 16];
+    const SITE_A: NodeId = NodeId([1u8; 16]);
+    const SITE_B: NodeId = NodeId([2u8; 16]);
 
     // ── should_apply_column ──
 
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn test_first_write_no_local() {
         // If local col_version is 0 (no entry), remote with version > 0 always wins
-        assert!(should_apply_column(1, b"v", &SITE_A, 0, b"", &[0u8; 16]));
+        assert!(should_apply_column(1, b"v", &SITE_A, 0, b"", &NodeId([0u8; 16])));
     }
 
     #[test]

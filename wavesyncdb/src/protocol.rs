@@ -36,6 +36,14 @@ pub enum SyncRequest {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
+    /// Announce application-level identity to a verified peer.
+    IdentityAnnounce {
+        /// Opaque application-defined identity string.
+        app_id: String,
+        /// HMAC tag for group authentication (present when a passphrase is configured).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
 }
 
 /// The response to a [`SyncRequest`].
@@ -60,18 +68,21 @@ pub enum SyncResponse {
     },
     /// Acknowledgement for a [`SyncRequest::Push`].
     PushAck,
+    /// Acknowledgement for a [`SyncRequest::IdentityAnnounce`].
+    IdentityAck,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::NodeId;
 
     #[test]
     fn test_sync_request_version_vector_roundtrip() {
         let req = SyncRequest::VersionVector {
             my_db_version: 10,
             your_last_db_version: 5,
-            site_id: [1u8; 16],
+            site_id: NodeId([1u8; 16]),
             topic: "my-topic".to_string(),
             hmac: Some([0xAB; 32]),
         };
@@ -98,11 +109,11 @@ mod tests {
     fn test_sync_response_changeset_response_roundtrip() {
         let resp = SyncResponse::ChangesetResponse {
             changes: vec![ColumnChange {
-                table: "tasks".to_string(),
-                pk: "pk-1".to_string(),
-                cid: "title".to_string(),
+                table: "tasks".into(),
+                pk: "pk-1".into(),
+                cid: "title".into(),
                 val: Some(serde_json::json!("Hello")),
-                site_id: [2u8; 16],
+                site_id: NodeId([2u8; 16]),
                 col_version: 3,
                 cl: 3,
                 seq: 0,
@@ -110,7 +121,7 @@ mod tests {
             }],
             my_db_version: 20,
             your_last_db_version: 10,
-            site_id: [2u8; 16],
+            site_id: NodeId([2u8; 16]),
             topic: "test".to_string(),
             hmac: None,
         };
@@ -149,7 +160,7 @@ mod tests {
             changes: vec![],
             my_db_version: 0,
             your_last_db_version: 0,
-            site_id: [0u8; 16],
+            site_id: NodeId([0u8; 16]),
             topic: String::new(),
             hmac: None,
         };
@@ -168,7 +179,7 @@ mod tests {
         use crate::messages::SyncChangeset;
         let req = SyncRequest::Push {
             changeset: SyncChangeset {
-                site_id: [5u8; 16],
+                site_id: NodeId([5u8; 16]),
                 db_version: 7,
                 changes: vec![],
             },

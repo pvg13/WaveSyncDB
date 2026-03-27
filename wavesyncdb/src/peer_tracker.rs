@@ -41,7 +41,7 @@ pub async fn upsert_peer_version(
             last_seen = excluded.last_seen",
         [
             peer_id.into(),
-            site_id.to_vec().into(),
+            site_id.0.to_vec().into(),
             (db_version as i64).into(),
             (now as i64).into(),
         ],
@@ -118,6 +118,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::NodeId;
     use sea_orm::Database;
 
     async fn setup_db() -> sea_orm::DatabaseConnection {
@@ -129,7 +130,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_and_get_peer_version() {
         let db = setup_db().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
         upsert_peer_version(&db, "peer-1", &site_id, 42)
             .await
             .unwrap();
@@ -147,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_updates_version() {
         let db = setup_db().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
         upsert_peer_version(&db, "peer-1", &site_id, 10)
             .await
             .unwrap();
@@ -161,8 +162,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_all_peer_versions() {
         let db = setup_db().await;
-        let site_a = [1u8; 16];
-        let site_b = [2u8; 16];
+        let site_a = NodeId([1u8; 16]);
+        let site_b = NodeId([2u8; 16]);
         upsert_peer_version(&db, "peer-1", &site_a, 10)
             .await
             .unwrap();
@@ -179,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_last_seen() {
         let db = setup_db().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
         upsert_peer_version(&db, "peer-1", &site_id, 42)
             .await
             .unwrap();

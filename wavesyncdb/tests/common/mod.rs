@@ -52,11 +52,11 @@ where
 }
 
 /// Create a deterministic node ID from a seed byte.
-pub fn make_node_id(seed: u8) -> [u8; 16] {
+pub fn make_node_id(seed: u8) -> wavesyncdb::NodeId {
     let mut id = [0u8; 16];
     id[0] = seed;
     id[15] = 1;
-    id
+    wavesyncdb::NodeId(id)
 }
 
 /// SeaORM entity for the `tasks` test table.

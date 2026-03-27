@@ -29,8 +29,10 @@ pub struct PeerInfo {
     /// Whether this peer was configured as a bootstrap peer.
     pub is_bootstrap: bool,
     /// Whether this peer is a group member (same topic/passphrase).
-    /// Starts `true` and flips to `false` after a topic mismatch rejection.
+    /// Starts `false` and flips to `true` after a successful HMAC-verified exchange.
     pub is_group_member: bool,
+    /// Application-defined identity announced by this peer (ephemeral, session-scoped).
+    pub app_id: Option<String>,
 }
 
 /// Relay connection status.
@@ -133,6 +135,10 @@ pub enum NetworkEvent {
     PeerDisconnected(PeerId),
     /// A peer was rejected (topic/passphrase mismatch).
     PeerRejected(PeerId),
+    /// A peer was verified via successful HMAC exchange.
+    PeerVerified(PeerId),
+    /// A peer announced its application-level identity.
+    PeerIdentityReceived { peer_id: PeerId, app_id: String },
     /// Relay connection status changed.
     RelayStatusChanged(RelayStatus),
     /// NAT detection status changed.
@@ -177,6 +183,7 @@ mod tests {
                     db_version: Some(5),
                     is_bootstrap: false,
                     is_group_member: true,
+                    app_id: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("b".into()),
@@ -184,6 +191,7 @@ mod tests {
                     db_version: None,
                     is_bootstrap: false,
                     is_group_member: false,
+                    app_id: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("c".into()),
@@ -191,6 +199,7 @@ mod tests {
                     db_version: Some(10),
                     is_bootstrap: true,
                     is_group_member: true,
+                    app_id: None,
                 },
             ],
             ..Default::default()
@@ -221,6 +230,7 @@ mod tests {
                 db_version: Some(42),
                 is_bootstrap: false,
                 is_group_member: true,
+                app_id: None,
             }],
             topic: "my-topic".into(),
             relay_status: RelayStatus::Connected,

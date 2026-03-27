@@ -361,6 +361,47 @@ impl WaveSyncDb {
             });
     }
 
+    /// Set the application-level identity for this peer.
+    ///
+    /// The identity is an opaque string — WaveSyncDB does not interpret it.
+    /// It is announced to all currently verified peers and to any peer that
+    /// becomes verified in the future. Identities are ephemeral (session-scoped)
+    /// and cleared on disconnect.
+    pub fn set_peer_identity(&self, app_id: &str) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::SetPeerIdentity(Some(
+                app_id.to_string(),
+            )));
+    }
+
+    /// Clear the application-level identity for this peer.
+    pub fn clear_peer_identity(&self) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::SetPeerIdentity(None));
+    }
+
+    /// Get all connected peers grouped by their application-level identity.
+    ///
+    /// Returns only peers that have announced an identity. Peers without
+    /// an identity are excluded.
+    pub fn peers_by_identity(
+        &self,
+    ) -> std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> {
+        let status = self.inner.network_status.read().unwrap();
+        let mut map: std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> =
+            std::collections::HashMap::new();
+        for peer in &status.connected_peers {
+            if let Some(ref app_id) = peer.app_id {
+                map.entry(app_id.clone()).or_default().push(peer.clone());
+            }
+        }
+        map
+    }
+
     /// Register a table for sync.
     pub fn register_table(&self, meta: TableMeta) {
         self.inner.registry.register(meta);
@@ -472,12 +513,21 @@ impl WaveSyncDb {
     }
 
     /// After a successful write, create and dispatch column-level CRDT changes.
-    fn dispatch_sync(&self, kind: WriteKind, table: &str, resolved_sql: &str) {
+    ///
+    /// Returns `Err` if the `db_version` persist to `_wavesync_meta` fails.
+    /// The in-memory counter is rolled back on failure so it stays in sync
+    /// with the persisted value.
+    async fn dispatch_sync(
+        &self,
+        kind: WriteKind,
+        table: &str,
+        resolved_sql: &str,
+    ) -> Result<(), DbErr> {
         if table.starts_with("_wavesync") {
-            return; // Don't sync internal tables
+            return Ok(()); // Don't sync internal tables
         }
         if !self.inner.registry.is_registered(table) {
-            return; // Don't sync unregistered tables
+            return Ok(()); // Don't sync unregistered tables
         }
 
         let pk_column = self
@@ -486,16 +536,24 @@ impl WaveSyncDb {
             .get(table)
             .map(|m| m.primary_key_column.clone());
         let Some(pk_col) = pk_column else {
-            return;
+            return Ok(());
         };
 
         let parsed = match parse_write_full(resolved_sql, &pk_col) {
             Some(p) => p,
-            None => return,
+            None => {
+                let truncated: String = resolved_sql.chars().take(200).collect();
+                log::warn!(
+                    "Sync skipped: parse_write_full returned None for registered table \"{}\". SQL: {}",
+                    table,
+                    truncated
+                );
+                return Ok(());
+            }
         };
 
         if parsed.primary_key.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Send change notification IMMEDIATELY — data is already committed.
@@ -507,9 +565,9 @@ impl WaveSyncDb {
             Some(parsed.columns.iter().map(|(col, _)| col.clone()).collect())
         };
         let _ = self.inner.change_tx.send(ChangeNotification {
-            table: table.to_string(),
+            table: table.to_string().into(),
             kind: kind.clone(),
-            primary_key: parsed.primary_key.clone(),
+            primary_key: parsed.primary_key.clone().into(),
             changed_columns,
         });
 
@@ -518,6 +576,13 @@ impl WaveSyncDb {
         let inner = self.inner.inner.clone();
         let table_owned = table.to_string();
         let kind_clone = kind.clone();
+
+        // Oneshot channel to report db_version persist result back to the caller.
+        // The spawned task holds the db_version lock for the full operation (shadow
+        // serialization) but signals persist success/failure immediately so the
+        // ConnectionTrait method can propagate errors.
+        let (persist_tx, persist_rx) =
+            tokio::sync::oneshot::channel::<Result<(), DbErr>>();
 
         // Async CRDT bookkeeping + P2P sync
         // The db_version lock is held for the entire operation to serialize
@@ -528,10 +593,13 @@ impl WaveSyncDb {
             let mut ver = shared.db_version.lock().await;
             *ver += 1;
             let new_db_version = *ver;
-            // Persist
+            // Persist — if this fails, roll back and report error
             if let Err(e) = crate::shadow::set_db_version(&inner, new_db_version).await {
-                log::error!("Failed to persist db_version: {}", e);
+                *ver -= 1;
+                let _ = persist_tx.send(Err(e));
+                return;
             }
+            let _ = persist_tx.send(Ok(()));
 
             let mut changes = Vec::new();
 
@@ -563,9 +631,9 @@ impl WaveSyncDb {
                     }
 
                     changes.push(ColumnChange {
-                        table: table_owned.clone(),
-                        pk: parsed.primary_key.clone(),
-                        cid: "__deleted".to_string(),
+                        table: table_owned.clone().into(),
+                        pk: parsed.primary_key.clone().into(),
+                        cid: "__deleted".into(),
                         val: None,
                         site_id,
                         col_version: tombstone_cv,
@@ -610,9 +678,9 @@ impl WaveSyncDb {
                         }
 
                         changes.push(ColumnChange {
-                            table: table_owned.clone(),
-                            pk: parsed.primary_key.clone(),
-                            cid: col.clone(),
+                            table: table_owned.clone().into(),
+                            pk: parsed.primary_key.clone().into(),
+                            cid: col.clone().into(),
                             val: Some(val.clone()),
                             site_id,
                             col_version: new_cv,
@@ -633,6 +701,14 @@ impl WaveSyncDb {
             let _ = shared.sync_tx.send(changeset).await;
             drop(ver); // Release lock after changeset is sent
         });
+
+        match persist_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(DbErr::Custom(
+                "db_version persist task panicked".into(),
+            )),
+        }
     }
 }
 
@@ -809,7 +885,7 @@ impl ConnectionTrait for WaveSyncDb {
         Box::pin(async move {
             let result = self.inner.inner.execute_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
-                self.dispatch_sync(kind, &table, &resolved_sql);
+                self.dispatch_sync(kind, &table, &resolved_sql).await?;
             }
             Ok(result)
         })
@@ -830,7 +906,7 @@ impl ConnectionTrait for WaveSyncDb {
         Box::pin(async move {
             let result = self.inner.inner.execute_unprepared(&sql_owned).await?;
             if let Some((kind, table)) = classify_write(&sql_owned) {
-                self.dispatch_sync(kind, &table, &sql_owned);
+                self.dispatch_sync(kind, &table, &sql_owned).await?;
             }
             Ok(result)
         })
@@ -854,7 +930,7 @@ impl ConnectionTrait for WaveSyncDb {
         Box::pin(async move {
             let result = self.inner.inner.query_one_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
-                self.dispatch_sync(kind, &table, &resolved_sql);
+                self.dispatch_sync(kind, &table, &resolved_sql).await?;
             }
             Ok(result)
         })
@@ -876,7 +952,7 @@ impl ConnectionTrait for WaveSyncDb {
         Box::pin(async move {
             let result = self.inner.inner.query_all_raw(stmt).await?;
             if let Some((kind, table)) = classify_write(&resolved_sql) {
-                self.dispatch_sync(kind, &table, &resolved_sql);
+                self.dispatch_sync(kind, &table, &resolved_sql).await?;
             }
             Ok(result)
         })

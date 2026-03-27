@@ -30,9 +30,9 @@ async fn test_change_rx_table_filter_pattern() {
     // Send a notification for a different table manually
     db.change_tx()
         .send(ChangeNotification {
-            table: "notes".to_string(),
+            table: "notes".into(),
             kind: WriteKind::Insert,
-            primary_key: "note-1".to_string(),
+            primary_key: "note-1".into(),
             changed_columns: Some(vec!["id".to_string(), "body".to_string()]),
         })
         .unwrap();
@@ -40,9 +40,9 @@ async fn test_change_rx_table_filter_pattern() {
     // Send a notification for the target table
     db.change_tx()
         .send(ChangeNotification {
-            table: "tasks".to_string(),
+            table: "tasks".into(),
             kind: WriteKind::Insert,
-            primary_key: "task-1".to_string(),
+            primary_key: "task-1".into(),
             changed_columns: Some(vec!["id".to_string(), "title".to_string()]),
         })
         .unwrap();
@@ -77,9 +77,9 @@ async fn test_change_rx_lagged_triggers_requery() {
     // Flood the channel past its 1024 capacity
     for i in 0..1100 {
         let _ = db.change_tx().send(ChangeNotification {
-            table: "tasks".to_string(),
+            table: "tasks".into(),
             kind: WriteKind::Insert,
-            primary_key: format!("task-{}", i),
+            primary_key: format!("task-{}", i).into(),
             changed_columns: None,
         });
     }
