@@ -229,6 +229,46 @@ pub fn use_network_status(db: WaveSyncDb) -> Signal<NetworkStatus> {
     signal
 }
 
+/// Reactive signal containing connected peers grouped by application-level identity.
+///
+/// Refreshes whenever a [`NetworkEvent::PeerIdentityReceived`](crate::NetworkEvent),
+/// [`NetworkEvent::PeerConnected`](crate::NetworkEvent), or
+/// [`NetworkEvent::PeerDisconnected`](crate::NetworkEvent) event is received.
+/// Only includes peers that have announced an identity.
+pub fn use_peer_identities(
+    db: WaveSyncDb,
+) -> Signal<std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>>> {
+    let mut signal = use_signal(|| db.peers_by_identity());
+
+    use_effect(move || {
+        let mut rx = db.network_event_rx();
+        let db = db.clone();
+        signal.set(db.peers_by_identity());
+        spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if matches!(
+                            event,
+                            crate::network_status::NetworkEvent::PeerIdentityReceived { .. }
+                                | crate::network_status::NetworkEvent::PeerConnected(_)
+                                | crate::network_status::NetworkEvent::PeerDisconnected(_)
+                        ) {
+                            signal.set(db.peers_by_identity());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        signal.set(db.peers_by_identity());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    });
+
+    signal
+}
+
 // ---------------------------------------------------------------------------
 // Reactive table/row hooks
 // ---------------------------------------------------------------------------

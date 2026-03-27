@@ -51,7 +51,8 @@ pub use auth::GroupKey;
 pub use connection::{SchemaBuilder, WaveSyncDb, WaveSyncDbBuilder};
 pub use engine::EngineCommand;
 pub use messages::{
-    ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
+    AppId, ChangeNotification, ColumnChange, ColumnName, DeletePolicy, HmacTag, NodeId, PrimaryKey,
+    SyncChangeset, TableName, TopicString, WriteKind,
 };
 pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
 pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};

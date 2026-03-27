@@ -135,9 +135,9 @@ pub async fn get_site_id(db: &impl ConnectionTrait) -> Result<NodeId, DbErr> {
     if let Some(row) = row
         && row.value.len() == 16
     {
-        let mut id: NodeId = [0u8; 16];
+        let mut id = [0u8; 16];
         id.copy_from_slice(&row.value);
-        return Ok(id);
+        return Ok(NodeId(id));
     }
 
     // Generate new site_id
@@ -159,7 +159,7 @@ pub async fn get_site_id(db: &impl ConnectionTrait) -> Result<NodeId, DbErr> {
     ))
     .await?;
 
-    Ok(id)
+    Ok(NodeId(id))
 }
 
 /// Get the current col_version for a specific column of a row.
@@ -220,12 +220,12 @@ pub async fn get_col_version_with_site(
 
     match row {
         Some(r) => {
-            let mut site_id: NodeId = [0u8; 16];
+            let mut id = [0u8; 16];
             let len = r.site_id.len().min(16);
-            site_id[..len].copy_from_slice(&r.site_id[..len]);
-            Ok((r.col_version as u64, site_id))
+            id[..len].copy_from_slice(&r.site_id[..len]);
+            Ok((r.col_version as u64, NodeId(id)))
         }
-        None => Ok((0, [0u8; 16])),
+        None => Ok((0, NodeId([0u8; 16]))),
     }
 }
 
@@ -256,7 +256,7 @@ pub async fn upsert_clock_entry(
             cid.into(),
             (col_version as i64).into(),
             (db_version as i64).into(),
-            site_id.to_vec().into(),
+            site_id.0.to_vec().into(),
             (seq as i32).into(),
         ],
     ))
@@ -296,15 +296,15 @@ pub async fn get_clock_entries_for_row(
     Ok(rows
         .into_iter()
         .map(|r| {
-            let mut site_id: NodeId = [0u8; 16];
+            let mut id = [0u8; 16];
             let len = r.site_id.len().min(16);
-            site_id[..len].copy_from_slice(&r.site_id[..len]);
+            id[..len].copy_from_slice(&r.site_id[..len]);
             ClockEntry {
                 pk: r.pk,
                 cid: r.cid,
                 col_version: r.col_version as u64,
                 db_version: r.db_version as u64,
-                site_id,
+                site_id: NodeId(id),
                 seq: r.seq as u32,
             }
         })
@@ -386,16 +386,16 @@ pub async fn get_changes_since(
                 continue;
             }
 
-            let mut site_id: NodeId = [0u8; 16];
+            let mut id = [0u8; 16];
             let len = row.site_id.len().min(16);
-            site_id[..len].copy_from_slice(&row.site_id[..len]);
+            id[..len].copy_from_slice(&row.site_id[..len]);
 
             all_changes.push(ColumnChange {
-                table: meta.table_name.clone(),
-                pk: row.pk,
-                cid: row.cid,
+                table: meta.table_name.clone().into(),
+                pk: row.pk.into(),
+                cid: row.cid.into(),
                 val,
-                site_id,
+                site_id: NodeId(id),
                 col_version: row.col_version as u64,
                 cl: row.col_version as u64, // causal length = col_version for non-deletes
                 seq: row.seq as u32,
@@ -498,6 +498,7 @@ pub async fn shadow_table_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::NodeId;
     use sea_orm::Database;
 
     async fn setup_db() -> sea_orm::DatabaseConnection {
@@ -552,7 +553,7 @@ mod tests {
         let id1 = get_site_id(&db).await.unwrap();
         let id2 = get_site_id(&db).await.unwrap();
         assert_eq!(id1, id2, "site_id should be persisted and stable");
-        assert_ne!(id1, [0u8; 16], "site_id should be non-zero");
+        assert_ne!(id1, NodeId([0u8; 16]), "site_id should be non-zero");
     }
 
     #[tokio::test]
@@ -572,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_and_get_col_version() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         // No entry yet
         assert_eq!(
@@ -602,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_clock_entries_for_row() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         upsert_clock_entry(&db, "tasks", "pk1", "title", 1, 1, &site_id, 0)
             .await
@@ -633,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_tombstone() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id)
             .await
@@ -650,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_clock_entries() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         upsert_clock_entry(&db, "tasks", "pk1", "title", 1, 1, &site_id, 0)
             .await
@@ -670,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_tombstone_preserves_column_clocks() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         // Set up column clock entries
         upsert_clock_entry(&db, "tasks", "pk1", "title", 5, 1, &site_id, 0)
@@ -733,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_changes_since() {
         let db = setup_with_shadow().await;
-        let site_id = [1u8; 16];
+        let site_id = NodeId([1u8; 16]);
 
         // Insert some data in the actual table
         db.execute_unprepared("INSERT INTO tasks VALUES ('pk1', 'Task 1', 0)")

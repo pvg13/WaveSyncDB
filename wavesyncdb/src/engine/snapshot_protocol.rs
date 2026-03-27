@@ -142,7 +142,7 @@ mod tests {
         let req = SyncRequest::VersionVector {
             my_db_version: 42,
             your_last_db_version: 10,
-            site_id: [1u8; 16],
+            site_id: crate::messages::NodeId([1u8; 16]),
             topic: "test-topic".to_string(),
             hmac: None,
         };
@@ -172,7 +172,7 @@ mod tests {
             changes: vec![],
             my_db_version: 100,
             your_last_db_version: 50,
-            site_id: [2u8; 16],
+            site_id: crate::messages::NodeId([2u8; 16]),
             topic: "test-topic".to_string(),
             hmac: None,
         };
