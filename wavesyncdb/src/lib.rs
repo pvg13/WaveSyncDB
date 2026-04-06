@@ -37,9 +37,12 @@
 //! - [`ChangeNotification`] — lightweight event emitted after every write
 
 pub mod auth;
+pub mod background_sync;
 pub mod conflict;
 pub mod connection;
 pub mod engine;
+#[cfg(feature = "mobile-ffi")]
+mod ffi;
 pub mod messages;
 pub mod network_status;
 pub mod peer_tracker;
@@ -48,7 +51,7 @@ pub mod registry;
 pub mod shadow;
 
 pub use auth::GroupKey;
-pub use connection::{SchemaBuilder, WaveSyncDb, WaveSyncDbBuilder};
+pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
 pub use engine::EngineCommand;
 pub use messages::{
     AppId, ChangeNotification, ColumnChange, ColumnName, DeletePolicy, HmacTag, NodeId, PrimaryKey,

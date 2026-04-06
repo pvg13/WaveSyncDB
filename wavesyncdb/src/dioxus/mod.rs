@@ -40,6 +40,7 @@
 //! }
 //! ```
 
+mod lifecycle;
 pub mod hooks;
 
 pub use hooks::*;

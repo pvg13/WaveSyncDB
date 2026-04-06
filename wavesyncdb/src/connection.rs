@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sea_orm::{
@@ -5,6 +6,7 @@ use sea_orm::{
     EntityTrait, ExecResult, Iterable, PrimaryKeyToColumn, QueryResult, Schema, Statement,
     sea_query::SqliteQueryBuilder,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use crate::messages::{
@@ -191,6 +193,7 @@ fn sql_value_to_json(val: &str) -> serde_json::Value {
 /// Internal shared state for [`WaveSyncDb`].
 struct WaveSyncDbInner {
     inner: DatabaseConnection,
+    database_url: String,
     sync_tx: mpsc::Sender<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     site_id: NodeId,
@@ -421,6 +424,7 @@ impl WaveSyncDb {
         SchemaBuilder {
             db: self,
             entries: Vec::new(),
+            crate_name: None,
         }
     }
 
@@ -428,6 +432,7 @@ impl WaveSyncDb {
     /// [`SchemaBuilder`] populated with all matching entities.
     pub fn get_schema_registry(&self, prefix: &str) -> SchemaBuilder<'_> {
         let mut builder = self.schema();
+        builder.crate_name = Some(prefix.to_string());
         let backend = self.get_database_backend();
 
         // Normalize: trim trailing ::* or ::, convert hyphens to underscores in crate name
@@ -963,6 +968,7 @@ impl ConnectionTrait for WaveSyncDb {
 pub struct SchemaBuilder<'a> {
     db: &'a WaveSyncDb,
     entries: Vec<EntityEntry>,
+    crate_name: Option<String>,
 }
 
 struct EntityEntry {
@@ -994,7 +1000,7 @@ impl<'a> SchemaBuilder<'a> {
 
     /// Create all registered tables and register synced ones for P2P replication.
     pub async fn sync(self) -> Result<(), DbErr> {
-        for entry in self.entries {
+        for entry in &self.entries {
             self.db
                 .inner
                 .inner
@@ -1004,7 +1010,18 @@ impl<'a> SchemaBuilder<'a> {
                 // Create shadow table for synced entities
                 crate::shadow::create_shadow_table(&self.db.inner.inner, &entry.meta.table_name)
                     .await?;
-                self.db.register_table(entry.meta);
+                self.db.register_table(entry.meta.clone());
+            }
+        }
+        // Persist the crate name so background sync can reconstruct the registry
+        if let Some(crate_name) = &self.crate_name
+            && let Some(config_path) = SyncConfig::config_path(&self.db.inner.database_url)
+            && let Ok(json) = std::fs::read_to_string(&config_path)
+            && let Ok(mut config) = serde_json::from_str::<SyncConfig>(&json)
+        {
+            config.crate_name = Some(crate_name.clone());
+            if let Ok(updated) = serde_json::to_string_pretty(&config) {
+                let _ = std::fs::write(&config_path, updated);
             }
         }
         // Signal the engine that tables are registered and sync can begin
@@ -1048,6 +1065,63 @@ impl<'a> SchemaBuilder<'a> {
     }
 }
 
+/// Persisted sync configuration for background sync services.
+///
+/// Written to `{db_directory}/.wavesync_config.json` during [`WaveSyncDbBuilder::build()`].
+/// Read by [`background_sync()`](crate::background_sync::background_sync) to reconstruct
+/// the builder without the app developer passing any configuration.
+///
+/// **Security note**: The passphrase is stored in plaintext. On Android/iOS the app's
+/// data directory is sandboxed (same protection as the SQLite database itself).
+#[derive(Serialize, Deserialize)]
+pub struct SyncConfig {
+    pub database_url: String,
+    pub topic: String,
+    pub relay_server: Option<String>,
+    pub passphrase: Option<String>,
+    pub rendezvous_server: Option<String>,
+    pub bootstrap_peers: Vec<String>,
+    pub api_key: Option<String>,
+    pub ipv6: bool,
+    pub crate_name: Option<String>,
+}
+
+impl SyncConfig {
+    /// Derive the config file path from a SQLite database URL.
+    ///
+    /// The config is stored alongside the database file as `.wavesync_config.json`.
+    pub fn config_path(database_url: &str) -> Option<PathBuf> {
+        // Strip the "sqlite:" or "sqlite://" prefix and query parameters
+        let path_str = database_url
+            .strip_prefix("sqlite://")
+            .or_else(|| database_url.strip_prefix("sqlite:"))
+            .unwrap_or(database_url);
+        let path_str = path_str.split('?').next().unwrap_or(path_str);
+        let db_path = PathBuf::from(path_str);
+        db_path.parent().map(|dir| dir.join(".wavesync_config.json"))
+    }
+
+    /// Read a previously saved config from the database directory.
+    pub fn load(database_url: &str) -> Result<Self, String> {
+        let path = Self::config_path(database_url)
+            .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read config at {}: {e}", path.display()))?;
+        serde_json::from_str(&json)
+            .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))
+    }
+
+    /// Save this config to the database directory.
+    fn save(&self) -> Result<(), String> {
+        let path = Self::config_path(&self.database_url)
+            .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("Failed to write config to {}: {e}", path.display()))
+    }
+}
+
 /// Builder for `WaveSyncDb`.
 pub struct WaveSyncDbBuilder {
     database_url: String,
@@ -1058,6 +1132,7 @@ pub struct WaveSyncDbBuilder {
     mdns_query_interval: std::time::Duration,
     mdns_ttl: std::time::Duration,
     group_key: Option<crate::auth::GroupKey>,
+    passphrase: Option<String>,
     bootstrap_peers: Vec<String>,
     rendezvous_server: Option<String>,
     rendezvous_discover_interval: std::time::Duration,
@@ -1081,6 +1156,7 @@ impl WaveSyncDbBuilder {
             mdns_query_interval: defaults.mdns_query_interval,
             mdns_ttl: defaults.mdns_ttl,
             group_key: None,
+            passphrase: None,
             bootstrap_peers: Vec::new(),
             rendezvous_server: None,
             rendezvous_discover_interval: defaults.rendezvous_discover_interval,
@@ -1172,6 +1248,7 @@ impl WaveSyncDbBuilder {
 
     pub fn with_passphrase(mut self, passphrase: &str) -> Self {
         self.group_key = Some(crate::auth::GroupKey::from_passphrase(passphrase));
+        self.passphrase = Some(passphrase.to_string());
         self
     }
 
@@ -1259,6 +1336,22 @@ impl WaveSyncDbBuilder {
             })
             .collect();
 
+        // Persist config for background sync services (before moving fields)
+        let sync_config = SyncConfig {
+            database_url: self.database_url.clone(),
+            topic: self.topic.clone(),
+            relay_server: self.relay_server.clone(),
+            passphrase: self.passphrase,
+            rendezvous_server: self.rendezvous_server.clone(),
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            api_key: self.api_key.clone(),
+            ipv6: self.ipv6,
+            crate_name: None, // Set by SchemaBuilder::sync()
+        };
+        if let Err(e) = sync_config.save() {
+            log::warn!("Failed to save sync config for background services: {e}");
+        }
+
         let engine_config = crate::engine::EngineConfig {
             sync_interval: self.sync_interval,
             mdns_query_interval: self.mdns_query_interval,
@@ -1294,6 +1387,7 @@ impl WaveSyncDbBuilder {
         let db = WaveSyncDb {
             inner: Arc::new(WaveSyncDbInner {
                 inner,
+                database_url: self.database_url,
                 sync_tx,
                 change_tx,
                 site_id,
