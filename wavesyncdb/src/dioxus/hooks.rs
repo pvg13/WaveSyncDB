@@ -367,6 +367,50 @@ pub fn use_app_resume(db: WaveSyncDb, foreground: Signal<bool>) {
     });
 }
 
+/// Automatically detects app lifecycle transitions and calls
+/// [`WaveSyncDb::resume()`] when the app returns to foreground.
+///
+/// On **Android**, polls `hasWindowFocus()` via JNI to detect foreground state.
+/// On **iOS**, observes `UIApplicationDidBecomeActiveNotification` /
+/// `UIApplicationWillResignActiveNotification` via `NSNotificationCenter`.
+/// On **desktop** and other platforms, this is a no-op — use
+/// [`use_app_resume()`] with a manual signal if you need desktop lifecycle.
+///
+/// ```ignore
+/// use_auto_lifecycle(db);  // One line — done.
+/// ```
+pub fn use_auto_lifecycle(db: WaveSyncDb) {
+    let rx = use_hook(|| {
+        let (tx, rx) = tokio::sync::watch::channel(true);
+        std::thread::Builder::new()
+            .name("wavesync-lifecycle".into())
+            .spawn(move || {
+                super::lifecycle::start_lifecycle_listener(tx);
+            })
+            .ok();
+        rx
+    });
+
+    use_effect(move || {
+        let mut rx = rx.clone();
+        let db = db.clone();
+        let mut was_foreground = true;
+        spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let is_foreground = *rx.borrow_and_update();
+                if is_foreground && !was_foreground {
+                    log::info!("Auto-lifecycle: app resumed, triggering sync");
+                    db.resume();
+                }
+                was_foreground = is_foreground;
+            }
+        });
+    });
+}
+
 /// Reactive signal for a single row, looked up by primary key.
 ///
 /// Performs an initial `E::find_by_id(pk).one(db)` query, then re-queries whenever

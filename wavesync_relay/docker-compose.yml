@@ -8,8 +8,7 @@ services:
       - "4001:4001/udp"
     volumes:
       - relay-data:/data
-      # Uncomment and mount your credential files if using push notifications:
-      # - ./fcm-service-account.json:/data/fcm-credentials.json:ro
+      - ./fcm-service-account.json:/data/fcm-credentials.json:ro
       # - ./AuthKey.p8:/data/apns-key.p8:ro
     environment:
       # Base64-encoded identity keypair. Generate with:
@@ -20,7 +19,7 @@ services:
       # Without this, clients get NoAddressesInReservation and WAN sync is broken.
       # For Coolify: set EXTERNAL_ADDRESS in Service > Environment Variables.
       EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS:-/ip4/YOUR_PUBLIC_IP/tcp/4001}"
-      # FCM_CREDENTIALS: /data/fcm-credentials.json
+      FCM_CREDENTIALS: /data/fcm-credentials.json
       # APNS_KEY_FILE: /data/apns-key.p8
       # APNS_KEY_ID: ""
       # APNS_TEAM_ID: ""
