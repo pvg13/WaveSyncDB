@@ -1,0 +1,8 @@
+[application]
+name = "WaveSyncDB FCM Sync"
+default_platform = "android"
+
+[android]
+min_sdk = 24
+target_sdk = 34
+identifier = "com.wavesync.mobile_demo"

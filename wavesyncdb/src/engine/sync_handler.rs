@@ -37,7 +37,9 @@ impl EngineRunner {
                             topic: peer_topic,
                             hmac: req_hmac,
                         } => {
-                            self.handle_push_request(peer, channel, changeset, peer_topic, req_hmac);
+                            self.handle_push_request(
+                                peer, channel, changeset, peer_topic, req_hmac,
+                            );
                         }
                         SyncRequest::IdentityAnnounce {
                             app_id,
@@ -212,9 +214,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!(
-                        "Rejecting unauthenticated sync request from peer {peer}"
-                    );
+                    log::debug!("Rejecting unauthenticated sync request from peer {peer}");
                     return;
                 }
             };
@@ -229,19 +229,15 @@ impl EngineRunner {
             if let Ok(bytes) = serde_json::to_vec(&verify_req)
                 && !gk.verify(&bytes, &tag)
             {
-                log::debug!(
-                    "Rejecting sync request with invalid HMAC from peer {peer}"
-                );
+                log::debug!("Rejecting sync request with invalid HMAC from peer {peer}");
                 return;
             }
             // HMAC verified — mark peer as group member
             if !self.verified_peers.contains(&peer) {
                 self.verified_peers.insert(peer);
-                self.emit_network_event(
-                    crate::network_status::NetworkEvent::PeerVerified(
-                        crate::network_status::PeerId(peer.to_string()),
-                    ),
-                );
+                self.emit_network_event(crate::network_status::NetworkEvent::PeerVerified(
+                    crate::network_status::PeerId(peer.to_string()),
+                ));
                 self.update_network_status();
                 // Announce identity to newly verified peer
                 if let Some(ref id) = self.local_app_id {
@@ -273,12 +269,10 @@ impl EngineRunner {
         let reported = self.peer_reported_versions.entry(peer).or_insert(0);
         *reported = (*reported).max(my_db_version);
 
-        self.emit_network_event(
-            crate::network_status::NetworkEvent::PeerSynced {
-                peer_id: crate::network_status::PeerId(peer.to_string()),
-                db_version: my_db_version,
-            },
-        );
+        self.emit_network_event(crate::network_status::NetworkEvent::PeerSynced {
+            peer_id: crate::network_status::PeerId(peer.to_string()),
+            db_version: my_db_version,
+        });
         self.update_network_status();
 
         // Spawn async task to query changes and respond
@@ -293,23 +287,18 @@ impl EngineRunner {
 
         tokio::spawn(async move {
             // Get changes since the peer's last known version of us
-            let changes = match shadow::get_changes_since(
-                &db,
-                &registry,
-                your_last_db_version,
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!(
-                        "Failed to get changes since {}: {}",
-                        your_last_db_version,
-                        e
-                    );
-                    Vec::new()
-                }
-            };
+            let changes =
+                match shadow::get_changes_since(&db, &registry, your_last_db_version).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get changes since {}: {}",
+                            your_last_db_version,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
 
             let mut resp = crate::protocol::SyncResponse::ChangesetResponse {
                 changes,
@@ -325,10 +314,7 @@ impl EngineRunner {
                 && let Ok(bytes) = serde_json::to_vec(&resp)
             {
                 let tag = gk.mac(&bytes);
-                if let crate::protocol::SyncResponse::ChangesetResponse {
-                    ref mut hmac,
-                    ..
-                } = resp
+                if let crate::protocol::SyncResponse::ChangesetResponse { ref mut hmac, .. } = resp
                 {
                     *hmac = Some(tag);
                 }
@@ -365,9 +351,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!(
-                        "Rejecting unauthenticated push from peer {peer}"
-                    );
+                    log::debug!("Rejecting unauthenticated push from peer {peer}");
                     return;
                 }
             };
@@ -379,19 +363,15 @@ impl EngineRunner {
             if let Ok(bytes) = serde_json::to_vec(&verify_req)
                 && !gk.verify(&bytes, &tag)
             {
-                log::debug!(
-                    "Rejecting push with invalid HMAC from peer {peer}"
-                );
+                log::debug!("Rejecting push with invalid HMAC from peer {peer}");
                 return;
             }
             // HMAC verified — mark peer as group member
             if !self.verified_peers.contains(&peer) {
                 self.verified_peers.insert(peer);
-                self.emit_network_event(
-                    crate::network_status::NetworkEvent::PeerVerified(
-                        crate::network_status::PeerId(peer.to_string()),
-                    ),
-                );
+                self.emit_network_event(crate::network_status::NetworkEvent::PeerVerified(
+                    crate::network_status::PeerId(peer.to_string()),
+                ));
                 self.update_network_status();
                 // Announce identity to newly verified peer
                 if let Some(ref id) = self.local_app_id {
@@ -453,9 +433,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!(
-                        "Rejecting unauthenticated identity announce from peer {peer}"
-                    );
+                    log::debug!("Rejecting unauthenticated identity announce from peer {peer}");
                     return;
                 }
             };
@@ -466,28 +444,22 @@ impl EngineRunner {
             if let Ok(bytes) = serde_json::to_vec(&verify_req)
                 && !gk.verify(&bytes, &tag)
             {
-                log::debug!(
-                    "Rejecting identity announce with invalid HMAC from peer {peer}"
-                );
+                log::debug!("Rejecting identity announce with invalid HMAC from peer {peer}");
                 return;
             }
         }
 
         // Only accept from verified peers
         if !self.verified_peers.contains(&peer) {
-            log::debug!(
-                "Ignoring identity announce from unverified peer {peer}"
-            );
+            log::debug!("Ignoring identity announce from unverified peer {peer}");
             return;
         }
 
         self.peer_identities.insert(peer, app_id.clone());
-        self.emit_network_event(
-            crate::network_status::NetworkEvent::PeerIdentityReceived {
-                peer_id: crate::network_status::PeerId(peer.to_string()),
-                app_id,
-            },
-        );
+        self.emit_network_event(crate::network_status::NetworkEvent::PeerIdentityReceived {
+            peer_id: crate::network_status::PeerId(peer.to_string()),
+            app_id,
+        });
         self.update_network_status();
 
         // Send IdentityAck
@@ -508,11 +480,9 @@ impl EngineRunner {
         self.peers.remove(&peer);
         self.peer_db_versions.remove(&peer);
         self.peer_reported_versions.remove(&peer);
-        self.emit_network_event(
-            crate::network_status::NetworkEvent::PeerRejected(
-                crate::network_status::PeerId(peer.to_string()),
-            ),
-        );
+        self.emit_network_event(crate::network_status::NetworkEvent::PeerRejected(
+            crate::network_status::PeerId(peer.to_string()),
+        ));
         self.update_network_status();
     }
 }
@@ -563,10 +533,9 @@ pub(super) async fn apply_remote_changeset(
                 is_delete = true;
             }
         } else {
-            let (applied, cols) = apply_remote_column_changes(
-                db, table, pk, row_changes, &meta, local_db_version,
-            )
-            .await;
+            let (applied, cols) =
+                apply_remote_column_changes(db, table, pk, row_changes, &meta, local_db_version)
+                    .await;
             if applied {
                 any_applied = true;
                 changed_columns = cols;
@@ -676,8 +645,7 @@ async fn apply_remote_column_changes(
             change.col_version > local_cv
         } else {
             let local_val_bytes =
-                get_local_value_bytes(db, table, &meta.primary_key_column, pk, &change.cid.0)
-                    .await;
+                get_local_value_bytes(db, table, &meta.primary_key_column, pk, &change.cid.0).await;
             conflict::should_apply_column(
                 change.col_version,
                 &remote_val_bytes,
@@ -689,8 +657,7 @@ async fn apply_remote_column_changes(
         };
 
         if should_apply {
-            winning_columns
-                .push((change.cid.0.clone(), json_to_sea_value(change.val.as_ref())));
+            winning_columns.push((change.cid.0.clone(), json_to_sea_value(change.val.as_ref())));
             changed_columns.push(change.cid.0.clone());
             pending_shadow_updates.push((
                 change.cid.0.clone(),
@@ -799,15 +766,18 @@ async fn flush_shadow_updates(
     local_db_version: u64,
 ) {
     for (cid, cv, site, seq) in updates {
-        let _ = shadow::upsert_clock_entry(
-            db, table, pk, cid, *cv, local_db_version, site, *seq,
-        )
-        .await;
+        let _ =
+            shadow::upsert_clock_entry(db, table, pk, cid, *cv, local_db_version, site, *seq).await;
     }
 }
 
 /// Check if a row exists in a table.
-pub(super) async fn row_exists(db: &DatabaseConnection, table: &str, pk_col: &str, pk: &str) -> bool {
+pub(super) async fn row_exists(
+    db: &DatabaseConnection,
+    table: &str,
+    pk_col: &str,
+    pk: &str,
+) -> bool {
     let sql = format!(
         "SELECT 1 FROM \"{}\" WHERE \"{}\" = $1 LIMIT 1",
         table, pk_col
@@ -1081,9 +1051,18 @@ mod tests {
             .await
             .unwrap();
         // Set local clock entry with version 5
-        crate::shadow::upsert_clock_entry(&db, "tasks", "c-1", "title", 5, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "c-1",
+            "title",
+            5,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote change with higher version (10) should win
         let changes = vec![ColumnChange {
@@ -1121,9 +1100,18 @@ mod tests {
         db.execute_unprepared("INSERT INTO tasks VALUES ('lv-1', 'Local', 0)")
             .await
             .unwrap();
-        crate::shadow::upsert_clock_entry(&db, "tasks", "lv-1", "title", 10, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "lv-1",
+            "title",
+            10,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote change with LOWER version (3) should lose
         let changes = vec![ColumnChange {
@@ -1165,9 +1153,18 @@ mod tests {
             .await
             .unwrap();
         // Set local clock for title only
-        crate::shadow::upsert_clock_entry(&db, "tasks", "dc-1", "title", 1, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "dc-1",
+            "title",
+            1,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote changes: higher version for title, and a new column "done"
         let changes = vec![
@@ -1220,9 +1217,18 @@ mod tests {
             .await
             .unwrap();
         // Set a high local clock
-        crate::shadow::upsert_clock_entry(&db, "tasks", "dlcl-1", "title", 10, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "dlcl-1",
+            "title",
+            10,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote delete with low causal length — should be rejected
         let changes = vec![ColumnChange {
@@ -1260,9 +1266,18 @@ mod tests {
             .await
             .unwrap();
         // Set local clock to 5
-        crate::shadow::upsert_clock_entry(&db, "tasks", "dw-1", "title", 5, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "dw-1",
+            "title",
+            5,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote delete with cl=5 (tie) — DeleteWins policy (default)
         let changes = vec![ColumnChange {
@@ -1300,9 +1315,18 @@ mod tests {
         db.execute_unprepared("INSERT INTO tasks VALUES ('aw-1', 'Tie Keep', 0)")
             .await
             .unwrap();
-        crate::shadow::upsert_clock_entry(&db, "tasks", "aw-1", "title", 5, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "aw-1",
+            "title",
+            5,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Remote delete with cl=5 (tie) — AddWins policy
         let changes = vec![ColumnChange {
@@ -1332,9 +1356,18 @@ mod tests {
         db.execute_unprepared("INSERT INTO tasks VALUES ('iad-1', 'Deleted', 0)")
             .await
             .unwrap();
-        crate::shadow::upsert_clock_entry(&db, "tasks", "iad-1", "title", 1, 1, &NodeId([1u8; 16]), 0)
-            .await
-            .unwrap();
+        crate::shadow::upsert_clock_entry(
+            &db,
+            "tasks",
+            "iad-1",
+            "title",
+            1,
+            1,
+            &NodeId([1u8; 16]),
+            0,
+        )
+        .await
+        .unwrap();
 
         // Apply remote delete
         let delete_changes = vec![ColumnChange {

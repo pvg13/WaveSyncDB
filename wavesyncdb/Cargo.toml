@@ -1,6 +1,6 @@
 [package]
 name = "wavesyncdb"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
@@ -22,7 +22,8 @@ uuid = { workspace = true }
 inventory = { workspace = true }
 blake3 = "1"
 wavesyncdb_derive = { path = "../wavesyncdb_derive", optional = true }
-dioxus = { version = "0.7.3", optional = true }
+dioxus = { version = "0.7.5", optional = true }
+manganis = { version = "0.7.5", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
@@ -40,4 +41,5 @@ env_logger = "0.11"
 default = []
 derive = ["dep:wavesyncdb_derive"]
 dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit"]
+android-fcm = ["mobile-ffi", "dep:jni", "dep:manganis"]
 mobile-ffi = []

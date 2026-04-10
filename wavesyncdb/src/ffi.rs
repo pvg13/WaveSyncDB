@@ -1,9 +1,13 @@
-//! C FFI exports for native mobile push notification services.
+//! FFI exports for native mobile push notification services.
 //!
-//! These functions are called from Android Kotlin (via JNI) or iOS Swift (via FFI)
-//! when a silent push notification wakes the app to sync.
+//! Two interfaces are provided:
 //!
-//! Enable with `features = ["mobile-ffi"]` in Cargo.toml.
+//! - **C FFI** (`wavesync_background_sync`) — called from iOS Swift via `@_silgen_name`.
+//!   Enable with `features = ["mobile-ffi"]`.
+//!
+//! - **JNI** (`Java_dev_dioxus_main_WaveSyncService_backgroundSync`) — called from
+//!   Android Kotlin via `WaveSyncService` in `dev.dioxus.main`.
+//!   Enable with `features = ["android-fcm"]`.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -11,13 +15,32 @@ use std::time::Duration;
 
 use crate::background_sync::{self, BackgroundSyncResult};
 
-/// Perform a one-shot background sync. Called from native Android/iOS push services.
-///
-/// # Arguments
-///
-/// * `database_url` — Null-terminated UTF-8 C string, e.g.
-///   `"sqlite:///data/data/com.example.app/databases/app.db?mode=rwc"`
-/// * `timeout_secs` — Maximum seconds to wait for sync completion
+/// Shared sync logic used by both C FFI and JNI entry points.
+fn run_background_sync(database_url: &str, timeout_secs: u32, peer_addrs: &[String]) -> i32 {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return -6,
+    };
+
+    let timeout = Duration::from_secs(timeout_secs.into());
+
+    rt.block_on(async {
+        match background_sync::background_sync_with_peers(database_url, timeout, peer_addrs).await {
+            Ok(BackgroundSyncResult::Synced { .. }) => 0,
+            Ok(BackgroundSyncResult::NoPeers) => 1,
+            Ok(BackgroundSyncResult::TimedOut { .. }) => 2,
+            Err(background_sync::BackgroundSyncError::ConfigNotFound(_)) => -1,
+            Err(background_sync::BackgroundSyncError::ConfigInvalid(_)) => -2,
+            Err(background_sync::BackgroundSyncError::DatabaseError(_)) => -3,
+            Err(background_sync::BackgroundSyncError::RegistryError(_)) => -4,
+        }
+    })
+}
+
+/// C FFI entry point for background sync. Called from iOS Swift via `@_silgen_name`.
 ///
 /// # Returns
 ///
@@ -41,29 +64,46 @@ pub extern "C" fn wavesync_background_sync(database_url: *const c_char, timeout_
     }
 
     let url = match unsafe { CStr::from_ptr(database_url) }.to_str() {
-        Ok(s) => s.to_string(),
+        Ok(s) => s,
         Err(_) => return -5,
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => return -6,
+    run_background_sync(url, timeout_secs, &[])
+}
+
+/// JNI entry point for background sync. Called from Dioxus-generated
+/// `WaveSyncService.backgroundSync()` in `dev.dioxus.main`.
+///
+/// `peer_addrs_json` is a JSON array of multiaddr strings from the FCM payload,
+/// e.g. `["/ip4/192.168.1.150/tcp/36189/p2p/12D3Koo..."]`. These are dialed
+/// directly as bootstrap peers, bypassing slow mDNS/relay discovery.
+///
+/// Same return codes as `wavesync_background_sync`.
+#[cfg(all(target_os = "android", feature = "android-fcm"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    database_url: jni::objects::JString,
+    timeout_secs: jni::sys::jint,
+    peer_addrs_json: jni::objects::JString,
+) -> jni::sys::jint {
+    let url: String = match env.get_string(&database_url) {
+        Ok(s) => s.into(),
+        Err(_) => return -5,
     };
 
-    let timeout = Duration::from_secs(timeout_secs.into());
-
-    rt.block_on(async {
-        match background_sync::background_sync(&url, timeout).await {
-            Ok(BackgroundSyncResult::Synced { .. }) => 0,
-            Ok(BackgroundSyncResult::NoPeers) => 1,
-            Ok(BackgroundSyncResult::TimedOut { .. }) => 2,
-            Err(background_sync::BackgroundSyncError::ConfigNotFound(_)) => -1,
-            Err(background_sync::BackgroundSyncError::ConfigInvalid(_)) => -2,
-            Err(background_sync::BackgroundSyncError::DatabaseError(_)) => -3,
-            Err(background_sync::BackgroundSyncError::RegistryError(_)) => -4,
+    let peer_addrs: Vec<String> = if peer_addrs_json.is_null() {
+        Vec::new()
+    } else {
+        match env.get_string(&peer_addrs_json) {
+            Ok(s) => {
+                let json: String = s.into();
+                serde_json::from_str(&json).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
         }
-    })
+    };
+
+    run_background_sync(&url, timeout_secs as u32, &peer_addrs)
 }

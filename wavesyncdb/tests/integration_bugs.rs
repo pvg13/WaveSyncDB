@@ -288,8 +288,13 @@ async fn test_n4_db_version_persist_failure_returns_error() {
     // Wait for async shadow work to complete
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let ver_after_first = wavesyncdb::shadow::get_db_version(db.inner()).await.unwrap();
-    assert_eq!(ver_after_first, 1, "db_version should be 1 after first insert");
+    let ver_after_first = wavesyncdb::shadow::get_db_version(db.inner())
+        .await
+        .unwrap();
+    assert_eq!(
+        ver_after_first, 1,
+        "db_version should be 1 after first insert"
+    );
 
     // Step 2: Drop _wavesync_meta to make set_db_version fail
     db.inner()
@@ -313,8 +318,12 @@ async fn test_n4_db_version_persist_failure_returns_error() {
     );
 
     // Step 4: Restore _wavesync_meta and set db_version back to 1
-    wavesyncdb::shadow::create_meta_table(db.inner()).await.unwrap();
-    wavesyncdb::shadow::set_db_version(db.inner(), 1).await.unwrap();
+    wavesyncdb::shadow::create_meta_table(db.inner())
+        .await
+        .unwrap();
+    wavesyncdb::shadow::set_db_version(db.inner(), 1)
+        .await
+        .unwrap();
 
     // Step 5: Insert again — should succeed and advance db_version to 2
     task::ActiveModel {
@@ -331,7 +340,9 @@ async fn test_n4_db_version_persist_failure_returns_error() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Step 6: Verify db_version is 2 (not 3), proving the in-memory rollback worked
-    let ver_final = wavesyncdb::shadow::get_db_version(db.inner()).await.unwrap();
+    let ver_final = wavesyncdb::shadow::get_db_version(db.inner())
+        .await
+        .unwrap();
     assert_eq!(
         ver_final, 2,
         "N4: db_version should be 2 (not 3) — in-memory counter must have been rolled back"
@@ -386,12 +397,7 @@ async fn test_r1_peer_starts_unverified() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
         .with_node_id(common::make_node_id(201))
@@ -402,12 +408,7 @@ async fn test_r1_peer_starts_unverified() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Immediately after creation, no peer should be a group member yet
     let status_a = peer_a.network_status();
@@ -438,12 +439,7 @@ async fn test_r1_peer_verified_after_sync() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
         .with_node_id(common::make_node_id(203))
@@ -454,12 +450,7 @@ async fn test_r1_peer_verified_after_sync() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // After sync exchange completes, both peers should see each other as group members
     assert_eventually("A sees B as group member", timeout, || async {
@@ -498,12 +489,7 @@ async fn test_r1_no_passphrase_never_verified() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
         .with_node_id(common::make_node_id(205))
@@ -513,12 +499,7 @@ async fn test_r1_no_passphrase_never_verified() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for sync to complete — data should replicate even without passphrase
     task::ActiveModel {
@@ -576,12 +557,7 @@ async fn test_r5_identity_announced_after_verification() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     // Set identity on A before B is created
     peer_a.set_peer_identity("user-123");
@@ -595,12 +571,7 @@ async fn test_r5_identity_announced_after_verification() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for B to see A's identity
     assert_eventually("B sees A's identity", timeout, || async {
@@ -639,12 +610,7 @@ async fn test_r5_identity_cleared_on_disconnect() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
     peer_a.set_peer_identity("user-456");
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
@@ -656,12 +622,7 @@ async fn test_r5_identity_cleared_on_disconnect() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for B to see A's identity
     assert_eventually("B sees A's identity", timeout, || async {
@@ -701,12 +662,7 @@ async fn test_r5_identity_not_sent_without_passphrase() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
     peer_a.set_peer_identity("user-789");
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
@@ -717,12 +673,7 @@ async fn test_r5_identity_not_sent_without_passphrase() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for sync to work (data replication should still happen)
     task::ActiveModel {

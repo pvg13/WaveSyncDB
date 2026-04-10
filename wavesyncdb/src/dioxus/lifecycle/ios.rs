@@ -30,8 +30,7 @@ unsafe fn register_observers(tx: watch::Sender<bool>) {
         );
 
     // UIApplicationWillResignActiveNotification
-    let resign_name: &NSNotificationName =
-        objc2_ui_kit::UIApplicationWillResignActiveNotification;
+    let resign_name: &NSNotificationName = objc2_ui_kit::UIApplicationWillResignActiveNotification;
     let tx_pause = tx;
     let pause_observer: Retained<ProtocolObject<dyn NSObjectProtocol>> = center
         .addObserverForName_object_queue_usingBlock(

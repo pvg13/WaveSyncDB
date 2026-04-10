@@ -1,5 +1,5 @@
-use jni::objects::JObject;
 use jni::JavaVM;
+use jni::objects::JObject;
 use tokio::sync::watch;
 
 /// Starts listening for Android activity lifecycle transitions.
@@ -19,7 +19,7 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
     };
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
-    let mut env = match vm.attach_current_thread() {
+    let env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(e) => {
             log::error!("Failed to attach JNI thread: {e}");

@@ -219,8 +219,12 @@ pub struct WaveSyncDb {
 
 impl Drop for WaveSyncDbInner {
     fn drop(&mut self) {
-        // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk between tests)
-        if let Some(handle) = self.engine_handle.lock().ok().and_then(|mut h| h.take()) {
+        // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk between tests).
+        // Use get_mut() instead of lock() — since we have &mut self, no other thread
+        // can hold a reference, so we can access the mutex data without locking.
+        // This avoids the "pthread_mutex_lock called on a destroyed mutex" crash
+        // on Android when the app process is killed.
+        if let Some(handle) = self.engine_handle.get_mut().ok().and_then(|h| h.take()) {
             handle.abort();
         }
     }
@@ -586,8 +590,7 @@ impl WaveSyncDb {
         // The spawned task holds the db_version lock for the full operation (shadow
         // serialization) but signals persist success/failure immediately so the
         // ConnectionTrait method can propagate errors.
-        let (persist_tx, persist_rx) =
-            tokio::sync::oneshot::channel::<Result<(), DbErr>>();
+        let (persist_tx, persist_rx) = tokio::sync::oneshot::channel::<Result<(), DbErr>>();
 
         // Async CRDT bookkeeping + P2P sync
         // The db_version lock is held for the entire operation to serialize
@@ -710,9 +713,7 @@ impl WaveSyncDb {
         match persist_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(DbErr::Custom(
-                "db_version persist task panicked".into(),
-            )),
+            Err(_) => Err(DbErr::Custom("db_version persist task panicked".into())),
         }
     }
 }
@@ -1084,6 +1085,15 @@ pub struct SyncConfig {
     pub api_key: Option<String>,
     pub ipv6: bool,
     pub crate_name: Option<String>,
+    /// Firebase project ID for background service cold-start init.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fcm_project_id: Option<String>,
+    /// Firebase application ID for background service cold-start init.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fcm_app_id: Option<String>,
+    /// Firebase API key for background service cold-start init.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fcm_api_key: Option<String>,
 }
 
 impl SyncConfig {
@@ -1098,7 +1108,9 @@ impl SyncConfig {
             .unwrap_or(database_url);
         let path_str = path_str.split('?').next().unwrap_or(path_str);
         let db_path = PathBuf::from(path_str);
-        db_path.parent().map(|dir| dir.join(".wavesync_config.json"))
+        db_path
+            .parent()
+            .map(|dir| dir.join(".wavesync_config.json"))
     }
 
     /// Read a previously saved config from the database directory.
@@ -1139,6 +1151,8 @@ pub struct WaveSyncDbBuilder {
     rendezvous_ttl: u64,
     ipv6: bool,
     push_token: Option<(String, String)>,
+    #[cfg(feature = "android-fcm")]
+    fcm_credentials: Option<crate::fcm::FcmCredentials>,
     api_key: Option<String>,
     keep_alive_interval: std::time::Duration,
     circuit_max_duration: std::time::Duration,
@@ -1163,6 +1177,8 @@ impl WaveSyncDbBuilder {
             rendezvous_ttl: defaults.rendezvous_ttl,
             ipv6: false,
             push_token: None,
+            #[cfg(feature = "android-fcm")]
+            fcm_credentials: None,
             api_key: None,
             keep_alive_interval: defaults.keep_alive_interval,
             circuit_max_duration: defaults.circuit_max_duration,
@@ -1262,6 +1278,53 @@ impl WaveSyncDbBuilder {
         self
     }
 
+    /// Configure FCM from a `google-services.json` file for push-based background sync.
+    ///
+    /// Pass the contents of your Firebase `google-services.json` file (use `include_str!`
+    /// to embed it at compile time). WaveSyncDB extracts the Firebase credentials and
+    /// handles initialization + token retrieval via JNI automatically.
+    ///
+    /// On non-Android platforms, the credentials are parsed (to catch errors early)
+    /// but initialization is skipped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let db = WaveSyncDbBuilder::new(db_url, "my-topic")
+    ///     .with_relay_server("/dns4/relay.example.com/tcp/4001/p2p/12D3Koo...")
+    ///     .with_google_services(include_str!("../google-services.json"))
+    ///     .build()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "android-fcm")]
+    pub fn with_google_services(mut self, google_services_json: &str) -> Self {
+        match crate::fcm::FcmCredentials::from_google_services_json(google_services_json) {
+            Ok(creds) => {
+                self.fcm_credentials = Some(creds);
+            }
+            Err(e) => {
+                log::error!("Failed to parse google-services.json: {e}");
+            }
+        }
+        self
+    }
+
+    /// Configure FCM with explicit Firebase credentials.
+    ///
+    /// Use this if you prefer not to use `google-services.json`. Get these values
+    /// from Firebase Console → Project Settings → General.
+    ///
+    /// See [`with_google_services()`](Self::with_google_services) for the simpler approach.
+    #[cfg(feature = "android-fcm")]
+    pub fn with_fcm(mut self, project_id: &str, app_id: &str, api_key: &str) -> Self {
+        self.fcm_credentials = Some(crate::fcm::FcmCredentials {
+            project_id: project_id.to_string(),
+            app_id: app_id.to_string(),
+            api_key: api_key.to_string(),
+        });
+        self
+    }
+
     /// Set the ping keep-alive interval (default: 90s).
     ///
     /// This should be shorter than the shortest CGNAT mapping timeout in the
@@ -1281,7 +1344,28 @@ impl WaveSyncDbBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<WaveSyncDb, DbErr> {
+    #[allow(unused_mut)]
+    pub async fn build(mut self) -> Result<WaveSyncDb, DbErr> {
+        // Auto-read FCM token from file written by WaveSyncInitProvider / WaveSyncService.
+        // The ContentProvider writes the token on a background thread at app startup,
+        // so we retry a few times with a short delay to handle the race.
+        // Only runs on Android — desktop has no FCM service to write the token file.
+        #[cfg(all(feature = "android-fcm", target_os = "android"))]
+        if self.fcm_credentials.is_some() && self.push_token.is_none() {
+            for attempt in 0..5 {
+                if let Some(token) = crate::fcm::read_token_file(&self.database_url) {
+                    self.push_token = Some(("Fcm".to_string(), token));
+                    break;
+                }
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+            if self.push_token.is_none() {
+                log::info!("No FCM token file found — push will be registered on next launch");
+            }
+        }
+
         let opts = ConnectOptions::new(&self.database_url);
         let inner = Database::connect(opts).await?;
 
@@ -1337,6 +1421,22 @@ impl WaveSyncDbBuilder {
             .collect();
 
         // Persist config for background sync services (before moving fields)
+        // Extract FCM credentials for config persistence (behind feature gate)
+        #[cfg(feature = "android-fcm")]
+        let (fcm_project_id, fcm_app_id, fcm_api_key) = self
+            .fcm_credentials
+            .as_ref()
+            .map(|c| {
+                (
+                    Some(c.project_id.clone()),
+                    Some(c.app_id.clone()),
+                    Some(c.api_key.clone()),
+                )
+            })
+            .unwrap_or((None, None, None));
+        #[cfg(not(feature = "android-fcm"))]
+        let (fcm_project_id, fcm_app_id, fcm_api_key) = (None, None, None);
+
         let sync_config = SyncConfig {
             database_url: self.database_url.clone(),
             topic: self.topic.clone(),
@@ -1347,6 +1447,9 @@ impl WaveSyncDbBuilder {
             api_key: self.api_key.clone(),
             ipv6: self.ipv6,
             crate_name: None, // Set by SchemaBuilder::sync()
+            fcm_project_id,
+            fcm_app_id,
+            fcm_api_key,
         };
         if let Err(e) = sync_config.save() {
             log::warn!("Failed to save sync config for background services: {e}");

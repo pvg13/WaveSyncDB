@@ -62,7 +62,7 @@ impl PushSender {
     }
 
     /// Send a data-only FCM notification to a device token.
-    pub async fn send_fcm(&self, token: &str, topic: &str) -> PushResult {
+    pub async fn send_fcm(&self, token: &str, topic: &str, peer_addrs: &[String]) -> PushResult {
         let fcm = match &self.fcm {
             Some(c) => c,
             None => return PushResult::Error("FCM not configured".to_string()),
@@ -83,7 +83,8 @@ impl PushSender {
                 "token": token,
                 "data": {
                     "type": "sync_available",
-                    "topic": topic
+                    "topic": topic,
+                    "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
                 }
             }
         });
