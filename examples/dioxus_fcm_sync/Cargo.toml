@@ -1,0 +1,14 @@
+[package]
+name = "example-dioxus-fcm-sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wavesyncdb = { workspace = true, features = ["derive", "dioxus", "android-fcm"] }
+sea-orm = { workspace = true }
+dioxus = { version = "0.7.5" }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = "0.10.0"
+uuid = { workspace = true }
+dioxus-sdk-storage = { git = "https://github.com/DioxusLabs/sdk.git" }

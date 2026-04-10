@@ -22,3 +22,8 @@ Cargo.lock
 
 # Keep CLAUDE.md and doc files tracked — only ignore generated markdown
 **/*.md
+**/*firebase*.json
+**/*google-services*.json
+**/.gradle/
+**/build/
+**/.kotlin/

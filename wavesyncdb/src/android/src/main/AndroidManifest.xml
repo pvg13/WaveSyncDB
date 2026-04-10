@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <service android:name="dev.dioxus.main.WaveSyncService" android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Auto-init Firebase + write FCM token on app startup -->
+        <provider
+            android:name="dev.dioxus.main.WaveSyncInitProvider"
+            android:authorities="${applicationId}.wavesync_init"
+            android:exported="false"
+            android:initOrder="100" />
+    </application>
+</manifest>

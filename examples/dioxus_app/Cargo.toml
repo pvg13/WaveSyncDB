@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 wavesyncdb = { workspace = true, features = ["derive", "dioxus"] }
 sea-orm = { workspace = true }
-dioxus = { version = "0.7.3", features = ["desktop"] }
+dioxus = { version = "0.7.5", features = ["desktop"] }
 tokio = { workspace = true }
 log = { workspace = true }
 env_logger = "0.10.0"

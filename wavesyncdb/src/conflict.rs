@@ -105,7 +105,14 @@ mod tests {
     #[test]
     fn test_first_write_no_local() {
         // If local col_version is 0 (no entry), remote with version > 0 always wins
-        assert!(should_apply_column(1, b"v", &SITE_A, 0, b"", &NodeId([0u8; 16])));
+        assert!(should_apply_column(
+            1,
+            b"v",
+            &SITE_A,
+            0,
+            b"",
+            &NodeId([0u8; 16])
+        ));
     }
 
     #[test]

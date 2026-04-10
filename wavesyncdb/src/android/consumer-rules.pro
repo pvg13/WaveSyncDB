@@ -1,0 +1,2 @@
+-keep class dev.dioxus.main.WaveSyncService { *; }
+-keep class dev.dioxus.main.WaveSyncNative { *; }

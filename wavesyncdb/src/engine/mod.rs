@@ -13,12 +13,12 @@
 
 pub(crate) mod auth_protocol;
 pub(crate) mod behaviour;
-pub(crate) mod push_protocol;
-pub(crate) mod snapshot_protocol;
 pub(crate) mod command_handler;
 pub(crate) mod identity_handler;
 pub(crate) mod peer_manager;
+pub(crate) mod push_protocol;
 pub(crate) mod relay_manager;
+pub(crate) mod snapshot_protocol;
 pub(crate) mod sync_handler;
 
 use sync_handler::apply_remote_changeset;
@@ -334,7 +334,7 @@ async fn run_engine(
         infrastructure_peers,
         pending_sync_peers: std::collections::HashSet::new(),
         dialing_peers: std::collections::HashSet::new(),
-        pending_rendezvous_dials: std::collections::VecDeque::new(),
+        pending_rendezvous_dials: VecDeque::new(),
         push_token,
         push_registered: false,
         network_status,
@@ -428,7 +428,7 @@ struct EngineRunner {
     /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
     pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
-    pub(crate) pending_rendezvous_dials: std::collections::VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
+    pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
     pub(crate) push_token: Option<(String, String)>,
     /// Whether push token has been registered with the relay.
@@ -513,8 +513,7 @@ impl EngineRunner {
     ) {
         // If this is the relay server, transition state
         if let Some(ref relay_addr) = self.config.relay_server
-            && let Some(libp2p::multiaddr::Protocol::P2p(relay_peer_id)) =
-                relay_addr.iter().last()
+            && let Some(libp2p::multiaddr::Protocol::P2p(relay_peer_id)) = relay_addr.iter().last()
             && peer_id == relay_peer_id
         {
             self.handle_relay_peer_connected(peer_id, relay_addr.clone());
@@ -568,11 +567,9 @@ impl EngineRunner {
             relay_peer_id: peer_id,
             connected_at: tokio::time::Instant::now(),
         };
-        self.emit_network_event(
-            crate::network_status::NetworkEvent::RelayStatusChanged(
-                crate::network_status::RelayStatus::Connected,
-            ),
-        );
+        self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+            crate::network_status::RelayStatus::Connected,
+        ));
         self.update_network_status();
 
         // Eagerly listen on relay circuit
@@ -595,17 +592,14 @@ impl EngineRunner {
 
         // Register with rendezvous immediately
         if let Some(ref rv_addr) = self.config.rendezvous_server
-            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
-                rv_addr.iter().last()
+            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
             && self.swarm.is_connected(&rv_peer_id)
         {
             self.rendezvous_register(rv_peer_id);
         }
 
         // Start NAT assumption timer
-        if self.nat_status == NatStatus::Unknown
-            && self.nat_assumption_deadline.is_none()
-        {
+        if self.nat_status == NatStatus::Unknown && self.nat_assumption_deadline.is_none() {
             self.nat_assumption_deadline =
                 Some(tokio::time::Instant::now() + Duration::from_secs(30));
         }
@@ -653,8 +647,8 @@ impl EngineRunner {
         }
 
         // Handle relay server disconnect
-        if let RelayState::Connected { relay_peer_id, .. }
-        | RelayState::Listening { relay_peer_id } = &self.relay_state
+        if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
+            &self.relay_state
             && peer_id == *relay_peer_id
         {
             self.handle_relay_peer_disconnected(peer_id);
@@ -662,8 +656,7 @@ impl EngineRunner {
 
         // If rendezvous server disconnected (and is different from relay)
         if let Some(ref rv_addr) = self.config.rendezvous_server
-            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
-                rv_addr.iter().last()
+            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
             && peer_id == rv_peer_id
             && !matches!(&self.relay_state, RelayState::Connecting { .. })
             && self.rendezvous_registered
@@ -671,9 +664,7 @@ impl EngineRunner {
             log::warn!("Lost connection to rendezvous server {peer_id}");
             self.rendezvous_registered = false;
             self.emit_network_event(
-                crate::network_status::NetworkEvent::RendezvousStatusChanged {
-                    registered: false,
-                },
+                crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
             self.update_network_status();
         }
@@ -695,23 +686,18 @@ impl EngineRunner {
         self.relay_state = RelayState::Connecting { retry_count: 0 };
         self.circuit_accepted_at = None;
         self.push_registered = false;
-        self.emit_network_event(
-            crate::network_status::NetworkEvent::RelayStatusChanged(
-                crate::network_status::RelayStatus::Connecting,
-            ),
-        );
+        self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+            crate::network_status::RelayStatus::Connecting,
+        ));
         // If relay also serves rendezvous, reset that too
         if let Some(ref rv_addr) = self.config.rendezvous_server
-            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
-                rv_addr.iter().last()
+            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
             && peer_id == rv_peer_id
         {
             log::warn!("Rendezvous server also disconnected (same as relay)");
             self.rendezvous_registered = false;
             self.emit_network_event(
-                crate::network_status::NetworkEvent::RendezvousStatusChanged {
-                    registered: false,
-                },
+                crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
         }
         self.update_network_status();
@@ -921,7 +907,6 @@ impl EngineRunner {
         }
     }
 
-
     async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
         // Update local db_version
         self.local_db_version = self.local_db_version.max(changeset.db_version);
@@ -1125,15 +1110,15 @@ impl EngineRunner {
                 log::warn!("Outgoing connection error to {peer_id:?}: {error}");
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
-                    if !self.swarm.is_connected(&pid)
-                        && self.peers.remove(&pid).is_some()
-                    {
+                    if !self.swarm.is_connected(&pid) && self.peers.remove(&pid).is_some() {
                         self.pending_sync_peers.remove(&pid);
                         self.verified_peers.remove(&pid);
                         self.peer_identities.remove(&pid);
-                        self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
-                            crate::network_status::PeerId(pid.to_string()),
-                        ));
+                        self.emit_network_event(
+                            crate::network_status::NetworkEvent::PeerDisconnected(
+                                crate::network_status::PeerId(pid.to_string()),
+                            ),
+                        );
                         self.update_network_status();
                     }
                 }
@@ -1142,7 +1127,6 @@ impl EngineRunner {
             _ => {}
         }
     }
-
 
     fn handle_push_event(
         &mut self,

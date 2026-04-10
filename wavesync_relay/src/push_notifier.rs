@@ -1,6 +1,10 @@
-//! Debounce coordinator for push notifications.
+//! Leading-edge debounce coordinator for push notifications.
 //!
-//! Batches rapid writes into a single notification per topic.
+//! Fires immediately on the first notification for a topic, then suppresses
+//! duplicates during a cooldown window. If notifications arrive during cooldown,
+//! the latest peer addresses are kept and a final notification fires when the
+//! cooldown expires. This ensures sub-second delivery for single writes while
+//! still batching rapid burst writes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +19,8 @@ use crate::push_store::PushStore;
 /// A notification request for a topic.
 pub struct TopicNotification {
     pub topic: String,
+    /// Addresses of the peer that triggered the notification.
+    pub peer_addrs: Vec<String>,
 }
 
 /// Background task that debounces topic notifications and fans out push messages.
@@ -27,69 +33,111 @@ impl PushNotifier {
     pub fn spawn(
         store: Arc<PushStore>,
         sender: Arc<PushSender>,
-        debounce_duration: Duration,
+        cooldown_duration: Duration,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<TopicNotification>(256);
-        tokio::spawn(notifier_loop(rx, store, sender, debounce_duration));
+        tokio::spawn(notifier_loop(rx, store, sender, cooldown_duration));
         Self { tx }
     }
 
     /// Queue a topic for notification (non-blocking, drops if channel full).
-    pub fn notify(&self, topic: String) {
-        let _ = self.tx.try_send(TopicNotification { topic });
+    pub fn notify(&self, topic: String, peer_addrs: Vec<String>) {
+        let _ = self.tx.try_send(TopicNotification { topic, peer_addrs });
     }
+}
+
+/// Per-topic cooldown state.
+struct CooldownState {
+    /// When the cooldown expires (next fire allowed).
+    expires_at: Instant,
+    /// If a notification arrived during cooldown, store its addresses here.
+    /// When cooldown expires, this fires as a trailing-edge notification.
+    pending: Option<Vec<String>>,
 }
 
 async fn notifier_loop(
     mut rx: mpsc::Receiver<TopicNotification>,
     store: Arc<PushStore>,
     sender: Arc<PushSender>,
-    debounce_duration: Duration,
+    cooldown_duration: Duration,
 ) {
-    // Track pending debounce timers per topic
-    let mut pending: HashMap<String, Instant> = HashMap::new();
+    let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
 
     loop {
-        // Calculate next deadline from pending timers
-        let next_deadline = pending.values().min().copied();
+        // Find the next cooldown expiry to check for trailing-edge fires
+        let next_expiry = cooldowns
+            .values()
+            .filter(|s| s.pending.is_some())
+            .map(|s| s.expires_at)
+            .min();
 
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Some(notification) => {
-                        // Reset or start debounce timer for this topic
-                        pending.insert(
-                            notification.topic,
-                            Instant::now() + debounce_duration,
-                        );
+                        let now = Instant::now();
+                        let topic = notification.topic;
+
+                        if let Some(state) = cooldowns.get_mut(&topic) {
+                            if now >= state.expires_at {
+                                // Cooldown expired — fire immediately (leading edge)
+                                fire_notifications(&store, &sender, &topic, &notification.peer_addrs).await;
+                                state.expires_at = now + cooldown_duration;
+                                state.pending = None;
+                            } else {
+                                // During cooldown — suppress, but save for trailing edge
+                                state.pending = Some(notification.peer_addrs);
+                            }
+                        } else {
+                            // First notification for this topic — fire immediately
+                            fire_notifications(&store, &sender, &topic, &notification.peer_addrs).await;
+                            cooldowns.insert(topic, CooldownState {
+                                expires_at: now + cooldown_duration,
+                                pending: None,
+                            });
+                        }
                     }
                     None => break, // Channel closed
                 }
             }
             _ = async {
-                match next_deadline {
+                match next_expiry {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                // Fire all expired timers
+                // Check for expired cooldowns with pending notifications
                 let now = Instant::now();
-                let expired: Vec<String> = pending
+                let expired: Vec<(String, Vec<String>)> = cooldowns
                     .iter()
-                    .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(topic, _)| topic.clone())
+                    .filter(|(_, state)| state.pending.is_some() && state.expires_at <= now)
+                    .map(|(topic, state)| (topic.clone(), state.pending.clone().unwrap()))
                     .collect();
 
-                for topic in expired {
-                    pending.remove(&topic);
-                    fire_notifications(&store, &sender, &topic).await;
+                for (topic, peer_addrs) in expired {
+                    fire_notifications(&store, &sender, &topic, &peer_addrs).await;
+                    if let Some(state) = cooldowns.get_mut(&topic) {
+                        state.expires_at = now + cooldown_duration;
+                        state.pending = None;
+                    }
                 }
+
+                // Clean up stale cooldowns (no pending, expired > 60s ago)
+                let stale_threshold = now - Duration::from_secs(60);
+                cooldowns.retain(|_, state| {
+                    state.pending.is_some() || state.expires_at > stale_threshold
+                });
             }
         }
     }
 }
 
-async fn fire_notifications(store: &PushStore, sender: &PushSender, topic: &str) {
+async fn fire_notifications(
+    store: &PushStore,
+    sender: &PushSender,
+    topic: &str,
+    peer_addrs: &[String],
+) {
     let tokens = match store.get_tokens_for_topic(topic).await {
         Ok(t) => t,
         Err(e) => {
@@ -103,13 +151,14 @@ async fn fire_notifications(store: &PushStore, sender: &PushSender, topic: &str)
     }
 
     log::info!(
-        "Sending push notifications for topic {topic} to {} devices",
-        tokens.len()
+        "Sending push notifications for topic {topic} to {} devices (peer_addrs: {})",
+        tokens.len(),
+        peer_addrs.len()
     );
 
     for token_entry in &tokens {
         let result = match token_entry.platform.as_str() {
-            "Fcm" => sender.send_fcm(&token_entry.token, topic).await,
+            "Fcm" => sender.send_fcm(&token_entry.token, topic, peer_addrs).await,
             "Apns" => sender.send_apns(&token_entry.token, topic).await,
             other => {
                 log::warn!("Unknown push platform: {other}");

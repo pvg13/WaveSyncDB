@@ -3,6 +3,7 @@ mod push_protocol;
 mod push_sender;
 mod push_store;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,8 +85,9 @@ struct Cli {
     #[arg(long)]
     apns_sandbox: bool,
 
-    /// Push notification debounce window in seconds (default: 5)
-    #[arg(long, default_value_t = 5)]
+    /// Push notification cooldown window in seconds (default: 2).
+    /// First notification fires immediately; subsequent ones within this window are batched.
+    #[arg(long, default_value_t = 2)]
     push_debounce_secs: u64,
 
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
@@ -291,16 +293,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("Also listening on {quic_addr}");
     }
 
+    // Track connected peer addresses for FCM push payloads.
+    // When a peer triggers NotifyTopic, we include the sender's known addresses
+    // so the waking device can dial directly without waiting for mDNS discovery.
+    let mut peer_addresses: HashMap<libp2p::PeerId, Vec<Multiaddr>> = HashMap::new();
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
                 log::info!("Listening on {address}/p2p/{peer_id}");
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
                 log::info!("Peer connected: {peer_id}");
+                let addr = endpoint.get_remote_address().clone();
+                peer_addresses.entry(peer_id).or_default().push(addr);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
                 log::info!("Peer disconnected: {peer_id}");
+                if num_established == 0 {
+                    peer_addresses.remove(&peer_id);
+                }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
                 log::info!("Relay: {event:?}");
@@ -312,6 +330,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 identify::Event::Received { info, peer_id, .. },
             )) => {
                 log::debug!("Identify from {peer_id}: {}", info.protocol_version);
+                // Update peer addresses from identify info (includes listen addresses)
+                let addrs = peer_addresses.entry(peer_id).or_default();
+                for addr in &info.listen_addrs {
+                    if !addrs.contains(addr) {
+                        addrs.push(addr.clone());
+                    }
+                }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
                 request_response::Event::Message {
@@ -323,8 +348,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
+                // Build the sender's reachable addresses for the FCM payload
+                let sender_addrs: Vec<String> = {
+                    let mut addrs: Vec<String> = peer_addresses
+                        .get(&peer)
+                        .into_iter()
+                        .flatten()
+                        .map(|a| format!("{a}/p2p/{peer}", peer = peer))
+                        .collect();
+                    // Add relay circuit address as WAN fallback
+                    for ext_addr in swarm.external_addresses() {
+                        addrs.push(format!("{ext_addr}/p2p/{peer_id}/p2p-circuit/p2p/{peer}"));
+                    }
+                    addrs
+                };
                 let response =
-                    handle_push_request(&push_notifier, &request, &peer.to_string()).await;
+                    handle_push_request(&push_notifier, &request, &peer.to_string(), sender_addrs)
+                        .await;
                 if let Err(resp) = swarm.behaviour_mut().push.send_response(channel, response) {
                     log::error!("Failed to send push response: {:?}", resp);
                 }
@@ -361,6 +401,7 @@ async fn handle_push_request(
     push_state: &Option<(Arc<PushStore>, push_notifier::PushNotifier)>,
     request: &PushRequest,
     peer_id: &str,
+    sender_addrs: Vec<String>,
 ) -> PushResponse {
     let (store, notifier) = match push_state {
         Some(s) => s,
@@ -412,7 +453,7 @@ async fn handle_push_request(
             sender_site_id,
         } => {
             log::debug!("Topic notification from {sender_site_id} for {topic}");
-            notifier.notify(topic.clone());
+            notifier.notify(topic.clone(), sender_addrs);
             PushResponse::Ok
         }
     }
