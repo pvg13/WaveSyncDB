@@ -6,6 +6,8 @@ members = [
     "examples/*",
 ]
 exclude = [
+    "examples/dioxus_app",
+    "examples/dioxus_dynamic",
     "examples/dioxus_fcm_sync",
 ]
 resolver = "3"
