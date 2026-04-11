@@ -106,10 +106,10 @@ fn main() {
         }
 
         // Configure FCM for background sync push notifications.
-        // Parses google-services.json at compile time. On Android, WaveSyncDB
-        // handles Firebase init + token retrieval internally via JNI.
+        // Set GOOGLE_SERVICES_JSON to the path of your google-services.json before building.
+        // On Android, WaveSyncDB handles Firebase init + token retrieval internally via JNI.
         // On non-Android, this is a no-op.
-        builder = builder.with_google_services(include_str!("../google-services.json"));
+        builder = builder.with_google_services(include_str!(env!("GOOGLE_SERVICES_JSON")));
 
         let db = builder.build().await.expect("Failed to create WaveSyncDb");
 
