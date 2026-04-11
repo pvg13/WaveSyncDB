@@ -61,8 +61,7 @@ impl WaveSyncBehaviour {
 
         let snapshot_behaviour = request_response::Behaviour::new(
             [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
-            request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30)),
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         );
 
         let push_behaviour = request_response::Behaviour::new(
