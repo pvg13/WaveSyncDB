@@ -11,6 +11,8 @@ services:
       - type: bind
         source: ./fcm-credentials.json
         target: /data/fcm-credentials.json
+        content: |  # This will tell Coolify to create the file (this is not available in a normal docker-compose)
+        
       # FCM credentials: configure as a File mount in Coolify Storage UI
       # (destination: /data/fcm-credentials.json). Do NOT add as a bind mount
       # here — Coolify auto-resets file bind mounts to directory mounts on redeploy.
