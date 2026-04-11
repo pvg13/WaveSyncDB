@@ -61,9 +61,11 @@ struct Cli {
     #[arg(long, env = "PUSH_DB")]
     push_db: Option<String>,
 
-    /// Path to FCM service account JSON file
+    /// FCM service account JSON — either a file path or the raw JSON string.
+    /// When the value starts with '{', it is treated as inline JSON;
+    /// otherwise it is read as a file path.
     #[arg(long, env = "FCM_CREDENTIALS")]
-    fcm_credentials: Option<PathBuf>,
+    fcm_credentials: Option<String>,
 
     /// Path to APNs .p8 key file
     #[arg(long, env = "APNS_KEY_FILE")]
@@ -180,9 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to open push token database"),
         );
 
-        let fcm_config = cli.fcm_credentials.as_ref().map(|path| {
-            let json = std::fs::read_to_string(path).expect("Failed to read FCM credentials file");
-            // Extract project_id from the service account JSON
+        let fcm_config = cli.fcm_credentials.as_ref().map(|value| {
+            // If the value looks like JSON, use it directly; otherwise treat as file path.
+            let json = if value.trim_start().starts_with('{') {
+                value.clone()
+            } else {
+                std::fs::read_to_string(value).expect("Failed to read FCM credentials file")
+            };
             let sa: serde_json::Value =
                 serde_json::from_str(&json).expect("Invalid FCM credentials JSON");
             let project_id = sa["project_id"]
