@@ -22,7 +22,7 @@ jobs:
       run: cargo clippy -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay -- -D warnings
     - name: Build
       run: cargo build -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay --verbose
-    - name: Run tests
-      run: cargo test -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay --verbose
+    - name: Run unit tests
+      run: cargo test -p wavesyncdb --lib -p wavesyncdb_derive -p wavesync_relay --verbose
     - name: Run integration tests
       run: cargo test -p wavesyncdb --test integration -- --test-threads=1
