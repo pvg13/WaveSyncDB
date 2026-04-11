@@ -8,6 +8,9 @@ services:
       - "4001:4001/udp"
     volumes:
       - relay-data:/data
+      - type: bind
+        source: ./fcm-credentials.json
+        target: /data/fcm-credentials.json
       # FCM credentials: configure as a File mount in Coolify Storage UI
       # (destination: /data/fcm-credentials.json). Do NOT add as a bind mount
       # here — Coolify auto-resets file bind mounts to directory mounts on redeploy.
