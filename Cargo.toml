@@ -5,6 +5,9 @@ members = [
     "wavesync_relay",
     "examples/*",
 ]
+exclude = [
+    "examples/dioxus_fcm_sync",
+]
 resolver = "3"
 
 [workspace.dependencies]
