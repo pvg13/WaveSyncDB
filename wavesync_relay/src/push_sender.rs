@@ -116,7 +116,7 @@ impl PushSender {
     }
 
     /// Send a silent/background APNs notification to a device token.
-    pub async fn send_apns(&self, token: &str, topic: &str) -> PushResult {
+    pub async fn send_apns(&self, token: &str, topic: &str, peer_addrs: &[String]) -> PushResult {
         let apns = match &self.apns {
             Some(c) => c,
             None => return PushResult::Error("APNs not configured".to_string()),
@@ -138,7 +138,8 @@ impl PushSender {
             "aps": {
                 "content-available": 1
             },
-            "topic": topic
+            "topic": topic,
+            "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
         });
 
         match self

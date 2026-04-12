@@ -159,7 +159,11 @@ async fn fire_notifications(
     for token_entry in &tokens {
         let result = match token_entry.platform.as_str() {
             "Fcm" => sender.send_fcm(&token_entry.token, topic, peer_addrs).await,
-            "Apns" => sender.send_apns(&token_entry.token, topic).await,
+            "Apns" => {
+                sender
+                    .send_apns(&token_entry.token, topic, peer_addrs)
+                    .await
+            }
             other => {
                 log::warn!("Unknown push platform: {other}");
                 continue;

@@ -71,6 +71,47 @@ pub extern "C" fn wavesync_background_sync(database_url: *const c_char, timeout_
     run_background_sync(url, timeout_secs, &[])
 }
 
+/// C FFI entry point for background sync with peer addresses.
+/// Called from iOS Swift via `@_silgen_name`.
+///
+/// `peer_addrs_json` is a JSON array of multiaddr strings from the APNs payload,
+/// e.g. `["/ip4/192.168.1.150/tcp/36189/p2p/12D3Koo..."]`. These are dialed
+/// directly as bootstrap peers, bypassing slow mDNS/relay discovery.
+/// Pass `null` to skip (equivalent to `wavesync_background_sync`).
+///
+/// Same return codes as `wavesync_background_sync`.
+///
+/// # Safety
+///
+/// `database_url` must be a valid, null-terminated UTF-8 string pointer.
+/// `peer_addrs_json`, if non-null, must be a valid, null-terminated UTF-8 string pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn wavesync_background_sync_with_peers(
+    database_url: *const c_char,
+    timeout_secs: u32,
+    peer_addrs_json: *const c_char,
+) -> i32 {
+    if database_url.is_null() {
+        return -5;
+    }
+
+    let url = match unsafe { CStr::from_ptr(database_url) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+
+    let peer_addrs: Vec<String> = if peer_addrs_json.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { CStr::from_ptr(peer_addrs_json) }.to_str() {
+            Ok(json) => serde_json::from_str(json).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    run_background_sync(url, timeout_secs, &peer_addrs)
+}
+
 /// JNI entry point for background sync. Called from Dioxus-generated
 /// `WaveSyncService.backgroundSync()` in `dev.dioxus.main`.
 ///

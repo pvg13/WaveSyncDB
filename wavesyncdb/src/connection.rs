@@ -1152,7 +1152,7 @@ pub struct WaveSyncDbBuilder {
     ipv6: bool,
     push_token: Option<(String, String)>,
     #[cfg(feature = "android-fcm")]
-    fcm_credentials: Option<crate::fcm::FcmCredentials>,
+    fcm_credentials: Option<crate::push::FcmCredentials>,
     api_key: Option<String>,
     keep_alive_interval: std::time::Duration,
     circuit_max_duration: std::time::Duration,
@@ -1298,7 +1298,7 @@ impl WaveSyncDbBuilder {
     /// ```
     #[cfg(feature = "android-fcm")]
     pub fn with_google_services(mut self, google_services_json: &str) -> Self {
-        match crate::fcm::FcmCredentials::from_google_services_json(google_services_json) {
+        match crate::push::FcmCredentials::from_google_services_json(google_services_json) {
             Ok(creds) => {
                 self.fcm_credentials = Some(creds);
             }
@@ -1317,7 +1317,7 @@ impl WaveSyncDbBuilder {
     /// See [`with_google_services()`](Self::with_google_services) for the simpler approach.
     #[cfg(feature = "android-fcm")]
     pub fn with_fcm(mut self, project_id: &str, app_id: &str, api_key: &str) -> Self {
-        self.fcm_credentials = Some(crate::fcm::FcmCredentials {
+        self.fcm_credentials = Some(crate::push::FcmCredentials {
             project_id: project_id.to_string(),
             app_id: app_id.to_string(),
             api_key: api_key.to_string(),
@@ -1353,7 +1353,7 @@ impl WaveSyncDbBuilder {
         #[cfg(all(feature = "android-fcm", target_os = "android"))]
         if self.fcm_credentials.is_some() && self.push_token.is_none() {
             for attempt in 0..5 {
-                if let Some(token) = crate::fcm::read_token_file(&self.database_url) {
+                if let Some(token) = crate::push::read_token_file(&self.database_url) {
                     self.push_token = Some(("Fcm".to_string(), token));
                     break;
                 }
@@ -1363,6 +1363,26 @@ impl WaveSyncDbBuilder {
             }
             if self.push_token.is_none() {
                 log::info!("No FCM token file found — push will be registered on next launch");
+            }
+        }
+
+        // Auto-read APNs token from file written by WaveSyncTokenWriter.
+        // The Swift handler writes the token during app startup after
+        // registerForRemoteNotifications() succeeds.
+        // Only runs on iOS — desktop/Android have no APNs service.
+        #[cfg(all(feature = "ios-push", target_os = "ios"))]
+        if self.push_token.is_none() {
+            for attempt in 0..5 {
+                if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
+                    self.push_token = Some(("Apns".to_string(), token));
+                    break;
+                }
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+            if self.push_token.is_none() {
+                log::info!("No APNs token file found — push will be registered on next launch");
             }
         }
 
