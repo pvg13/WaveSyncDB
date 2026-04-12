@@ -368,6 +368,19 @@ impl WaveSyncDb {
             });
     }
 
+    /// Returns the parent directory of the database file.
+    ///
+    /// This is where push token files (`wavesync_apns_token`, `wavesync_fcm_token`)
+    /// and the sync config (`.wavesync_config.json`) are stored.
+    pub fn database_directory(&self) -> Option<std::path::PathBuf> {
+        crate::push::extract_db_path(&self.inner.database_url)
+            .and_then(|p| {
+                std::path::Path::new(&p)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+            })
+    }
+
     /// Set the application-level identity for this peer.
     ///
     /// The identity is an opaque string — WaveSyncDB does not interpret it.

@@ -411,6 +411,57 @@ pub fn use_auto_lifecycle(db: WaveSyncDb) {
     });
 }
 
+/// Automatically registers for iOS push notifications and delivers
+/// the APNs device token to the engine.
+///
+/// On iOS, this injects delegate methods into tao's AppDelegate at runtime,
+/// calls `registerForRemoteNotifications()`, and writes the resulting token
+/// to the `wavesync_apns_token` file next to the database. The existing
+/// retry loop in [`WaveSyncDbBuilder::build()`] will pick up the token.
+///
+/// If the DB was already built when the token arrives (race condition),
+/// this hook also polls the token file and calls
+/// [`WaveSyncDb::register_push_token()`] to deliver it at runtime.
+///
+/// On other platforms, this is a no-op.
+///
+/// ```ignore
+/// use_auto_push(db);  // One line — done.
+/// ```
+pub fn use_auto_push(db: WaveSyncDb) {
+    use_hook(move || {
+        let Some(token_dir) = db.database_directory() else {
+            log::warn!("use_auto_push: could not determine database directory");
+            return;
+        };
+
+        // Set up the push token writer (injects delegate methods on iOS,
+        // no-op on other platforms).
+        super::push::setup_push_token_writer(token_dir.clone());
+
+        // If the token arrives after build() completed, poll the file and
+        // register it with the engine at runtime.
+        let db = db.clone();
+        spawn(async move {
+            let token_path = token_dir.join(crate::push::APNS_TOKEN_FILENAME);
+
+            // Poll up to 10 times over ~10 seconds for the token file to appear.
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Ok(token) = std::fs::read_to_string(&token_path) {
+                    let token = token.trim().to_string();
+                    if !token.is_empty() {
+                        log::info!("use_auto_push: found APNs token, registering with engine");
+                        db.register_push_token("Apns", &token);
+                        return;
+                    }
+                }
+            }
+            log::debug!("use_auto_push: no APNs token file found after polling (expected on simulator)");
+        });
+    });
+}
+
 /// Reactive signal for a single row, looked up by primary key.
 ///
 /// Performs an initial `E::find_by_id(pk).one(db)` query, then re-queries whenever
