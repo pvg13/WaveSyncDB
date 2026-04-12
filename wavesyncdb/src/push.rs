@@ -27,7 +27,9 @@ extern "Kotlin" {}
 // and links the static library into the app binary.
 #[cfg(all(target_os = "ios", feature = "ios-push"))]
 #[manganis::ffi("src/ios")]
-extern "Swift" {}
+extern "Swift" {
+    pub type WaveSyncPush;
+}
 
 // ── Shared: file-based token reading ────────────────────────────────────────
 

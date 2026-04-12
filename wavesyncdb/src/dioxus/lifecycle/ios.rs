@@ -1,3 +1,4 @@
+use std::ptr::NonNull;
 use tokio::sync::watch;
 
 /// Starts listening for iOS application lifecycle notifications.
@@ -10,36 +11,39 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
 }
 
 unsafe fn register_observers(tx: watch::Sender<bool>) {
+    use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2_foundation::{NSNotificationCenter, NSNotificationName, NSObjectProtocol};
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol};
 
     let center = NSNotificationCenter::defaultCenter();
 
     // UIApplicationDidBecomeActiveNotification
     let active_name: &NSNotificationName = objc2_ui_kit::UIApplicationDidBecomeActiveNotification;
     let tx_resume = tx.clone();
+    let resume_block = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+        let _ = tx_resume.send(true);
+    });
     let resume_observer: Retained<ProtocolObject<dyn NSObjectProtocol>> = center
         .addObserverForName_object_queue_usingBlock(
             Some(active_name),
             None,
             None,
-            &move |_notification| {
-                let _ = tx_resume.send(true);
-            },
+            &resume_block,
         );
 
     // UIApplicationWillResignActiveNotification
     let resign_name: &NSNotificationName = objc2_ui_kit::UIApplicationWillResignActiveNotification;
     let tx_pause = tx;
+    let pause_block = RcBlock::new(move |_notification: NonNull<NSNotification>| {
+        let _ = tx_pause.send(false);
+    });
     let pause_observer: Retained<ProtocolObject<dyn NSObjectProtocol>> = center
         .addObserverForName_object_queue_usingBlock(
             Some(resign_name),
             None,
             None,
-            &move |_notification| {
-                let _ = tx_pause.send(false);
-            },
+            &pause_block,
         );
 
     // Leak observer tokens — they must live for the app's entire lifetime.

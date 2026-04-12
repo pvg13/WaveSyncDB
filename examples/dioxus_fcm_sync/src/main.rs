@@ -94,6 +94,11 @@ fn main() {
 
         let data_directory = dioxus_sdk_storage::data_directory().join("mobile_tasks.db");
 
+        // Ensure the parent directory exists (iOS sandbox may not pre-create it)
+        if let Some(parent) = data_directory.parent() {
+            std::fs::create_dir_all(parent).expect("Failed to create data directory");
+        }
+
         let mut builder = WaveSyncDbBuilder::new(
             &format!("sqlite:{}?mode=rwc", data_directory.display()),
             "mobile-tasks-demo",
@@ -105,11 +110,13 @@ fn main() {
             builder = builder.with_relay_server(relay);
         }
 
-        // Configure FCM for background sync push notifications.
+        // Configure FCM for background sync push notifications (Android only).
         // Set GOOGLE_SERVICES_JSON to the path of your google-services.json before building.
-        // On Android, WaveSyncDB handles Firebase init + token retrieval internally via JNI.
-        // On non-Android, this is a no-op.
-        builder = builder.with_google_services(include_str!(env!("GOOGLE_SERVICES_JSON")));
+        // On iOS, push is handled via APNs — no google-services.json needed.
+        #[cfg(target_os = "android")]
+        {
+            builder = builder.with_google_services(include_str!(env!("GOOGLE_SERVICES_JSON")));
+        }
 
         let db = builder.build().await.expect("Failed to create WaveSyncDb");
 
