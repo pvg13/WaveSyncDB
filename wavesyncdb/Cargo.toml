@@ -33,6 +33,7 @@ ndk-context = { version = "0.1", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
 objc2-ui-kit = { version = "0.3", optional = true, features = ["UIApplication"] }
+block2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -40,7 +41,7 @@ env_logger = "0.11"
 [features]
 default = []
 derive = ["dep:wavesyncdb_derive"]
-dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit"]
+dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
 android-fcm = ["mobile-ffi", "dep:jni", "dep:manganis"]
 ios-push = ["mobile-ffi", "dep:manganis"]
 mobile-ffi = []

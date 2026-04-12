@@ -6,3 +6,6 @@ default_platform = "android"
 min_sdk = 24
 target_sdk = 34
 identifier = "com.wavesync.mobile_demo"
+
+[ios]
+identifier = "com.wavesync.mobile-demo"
