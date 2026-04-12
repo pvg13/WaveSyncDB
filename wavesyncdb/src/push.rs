@@ -41,7 +41,6 @@ use std::path::Path;
 pub const FCM_TOKEN_FILENAME: &str = "wavesync_fcm_token";
 
 /// The filename where the iOS Swift handler writes the APNs device token.
-#[cfg(target_os = "ios")]
 pub const APNS_TOKEN_FILENAME: &str = "wavesync_apns_token";
 
 /// Extract the filesystem path from a SQLite URL.
@@ -50,8 +49,7 @@ pub const APNS_TOKEN_FILENAME: &str = "wavesync_apns_token";
 /// - `sqlite:///data/data/com.app/files/db.db?mode=rwc`
 /// - `sqlite:/data/data/com.app/files/db.db?mode=rwc`
 /// - `sqlite:db.db?mode=rwc`
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn extract_db_path(url: &str) -> Option<String> {
+pub(crate) fn extract_db_path(url: &str) -> Option<String> {
     let without_scheme = url.strip_prefix("sqlite:")?;
     let without_params = without_scheme.split('?').next()?;
     // Strip leading slashes for URI format (sqlite:///path → /path)

@@ -1,11 +1,11 @@
 {
-  "database_url": "sqlite:./mobile_tasks.db?mode=rwc",
-  "topic": "mobile-tasks-demo",
+  "database_url": "sqlite::memory:",
+  "topic": "p2p_tasks",
   "relay_server": null,
-  "passphrase": "demo-shared-secret",
+  "passphrase": null,
   "rendezvous_server": null,
   "bootstrap_peers": [],
   "api_key": null,
   "ipv6": false,
-  "crate_name": "example_dioxus_mobile"
+  "crate_name": "example_p2p"
 }

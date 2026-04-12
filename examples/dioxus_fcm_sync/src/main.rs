@@ -38,7 +38,8 @@ use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::dioxus::{
-    use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync, use_wavesync_provider,
+    use_auto_lifecycle, use_auto_push, use_network_status, use_synced_table, use_wavesync,
+    use_wavesync_provider,
 };
 use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
 
@@ -70,7 +71,7 @@ const STYLE: &str = r#"
 /// Example: "/ip4/your-server-ip/tcp/4001/p2p/12D3KooW..."
 /// Leave as None for LAN-only mDNS sync (desktop testing).
 const RELAY_SERVER: Option<&str> =
-    Some("/ip4/192.168.1.150/tcp/4001/p2p/12D3KooWDPbQEj5Zk8S4T1QZ8oMDGX5vcU8etY9LWc1wCJYbsK8p");
+    Some("/dns4/relay.roommatesapp.es/tcp/4001/p2p/12D3KooWSH8G4zDwzK2srm8u6DWxvFiY6emuJkKSKswvGiG2i8qh");
 
 static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 
@@ -142,6 +143,10 @@ fn App() -> Element {
     // Auto lifecycle: on mobile, this detects app resume and triggers sync.
     // On desktop, this is a no-op — peers sync via mDNS anyway.
     use_auto_lifecycle(db.clone());
+
+    // Auto push: on iOS, injects APNs delegate methods and registers for
+    // remote notifications. On other platforms, this is a no-op.
+    use_auto_push(db.clone());
 
     rsx! {
         style { {STYLE} }

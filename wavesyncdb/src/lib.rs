@@ -47,7 +47,6 @@ pub mod messages;
 pub mod network_status;
 pub mod peer_tracker;
 pub mod protocol;
-#[cfg(any(feature = "android-fcm", feature = "ios-push"))]
 pub(crate) mod push;
 pub mod registry;
 pub mod shadow;
