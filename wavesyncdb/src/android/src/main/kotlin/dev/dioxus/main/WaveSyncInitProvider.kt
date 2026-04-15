@@ -7,11 +7,11 @@ import android.net.Uri
 import android.util.Log
 
 /**
- * Auto-initializes Firebase and writes the FCM token on app startup.
+ * Auto-initializes Firebase and persists the FCM token on app startup.
  *
  * ContentProviders run before Application.onCreate() and before any Activity,
- * ensuring the token file exists by the time Rust code reads it during
- * WaveSyncDbBuilder::build().
+ * ensuring the token is persisted to SyncConfig by the time Rust code reads
+ * it during WaveSyncDbBuilder::build().
  *
  * Registered via manifest merging from the Android module — no app-side setup needed.
  */
@@ -19,12 +19,12 @@ class WaveSyncInitProvider : ContentProvider() {
 
     override fun onCreate(): Boolean {
         val ctx = context ?: return false
-        Log.i("WaveSyncInitProvider", "Initializing Firebase and writing FCM token")
+        Log.i("WaveSyncInitProvider", "Initializing Firebase and persisting FCM token")
 
         // Run token fetch on a background thread to avoid blocking app startup,
         // but it will still complete before most Rust code runs.
         Thread {
-            WaveSyncService.ensureTokenFile(ctx)
+            WaveSyncService.ensureToken(ctx)
         }.start()
 
         return true

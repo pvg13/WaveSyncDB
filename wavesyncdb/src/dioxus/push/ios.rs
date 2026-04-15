@@ -1,29 +1,35 @@
-use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use objc2::runtime::AnyObject;
 
-/// Directory where the APNs token file will be written.
-/// Set once before calling `registerForRemoteNotifications()`.
-static TOKEN_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Cached APNs token, set by the injected ObjC delegate callback.
+/// Available for synchronous reads (e.g. during `build()`).
+static APNS_TOKEN: OnceLock<String> = OnceLock::new();
 
-/// Set up automatic APNs token writing by injecting delegate methods
+/// Callback invoked when the APNs token arrives.
+/// Captures a `WaveSyncDb` clone to call `register_push_token()` directly.
+static TOKEN_CALLBACK: OnceLock<Box<dyn Fn(String) + Send + Sync>> = OnceLock::new();
+
+/// Returns the cached APNs token if the ObjC callback has already fired.
+///
+/// Used by `WaveSyncDbBuilder::build()` to pull the token without file I/O.
+pub fn cached_apns_token() -> Option<String> {
+    APNS_TOKEN.get().cloned()
+}
+
+/// Set up automatic APNs token retrieval by injecting delegate methods
 /// into tao's existing `UIApplicationDelegate` at runtime.
 ///
-/// This is the iOS equivalent of Android's `WaveSyncInitProvider`:
-/// - Injects `application:didRegisterForRemoteNotificationsWithDeviceToken:` into the app delegate
-/// - Calls `UIApplication.registerForRemoteNotifications()`
-/// - When iOS delivers the token, the injected method writes it to
-///   `{token_dir}/wavesync_apns_token` — the same file that
-///   [`WaveSyncDbBuilder::build()`] reads with its retry loop.
+/// When iOS delivers the token, the injected method stores it in a Rust
+/// static and invokes `callback` to register it with the running engine.
 ///
 /// # Arguments
 ///
-/// * `token_dir` — directory where the token file should be written
-///   (same directory as the database file).
-pub fn setup_push_token_writer(token_dir: PathBuf) {
-    TOKEN_DIR.set(token_dir).ok();
+/// * `callback` — called with the hex-encoded APNs token when it arrives.
+///   Typically calls `db.register_push_token("Apns", &token)`.
+pub fn setup_push_token(callback: Box<dyn Fn(String) + Send + Sync>) {
+    TOKEN_CALLBACK.set(callback).ok();
     unsafe { inject_and_register() };
 }
 
@@ -36,7 +42,7 @@ unsafe fn inject_and_register() {
 
     // Must be on main thread for UIKit APIs.
     let Some(mtm) = objc2::MainThreadMarker::new() else {
-        log::error!("setup_push_token_writer must be called from the main thread");
+        log::error!("setup_push_token must be called from the main thread");
         return;
     };
 
@@ -63,7 +69,7 @@ unsafe fn inject_and_register() {
         log::warn!(
             "App delegate already implements didRegisterForRemoteNotificationsWithDeviceToken: — \
              skipping injection. Ensure the existing implementation writes the APNs token to \
-             the wavesync_apns_token file."
+             the WaveSyncDB engine."
         );
     }
 
@@ -79,7 +85,8 @@ unsafe fn inject_and_register() {
 
 /// ObjC callback: `application:didRegisterForRemoteNotificationsWithDeviceToken:`
 ///
-/// Hex-encodes the device token and writes it to `{TOKEN_DIR}/wavesync_apns_token`.
+/// Hex-encodes the device token, caches it in a static, and invokes the
+/// registered callback to deliver it to the running engine.
 unsafe extern "C" fn did_register_for_remote_notifications(
     _this: &AnyObject,
     _cmd: objc2::runtime::Sel,
@@ -90,20 +97,15 @@ unsafe extern "C" fn did_register_for_remote_notifications(
     let bytes = unsafe { data.as_bytes_unchecked() };
     let hex_token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    let Some(dir) = TOKEN_DIR.get() else {
-        log::error!("TOKEN_DIR not set — cannot write APNs token file");
-        return;
-    };
+    let preview = &hex_token[..hex_token.len().min(10)];
+    log::info!("APNs device token received: {preview}...");
 
-    let path = dir.join(crate::push::APNS_TOKEN_FILENAME);
-    match std::fs::write(&path, &hex_token) {
-        Ok(()) => {
-            let preview = &hex_token[..hex_token.len().min(10)];
-            log::info!("APNs token written to {}: {preview}...", path.display());
-        }
-        Err(e) => {
-            log::error!("Failed to write APNs token file {}: {e}", path.display());
-        }
+    // Cache for synchronous access (e.g. build() pulling the token).
+    APNS_TOKEN.set(hex_token.clone()).ok();
+
+    // Notify the running engine via the registered callback.
+    if let Some(cb) = TOKEN_CALLBACK.get() {
+        cb(hex_token);
     }
 }
 

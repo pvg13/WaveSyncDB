@@ -1,0 +1,98 @@
+name: Build iOS
+
+on:
+  push:
+    paths:
+      - 'wavesyncdb/**'
+      - 'wavesyncdb_ffi/**'
+      - 'packages/wavesync-rn/ios/**'
+      - 'scripts/build-ios.sh'
+      - '.github/workflows/build-ios.yml'
+  pull_request:
+    paths:
+      - 'wavesyncdb/**'
+      - 'wavesyncdb_ffi/**'
+      - 'packages/wavesync-rn/ios/**'
+  workflow_dispatch:
+
+jobs:
+  build-ios-libs:
+    runs-on: macos-14  # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ios-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ios-rust-
+
+      - name: Build iOS libraries and generate bindings
+        run: ./scripts/build-ios.sh release
+
+      - name: Upload xcframework
+        uses: actions/upload-artifact@v4
+        with:
+          name: wavesyncdb-ios-xcframework
+          path: packages/wavesync-rn/ios/Frameworks/wavesyncdb_ffi.xcframework
+          retention-days: 30
+
+      - name: Upload Swift bindings
+        uses: actions/upload-artifact@v4
+        with:
+          name: wavesyncdb-ios-bindings
+          path: |
+            packages/wavesync-rn/ios/Generated/wavesyncdb_ffi.swift
+            packages/wavesync-rn/ios/Generated/wavesyncdb_ffiFFI.h
+            packages/wavesync-rn/ios/Generated/wavesyncdb_ffiFFI.modulemap
+
+  verify-pod:
+    needs: build-ios-libs
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xcframework
+        uses: actions/download-artifact@v4
+        with:
+          name: wavesyncdb-ios-xcframework
+          path: packages/wavesync-rn/ios/Frameworks/wavesyncdb_ffi.xcframework
+
+      - name: Download Swift bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: wavesyncdb-ios-bindings
+          path: packages/wavesync-rn/ios/Generated
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install RN demo dependencies
+        working-directory: examples/rn-sync-demo
+        run: npm install
+
+      - name: Pod install
+        working-directory: examples/rn-sync-demo/ios
+        run: pod install
+
+      - name: Build iOS app (Release, no code sign)
+        working-directory: examples/rn-sync-demo/ios
+        run: |
+          xcodebuild build \
+            -workspace WaveSyncDemo.xcworkspace \
+            -scheme WaveSyncDemo \
+            -sdk iphonesimulator \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet

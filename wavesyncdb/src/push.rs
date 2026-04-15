@@ -1,14 +1,16 @@
 //! Push notification integration for mobile platforms.
 //!
-//! Uses a file-based approach for token exchange between native services and Rust:
+//! Native services persist push tokens to `SyncConfig` via Rust FFI:
 //!
-//! - **Android (FCM):** The Kotlin `WaveSyncService` writes the FCM token to a file;
-//!   Rust reads it during [`WaveSyncDbBuilder::build()`](crate::WaveSyncDbBuilder::build).
-//! - **iOS (APNs):** The Swift `WaveSyncTokenWriter` writes the APNs device token to a file;
-//!   Rust reads it during [`WaveSyncDbBuilder::build()`](crate::WaveSyncDbBuilder::build).
+//! - **Android (FCM):** The Kotlin `WaveSyncService` calls `setPushToken()` JNI
+//!   to persist the FCM token in `SyncConfig`.
+//! - **iOS (APNs):** The Swift `WaveSyncTokenWriter` calls `wavesync_set_push_token()`
+//!   C FFI to persist the APNs device token in `SyncConfig`.
+//! - **Dioxus iOS:** The injected ObjC callback stores the token in a Rust static
+//!   and calls `register_push_token()` on the running engine directly.
 //!
-//! This avoids JNI classloader issues on Android and keeps the iOS integration
-//! consistent with the same pattern.
+//! During cold sync (`background_sync`), the token is read from `SyncConfig`
+//! and registered with the relay server.
 
 // ── Android: bundle Kotlin sources ──────────────────────────────────────────
 
@@ -31,17 +33,7 @@ extern "Swift" {
     pub type WaveSyncPush;
 }
 
-// ── Shared: file-based token reading ────────────────────────────────────────
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use std::path::Path;
-
-/// The filename where the Android Kotlin service writes the FCM token.
-#[cfg(target_os = "android")]
-pub const FCM_TOKEN_FILENAME: &str = "wavesync_fcm_token";
-
-/// The filename where the iOS Swift handler writes the APNs device token.
-pub const APNS_TOKEN_FILENAME: &str = "wavesync_apns_token";
+// ── Shared utilities ────────────────────────────────────────────────────────
 
 /// Extract the filesystem path from a SQLite URL.
 ///
@@ -65,51 +57,7 @@ pub(crate) fn extract_db_path(url: &str) -> Option<String> {
     }
 }
 
-/// Read a push token from a file next to the database.
-///
-/// Returns `None` if the file doesn't exist yet (first launch before the
-/// native service delivers the token).
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn read_token_from_file(database_url: &str, filename: &str, platform_name: &str) -> Option<String> {
-    let db_path = extract_db_path(database_url)?;
-    let dir = Path::new(&db_path).parent()?;
-    let token_path = dir.join(filename);
-
-    match std::fs::read_to_string(&token_path) {
-        Ok(token) => {
-            let token = token.trim().to_string();
-            if token.is_empty() {
-                None
-            } else {
-                log::info!(
-                    "{platform_name} token read from {}: {}...",
-                    token_path.display(),
-                    &token[..token.len().min(10)]
-                );
-                Some(token)
-            }
-        }
-        Err(_) => {
-            log::debug!(
-                "No {platform_name} token file at {} (expected on first launch)",
-                token_path.display()
-            );
-            None
-        }
-    }
-}
-
 // ── Android-specific ────────────────────────────────────────────────────────
-
-/// Read the FCM token from the file written by `WaveSyncService`.
-///
-/// The token file is located next to the database file (in the same directory).
-/// Returns `None` if the file doesn't exist yet (first launch before Firebase
-/// delivers the token).
-#[cfg(target_os = "android")]
-pub(crate) fn read_token_file(database_url: &str) -> Option<String> {
-    read_token_from_file(database_url, FCM_TOKEN_FILENAME, "FCM")
-}
 
 /// Firebase credentials parsed from `google-services.json`.
 ///
@@ -164,18 +112,6 @@ impl FcmCredentials {
     }
 }
 
-// ── iOS-specific ────────────────────────────────────────────────────────────
-
-/// Read the APNs device token from the file written by `WaveSyncTokenWriter`.
-///
-/// The token file is located next to the database file (in the same directory).
-/// Returns `None` if the file doesn't exist yet (first launch before the app
-/// registers for remote notifications).
-#[cfg(target_os = "ios")]
-pub(crate) fn read_apns_token_file(database_url: &str) -> Option<String> {
-    read_token_from_file(database_url, APNS_TOKEN_FILENAME, "APNs")
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -219,7 +155,4 @@ mod tests {
                 .is_err()
         );
     }
-
-    // extract_db_path and read_token_file are only compiled on mobile targets
-    // so their tests are also mobile-only.
 }

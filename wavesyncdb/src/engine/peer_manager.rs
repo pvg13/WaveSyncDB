@@ -72,48 +72,38 @@ impl EngineRunner {
                     if self.rejected_peers.contains(&peer_id) {
                         continue;
                     }
-                    // Skip dial and address update if already tracked and connected —
-                    // avoids duplicate dials from multi-address mDNS discovery
-                    // (TCP+QUIC × multiple IPs), but still allow sync initiation below
+                    // Already tracked and connected — just sync if ready
                     if self.peers.contains_key(&peer_id) && self.swarm.is_connected(&peer_id) {
                         if self.registry_is_ready {
                             self.initiate_sync_for_peer(peer_id);
                         }
                         continue;
                     }
+
+                    if self.swarm.is_connected(&peer_id) {
+                        // Connected but not in self.peers — track it now
+                        // (can happen if connection arrived before registry was ready)
+                        self.peers.insert(peer_id, multiaddr.clone());
+                        self.update_network_status();
+                        if self.registry_is_ready {
+                            self.initiate_sync_for_peer(peer_id);
+                        }
+                        continue;
+                    }
+
                     log::info!("Discovered peer {peer_id} at {multiaddr}");
-                    // Dial if not currently connected (handles both new peers and reconnections
-                    // after network disruption where the peer is still in self.peers but the
-                    // TCP/QUIC connection is dead)
-                    if !self.swarm.is_connected(&peer_id)
-                        && let Err(e) = self.swarm.dial(multiaddr.clone())
-                    {
+                    // Dial if not currently connected — peer will be added to self.peers
+                    // by handle_connection_established once the connection succeeds.
+                    if let Err(e) = self.swarm.dial(multiaddr.clone()) {
                         log::warn!("Failed to dial peer {peer_id}: {e}");
                     }
-                    self.peers.insert(peer_id, multiaddr.clone());
 
-                    self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
-                        crate::network_status::PeerInfo {
-                            peer_id: crate::network_status::PeerId(peer_id.to_string()),
-                            address: multiaddr.to_string(),
-                            db_version: self.peer_db_versions.get(&peer_id).copied(),
-                            is_bootstrap: self.bootstrap_peers.contains(&peer_id),
-                            is_group_member: false,
-                            app_id: None,
-                        },
-                    ));
-                    self.update_network_status();
-
-                    // Register peer and update last_seen
+                    // Update last_seen for peer tracking DB
                     let db = self.db.clone();
                     let peer_str = peer_id.to_string();
                     tokio::spawn(async move {
                         let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
                     });
-
-                    if self.registry_is_ready && self.swarm.is_connected(&peer_id) {
-                        self.initiate_sync_for_peer(peer_id);
-                    }
                 }
             }
             mdns::Event::Expired(list) => {

@@ -1,0 +1,10 @@
+# Dummy Cargo.toml — prevents workspace glob from failing.
+# This is a React Native project, not a Rust crate.
+[package]
+name = "rn-sync-demo-placeholder"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"

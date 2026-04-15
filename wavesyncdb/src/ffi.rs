@@ -112,6 +112,61 @@ pub extern "C" fn wavesync_background_sync_with_peers(
     run_background_sync(url, timeout_secs, &peer_addrs)
 }
 
+/// C FFI entry point for persisting a push notification token.
+///
+/// Loads the `SyncConfig` from the database directory, updates the push token
+/// fields, and saves it back. This allows cold sync (`background_sync`) to
+/// read the token and register it with the relay server.
+///
+/// Called from iOS Swift (via `WaveSyncTokenWriter`) or directly by consuming apps.
+///
+/// # Returns
+///
+/// * `0` — Success
+/// * `-1` — Config not found (app was never started)
+/// * `-2` — Failed to save config
+/// * `-5` — Invalid arguments (null pointer or bad UTF-8)
+///
+/// # Safety
+///
+/// All pointer arguments must be valid, null-terminated UTF-8 string pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn wavesync_set_push_token(
+    database_url: *const c_char,
+    platform: *const c_char,
+    token: *const c_char,
+) -> i32 {
+    if database_url.is_null() || platform.is_null() || token.is_null() {
+        return -5;
+    }
+
+    let url = match unsafe { CStr::from_ptr(database_url) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+    let platform_str = match unsafe { CStr::from_ptr(platform) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+    let token_str = match unsafe { CStr::from_ptr(token) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+
+    let mut config = match crate::connection::SyncConfig::load(url) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+
+    config.push_platform = Some(platform_str.to_string());
+    config.push_token = Some(token_str.to_string());
+
+    match config.save() {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
+}
+
 /// JNI entry point for background sync. Called from Dioxus-generated
 /// `WaveSyncService.backgroundSync()` in `dev.dioxus.main`.
 ///
@@ -147,4 +202,41 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
     };
 
     run_background_sync(&url, timeout_secs as u32, &peer_addrs)
+}
+
+/// JNI entry point for persisting a push notification token.
+///
+/// Loads the `SyncConfig`, updates the push token fields, and saves it back.
+/// Called from Kotlin `WaveSyncService.setPushToken()`.
+///
+/// Same return codes as `wavesync_set_push_token`.
+#[cfg(all(target_os = "android", feature = "android-fcm"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_setPushToken(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    database_url: jni::objects::JString,
+    token: jni::objects::JString,
+) -> jni::sys::jint {
+    let url: String = match env.get_string(&database_url) {
+        Ok(s) => s.into(),
+        Err(_) => return -5,
+    };
+    let token_str: String = match env.get_string(&token) {
+        Ok(s) => s.into(),
+        Err(_) => return -5,
+    };
+
+    let mut config = match crate::connection::SyncConfig::load(&url) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+
+    config.push_platform = Some("Fcm".to_string());
+    config.push_token = Some(token_str);
+
+    match config.save() {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
 }

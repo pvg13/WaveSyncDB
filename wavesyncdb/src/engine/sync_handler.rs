@@ -181,12 +181,29 @@ impl EngineRunner {
             request_response::Event::OutboundFailure { peer, error, .. } => {
                 self.pending_sync_peers.remove(&peer);
                 log::warn!("Sync request to {peer} failed: {error}");
-                // Connection might be dead — re-dial if we know the peer's address
+                // Connection might be dead — re-dial with exponential backoff
                 if let Some(addr) = self.peers.get(&peer).cloned()
                     && !self.swarm.is_connected(&peer)
                 {
-                    log::info!("Re-dialing {peer} after outbound failure");
-                    let _ = self.swarm.dial(addr);
+                    let now = tokio::time::Instant::now();
+                    let (eligible_at, attempts) = self
+                        .dial_backoff
+                        .entry(peer)
+                        .or_insert((now, 0));
+
+                    if now >= *eligible_at {
+                        log::info!("Re-dialing {peer} after outbound failure (attempt {})", *attempts + 1);
+                        let _ = self.swarm.dial(addr);
+                        *attempts += 1;
+                        // Exponential backoff: 30s, 60s, 120s (capped)
+                        let delay_secs = 30u64 << (*attempts - 1).min(2);
+                        *eligible_at = now + Duration::from_secs(delay_secs);
+                    } else {
+                        log::debug!(
+                            "Skipping re-dial for {peer}: backoff active ({} attempts)",
+                            *attempts
+                        );
+                    }
                 }
             }
             request_response::Event::InboundFailure { peer, error, .. } => {

@@ -67,9 +67,11 @@ struct Cli {
     #[arg(long, env = "FCM_CREDENTIALS")]
     fcm_credentials: Option<String>,
 
-    /// Path to APNs .p8 key file
-    #[arg(long, env = "APNS_KEY_FILE")]
-    apns_key_file: Option<PathBuf>,
+    /// APNs .p8 key — either a file path or the raw PEM string.
+    /// When the value starts with '-----BEGIN', it is treated as inline PEM;
+    /// otherwise it is read as a file path.
+    #[arg(long, env = "APNS_KEY_PEM", alias = "apns-key-file")]
+    apns_key_pem: Option<String>,
 
     /// APNs key ID
     #[arg(long, env = "APNS_KEY_ID")]
@@ -201,13 +203,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        let apns_config = if let (Some(key_file), Some(key_id), Some(team_id), Some(bundle_id)) = (
-            &cli.apns_key_file,
+        let apns_config = if let (Some(key_value), Some(key_id), Some(team_id), Some(bundle_id)) = (
+            &cli.apns_key_pem,
             &cli.apns_key_id,
             &cli.apns_team_id,
             &cli.apns_bundle_id,
         ) {
-            let key_pem = std::fs::read_to_string(key_file).expect("Failed to read APNs key file");
+            // If the value looks like PEM, use it directly; otherwise treat as file path.
+            let key_pem = if key_value.trim_start().starts_with("-----BEGIN") {
+                key_value.clone()
+            } else {
+                std::fs::read_to_string(key_value).expect("Failed to read APNs key file")
+            };
             Some(ApnsConfig {
                 key_pem,
                 key_id: key_id.clone(),

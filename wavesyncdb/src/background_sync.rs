@@ -141,27 +141,47 @@ pub async fn background_sync_with_peers(
         builder = builder.with_bootstrap_peer(addr);
     }
 
+    // Read push token from config so the engine registers it with the relay.
+    if let (Some(platform), Some(token)) = (&config.push_platform, &config.push_token) {
+        builder = builder.with_push_token(platform, token);
+    }
+
     // 3. Build the DB (starts engine)
+    log::info!("background_sync: building engine for topic={}", config.topic);
     let db = builder
         .build()
         .await
         .map_err(|e| BackgroundSyncError::DatabaseError(e.to_string()))?;
 
+    // Subscribe to events BEFORE registry_ready so we don't miss PeerConnected
+    // events that fire immediately when sync_all_known_peers() runs.
+    let mut events = db.network_event_rx();
+
     // 4. Initialize schema registry (tables already exist, but registry needs populating)
     if let Some(ref crate_name) = config.crate_name {
+        // Dioxus path: auto-discover entities via inventory
+        log::info!("background_sync: using crate_name={crate_name} for schema discovery");
         db.get_schema_registry(crate_name)
             .sync()
             .await
             .map_err(|e| BackgroundSyncError::RegistryError(e.to_string()))?;
+    } else if let Some(ref tables) = config.registered_tables {
+        // FFI/RN path: re-register tables from persisted metadata
+        log::info!("background_sync: re-registering {} table(s) from config", tables.len());
+        for meta in tables {
+            log::debug!("background_sync: registering table={}", meta.table_name);
+            db.register_table(meta.clone());
+        }
+        db.registry_ready();
     } else {
-        // No crate name saved — signal registry ready anyway so engine can proceed
+        // No schema info — signal registry ready anyway so engine can proceed
+        log::warn!("background_sync: no crate_name or registered_tables in config — registry is empty");
         db.registry_ready();
     }
 
     // 5. Wait for peer discovery, then sync.
     // Don't call request_full_sync() immediately — peers haven't been discovered yet.
     // Instead, wait for PeerConnected events and trigger sync when peers appear.
-    let mut events = db.network_event_rx();
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
 
