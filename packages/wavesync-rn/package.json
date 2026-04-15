@@ -1,0 +1,34 @@
+{
+  "name": "@wavesync/react-native",
+  "version": "0.1.0",
+  "description": "React Native bindings for WaveSyncDB — P2P SQLite sync",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src/",
+    "android/",
+    "ios/",
+    "react-native.config.js",
+    "wavesync-react-native.podspec"
+  ],
+  "keywords": [
+    "react-native",
+    "sqlite",
+    "p2p",
+    "sync",
+    "crdt",
+    "offline-first"
+  ],
+  "peerDependencies": {
+    "react-native": ">=0.73.0",
+    "@react-native-firebase/app": ">=18.0.0",
+    "@react-native-firebase/messaging": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@react-native-firebase/app": { "optional": true },
+    "@react-native-firebase/messaging": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

@@ -21,7 +21,6 @@ class WaveSyncService : FirebaseMessagingService() {
 
     companion object {
         private const val TAG = "WaveSyncService"
-        private const val TOKEN_FILENAME = "wavesync_fcm_token"
 
         private var nativeLoaded = false
 
@@ -79,11 +78,11 @@ class WaveSyncService : FirebaseMessagingService() {
         }
 
         /**
-         * Get the current FCM token and write it to a file for Rust to read.
-         * Call this from the main thread during app startup.
+         * Get the current FCM token and persist it to SyncConfig via Rust FFI.
+         * Call this from a background thread during app startup.
          */
         @JvmStatic
-        fun ensureTokenFile(context: Context) {
+        fun ensureToken(context: Context) {
             // Init Firebase if not already done (cold start path)
             ensureFirebaseFromConfig(context)
 
@@ -92,16 +91,53 @@ class WaveSyncService : FirebaseMessagingService() {
                     FirebaseMessaging.getInstance().token
                 )
                 if (token != null) {
-                    File(context.filesDir, TOKEN_FILENAME).writeText(token)
-                    Log.i(TAG, "FCM token written: ${token.take(10)}...")
+                    val dbUrl = findDatabaseUrlStatic(context)
+                    if (dbUrl != null) {
+                        ensureNativeLoaded()
+                        if (nativeLoaded) {
+                            val result = setPushToken(dbUrl, token)
+                            if (result == 0) {
+                                Log.i(TAG, "FCM token persisted to config: ${token.take(10)}...")
+                            } else {
+                                Log.w(TAG, "Failed to persist FCM token via FFI: $result")
+                            }
+                        }
+                    } else {
+                        Log.w(TAG, "Cannot persist FCM token: no database URL found")
+                    }
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Could not get FCM token yet: ${e.message}")
             }
         }
 
+        private fun findDatabaseUrlStatic(context: Context): String? {
+            val configInFiles = File(context.filesDir, ".wavesync_config.json")
+            if (configInFiles.exists()) return extractDatabaseUrlFromFile(configInFiles)
+
+            context.filesDir.listFiles()?.forEach { dir ->
+                if (dir.isDirectory) {
+                    val config = File(dir, ".wavesync_config.json")
+                    if (config.exists()) return extractDatabaseUrlFromFile(config)
+                }
+            }
+            return null
+        }
+
+        private fun extractDatabaseUrlFromFile(configFile: File): String? {
+            return try {
+                val json = configFile.readText()
+                Regex(""""database_url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
         @JvmStatic
         private external fun backgroundSync(databaseUrl: String, timeoutSecs: Int, peerAddrsJson: String?): Int
+
+        @JvmStatic
+        private external fun setPushToken(databaseUrl: String, token: String): Int
     }
 
     override fun onCreate() {
@@ -150,11 +186,18 @@ class WaveSyncService : FirebaseMessagingService() {
             .putString("fcm_token", token)
             .apply()
 
-        // Write to file so Rust can read it without JNI
-        try {
-            File(applicationContext.filesDir, TOKEN_FILENAME).writeText(token)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to write token file: ${e.message}")
+        // Persist token to SyncConfig via Rust FFI
+        ensureNativeLoaded()
+        if (nativeLoaded) {
+            val dbUrl = findDatabaseUrl()
+            if (dbUrl != null) {
+                val result = setPushToken(dbUrl, token)
+                if (result == 0) {
+                    Log.i(TAG, "Refreshed FCM token persisted to config")
+                } else {
+                    Log.w(TAG, "Failed to persist refreshed FCM token: $result")
+                }
+            }
         }
     }
 

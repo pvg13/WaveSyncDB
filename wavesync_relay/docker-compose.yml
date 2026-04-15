@@ -8,7 +8,6 @@ services:
       - "4001:4001/udp"
     volumes:
       - relay-data:/data
-      # - ./AuthKey.p8:/data/apns-key.p8:ro
     environment:
       # Base64-encoded identity keypair. Generate with:
       #   docker compose run --rm wavesync-relay --generate-identity
@@ -20,7 +19,8 @@ services:
       EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS:-/ip4/YOUR_PUBLIC_IP/tcp/4001}"
       # FCM: paste the service account JSON directly (or a file path).
       # FCM_CREDENTIALS: '{"type":"service_account","project_id":"...","private_key":"...","client_email":"...",...}'
-      # APNS_KEY_FILE: /data/apns-key.p8
+      # APNs: paste the .p8 key content directly (or a file path).
+      # APNS_KEY_PEM: "-----BEGIN PRIVATE KEY-----\nMIGTAg..."
       # APNS_KEY_ID: ""
       # APNS_TEAM_ID: ""
       # APNS_BUNDLE_ID: ""

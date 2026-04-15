@@ -13,7 +13,7 @@ use sea_orm::DatabaseBackend;
 use crate::messages::DeletePolicy;
 
 /// Metadata about a synced table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableMeta {
     /// The SQL table name (e.g., `"tasks"`).
     pub table_name: String,

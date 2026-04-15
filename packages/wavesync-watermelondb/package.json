@@ -1,0 +1,26 @@
+{
+  "name": "@wavesync/watermelondb",
+  "version": "0.1.0",
+  "description": "WatermelonDB adapter for WaveSyncDB — zero-config P2P sync",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src/"
+  ],
+  "keywords": [
+    "watermelondb",
+    "react-native",
+    "p2p",
+    "sync",
+    "crdt",
+    "offline-first"
+  ],
+  "peerDependencies": {
+    "@nozbe/watermelondb": ">=0.27.0",
+    "@wavesync/react-native": ">=0.1.0",
+    "react-native": ">=0.73.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

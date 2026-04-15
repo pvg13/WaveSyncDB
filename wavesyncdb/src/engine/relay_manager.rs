@@ -88,6 +88,7 @@ impl EngineRunner {
                     "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
                 );
                 self.rendezvous_registered = true;
+                self.rendezvous_registered_at = Some(tokio::time::Instant::now());
                 self.emit_network_event(
                     crate::network_status::NetworkEvent::RendezvousStatusChanged {
                         registered: true,
@@ -229,9 +230,19 @@ impl EngineRunner {
             }
         };
 
-        // Re-register if we have external addresses (avoids NoExternalAddresses error).
-        // Handles TTL expiry and stale state after silent disconnects.
-        if self.swarm.external_addresses().count() > 0 {
+        // Re-register only if not currently registered or approaching TTL expiry.
+        // Server TTL is 7200s; re-register at 80% (5760s) to be safe.
+        let should_reregister = if self.swarm.external_addresses().count() == 0 {
+            false
+        } else if !self.rendezvous_registered {
+            true
+        } else if let Some(registered_at) = self.rendezvous_registered_at {
+            registered_at.elapsed() > Duration::from_secs(5760)
+        } else {
+            true // no timestamp means unknown state, re-register to be safe
+        };
+
+        if should_reregister {
             self.rendezvous_register(server_peer_id);
         }
 

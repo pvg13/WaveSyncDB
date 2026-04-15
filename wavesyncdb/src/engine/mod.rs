@@ -345,6 +345,8 @@ async fn run_engine(
         nat_assumption_deadline: None,
         circuit_accepted_at: None,
         circuit_retry_count: 0,
+        dial_backoff: HashMap::new(),
+        rendezvous_registered_at: None,
     };
 
     // Set initial network status with local_peer_id and topic
@@ -450,6 +452,10 @@ struct EngineRunner {
     pub(crate) circuit_accepted_at: Option<tokio::time::Instant>,
     /// Number of circuit reservation retries while stuck in `Connected` state.
     pub(crate) circuit_retry_count: u32,
+    /// Per-peer backoff tracking: maps peer to (next_eligible_dial, attempt_count).
+    pub(crate) dial_backoff: HashMap<libp2p::PeerId, (tokio::time::Instant, u32)>,
+    /// When we last successfully registered with rendezvous (for TTL-aware re-registration).
+    pub(crate) rendezvous_registered_at: Option<tokio::time::Instant>,
 }
 
 impl EngineRunner {
@@ -457,10 +463,16 @@ impl EngineRunner {
     fn update_network_status(&self) {
         use crate::network_status as ns;
 
+        // Only report peers that are actually connected right now.
+        // self.peers keeps known peers (including temporarily disconnected relay
+        // peers) for sync fan-out, but the UI should reflect live connections.
         let connected_peers = self
             .peers
             .iter()
-            .filter(|(peer_id, _)| !self.infrastructure_peers.contains(peer_id))
+            .filter(|(peer_id, _)| {
+                !self.infrastructure_peers.contains(peer_id)
+                    && self.swarm.is_connected(peer_id)
+            })
             .map(|(peer_id, addr)| ns::PeerInfo {
                 peer_id: ns::PeerId(peer_id.to_string()),
                 address: addr.to_string(),
@@ -535,19 +547,39 @@ impl EngineRunner {
             self.handle_bootstrap_peer_connected(peer_id, endpoint);
         }
 
-        if self.registry_is_ready
-            && !self.rejected_peers.contains(&peer_id)
+        // Always track peers in the map — even before registry is ready.
+        // sync_all_known_peers() on registry_ready needs these entries.
+        if !self.rejected_peers.contains(&peer_id)
             && !self.infrastructure_peers.contains(&peer_id)
         {
-            // Ensure reconnecting peer is tracked for future periodic syncs
-            self.peers
-                .entry(peer_id)
-                .or_insert_with(|| endpoint.get_remote_address().clone());
-            // Refresh local_db_version in case spawned tasks updated it
-            self.local_db_version = shadow::get_db_version(&self.db)
-                .await
-                .unwrap_or(self.local_db_version);
-            self.initiate_sync_for_peer(peer_id);
+            let addr = endpoint.get_remote_address().clone();
+            let is_new = !self.peers.contains_key(&peer_id);
+            self.peers.entry(peer_id).or_insert(addr.clone());
+            self.dial_backoff.remove(&peer_id);
+
+            if is_new {
+                self.emit_network_event(
+                    crate::network_status::NetworkEvent::PeerConnected(
+                        crate::network_status::PeerInfo {
+                            peer_id: crate::network_status::PeerId(peer_id.to_string()),
+                            address: addr.to_string(),
+                            db_version: self.peer_db_versions.get(&peer_id).copied(),
+                            is_bootstrap: self.bootstrap_peers.contains(&peer_id),
+                            is_group_member: false,
+                            app_id: None,
+                        },
+                    ),
+                );
+                self.update_network_status();
+            }
+
+            // Only initiate sync if registry is ready
+            if self.registry_is_ready {
+                self.local_db_version = shadow::get_db_version(&self.db)
+                    .await
+                    .unwrap_or(self.local_db_version);
+                self.initiate_sync_for_peer(peer_id);
+            }
         }
 
         self.dialing_peers.remove(&peer_id);
@@ -646,6 +678,19 @@ impl EngineRunner {
             return;
         }
 
+        // Keep peers in the map for sync fan-out (relay peers may reconnect
+        // on the next rendezvous cycle). update_network_status() filters by
+        // swarm.is_connected() so the UI reflects the real connection state.
+        if !self.infrastructure_peers.contains(&peer_id) && self.peers.contains_key(&peer_id) {
+            self.dial_backoff.remove(&peer_id);
+            self.emit_network_event(
+                crate::network_status::NetworkEvent::PeerDisconnected(
+                    crate::network_status::PeerId(peer_id.to_string()),
+                ),
+            );
+            self.update_network_status();
+        }
+
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
             &self.relay_state
@@ -663,20 +708,36 @@ impl EngineRunner {
         {
             log::warn!("Lost connection to rendezvous server {peer_id}");
             self.rendezvous_registered = false;
+            self.rendezvous_registered_at = None;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
             self.update_network_status();
         }
 
-        // Trigger rendezvous discover for disconnected sync peers
+        // Only trigger rendezvous discover if we have no remaining live connections.
+        // The periodic 60s rendezvous timer handles non-urgent reconnection.
         if !self.infrastructure_peers.contains(&peer_id)
             && self.peer_db_versions.contains_key(&peer_id)
         {
-            log::info!(
-                "Peer {peer_id} disconnected with sync history, triggering rendezvous discover"
-            );
-            self.rendezvous_discover();
+            let connected_sync_peers = self
+                .peers
+                .keys()
+                .filter(|p| {
+                    !self.infrastructure_peers.contains(p) && self.swarm.is_connected(p)
+                })
+                .count();
+
+            if connected_sync_peers == 0 {
+                log::info!(
+                    "No connected sync peers after {peer_id} disconnected, triggering rendezvous discover"
+                );
+                self.rendezvous_discover();
+            } else {
+                log::debug!(
+                    "Peer {peer_id} disconnected but {connected_sync_peers} sync peers still connected"
+                );
+            }
         }
     }
 
@@ -696,6 +757,7 @@ impl EngineRunner {
         {
             log::warn!("Rendezvous server also disconnected (same as relay)");
             self.rendezvous_registered = false;
+            self.rendezvous_registered_at = None;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
@@ -1110,15 +1172,12 @@ impl EngineRunner {
                 log::warn!("Outgoing connection error to {peer_id:?}: {error}");
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
-                    if !self.swarm.is_connected(&pid) && self.peers.remove(&pid).is_some() {
+                    if !self.swarm.is_connected(&pid) && self.peers.contains_key(&pid) {
                         self.pending_sync_peers.remove(&pid);
                         self.verified_peers.remove(&pid);
                         self.peer_identities.remove(&pid);
-                        self.emit_network_event(
-                            crate::network_status::NetworkEvent::PeerDisconnected(
-                                crate::network_status::PeerId(pid.to_string()),
-                            ),
-                        );
+                        // Keep peer in map for future sync attempts; update_network_status
+                        // uses swarm.is_connected() so the UI count stays accurate.
                         self.update_network_status();
                     }
                 }

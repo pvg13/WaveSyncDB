@@ -40,9 +40,11 @@ EXPOSE 4001/tcp 4001/udp
 #
 # Push notification environment variables (all optional):
 #   PUSH_DB             - path to push token SQLite DB (e.g., /data/push_tokens.db)
-#   FCM_CREDENTIALS     - FCM service account JSON (inline or file path)
-#   APNS_KEY_FILE       - path to APNs .p8 key file
-#   APNS_KEY_ID         - APNs key ID
+#
+#   FCM_CREDENTIALS     - FCM service account JSON (inline JSON string or file path)
+#
+#   APNS_KEY_PEM        - APNs .p8 key (inline PEM string or file path)
+#   APNS_KEY_ID         - APNs key ID from Apple Developer portal
 #   APNS_TEAM_ID        - APNs team ID
 #   APNS_BUNDLE_ID      - APNs app bundle ID (e.g., com.example.myapp)
 

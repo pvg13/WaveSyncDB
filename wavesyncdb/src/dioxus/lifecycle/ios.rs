@@ -14,7 +14,9 @@ unsafe fn register_observers(tx: watch::Sender<bool>) {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol};
+    use objc2_foundation::{
+        NSNotification, NSNotificationCenter, NSNotificationName, NSObjectProtocol,
+    };
 
     let center = NSNotificationCenter::defaultCenter();
 
@@ -25,12 +27,7 @@ unsafe fn register_observers(tx: watch::Sender<bool>) {
         let _ = tx_resume.send(true);
     });
     let resume_observer: Retained<ProtocolObject<dyn NSObjectProtocol>> = center
-        .addObserverForName_object_queue_usingBlock(
-            Some(active_name),
-            None,
-            None,
-            &resume_block,
-        );
+        .addObserverForName_object_queue_usingBlock(Some(active_name), None, None, &resume_block);
 
     // UIApplicationWillResignActiveNotification
     let resign_name: &NSNotificationName = objc2_ui_kit::UIApplicationWillResignActiveNotification;
@@ -39,12 +36,7 @@ unsafe fn register_observers(tx: watch::Sender<bool>) {
         let _ = tx_pause.send(false);
     });
     let pause_observer: Retained<ProtocolObject<dyn NSObjectProtocol>> = center
-        .addObserverForName_object_queue_usingBlock(
-            Some(resign_name),
-            None,
-            None,
-            &pause_block,
-        );
+        .addObserverForName_object_queue_usingBlock(Some(resign_name), None, None, &pause_block);
 
     // Leak observer tokens — they must live for the app's entire lifetime.
     // The app lifecycle is the process lifecycle, so this is intentional.

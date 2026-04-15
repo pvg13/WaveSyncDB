@@ -260,6 +260,11 @@ impl WaveSyncDb {
         &self.inner.site_id
     }
 
+    /// Get the database URL.
+    pub fn database_url(&self) -> &str {
+        &self.inner.database_url
+    }
+
     /// Get a handle to the change notification broadcast channel.
     pub fn change_rx(&self) -> broadcast::Receiver<ChangeNotification> {
         self.inner.change_tx.subscribe()
@@ -366,19 +371,20 @@ impl WaveSyncDb {
                 platform: platform.to_string(),
                 token: token.to_string(),
             });
+        // Persist to SyncConfig so cold sync (background_sync) can read it.
+        if let Ok(mut config) = SyncConfig::load(&self.inner.database_url) {
+            config.push_platform = Some(platform.to_string());
+            config.push_token = Some(token.to_string());
+            let _ = config.save();
+        }
     }
 
     /// Returns the parent directory of the database file.
     ///
-    /// This is where push token files (`wavesync_apns_token`, `wavesync_fcm_token`)
-    /// and the sync config (`.wavesync_config.json`) are stored.
+    /// This is where the sync config (`.wavesync_config.json`) is stored.
     pub fn database_directory(&self) -> Option<std::path::PathBuf> {
         crate::push::extract_db_path(&self.inner.database_url)
-            .and_then(|p| {
-                std::path::Path::new(&p)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-            })
+            .and_then(|p| std::path::Path::new(&p).parent().map(|p| p.to_path_buf()))
     }
 
     /// Set the application-level identity for this peer.
@@ -1107,6 +1113,16 @@ pub struct SyncConfig {
     /// Firebase API key for background service cold-start init.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fcm_api_key: Option<String>,
+    /// Push notification platform ("Fcm" or "Apns").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub push_platform: Option<String>,
+    /// Push notification device token (hex-encoded for APNs, raw for FCM).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub push_token: Option<String>,
+    /// Table metadata for background sync registry reconstruction.
+    /// Used by RN/FFI integrations that don't have compile-time entity discovery.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registered_tables: Option<Vec<crate::registry::TableMeta>>,
 }
 
 impl SyncConfig {
@@ -1137,7 +1153,7 @@ impl SyncConfig {
     }
 
     /// Save this config to the database directory.
-    fn save(&self) -> Result<(), String> {
+    pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path(&self.database_url)
             .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
         let json = serde_json::to_string_pretty(self)
@@ -1359,44 +1375,20 @@ impl WaveSyncDbBuilder {
 
     #[allow(unused_mut)]
     pub async fn build(mut self) -> Result<WaveSyncDb, DbErr> {
-        // Auto-read FCM token from file written by WaveSyncInitProvider / WaveSyncService.
-        // The ContentProvider writes the token on a background thread at app startup,
-        // so we retry a few times with a short delay to handle the race.
-        // Only runs on Android — desktop has no FCM service to write the token file.
-        #[cfg(all(feature = "android-fcm", target_os = "android"))]
-        if self.fcm_credentials.is_some() && self.push_token.is_none() {
-            for attempt in 0..5 {
-                if let Some(token) = crate::push::read_token_file(&self.database_url) {
-                    self.push_token = Some(("Fcm".to_string(), token));
-                    break;
-                }
-                if attempt < 4 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-            if self.push_token.is_none() {
-                log::info!("No FCM token file found — push will be registered on next launch");
-            }
+        // Pull push token from sources if not already set by the caller.
+        // 1. Check SyncConfig (persisted by a previous launch or native FFI).
+        // 2. On iOS/Dioxus: check the Rust static set by the ObjC callback.
+        if self.push_token.is_none()
+            && let Ok(config) = SyncConfig::load(&self.database_url)
+            && let (Some(platform), Some(token)) = (config.push_platform, config.push_token)
+        {
+            self.push_token = Some((platform, token));
         }
-
-        // Auto-read APNs token from file written by WaveSyncTokenWriter.
-        // The Swift handler writes the token during app startup after
-        // registerForRemoteNotifications() succeeds.
-        // Only runs on iOS — desktop/Android have no APNs service.
-        #[cfg(all(feature = "ios-push", target_os = "ios"))]
-        if self.push_token.is_none() {
-            for attempt in 0..5 {
-                if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
-                    self.push_token = Some(("Apns".to_string(), token));
-                    break;
-                }
-                if attempt < 4 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-            if self.push_token.is_none() {
-                log::info!("No APNs token file found — push will be registered on next launch");
-            }
+        #[cfg(all(feature = "dioxus", target_os = "ios"))]
+        if self.push_token.is_none()
+            && let Some(token) = crate::dioxus::push::cached_apns_token()
+        {
+            self.push_token = Some(("Apns".to_string(), token));
         }
 
         let opts = ConnectOptions::new(&self.database_url);
@@ -1483,6 +1475,9 @@ impl WaveSyncDbBuilder {
             fcm_project_id,
             fcm_app_id,
             fcm_api_key,
+            push_platform: self.push_token.as_ref().map(|(p, _)| p.clone()),
+            push_token: self.push_token.as_ref().map(|(_, t)| t.clone()),
+            registered_tables: None, // Set by FFI registry_ready()
         };
         if let Err(e) = sync_config.save() {
             log::warn!("Failed to save sync config for background services: {e}");

@@ -1,0 +1,49 @@
+buildscript {
+    ext.getExtOrDefault = { name ->
+        return rootProject.ext.has(name) ? rootProject.ext.get(name) : project.properties['WaveSync_' + name]
+    }
+    ext.getExtOrIntegerDefault = { name ->
+        return rootProject.ext.has(name) ? rootProject.ext.get(name) : (project.properties['WaveSync_' + name]).toInteger()
+    }
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${getExtOrDefault('kotlinVersion')}")
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    compileSdkVersion getExtOrIntegerDefault('compileSdkVersion')
+    namespace "com.wavesync"
+
+    defaultConfig {
+        minSdkVersion getExtOrIntegerDefault('minSdkVersion')
+        targetSdkVersion getExtOrIntegerDefault('targetSdkVersion')
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+dependencies {
+    //noinspection GradleDynamicVersion
+    implementation 'com.facebook.react:react-native:+'
+    implementation 'net.java.dev.jna:jna:5.14.0@aar'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    // compileOnly — the app provides the actual Firebase dependency.
+    // If the app doesn't include Firebase, the service class is present but
+    // never instantiated (no MESSAGING_EVENT intent sender).
+    compileOnly 'com.google.firebase:firebase-messaging:24.1.0'
+}

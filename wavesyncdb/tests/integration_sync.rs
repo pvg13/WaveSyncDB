@@ -1494,3 +1494,150 @@ async fn test_insert_delete_before_sync() {
         .unwrap_or(0);
     assert_eq!(count, 0, "B should have 0 rows after insert+delete");
 }
+
+// ---------------------------------------------------------------------------
+// background_sync: Config persistence (registered_tables round-trip)
+// Seeds: 200–201
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_background_sync_config_persists_tables() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-bgcfg-{}", Uuid::new_v4());
+    let db_url = mem_db("bgcfg");
+
+    // Build DB and register tables manually (like FFI does)
+    let db = WaveSyncDbBuilder::new(&db_url, &topic)
+        .with_node_id(make_node_id(200))
+        .with_sync_interval(Duration::from_secs(60))
+        .build()
+        .await
+        .unwrap();
+
+    // Create table
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL DEFAULT '', completed INTEGER NOT NULL DEFAULT 0)",
+        )
+        .await
+        .unwrap();
+    wavesyncdb::shadow::create_shadow_table(db.inner(), "tasks")
+        .await
+        .unwrap();
+    db.register_table(TableMeta {
+        table_name: "tasks".to_string(),
+        primary_key_column: "id".to_string(),
+        columns: vec!["id".to_string(), "title".to_string(), "completed".to_string()],
+        delete_policy: DeletePolicy::DeleteWins,
+    });
+
+    // Persist tables to config (mimics FFI registry_ready)
+    let tables = db.registry().all_tables();
+    assert_eq!(tables.len(), 1, "Should have 1 registered table");
+
+    let mut config = wavesyncdb::connection::SyncConfig::load(&db_url).unwrap();
+    config.registered_tables = Some(tables);
+    config.save().unwrap();
+
+    // Reload and verify
+    let reloaded = wavesyncdb::connection::SyncConfig::load(&db_url).unwrap();
+    let rt = reloaded.registered_tables.expect("registered_tables should be Some");
+    assert_eq!(rt.len(), 1);
+    assert_eq!(rt[0].table_name, "tasks");
+    assert_eq!(rt[0].primary_key_column, "id");
+    assert_eq!(rt[0].columns, vec!["id", "title", "completed"]);
+
+    db.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// background_sync: Full cold sync via mDNS (peer A live, peer B cold-starts)
+// Seeds: 202–203
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_background_sync_pulls_data_from_live_peer() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-bgsync-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    // --- Peer A: live peer with data ---
+    let db_a_url = mem_db("bgsync_a");
+    let peer_a = make_peer(&db_a_url, &topic, 202).await;
+
+    let task_id = Uuid::new_v4().to_string();
+    task::ActiveModel {
+        id: Set(task_id.clone()),
+        title: Set("Cold sync test".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&peer_a)
+    .await
+    .unwrap();
+
+    // Verify A has the task
+    let a_tasks = task::Entity::find().all(&peer_a).await.unwrap();
+    assert_eq!(a_tasks.len(), 1);
+
+    // --- Peer B: simulate cold sync ---
+    // Create a separate database URL for B
+    let db_b_url = mem_db("bgsync_b");
+
+    // First, B needs to have been "started once" so the config exists.
+    // We simulate this by building, registering, saving config, then shutting down.
+    let peer_b_init = WaveSyncDbBuilder::new(&db_b_url, &topic)
+        .with_node_id(make_node_id(203))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .unwrap();
+
+    // Register schema and persist to config (like FFI registry_ready)
+    peer_b_init
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
+
+    // Also save registered_tables for the FFI path
+    let tables = peer_b_init.registry().all_tables();
+    let mut config_b = wavesyncdb::connection::SyncConfig::load(&db_b_url).unwrap();
+    config_b.registered_tables = Some(tables);
+    config_b.save().unwrap();
+
+    // Shut down B completely (simulates app being killed)
+    peer_b_init.shutdown().await;
+
+    // Give a moment for the port to be released
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // --- Cold sync B ---
+    let result = wavesyncdb::background_sync::background_sync_with_peers(
+        &db_b_url,
+        timeout,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    // Verify B got A's data
+    match result {
+        wavesyncdb::background_sync::BackgroundSyncResult::Synced { peers_synced } => {
+            assert!(peers_synced > 0, "Should have synced with at least 1 peer");
+        }
+        other => {
+            panic!("Expected Synced, got {:?}", other);
+        }
+    }
+
+    // Open B's database to verify the data is there
+    let db_b_verify = sea_orm::Database::connect(&db_b_url).await.unwrap();
+    let b_tasks = task::Entity::find().all(&db_b_verify).await.unwrap();
+    assert_eq!(b_tasks.len(), 1, "B should have 1 task after cold sync");
+    assert_eq!(b_tasks[0].title, "Cold sync test");
+
+    db_b_verify.close().await.unwrap();
+    peer_a.shutdown().await;
+}
