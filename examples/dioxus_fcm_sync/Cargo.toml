@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wavesyncdb = { workspace = true, features = ["derive", "dioxus", "android-fcm", "ios-push"] }
+wavesyncdb = { workspace = true, features = ["derive", "dioxus", "push-sync"] }
 sea-orm = { workspace = true }
 dioxus = { version = "0.7.5" }
 tokio = { workspace = true }

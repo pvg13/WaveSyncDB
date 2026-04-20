@@ -7,7 +7,7 @@
 //!
 //! - **JNI** (`Java_dev_dioxus_main_WaveSyncService_backgroundSync`) — called from
 //!   Android Kotlin via `WaveSyncService` in `dev.dioxus.main`.
-//!   Enable with `features = ["android-fcm"]`.
+//!   Enable with `features = ["push-sync"]`.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -120,7 +120,7 @@ pub extern "C" fn wavesync_background_sync_with_peers(
 /// directly as bootstrap peers, bypassing slow mDNS/relay discovery.
 ///
 /// Same return codes as `wavesync_background_sync`.
-#[cfg(all(target_os = "android", feature = "android-fcm"))]
+#[cfg(all(target_os = "android", feature = "push-sync"))]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
     mut env: jni::JNIEnv,

@@ -1,11 +1,12 @@
-//! # WaveSyncDB FCM Sync Example
+//! # WaveSyncDB Push-Sync Example
 //!
-//! Demonstrates push-based background sync via Firebase Cloud Messaging.
-//! When a peer writes data, sleeping devices receive an FCM push, wake a
-//! background service, sync with peers, and shut down — like WhatsApp.
+//! Demonstrates push-based background sync on mobile. When a peer writes
+//! data, sleeping devices receive a silent push (FCM on Android, APNs on
+//! iOS), wake a short-lived background task, sync with peers, and shut down
+//! — like WhatsApp.
 //!
-//! Works on **Android, desktop, and any platform** — FCM is only used for
-//! wake-up on mobile; LAN peers sync via mDNS regardless.
+//! Works on **Android, iOS, desktop, and any platform** — push is only used
+//! for wake-up on mobile; LAN peers sync via mDNS regardless.
 //!
 //! ## Running (desktop, for testing)
 //!
@@ -22,12 +23,25 @@
 //! dx serve --platform android
 //! ```
 //!
+//! ## Running (iOS)
+//!
+//! ```sh
+//! cd examples/dioxus_fcm_sync
+//! dx serve --platform ios --device   # physical device required for real APNs
+//! ```
+//!
 //! ## Setup
 //!
-//! 1. Place `google-services.json` in your project root (from Firebase Console)
-//! 2. Add `wavesyncdb` with `android-fcm` feature — the Kotlin service is bundled automatically
-//! 3. Set `RELAY_SERVER` to your relay's multiaddr for WAN + push
-//! 4. In Rust: `.with_google_services(include_str!("../google-services.json"))`
+//! 1. Android: place `google-services.json` in your project root (from Firebase Console).
+//! 2. iOS: enable Push Notifications + Background Modes ("Remote notifications")
+//!    on your app target; ensure your provisioning profile has the
+//!    `aps-environment` entitlement (see `entitlements.plist`).
+//! 3. Add `wavesyncdb` with `push-sync` feature — the Kotlin AAR and Swift
+//!    Package are bundled automatically via manganis.
+//! 4. Set `RELAY_SERVER` to your relay's multiaddr for WAN + push.
+//! 5. On Android, in Rust:
+//!    `.with_google_services(include_str!("../google-services.json"))`.
+//!    iOS needs no equivalent call — APNs integration is zero-config.
 
 mod entity;
 
@@ -38,7 +52,7 @@ use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::dioxus::{
-    use_auto_lifecycle, use_auto_push, use_network_status, use_synced_table, use_wavesync,
+    use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync,
     use_wavesync_provider,
 };
 use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
@@ -143,10 +157,6 @@ fn App() -> Element {
     // Auto lifecycle: on mobile, this detects app resume and triggers sync.
     // On desktop, this is a no-op — peers sync via mDNS anyway.
     use_auto_lifecycle(db.clone());
-
-    // Auto push: on iOS, injects APNs delegate methods and registers for
-    // remote notifications. On other platforms, this is a no-op.
-    use_auto_push(db.clone());
 
     rsx! {
         style { {STYLE} }

@@ -20,10 +20,15 @@ target/
 **/*.db
 Cargo.lock
 
+# Runtime artefact written by WaveSyncDbBuilder::build() — never belongs in VCS.
+.wavesync_config.json
+**/.wavesync_config.json
+
 # Keep CLAUDE.md and doc files tracked — only ignore generated markdown
 **/*.md
 **/*firebase*.json
 **/*google-services*.json
 **/.gradle/
 **/build/
+**/.build/
 **/.kotlin/
