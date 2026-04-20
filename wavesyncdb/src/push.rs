@@ -14,18 +14,22 @@
 
 // Bundle the Android Kotlin sources (WaveSyncService, WaveSyncInitProvider) as a
 // Gradle submodule. dx build picks this up from the compiled binary's symbol table,
-// so apps that depend on wavesyncdb with `android-fcm` feature get the service
+// so apps that depend on wavesyncdb with `push-sync` feature get the service
 // automatically — no manual copying of Kotlin files needed.
-#[cfg(all(target_os = "android", feature = "android-fcm"))]
+#[cfg(all(target_os = "android", feature = "push-sync"))]
 #[manganis::ffi("src/android")]
 extern "Kotlin" {}
 
 // ── iOS: bundle Swift package ───────────────────────────────────────────────
 
-// Bundle the Swift WaveSyncPush package (WaveSyncTokenWriter, WaveSyncPushHandler)
-// as a Swift Package Manager library. dx build compiles it via `xcrun swift build`
-// and links the static library into the app binary.
-#[cfg(all(target_os = "ios", feature = "ios-push"))]
+// Bundle the Swift WaveSyncPush package as a Swift Package Manager library.
+// `dx build` compiles it via `xcrun swift build` and links the static library
+// into the app binary. The ObjC `+load` method in `WaveSyncAppDelegateProxy`
+// runs at image load and installs the APNs AppDelegate selectors automatically.
+//
+// The `pub type WaveSyncPush` anchor references the package's product name
+// so the linker cannot dead-strip the static archive.
+#[cfg(all(target_os = "ios", feature = "push-sync"))]
 #[manganis::ffi("src/ios")]
 extern "Swift" {
     pub type WaveSyncPush;
@@ -41,6 +45,7 @@ use std::path::Path;
 pub const FCM_TOKEN_FILENAME: &str = "wavesync_fcm_token";
 
 /// The filename where the iOS Swift handler writes the APNs device token.
+#[cfg(target_os = "ios")]
 pub const APNS_TOKEN_FILENAME: &str = "wavesync_apns_token";
 
 /// Extract the filesystem path from a SQLite URL.
@@ -115,7 +120,7 @@ pub(crate) fn read_token_file(database_url: &str) -> Option<String> {
 ///
 /// Used for validation at build time and persisted in the sync config
 /// so the background service can re-initialize Firebase if needed.
-#[cfg(feature = "android-fcm")]
+#[cfg(feature = "push-sync")]
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct FcmCredentials {
@@ -124,7 +129,7 @@ pub(crate) struct FcmCredentials {
     pub api_key: String,
 }
 
-#[cfg(feature = "android-fcm")]
+#[cfg(feature = "push-sync")]
 impl FcmCredentials {
     /// Parse a `google-services.json` file to extract Firebase credentials.
     pub(crate) fn from_google_services_json(json: &str) -> Result<Self, String> {
@@ -166,7 +171,7 @@ impl FcmCredentials {
 
 // ── iOS-specific ────────────────────────────────────────────────────────────
 
-/// Read the APNs device token from the file written by `WaveSyncTokenWriter`.
+/// Read the APNs device token from the file written by `WaveSyncPushHandler`.
 ///
 /// The token file is located next to the database file (in the same directory).
 /// Returns `None` if the file doesn't exist yet (first launch before the app
@@ -176,13 +181,44 @@ pub(crate) fn read_apns_token_file(database_url: &str) -> Option<String> {
     read_token_from_file(database_url, APNS_TOKEN_FILENAME, "APNs")
 }
 
+/// Tell the Swift side of the iOS integration where to write the APNs token
+/// file. Resolves to the database file's parent directory. Swift stores this
+/// path in `WaveSyncTokenStore.tokenDir` and consults it when APNs delivers
+/// a device token to the swizzled `didRegister…` selector.
+///
+/// Called once from `WaveSyncDbBuilder::build()` on iOS. The Swift side
+/// makes the call idempotent and logs a warning on mismatch.
+#[cfg(all(feature = "push-sync", target_os = "ios"))]
+pub(crate) fn notify_ios_token_dir(database_url: &str) {
+    use std::ffi::CString;
+
+    let Some(db_path) = extract_db_path(database_url) else {
+        log::warn!("notify_ios_token_dir: could not extract path from {database_url}");
+        return;
+    };
+    let Some(dir) = Path::new(&db_path).parent() else {
+        log::warn!("notify_ios_token_dir: no parent directory for {db_path}");
+        return;
+    };
+    let Ok(c_path) = CString::new(dir.to_string_lossy().as_ref()) else {
+        log::warn!("notify_ios_token_dir: path contains NUL byte: {}", dir.display());
+        return;
+    };
+
+    // Symbol defined by the Swift package (see WaveSyncTokenStore.swift).
+    unsafe extern "C" {
+        fn wavesync_set_ios_token_dir(path: *const std::os::raw::c_char);
+    }
+    unsafe { wavesync_set_ios_token_dir(c_path.as_ptr()) };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "android-fcm")]
+    #[cfg(feature = "push-sync")]
     #[test]
     fn test_parse_google_services_json() {
         let json = r#"{
@@ -209,7 +245,7 @@ mod tests {
         assert_eq!(creds.api_key, "AIzaSyC7yttzT4g7R83Vx7vQw9WPH_CqXoCXhpc");
     }
 
-    #[cfg(feature = "android-fcm")]
+    #[cfg(feature = "push-sync")]
     #[test]
     fn test_parse_google_services_json_invalid() {
         assert!(FcmCredentials::from_google_services_json("not json").is_err());
@@ -220,6 +256,38 @@ mod tests {
         );
     }
 
-    // extract_db_path and read_token_file are only compiled on mobile targets
-    // so their tests are also mobile-only.
+    #[test]
+    fn test_extract_db_path_ios_application_support() {
+        // iOS path shape produced by `dioxus_sdk_storage::data_directory()`.
+        let url = "sqlite:///var/mobile/Containers/Data/Application/\
+                   12345678-1234-1234-1234-123456789abc/Library/Application Support/\
+                   com.example.myapp/mobile_tasks.db?mode=rwc";
+        let path = extract_db_path(url).expect("iOS app-support path should parse");
+        assert!(path.starts_with("/var/mobile/Containers/"));
+        assert!(path.ends_with("/mobile_tasks.db"));
+        assert!(!path.contains('?'));
+    }
+
+    #[test]
+    fn test_extract_db_path_android() {
+        let url = "sqlite:///data/data/com.example.myapp/files/app.db?mode=rwc";
+        assert_eq!(
+            extract_db_path(url).as_deref(),
+            Some("/data/data/com.example.myapp/files/app.db")
+        );
+    }
+
+    #[test]
+    fn test_extract_db_path_relative() {
+        assert_eq!(
+            extract_db_path("sqlite:app.db?mode=rwc").as_deref(),
+            Some("app.db")
+        );
+    }
+
+    #[test]
+    fn test_extract_db_path_empty_returns_none() {
+        assert!(extract_db_path("sqlite:").is_none());
+        assert!(extract_db_path("sqlite:///").is_none());
+    }
 }

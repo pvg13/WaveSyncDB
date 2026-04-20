@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+### iOS cold-sync + unified `push-sync` feature
+
+iOS APNs integration now matches Android's zero-setup experience. A Swift
+Package (`WaveSyncPush`) bundled via `manganis` installs its AppDelegate
+hooks at image-load time through an ObjC `+load` method, so consumer apps
+need no AppDelegate wiring. Cold-start pushes (app launched by silent
+APNs) are handled by inspecting `UIApplicationLaunchOptionsRemoteNotificationKey`
+and re-dispatching into the same handler path as foreground pushes.
+
+#### Added
+- `wavesyncdb/src/ios/Sources/WaveSyncPushObjC/` — ObjC target with
+  `WaveSyncAppDelegateProxy` (`+load` entry point, selector installation,
+  launch-options scan) and `WaveSyncCompletionWrapper` (safe ObjC→Swift
+  completion-block bridging).
+- `wavesyncdb/src/ios/Sources/WaveSyncPush/WaveSyncTokenStore.swift`,
+  `WaveSyncPushBridge.swift`, `WaveSyncPushHandler.swift` — Swift helpers
+  that own the APNs token path, parse push payloads, and call Rust's
+  `wavesync_background_sync_with_peers` C FFI.
+- `wavesyncdb/src/push.rs::notify_ios_token_dir` — Rust-side bridge that
+  hands Swift the database directory so the token file lands next to
+  the SQLite DB.
+- `findDatabaseUrl()` now searches `Application Support/` (Dioxus apps)
+  before `Documents/` (legacy / custom path users).
+- APNs token file written with `NSFileProtectionCompleteUntilFirstUserAuthentication`
+  so background-launched pushes can read it before first unlock after reboot.
+- `extract_db_path` tests covering iOS Application-Support URLs, Android
+  app-data URLs, relative paths, and malformed inputs.
+
+#### Changed
+- **Feature flags:** `android-fcm` and `ios-push` collapse into a single
+  `push-sync` feature. `push-sync = ["mobile-ffi", "dep:manganis"]`.
+  Platform-specific code remains gated by `#[cfg(target_os = "...")]`.
+  Update `wavesyncdb = { features = [..., "push-sync"] }` and drop the
+  two old flags.
+- `use_auto_push(db)` is now a deprecated no-op — push registration is
+  automatic on both platforms. Remove the call at your leisure; it will
+  be dropped in the release after next.
+- `wavesyncdb/src/dioxus/push/` deleted — its ObjC-runtime injection
+  logic lived in a layer that the Swift Package now replaces cleanly.
+
+#### Removed
+- `wavesyncdb/src/dioxus/push/ios.rs` — Rust-side ObjC `class_addMethod`
+  manipulation.
+- `wavesyncdb/src/ios/Sources/WaveSyncPush/WaveSyncTokenWriter.swift` —
+  hex-encoding logic absorbed into `WaveSyncPushHandler.writeDeviceToken`.
+- `wavesyncdb/src/ios/Integration/` — stray directory outside the Swift
+  Package tree.
+- `templates/ios/WaveSyncNotificationHandler.swift` — the automatic path
+  is the only supported one now; manual wire-up is available via a future
+  opt-in feature if users need it.
+- Accidentally-committed `.wavesync_config.json` at repo root; added to
+  `.gitignore`.
+
 ## v0.3.0 — 25/02/2026
 
 ### Architecture rewrite: SeaORM connection wrapper

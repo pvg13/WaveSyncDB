@@ -41,7 +41,15 @@ env_logger = "0.11"
 [features]
 default = []
 derive = ["dep:wavesyncdb_derive"]
+# Dioxus integration: lifecycle hooks, reactive signals, platform observers.
+# Platform-specific deps (jni on Android; objc2 family on iOS) are target-gated
+# in the `[target.'cfg(...)'.dependencies]` sections above, so enabling `dioxus`
+# on desktop does not pull them in — Cargo silently skips `dep:` references
+# that point at target-gated optional deps on non-matching targets.
 dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
-android-fcm = ["mobile-ffi", "dep:jni", "dep:manganis"]
-ios-push = ["mobile-ffi", "dep:manganis"]
+# Cold-sync push notifications (FCM on Android, APNs on iOS). Bundles the
+# Kotlin AAR / Swift Package into consumer apps via manganis; gates the
+# Rust-side token-read helpers and FFI exports. Platform-specific code
+# inside the crate is additionally gated by `#[cfg(target_os = "...")]`.
+push-sync = ["mobile-ffi", "dep:manganis"]
 mobile-ffi = []
