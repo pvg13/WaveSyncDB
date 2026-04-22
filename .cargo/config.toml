@@ -1,0 +1,17 @@
+# Workspace-wide cargo configuration.
+#
+# `IPHONEOS_DEPLOYMENT_TARGET` is required when building for Apple's iOS
+# targets (simulator *and* device): the rustc `aarch64-apple-ios` target
+# defaults to iOS 10.0, but modern object files (libring, blake3, sqlite)
+# reference runtime helpers introduced later. Pinning to iOS 16 matches
+# the Swift Package's floor and avoids link errors like:
+#
+#     Undefined symbols for architecture arm64:
+#         "___chkstk_darwin"
+#
+# This must live in a cargo config file (rather than Dioxus.toml's
+# `[ios] deployment_target`) because it has to be set *before* rustc
+# runs; Dioxus' own `deployment_target` only influences the Swift Package
+# build and the generated Info.plist.
+[env]
+IPHONEOS_DEPLOYMENT_TARGET = "16.0"
