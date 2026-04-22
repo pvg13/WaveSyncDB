@@ -1079,6 +1079,95 @@ impl<'a> SchemaBuilder<'a> {
     }
 }
 
+/// Parse a multiaddr string and replace its first `/dns4/` or `/dns6/` hop
+/// with the corresponding `/ip4/` or `/ip6/` hop, resolved via the OS
+/// resolver (`getaddrinfo` underneath `tokio::net::lookup_host`).
+///
+/// Why this exists: libp2p's `dns::Transport` delegates to `hickory-resolver`
+/// which on iOS cannot load the system DNS configuration and ends up
+/// unable to resolve anything. Pre-resolving in the builder sidesteps that
+/// entirely while leaving behaviour on desktop and Android unchanged —
+/// the OS resolver is what libp2p would have used eventually.
+///
+/// If resolution fails, the original multiaddr is returned unchanged and a
+/// warning is logged. That way hosts that are temporarily unreachable do
+/// not prevent the engine from starting; libp2p will surface a dial error
+/// later with its own diagnostics.
+async fn parse_and_resolve_multiaddr(addr_str: &str) -> Result<libp2p::Multiaddr, String> {
+    use libp2p::multiaddr::Protocol;
+
+    let original: libp2p::Multiaddr = addr_str
+        .parse()
+        .map_err(|e| format!("bad multiaddr '{addr_str}': {e}"))?;
+
+    let mut protos: Vec<Protocol<'static>> = original.iter().map(|p| p.acquire()).collect();
+    let mut resolved_once = false;
+
+    for slot in protos.iter_mut() {
+        if resolved_once {
+            break;
+        }
+        match slot {
+            Protocol::Dns4(host) | Protocol::Dns(host) => {
+                let host_str = host.to_string();
+                match lookup_first_addr(&host_str).await {
+                    Ok(std::net::IpAddr::V4(v4)) => {
+                        *slot = Protocol::Ip4(v4);
+                        resolved_once = true;
+                    }
+                    Ok(std::net::IpAddr::V6(v6)) => {
+                        *slot = Protocol::Ip6(v6);
+                        resolved_once = true;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "DNS resolution failed for '{host_str}' in '{addr_str}': {e}; \
+                             passing multiaddr through to libp2p unchanged"
+                        );
+                        return Ok(original);
+                    }
+                }
+            }
+            Protocol::Dns6(host) => {
+                let host_str = host.to_string();
+                match lookup_first_addr(&host_str).await {
+                    Ok(std::net::IpAddr::V6(v6)) => {
+                        *slot = Protocol::Ip6(v6);
+                        resolved_once = true;
+                    }
+                    Ok(std::net::IpAddr::V4(v4)) => {
+                        // Unusual (AAAA requested, A returned); use it anyway.
+                        *slot = Protocol::Ip4(v4);
+                        resolved_once = true;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "DNS resolution failed for '{host_str}' in '{addr_str}': {e}; \
+                             passing multiaddr through to libp2p unchanged"
+                        );
+                        return Ok(original);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(protos.into_iter().collect())
+}
+
+async fn lookup_first_addr(host: &str) -> std::io::Result<std::net::IpAddr> {
+    // `tokio::net::lookup_host` expects `host:port`; we use port 0 because
+    // only the IP matters here.
+    tokio::net::lookup_host(format!("{host}:0"))
+        .await?
+        .map(|sa| sa.ip())
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no A/AAAA for {host}"))
+        })
+}
+
 /// Persisted sync configuration for background sync services.
 ///
 /// Written to `{db_directory}/.wavesync_config.json` during [`WaveSyncDbBuilder::build()`].
@@ -1442,32 +1531,40 @@ impl WaveSyncDbBuilder {
         ));
         let (network_event_tx, _) = broadcast::channel::<crate::network_status::NetworkEvent>(256);
 
-        // Parse multiaddrs for WAN config
-        let relay_server = self
-            .relay_server
-            .as_deref()
-            .map(|s| s.parse::<libp2p::Multiaddr>())
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("Invalid relay server address: {e}")))?;
+        // Parse multiaddrs for WAN config, pre-resolving any `/dns4/` or
+        // `/dns6/` hops against the OS resolver (`getaddrinfo`). libp2p's
+        // built-in `dns::Transport` uses `hickory-resolver`, which on iOS
+        // cannot read the DNS configuration (there is no `/etc/resolv.conf`
+        // and it does not currently consume `SCDynamicStore`), so DNS
+        // multiaddrs silently hang. Pre-resolving here lets the system
+        // resolver do its job and keeps desktop / Android behaviour
+        // unchanged — on those platforms libp2p-dns would have worked
+        // anyway, and resolving once up front is indistinguishable.
+        let relay_server = match self.relay_server.as_deref() {
+            Some(s) => Some(
+                parse_and_resolve_multiaddr(s)
+                    .await
+                    .map_err(|e| DbErr::Custom(format!("Invalid relay server address: {e}")))?,
+            ),
+            None => None,
+        };
 
-        let rendezvous_server = self
-            .rendezvous_server
-            .as_deref()
-            .map(|s| s.parse::<libp2p::Multiaddr>())
-            .transpose()
-            .map_err(|e| DbErr::Custom(format!("Invalid rendezvous server address: {e}")))?;
+        let rendezvous_server = match self.rendezvous_server.as_deref() {
+            Some(s) => Some(
+                parse_and_resolve_multiaddr(s)
+                    .await
+                    .map_err(|e| DbErr::Custom(format!("Invalid rendezvous server address: {e}")))?,
+            ),
+            None => None,
+        };
 
-        let bootstrap_peers: Vec<libp2p::Multiaddr> = self
-            .bootstrap_peers
-            .iter()
-            .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
-                Ok(addr) => Some(addr),
-                Err(e) => {
-                    log::warn!("Skipping invalid bootstrap peer address '{}': {}", s, e);
-                    None
-                }
-            })
-            .collect();
+        let mut bootstrap_peers: Vec<libp2p::Multiaddr> = Vec::new();
+        for s in &self.bootstrap_peers {
+            match parse_and_resolve_multiaddr(s).await {
+                Ok(addr) => bootstrap_peers.push(addr),
+                Err(e) => log::warn!("Skipping invalid bootstrap peer address '{s}': {e}"),
+            }
+        }
 
         // Persist config for background sync services (before moving fields)
         // Extract FCM credentials for config persistence (behind feature gate)
