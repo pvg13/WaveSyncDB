@@ -16,6 +16,11 @@ identifier = "com.wavesync.mobile_demo"
 
 [ios]
 identifier = "com.wavesync.mobile-demo"
+# iOS 16 matches the Swift Package's deployment floor. Older values
+# (like the rustc default of iOS 10) trigger `___chkstk_darwin` undefined
+# symbol errors at link time because modern object files reference
+# iOS 13+ runtime helpers.
+deployment_target = "16.0"
 
 # APNs sandbox entitlement. dx generates the matching
 # entitlements.plist automatically; set to "production" for App Store /
