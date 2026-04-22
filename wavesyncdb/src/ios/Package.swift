@@ -22,12 +22,20 @@ import PackageDescription
 let package = Package(
     name: "WaveSyncPush",
     platforms: [
-        .iOS(.v14)
+        // iOS 16 is the effective floor for Swift's auto-linked stdlib bits
+        // (notably SwiftUICore) on current Xcode/iOS SDKs. Older deployment
+        // targets trigger spurious `-Wincompatible-sysroot` warnings and
+        // "not an allowed client of SwiftUICore" link errors when the Swift
+        // toolchain auto-links against host frameworks.
+        .iOS(.v16)
     ],
     products: [
+        // `dx build` consumes this product as a dynamic framework embedded
+        // in `.app/Frameworks/`; the Rust-side `@_silgen_name` symbols are
+        // resolved by dyld against the main executable at runtime.
         .library(
             name: "WaveSyncPush",
-            type: .static,
+            type: .dynamic,
             targets: ["WaveSyncPush", "WaveSyncPushObjC"]
         )
     ],
@@ -40,7 +48,19 @@ let package = Package(
         .target(
             name: "WaveSyncPush",
             dependencies: ["WaveSyncPushObjC"],
-            path: "Sources/WaveSyncPush"
+            path: "Sources/WaveSyncPush",
+            // Rust's C-ABI exports (e.g. `wavesync_background_sync_with_peers`)
+            // live in the main executable, not in any library this target
+            // links against. Tell ld to accept them as undefined and let
+            // dyld resolve them against the main image at load time. The
+            // Darwin linker retains support for `dynamic_lookup` on dynamic
+            // libraries; on iOS it is restricted from executable targets.
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-undefined",
+                    "-Xlinker", "dynamic_lookup",
+                ])
+            ]
         )
     ]
 )

@@ -22,8 +22,8 @@ uuid = { workspace = true }
 inventory = { workspace = true }
 blake3 = "1"
 wavesyncdb_derive = { path = "../wavesyncdb_derive", optional = true }
-dioxus = { version = "0.7.5", optional = true }
-manganis = { version = "0.7.5", optional = true }
+dioxus = { version = "0.7.6", optional = true }
+manganis = { version = "0.7.6", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }

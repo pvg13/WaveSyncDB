@@ -1379,19 +1379,24 @@ impl WaveSyncDbBuilder {
             }
         }
 
-        // Tell the Swift `WaveSyncPush` package where to write the APNs token
-        // file so the `didRegisterForRemoteNotificationsWithDeviceToken:`
-        // callback (installed by `WaveSyncAppDelegateProxy+load`) persists it
-        // next to our database. Must happen *before* the event loop starts,
-        // because APNs registration fires asynchronously after
-        // `UIApplicationDidFinishLaunching`.
+        // On iOS the APNs token is written by the Swift `WaveSyncPush`
+        // package's `didRegisterForRemoteNotificationsWithDeviceToken:`
+        // swizzle (installed at image load by `WaveSyncAppDelegateProxy+load`).
+        // The Swift side discovers where to write the token by locating the
+        // `.wavesync_config.json` file that `SyncConfig::save` writes below.
         //
-        // Then poll briefly for a token file written by a previous launch;
-        // a first-ever-launch produces no file, which is expected — the token
-        // gets picked up at the next `build()` once APNs has responded.
+        // First, force-load the framework: dx embeds it in `.app/Frameworks/`
+        // but does not add an `LC_LOAD_DYLIB` entry on the Rust binary, so
+        // dyld would otherwise never load it and `+load` would never run.
+        // We dlopen it here, early in `build()`, so the observer registers
+        // before `UIApplicationDidFinishLaunchingNotification` fires.
+        //
+        // Then poll briefly for a token file left by a previous run.
+        // First-ever launch produces no file; Swift will write it on the
+        // *next* launch once APNs responds, and we pick it up then.
         #[cfg(all(feature = "push-sync", target_os = "ios"))]
         {
-            crate::push::notify_ios_token_dir(&self.database_url);
+            crate::push::load_ios_push_framework();
             if self.push_token.is_none() {
                 for attempt in 0..5 {
                     if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {

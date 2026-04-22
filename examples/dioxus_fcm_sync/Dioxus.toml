@@ -2,6 +2,13 @@
 name = "WaveSyncDB FCM Sync"
 default_platform = "android"
 
+# Request background execution for silent push notifications on both
+# platforms. dx maps this to `UIBackgroundModes = [remote-notification]`
+# in the iOS Info.plist and to the Firebase Cloud Messaging service in
+# the Android manifest.
+[background]
+remote-notifications = true
+
 [android]
 min_sdk = 24
 target_sdk = 34
@@ -9,3 +16,9 @@ identifier = "com.wavesync.mobile_demo"
 
 [ios]
 identifier = "com.wavesync.mobile-demo"
+
+# APNs sandbox entitlement. dx generates the matching
+# entitlements.plist automatically; set to "production" for App Store /
+# TestFlight builds.
+[ios.entitlements]
+aps-environment = "development"

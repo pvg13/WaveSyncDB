@@ -4,5 +4,8 @@
 <dict>
 	<key>aps-environment</key>
 	<string>development</string>
+	<!-- Required for ad-hoc-signed debug builds to launch on iOS Simulator. -->
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
 </dict>
 </plist>

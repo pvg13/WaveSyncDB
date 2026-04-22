@@ -176,40 +176,94 @@ impl FcmCredentials {
 /// The token file is located next to the database file (in the same directory).
 /// Returns `None` if the file doesn't exist yet (first launch before the app
 /// registers for remote notifications).
+///
+/// Swift discovers this same directory by reading `.wavesync_config.json`
+/// (written by `SyncConfig::save` in `connection.rs`) — Rust does not push
+/// the path across to Swift, keeping the build-time link graph strictly
+/// Swift → Rust.
 #[cfg(target_os = "ios")]
 pub(crate) fn read_apns_token_file(database_url: &str) -> Option<String> {
     read_token_from_file(database_url, APNS_TOKEN_FILENAME, "APNs")
 }
 
-/// Tell the Swift side of the iOS integration where to write the APNs token
-/// file. Resolves to the database file's parent directory. Swift stores this
-/// path in `WaveSyncTokenStore.tokenDir` and consults it when APNs delivers
-/// a device token to the swizzled `didRegister…` selector.
+/// Force-load the Swift `WaveSyncPush` framework so its ObjC `+load` method
+/// runs and installs the APNs AppDelegate selectors.
 ///
-/// Called once from `WaveSyncDbBuilder::build()` on iOS. The Swift side
-/// makes the call idempotent and logs a warning on mismatch.
-#[cfg(all(feature = "push-sync", target_os = "ios"))]
-pub(crate) fn notify_ios_token_dir(database_url: &str) {
-    use std::ffi::CString;
-
-    let Some(db_path) = extract_db_path(database_url) else {
-        log::warn!("notify_ios_token_dir: could not extract path from {database_url}");
-        return;
-    };
-    let Some(dir) = Path::new(&db_path).parent() else {
-        log::warn!("notify_ios_token_dir: no parent directory for {db_path}");
-        return;
-    };
-    let Ok(c_path) = CString::new(dir.to_string_lossy().as_ref()) else {
-        log::warn!("notify_ios_token_dir: path contains NUL byte: {}", dir.display());
-        return;
-    };
-
-    // Symbol defined by the Swift package (see WaveSyncTokenStore.swift).
-    unsafe extern "C" {
-        fn wavesync_set_ios_token_dir(path: *const std::os::raw::c_char);
+/// `dx build` compiles the Swift Package into a dynamic framework
+/// (`DioxusSwiftPlugins.framework`) and embeds it in `.app/Frameworks/`, but
+/// it never adds an `LC_LOAD_DYLIB` entry on the Rust-produced main
+/// executable, because Rust's static link phase runs *before* the Swift
+/// framework is built. Without that link command, dyld has no reason to
+/// load the framework at launch, so `+load` never fires and the swizzle
+/// never happens.
+///
+/// We work around the ordering by calling `dlopen` from Rust at DB-build
+/// time — long before the UI event loop starts, so the `+load` handler
+/// can finish its `UIApplicationDidFinishLaunchingNotification` observer
+/// registration in time to catch the cold-start launch. Uses the standard
+/// `@executable_path` rpath semantics so the same path works in both the
+/// simulator and a signed on-device bundle.
+///
+/// Idempotent: `dlopen` reference-counts, so repeated calls are harmless.
+/// Force-preserve the C-ABI FFI symbols the Swift framework will need at
+/// runtime. The Rust linker aggressively dead-strips `#[unsafe(no_mangle)]`
+/// functions that no Rust code references, which is our situation here:
+/// `wavesync_background_sync_with_peers` is only called from Swift, via
+/// dyld's flat-namespace lookup into the main executable. Referencing the
+/// function address from reachable Rust code (this function is called from
+/// `WaveSyncDbBuilder::build`) teaches the linker to keep the symbol.
+#[cfg(all(feature = "push-sync", feature = "mobile-ffi", target_os = "ios"))]
+#[inline(never)]
+fn anchor_ios_ffi_exports() {
+    // Cast through a volatile write so even aggressive LTO cannot elide.
+    let slots: [*const (); 2] = [
+        crate::ffi::wavesync_background_sync as *const (),
+        crate::ffi::wavesync_background_sync_with_peers as *const (),
+    ];
+    unsafe {
+        std::ptr::read_volatile(&slots as *const [*const (); 2]);
     }
-    unsafe { wavesync_set_ios_token_dir(c_path.as_ptr()) };
+}
+
+#[cfg(all(feature = "push-sync", target_os = "ios"))]
+pub(crate) fn load_ios_push_framework() {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    // Keep the C FFI exports alive against linker dead-strip.
+    #[cfg(feature = "mobile-ffi")]
+    anchor_ios_ffi_exports();
+
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlerror() -> *const c_char;
+    }
+    const RTLD_NOW: c_int = 0x2;
+
+    // dx currently bundles every Swift Package referenced via
+    // `#[manganis::ffi]` into a single combined framework named
+    // `DioxusSwiftPlugins`. If dx's bundling convention ever changes, this
+    // constant is the only place that needs updating.
+    let framework_path =
+        c"@executable_path/Frameworks/DioxusSwiftPlugins.framework/DioxusSwiftPlugins";
+
+    unsafe {
+        let handle = dlopen(framework_path.as_ptr(), RTLD_NOW);
+        if handle.is_null() {
+            let err_ptr = dlerror();
+            let err = if err_ptr.is_null() {
+                "unknown dlopen error".into()
+            } else {
+                CStr::from_ptr(err_ptr).to_string_lossy()
+            };
+            log::warn!(
+                "Failed to load WaveSyncPush framework: {err}. \
+                 APNs integration will be unavailable this launch."
+            );
+        } else {
+            log::info!("Loaded WaveSyncPush framework (dlopen); +load handlers active");
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
