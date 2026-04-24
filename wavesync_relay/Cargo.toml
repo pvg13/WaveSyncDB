@@ -9,15 +9,19 @@ description = "Relay and rendezvous server for WaveSyncDB WAN peer discovery and
 name = "wavesync-relay"
 path = "src/main.rs"
 
+# Dependencies are pinned directly (no `workspace = true`) so the crate
+# can be built standalone — e.g. when Dokploy clones the repo and sets
+# the build context to this subdirectory. Keep these versions in sync
+# with the workspace root's `[workspace.dependencies]` on bumps.
 [dependencies]
-libp2p = { workspace = true, features = ["relay", "rendezvous", "identify", "ping", "autonat", "request-response"] }
+libp2p = { version = "0.56.0", features = ["relay", "rendezvous", "identify", "ping", "autonat", "request-response", "tokio", "noise", "yamux", "tcp", "quic"] }
 libp2p-swarm-derive = "0.35.1"
-tokio = { workspace = true }
-log = { workspace = true }
+tokio = { version = "1.47", features = ["full"] }
+log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
-serde = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
 futures = "0.3"

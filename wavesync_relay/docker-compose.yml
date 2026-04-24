@@ -1,5 +1,10 @@
 # WaveSyncDB relay — deployment via a prebuilt GHCR image.
 #
+# The relay crate is standalone (no workspace dependencies), so platforms
+# that clone the repo and set the build context to this `wavesync_relay/`
+# subdirectory can also build from source using the sibling Dockerfile.
+# Swap `image:` below for `build: .` to do that.
+#
 # Works on Dokploy, Coolify, or plain Docker. All three secret inputs
 # (IDENTITY_KEYPAIR, FCM_CREDENTIALS, APNS_KEY_FILE) accept either:
 #   * the raw value inline via an env var, OR
