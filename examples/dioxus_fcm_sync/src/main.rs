@@ -126,11 +126,12 @@ fn main() {
         }
 
         // Configure FCM for background sync push notifications (Android only).
-        // Set GOOGLE_SERVICES_JSON to the path of your google-services.json before building.
+        // Drop `google-services.json` into the example root and build.rs will
+        // set the `has_google_services` cfg so the file is embedded automatically.
         // On iOS, push is handled via APNs — no google-services.json needed.
-        #[cfg(target_os = "android")]
+        #[cfg(all(target_os = "android", has_google_services))]
         {
-            builder = builder.with_google_services(include_str!(env!("GOOGLE_SERVICES_JSON")));
+            builder = builder.with_google_services(include_str!("../google-services.json"));
         }
 
         let db = builder.build().await.expect("Failed to create WaveSyncDb");
