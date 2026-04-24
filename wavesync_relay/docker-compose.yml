@@ -1,29 +1,56 @@
+# WaveSyncDB relay — Coolify-ready deployment via a prebuilt GHCR image.
+#
+# In Coolify:
+#   1. New Resource → "Docker Compose Empty" (or "Docker Compose from a Git Repository"
+#      pointing at this file).
+#   2. Paste this YAML into the compose editor.
+#   3. Under "Environment Variables" set at minimum:
+#          EXTERNAL_ADDRESS   (REQUIRED)
+#          IDENTITY_KEYPAIR   (recommended — pins the relay's PeerId across restarts)
+#          RELAY_TCP_PORT     (optional, defaults to 4001 — set this when running
+#                              multiple relays on the same host for different apps)
+#          RELAY_UDP_PORT     (optional, defaults to 4001)
+#          FCM_CREDENTIALS / APNS_* (optional, for push wake-up)
+#   4. Do NOT set any pre-deployment command. Coolify's own "docker compose pull"
+#      runs on the host and picks up :latest from ghcr.io.
+#   5. If the GHCR package is private, configure it under Coolify → Sources →
+#      "Private Docker Registry" with a GitHub PAT (scope: read:packages).
+#
+# For local testing: copy .env.example to .env, fill in values, run `docker compose up`.
+
 services:
   wavesync-relay:
     image: ghcr.io/pvg13/wavesync-relay:latest
-    container_name: wavesync-relay
     restart: unless-stopped
     ports:
-      - "4001:4001/tcp"
-      - "4001:4001/udp"
+      # Coolify host → container. Override RELAY_TCP_PORT/RELAY_UDP_PORT to run
+      # multiple relay instances on the same host (one per app).
+      - "${RELAY_TCP_PORT:-4001}:4001/tcp"
+      - "${RELAY_UDP_PORT:-4001}:4001/udp"
     volumes:
       - relay-data:/data
-      # - ./AuthKey.p8:/data/apns-key.p8:ro
     environment:
-      # Base64-encoded identity keypair. Generate with:
-      #   docker compose run --rm wavesync-relay --generate-identity
-      # IDENTITY_KEYPAIR: ""
+      # REQUIRED: public multiaddr advertised to clients. Without it clients
+      # get NoAddressesInReservation and WAN sync is broken.
+      # Example: /dns4/relay.roommatesapp.es/tcp/4001
+      EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS}"
+
+      # Recommended: pin the relay's libp2p identity so clients don't have to
+      # update their relay multiaddr after every redeploy. Generate once with:
+      #   docker run --rm ghcr.io/pvg13/wavesync-relay:latest --generate-identity
+      # then paste the IDENTITY_KEYPAIR line into Coolify env vars.
+      IDENTITY_KEYPAIR: "${IDENTITY_KEYPAIR:-}"
+
+      # Push notification store (always enable — small overhead, needed for FCM/APNs)
       PUSH_DB: /data/push_tokens.db
-      # REQUIRED: Public address to advertise so clients can build relay circuit addresses.
-      # Without this, clients get NoAddressesInReservation and WAN sync is broken.
-      # For Coolify: set EXTERNAL_ADDRESS in Service > Environment Variables.
-      EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS:-/ip4/YOUR_PUBLIC_IP/tcp/4001}"
-      # FCM: paste the service account JSON directly (or a file path).
-      # FCM_CREDENTIALS: '{"type":"service_account","project_id":"...","private_key":"...","client_email":"...",...}'
-      # APNS_KEY_FILE: /data/apns-key.p8
-      # APNS_KEY_ID: ""
-      # APNS_TEAM_ID: ""
-      # APNS_BUNDLE_ID: ""
+
+      # Push credentials (all optional; set only the ones you use)
+      FCM_CREDENTIALS: "${FCM_CREDENTIALS:-}"
+      APNS_KEY_FILE: "${APNS_KEY_FILE:-}"
+      APNS_KEY_ID: "${APNS_KEY_ID:-}"
+      APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
+      APNS_BUNDLE_ID: "${APNS_BUNDLE_ID:-}"
+      APNS_SANDBOX: "${APNS_SANDBOX:-}"
 
 volumes:
   relay-data:
