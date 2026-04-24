@@ -958,41 +958,45 @@ impl EngineRunner {
             .collect();
 
         if peer_ids.is_empty() {
-            log::debug!("No peers to push changeset to");
-            return;
-        }
+            log::debug!(
+                "No directly-connected peers; relying on relay push to wake sleeping peers"
+            );
+        } else {
+            for peer_id in &peer_ids {
+                let mut req = SyncRequest::Push {
+                    changeset: changeset.clone(),
+                    topic: self.topic_name.clone(),
+                    hmac: None,
+                };
 
-        for peer_id in &peer_ids {
-            let mut req = SyncRequest::Push {
-                changeset: changeset.clone(),
-                topic: self.topic_name.clone(),
-                hmac: None,
-            };
-
-            if let Some(ref gk) = self.group_key {
-                // Serialize with hmac: None, compute MAC, then set hmac
-                if let Ok(bytes) = serde_json::to_vec(&req) {
-                    let tag = gk.mac(&bytes);
-                    let SyncRequest::Push { ref mut hmac, .. } = req else {
-                        unreachable!()
-                    };
-                    *hmac = Some(tag);
+                if let Some(ref gk) = self.group_key {
+                    // Serialize with hmac: None, compute MAC, then set hmac
+                    if let Ok(bytes) = serde_json::to_vec(&req) {
+                        let tag = gk.mac(&bytes);
+                        let SyncRequest::Push { ref mut hmac, .. } = req else {
+                            unreachable!()
+                        };
+                        *hmac = Some(tag);
+                    }
                 }
+
+                self.swarm
+                    .behaviour_mut()
+                    .snapshot
+                    .send_request(peer_id, req);
             }
 
-            self.swarm
-                .behaviour_mut()
-                .snapshot
-                .send_request(peer_id, req);
+            log::info!(
+                "Pushed changeset (db_version={}) to {} peers",
+                changeset.db_version,
+                peer_ids.len()
+            );
         }
 
-        log::info!(
-            "Pushed changeset (db_version={}) to {} peers",
-            changeset.db_version,
-            peer_ids.len()
-        );
-
-        // Notify relay to send push notifications to sleeping mobile peers
+        // Notify relay to send push notifications to sleeping mobile peers.
+        // Must run even when peer_ids is empty — that's the case where both
+        // peers are behind NAT with no direct connection, and push is the
+        // only way to wake the other side.
         self.notify_relay_topic();
     }
 
