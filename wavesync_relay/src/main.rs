@@ -28,12 +28,12 @@ use push_store::PushStore;
 )]
 struct Cli {
     /// Listen address (default: /ip4/0.0.0.0/tcp/4001)
-    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/4001")]
+    #[arg(long, env = "LISTEN_ADDR", default_value = "/ip4/0.0.0.0/tcp/4001")]
     listen_addr: String,
 
     /// Path to a file containing the persistent identity keypair.
     /// If the file does not exist, a new keypair is generated and saved.
-    #[arg(long)]
+    #[arg(long, env = "IDENTITY_FILE")]
     identity_file: Option<PathBuf>,
 
     /// Base64-encoded protobuf identity keypair, or a path to a file whose
@@ -47,15 +47,15 @@ struct Cli {
     generate_identity: bool,
 
     /// Maximum number of relay circuits (0 = unlimited)
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "MAX_CIRCUITS", default_value_t = 256)]
     max_circuits: usize,
 
     /// Maximum circuit duration in seconds (default: 3600 = 1 hour)
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, env = "MAX_CIRCUIT_DURATION_SECS", default_value_t = 3600)]
     max_circuit_duration: u64,
 
     /// Maximum bytes per circuit (0 = unlimited, default: unlimited)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "MAX_CIRCUIT_BYTES", default_value_t = 0)]
     max_circuit_bytes: u64,
 
     /// Path to the push token SQLite database (enables push notifications)
@@ -70,7 +70,7 @@ struct Cli {
 
     /// APNs .p8 key — either the PEM contents (starting with `-----BEGIN`)
     /// or a filesystem path to a .p8 file. Matches the FCM_CREDENTIALS
-    /// convention so both can be pasted as inline secrets in Coolify/Fly.
+    /// convention so both can be pasted as inline secrets.
     #[arg(long, env = "APNS_KEY_FILE")]
     apns_key_file: Option<String>,
 
@@ -92,18 +92,18 @@ struct Cli {
 
     /// Push notification cooldown window in seconds (default: 2).
     /// First notification fires immediately; subsequent ones within this window are batched.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, env = "PUSH_DEBOUNCE_SECS", default_value_t = 2)]
     push_debounce_secs: u64,
 
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
     /// Required when running behind NAT or in Docker.
-    #[arg(long, env = "EXTERNAL_ADDRESS")]
+    #[arg(long, env = "EXTERNAL_ADDRESS", value_delimiter = ',')]
     external_address: Vec<String>,
 
     /// Idle connection timeout in seconds (default: 300).
     /// Must be longer than the client keep-alive interval to prevent premature
     /// disconnects. 300s works with the default 90s client ping interval.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, env = "IDLE_CONNECTION_TIMEOUT_SECS", default_value_t = 300)]
     idle_connection_timeout: u64,
 }
 
@@ -140,7 +140,34 @@ fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // Compose interpolation (`${FOO:-}`) leaves unset vars as empty strings,
+    // which clap happily populates as `Some("")`. Downstream code then tries
+    // to read an empty file path and panics. Normalize empty/whitespace-only
+    // strings back to None here.
+    fn blank_to_none(opt: &mut Option<String>) {
+        if let Some(s) = opt
+            && s.trim().is_empty()
+        {
+            *opt = None;
+        }
+    }
+    blank_to_none(&mut cli.identity_keypair);
+    blank_to_none(&mut cli.push_db);
+    blank_to_none(&mut cli.fcm_credentials);
+    blank_to_none(&mut cli.apns_key_file);
+    blank_to_none(&mut cli.apns_key_id);
+    blank_to_none(&mut cli.apns_team_id);
+    blank_to_none(&mut cli.apns_bundle_id);
+    if cli
+        .identity_file
+        .as_ref()
+        .is_some_and(|p| p.as_os_str().is_empty())
+    {
+        cli.identity_file = None;
+    }
+    cli.external_address.retain(|s| !s.trim().is_empty());
 
     if cli.generate_identity {
         let keypair = identity::Keypair::generate_ed25519();
