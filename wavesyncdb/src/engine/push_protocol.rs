@@ -20,7 +20,8 @@ pub enum PushPlatform {
     Apns,
 }
 
-/// Request sent to the relay for push notification management.
+/// Request sent to the relay for push notification management, or from the
+/// relay to a peer for presence notifications.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PushRequest {
     RegisterToken {
@@ -36,13 +37,35 @@ pub enum PushRequest {
         topic: String,
         sender_site_id: String,
     },
+    /// Sent by a peer on relay connect to announce presence for a topic
+    /// and receive the list of other peers currently registered on that
+    /// topic. Response: `PushResponse::PeerList`.
+    AnnouncePresence {
+        topic: String,
+    },
+    /// Sent by the relay to each existing peer on a topic when a new peer
+    /// announces presence. The receiver dials the addresses so the normal
+    /// sync flow can start. Response: `PushResponse::Ok`.
+    PeerJoined {
+        topic: String,
+        peer_addrs: Vec<String>,
+    },
 }
 
-/// Response from the relay for push notification requests.
+/// Response from the relay (or from a peer responding to a relay-pushed
+/// `PeerJoined`) for push notification requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PushResponse {
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
+    /// Response to `AnnouncePresence` — the circuit multiaddrs of other
+    /// peers on the same topic. Each entry is a fully-qualified multiaddr
+    /// with a trailing `/p2p/<peer-id>` component.
+    PeerList {
+        peers: Vec<String>,
+    },
 }
 
 /// Codec for serializing/deserializing push notification messages.
