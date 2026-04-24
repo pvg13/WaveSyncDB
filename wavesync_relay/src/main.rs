@@ -140,34 +140,37 @@ fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let mut cli = Cli::parse();
-
-    // Compose interpolation (`${FOO:-}`) leaves unset vars as empty strings,
-    // which clap happily populates as `Some("")`. Downstream code then tries
-    // to read an empty file path and panics. Normalize empty/whitespace-only
-    // strings back to None here.
-    fn blank_to_none(opt: &mut Option<String>) {
-        if let Some(s) = opt
-            && s.trim().is_empty()
-        {
-            *opt = None;
+    // Compose interpolation (`${FOO:-}`) leaves unset vars as empty strings in
+    // the process env. For string flags that becomes `Some("")` and panics
+    // later; for bool flags like APNS_SANDBOX, clap itself errors out
+    // (empty string is not a valid bool). Strip blank env vars up-front so
+    // every flag falls back to its declared default / None.
+    //
+    // SAFETY: called before any threads are spawned in this process.
+    for var in [
+        "LISTEN_ADDR",
+        "IDENTITY_FILE",
+        "IDENTITY_KEYPAIR",
+        "MAX_CIRCUITS",
+        "MAX_CIRCUIT_DURATION_SECS",
+        "MAX_CIRCUIT_BYTES",
+        "PUSH_DB",
+        "PUSH_DEBOUNCE_SECS",
+        "FCM_CREDENTIALS",
+        "APNS_KEY_FILE",
+        "APNS_KEY_ID",
+        "APNS_TEAM_ID",
+        "APNS_BUNDLE_ID",
+        "APNS_SANDBOX",
+        "EXTERNAL_ADDRESS",
+        "IDLE_CONNECTION_TIMEOUT_SECS",
+    ] {
+        if std::env::var(var).is_ok_and(|v| v.trim().is_empty()) {
+            unsafe { std::env::remove_var(var) };
         }
     }
-    blank_to_none(&mut cli.identity_keypair);
-    blank_to_none(&mut cli.push_db);
-    blank_to_none(&mut cli.fcm_credentials);
-    blank_to_none(&mut cli.apns_key_file);
-    blank_to_none(&mut cli.apns_key_id);
-    blank_to_none(&mut cli.apns_team_id);
-    blank_to_none(&mut cli.apns_bundle_id);
-    if cli
-        .identity_file
-        .as_ref()
-        .is_some_and(|p| p.as_os_str().is_empty())
-    {
-        cli.identity_file = None;
-    }
-    cli.external_address.retain(|s| !s.trim().is_empty());
+
+    let cli = Cli::parse();
 
     if cli.generate_identity {
         let keypair = identity::Keypair::generate_ed25519();
