@@ -36,7 +36,8 @@ struct Cli {
     #[arg(long)]
     identity_file: Option<PathBuf>,
 
-    /// Base64-encoded protobuf identity keypair. Overrides --identity-file.
+    /// Base64-encoded protobuf identity keypair, or a path to a file whose
+    /// contents are the base64 string. Overrides --identity-file.
     /// Generate with: wavesync-relay --generate-identity
     #[arg(long, env = "IDENTITY_KEYPAIR")]
     identity_keypair: Option<String>,
@@ -154,9 +155,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let keypair = if let Some(ref b64) = cli.identity_keypair {
+    let keypair = if let Some(ref value) = cli.identity_keypair {
+        // Accept either an inline base64 string or a path to a file that
+        // contains it. Mirrors the FCM_CREDENTIALS / APNS_KEY_FILE convention
+        // so Dokploy / Docker-secret style file mounts work transparently.
+        let b64 = if std::path::Path::new(value).is_file() {
+            std::fs::read_to_string(value)
+                .expect("Failed to read IDENTITY_KEYPAIR file")
+                .trim()
+                .to_string()
+        } else {
+            value.trim().to_string()
+        };
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
+            .decode(&b64)
             .expect("IDENTITY_KEYPAIR is not valid base64");
         identity::Keypair::from_protobuf_encoding(&bytes)
             .expect("IDENTITY_KEYPAIR is not a valid protobuf-encoded keypair")
@@ -189,7 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let json = if value.trim_start().starts_with('{') {
                 value.clone()
             } else {
-                std::fs::read_to_string(value).expect("Failed to read FCM credentials file")
+                std::fs::read_to_string(value).unwrap_or_else(|e| {
+                    panic!("Failed to read FCM credentials file at {value:?}: {e}")
+                })
             };
             let sa: serde_json::Value =
                 serde_json::from_str(&json).expect("Invalid FCM credentials JSON");
@@ -214,7 +228,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_pem = if key_source.contains("-----BEGIN") {
                 key_source.clone()
             } else {
-                std::fs::read_to_string(key_source).expect("Failed to read APNs key file")
+                std::fs::read_to_string(key_source).unwrap_or_else(|e| {
+                    panic!("Failed to read APNs key file at {key_source:?}: {e}")
+                })
             };
             Some(ApnsConfig {
                 key_pem,

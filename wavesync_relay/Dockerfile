@@ -54,15 +54,19 @@ EXPOSE 4001/tcp 4001/udp
 #   EXTERNAL_ADDRESS    - REQUIRED: public address to advertise to clients
 #                         e.g., /ip4/77.37.125.212/tcp/4001
 #                         Without this, clients get NoAddressesInReservation and
-#                         WAN sync is broken. In Coolify, set this in Environment Variables.
+#                         WAN sync is broken.
 #
-#   IDENTITY_KEYPAIR    - base64-encoded protobuf keypair (overrides --identity-file)
+#   IDENTITY_KEYPAIR    - base64-encoded protobuf keypair (inline or file path).
+#                         Overrides --identity-file.
 #                         Generate with: wavesync-relay --generate-identity
+#
+# All secret inputs (IDENTITY_KEYPAIR, FCM_CREDENTIALS, APNS_KEY_FILE) accept
+# either the raw value inline OR a filesystem path to a mounted secret file.
 #
 # Push notification environment variables (all optional):
 #   PUSH_DB             - path to push token SQLite DB (e.g., /data/push_tokens.db)
 #   FCM_CREDENTIALS     - FCM service account JSON (inline or file path)
-#   APNS_KEY_FILE       - path to APNs .p8 key file
+#   APNS_KEY_FILE       - APNs .p8 key (inline PEM or file path)
 #   APNS_KEY_ID         - APNs key ID
 #   APNS_TEAM_ID        - APNs team ID
 #   APNS_BUNDLE_ID      - APNs app bundle ID (e.g., com.example.myapp)
