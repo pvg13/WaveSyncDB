@@ -15,7 +15,7 @@ target_sdk = 34
 identifier = "com.wavesync.mobile_demo"
 
 [ios]
-identifier = "com.wavesync.mobile-demo"
+identifier = "com.pvazquez.example"
 # iOS 16 matches the Swift Package's deployment floor. Older values
 # (like the rustc default of iOS 10) trigger `___chkstk_darwin` undefined
 # symbol errors at link time because modern object files reference
