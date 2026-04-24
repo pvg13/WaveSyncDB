@@ -15,3 +15,22 @@
 # build and the generated Info.plist.
 [env]
 IPHONEOS_DEPLOYMENT_TARGET = "16.0"
+
+# Android 15+ (API 35) can run with a 16 KB memory page size. Native
+# libraries must have their ELF LOAD segments aligned to 16 KB or the
+# installer refuses to load them on 16 KB kernels (warning:
+# "no está alineado con el tamaño de página de 16 kB"). The default
+# page size is 4 KB, so we pass `-z max-page-size=16384` to the linker
+# for every Android target.
+# See: https://developer.android.com/guide/practices/page-sizes
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
