@@ -118,6 +118,38 @@ struct RelayServerBehaviour {
     push: request_response::Behaviour<PushCodec>,
 }
 
+/// Read a secret file and return its trimmed contents, or log a warning and
+/// return `None` if the path is missing / is a directory / is empty. Docker
+/// auto-creates host paths for bind mounts whose source doesn't exist, so a
+/// "mounted but never populated" secret shows up inside the container as an
+/// empty directory rather than a missing path — handle both.
+fn read_optional_secret(kind: &str, path: &str) -> Option<String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => match std::fs::read_to_string(path) {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            Ok(_) => {
+                log::warn!("{kind} file at {path:?} is empty; skipping");
+                None
+            }
+            Err(e) => {
+                log::warn!("{kind} file at {path:?} not readable ({e}); skipping");
+                None
+            }
+        },
+        Ok(_) => {
+            log::warn!(
+                "{kind} path {path:?} exists but is not a regular file \
+                 (empty bind mount?); skipping"
+            );
+            None
+        }
+        Err(e) => {
+            log::warn!("{kind} file at {path:?} not available ({e}); skipping");
+            None
+        }
+    }
+}
+
 fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
     if path.exists() {
         let bytes = std::fs::read(path).expect("Failed to read identity file");
@@ -185,28 +217,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let keypair = if let Some(ref value) = cli.identity_keypair {
-        // Accept either an inline base64 string or a path to a file that
-        // contains it. Mirrors the FCM_CREDENTIALS / APNS_KEY_FILE convention
-        // so Dokploy / Docker-secret style file mounts work transparently.
-        let b64 = if std::path::Path::new(value).is_file() {
-            std::fs::read_to_string(value)
-                .expect("Failed to read IDENTITY_KEYPAIR file")
+    // Resolve the identity keypair. IDENTITY_KEYPAIR takes precedence (inline
+    // base64 or path-to-base64). If it's a path that doesn't resolve to a
+    // populated file, fall through to IDENTITY_FILE (generate-and-persist)
+    // rather than crashing — makes the docker-compose setup forgiving when a
+    // user deploys without populating every secret mount.
+    let keypair_from_keypair_value = cli.identity_keypair.as_ref().and_then(|value| {
+        let looks_like_path = value.contains('/') || value.contains('\\');
+        let b64 = if looks_like_path {
+            read_optional_secret("IDENTITY_KEYPAIR", value)?
                 .trim()
                 .to_string()
         } else {
             value.trim().to_string()
         };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&b64)
-            .expect("IDENTITY_KEYPAIR is not valid base64");
-        identity::Keypair::from_protobuf_encoding(&bytes)
-            .expect("IDENTITY_KEYPAIR is not a valid protobuf-encoded keypair")
-    } else if let Some(ref path) = cli.identity_file {
-        load_or_generate_keypair(path)
-    } else {
-        identity::Keypair::generate_ed25519()
-    };
+        match base64::engine::general_purpose::STANDARD.decode(&b64) {
+            Ok(bytes) => match identity::Keypair::from_protobuf_encoding(&bytes) {
+                Ok(kp) => Some(kp),
+                Err(e) => {
+                    log::warn!(
+                        "IDENTITY_KEYPAIR not a valid protobuf-encoded keypair ({e}); falling back"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!("IDENTITY_KEYPAIR not valid base64 ({e}); falling back");
+                None
+            }
+        }
+    });
+    let keypair = keypair_from_keypair_value
+        .or_else(|| cli.identity_file.as_ref().map(load_or_generate_keypair))
+        .unwrap_or_else(identity::Keypair::generate_ed25519);
 
     let peer_id = keypair.public().to_peer_id();
     log::info!("Relay server PeerId: {peer_id}");
@@ -226,24 +269,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to open push token database"),
         );
 
-        let fcm_config = cli.fcm_credentials.as_ref().map(|value| {
-            // If the value looks like JSON, use it directly; otherwise treat as file path.
+        let fcm_config = cli.fcm_credentials.as_ref().and_then(|value| {
+            // Inline JSON if it starts with '{', otherwise a file path.
             let json = if value.trim_start().starts_with('{') {
                 value.clone()
             } else {
-                std::fs::read_to_string(value).unwrap_or_else(|e| {
-                    panic!("Failed to read FCM credentials file at {value:?}: {e}")
-                })
+                read_optional_secret("FCM credentials", value)?
             };
-            let sa: serde_json::Value =
-                serde_json::from_str(&json).expect("Invalid FCM credentials JSON");
-            let project_id = sa["project_id"]
-                .as_str()
-                .expect("Missing project_id in FCM credentials")
-                .to_string();
-            FcmConfig {
-                project_id,
-                service_account_json: json,
+            match serde_json::from_str::<serde_json::Value>(&json) {
+                Ok(sa) => match sa["project_id"].as_str() {
+                    Some(project_id) => Some(FcmConfig {
+                        project_id: project_id.to_string(),
+                        service_account_json: json,
+                    }),
+                    None => {
+                        log::warn!("FCM credentials missing project_id; skipping FCM");
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::warn!("FCM credentials JSON invalid ({e}); skipping FCM");
+                    None
+                }
             }
         });
 
@@ -253,17 +300,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &cli.apns_team_id,
             &cli.apns_bundle_id,
         ) {
-            // If the value contains a PEM header it's inline content, else
-            // treat it as a filesystem path (mirrors FCM_CREDENTIALS behavior).
+            // Inline PEM if it contains `-----BEGIN`, otherwise a file path.
             let key_pem = if key_source.contains("-----BEGIN") {
-                key_source.clone()
+                Some(key_source.clone())
             } else {
-                std::fs::read_to_string(key_source).unwrap_or_else(|e| {
-                    panic!("Failed to read APNs key file at {key_source:?}: {e}")
-                })
+                read_optional_secret("APNs key", key_source)
             };
-            Some(ApnsConfig {
-                key_pem,
+            key_pem.map(|pem| ApnsConfig {
+                key_pem: pem,
                 key_id: key_id.clone(),
                 team_id: team_id.clone(),
                 bundle_id: bundle_id.clone(),
