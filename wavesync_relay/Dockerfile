@@ -71,5 +71,10 @@ EXPOSE 4001/tcp 4001/udp
 #   APNS_TEAM_ID        - APNs team ID
 #   APNS_BUNDLE_ID      - APNs app bundle ID (e.g., com.example.myapp)
 
+# Default identity persistence path. The relay only writes here if the
+# user hasn't supplied IDENTITY_KEYPAIR (which wins over IDENTITY_FILE).
+# Overridable from docker-compose / Dokploy without needing a CMD override.
+ENV IDENTITY_FILE=/data/identity.key
+
 ENTRYPOINT ["wavesync-relay"]
-CMD ["--listen-addr", "/ip4/0.0.0.0/tcp/4001", "--identity-file", "/data/identity.key"]
+CMD []
