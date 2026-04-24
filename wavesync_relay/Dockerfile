@@ -1,6 +1,17 @@
+# syntax=docker/dockerfile:1.6
+#
+# BuildKit syntax version is required for `RUN --mount=type=cache`. These
+# cache mounts persist the cargo registry, git checkouts, and the target
+# directory across builds on the same builder (GHA's buildx-cache keeps
+# them across CI runs). With no dependency changes, the cook + build
+# stages are close to a no-op — most of the CI time ends up being the
+# Docker layer push.
+
 # -- Plan stage (cargo-chef) --
 FROM rust:1.92-bookworm AS chef
-RUN cargo install cargo-chef
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo install cargo-chef --locked
 WORKDIR /src
 
 # -- Recipe: capture dependency graph --
@@ -11,10 +22,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 # -- Build stage: cook deps, then build --
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json -p wavesync_relay
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo chef cook --release --recipe-path recipe.json -p wavesync_relay
 
 COPY . .
-RUN cargo build --release -p wavesync_relay
+# Final build reuses the cooked dependency cache; the binary is copied
+# out of /src/target before the cache mount is released (otherwise it
+# would disappear with the mount).
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p wavesync_relay \
+    && cp /src/target/release/wavesync-relay /usr/local/bin/wavesync-relay
 
 # -- Runtime stage --
 FROM debian:bookworm-slim
@@ -22,7 +43,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/target/release/wavesync-relay /usr/local/bin/wavesync-relay
+COPY --from=builder /usr/local/bin/wavesync-relay /usr/local/bin/wavesync-relay
 
 # /data stores persistent identity key and push token database
 VOLUME /data
