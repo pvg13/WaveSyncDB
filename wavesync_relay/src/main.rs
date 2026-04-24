@@ -391,10 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .collect();
 
                         // Register the newcomer for this topic
-                        topic_peers
-                            .entry(topic.clone())
-                            .or_default()
-                            .insert(peer);
+                        topic_peers.entry(topic.clone()).or_default().insert(peer);
                         log::info!(
                             "Presence announced: topic={topic} peer={peer} ({} existing)",
                             existing.len()

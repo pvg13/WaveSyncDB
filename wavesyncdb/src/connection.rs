@@ -374,11 +374,7 @@ impl WaveSyncDb {
     /// and the sync config (`.wavesync_config.json`) are stored.
     pub fn database_directory(&self) -> Option<std::path::PathBuf> {
         crate::push::extract_db_path(&self.inner.database_url)
-            .and_then(|p| {
-                std::path::Path::new(&p)
-                    .parent()
-                    .map(|p| p.to_path_buf())
-            })
+            .and_then(|p| std::path::Path::new(&p).parent().map(|p| p.to_path_buf()))
     }
 
     /// Set the application-level identity for this peer.
@@ -1164,7 +1160,10 @@ async fn lookup_first_addr(host: &str) -> std::io::Result<std::net::IpAddr> {
         .map(|sa| sa.ip())
         .next()
         .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, format!("no A/AAAA for {host}"))
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no A/AAAA for {host}"),
+            )
         })
 }
 
@@ -1497,9 +1496,7 @@ impl WaveSyncDbBuilder {
                     }
                 }
                 if self.push_token.is_none() {
-                    log::info!(
-                        "No APNs token file found — push will be registered on next launch"
-                    );
+                    log::info!("No APNs token file found — push will be registered on next launch");
                 }
             }
         }
@@ -1549,14 +1546,13 @@ impl WaveSyncDbBuilder {
             None => None,
         };
 
-        let rendezvous_server = match self.rendezvous_server.as_deref() {
-            Some(s) => Some(
-                parse_and_resolve_multiaddr(s)
-                    .await
-                    .map_err(|e| DbErr::Custom(format!("Invalid rendezvous server address: {e}")))?,
-            ),
-            None => None,
-        };
+        let rendezvous_server =
+            match self.rendezvous_server.as_deref() {
+                Some(s) => Some(parse_and_resolve_multiaddr(s).await.map_err(|e| {
+                    DbErr::Custom(format!("Invalid rendezvous server address: {e}"))
+                })?),
+                None => None,
+            };
 
         let mut bootstrap_peers: Vec<libp2p::Multiaddr> = Vec::new();
         for s in &self.bootstrap_peers {

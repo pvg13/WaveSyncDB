@@ -52,8 +52,7 @@ use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::dioxus::{
-    use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync,
-    use_wavesync_provider,
+    use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync, use_wavesync_provider,
 };
 use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
 
@@ -84,8 +83,9 @@ const STYLE: &str = r#"
 /// Relay server address. Set this to your relay's multiaddr for WAN sync.
 /// Example: "/ip4/your-server-ip/tcp/4001/p2p/12D3KooW..."
 /// Leave as None for LAN-only mDNS sync (desktop testing).
-const RELAY_SERVER: Option<&str> =
-    Some("/dns4/relay.roommatesapp.es/tcp/4001/p2p/12D3KooWSH8G4zDwzK2srm8u6DWxvFiY6emuJkKSKswvGiG2i8qh");
+const RELAY_SERVER: Option<&str> = Some(
+    "/dns4/relay.roommatesapp.es/tcp/4001/p2p/12D3KooWSH8G4zDwzK2srm8u6DWxvFiY6emuJkKSKswvGiG2i8qh",
+);
 
 static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 
