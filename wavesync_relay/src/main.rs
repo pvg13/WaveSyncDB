@@ -3,7 +3,7 @@ mod push_protocol;
 mod push_sender;
 mod push_store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -304,6 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so the waking device can dial directly without waiting for mDNS discovery.
     let mut peer_addresses: HashMap<libp2p::PeerId, Vec<Multiaddr>> = HashMap::new();
 
+    // Relay-as-presence-server: track which peers are currently online for
+    // each topic. Populated by `AnnouncePresence` requests, cleaned up on
+    // disconnect. Used to answer presence requests with a peer list and to
+    // push `PeerJoined` to existing peers when a newcomer arrives.
+    //
+    // This is intentionally in-memory — presence is session-scoped and should
+    // not survive a relay restart (peers will re-announce when they reconnect).
+    let mut topic_peers: HashMap<String, HashSet<libp2p::PeerId>> = HashMap::new();
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -324,6 +333,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::info!("Peer disconnected: {peer_id}");
                 if num_established == 0 {
                     peer_addresses.remove(&peer_id);
+                    // Drop from every topic set; leave empty sets so the
+                    // topic key is reclaimed on the next scan
+                    topic_peers.retain(|_, set| {
+                        set.remove(&peer_id);
+                        !set.is_empty()
+                    });
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
@@ -354,26 +369,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
-                // Build the sender's reachable addresses for the FCM payload
-                let sender_addrs: Vec<String> = {
-                    let mut addrs: Vec<String> = peer_addresses
-                        .get(&peer)
-                        .into_iter()
-                        .flatten()
-                        .map(|a| format!("{a}/p2p/{peer}", peer = peer))
-                        .collect();
-                    // Add relay circuit address as WAN fallback
-                    for ext_addr in swarm.external_addresses() {
-                        addrs.push(format!("{ext_addr}/p2p/{peer_id}/p2p-circuit/p2p/{peer}"));
+                // Build the sender's reachable addresses (used in both FCM
+                // payloads and presence introductions).
+                let sender_addrs: Vec<String> =
+                    build_peer_addrs(&peer_addresses, &swarm, peer, peer_id);
+
+                let response = match &request {
+                    PushRequest::AnnouncePresence { topic } => {
+                        // Gather existing peers' dial addresses BEFORE inserting
+                        // the newcomer, so the response doesn't echo them back.
+                        let existing: Vec<libp2p::PeerId> = topic_peers
+                            .get(topic)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(|p| *p != peer)
+                            .collect();
+                        let existing_addrs: Vec<String> = existing
+                            .iter()
+                            .flat_map(|p| build_peer_addrs(&peer_addresses, &swarm, *p, peer_id))
+                            .collect();
+
+                        // Register the newcomer for this topic
+                        topic_peers
+                            .entry(topic.clone())
+                            .or_default()
+                            .insert(peer);
+                        log::info!(
+                            "Presence announced: topic={topic} peer={peer} ({} existing)",
+                            existing.len()
+                        );
+
+                        // Fan-out PeerJoined to each existing peer so they
+                        // dial the newcomer and the normal sync flow can start.
+                        if !sender_addrs.is_empty() {
+                            for existing_peer in &existing {
+                                let notify = PushRequest::PeerJoined {
+                                    topic: topic.clone(),
+                                    peer_addrs: sender_addrs.clone(),
+                                };
+                                swarm
+                                    .behaviour_mut()
+                                    .push
+                                    .send_request(existing_peer, notify);
+                            }
+                        }
+
+                        PushResponse::PeerList {
+                            peers: existing_addrs,
+                        }
                     }
-                    addrs
+                    _ => {
+                        handle_push_request(
+                            &push_notifier,
+                            &request,
+                            &peer.to_string(),
+                            sender_addrs,
+                        )
+                        .await
+                    }
                 };
-                let response =
-                    handle_push_request(&push_notifier, &request, &peer.to_string(), sender_addrs)
-                        .await;
+
                 if let Err(resp) = swarm.behaviour_mut().push.send_response(channel, response) {
                     log::error!("Failed to send push response: {:?}", resp);
                 }
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { .. },
+                    ..
+                },
+            )) => {
+                // `PeerJoined` acks from peers; nothing to do.
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                log::debug!("PeerJoined delivery to {peer} failed: {error}");
             }
             SwarmEvent::IncomingConnectionError {
                 local_addr,
@@ -462,7 +534,39 @@ async fn handle_push_request(
             notifier.notify(topic.clone(), sender_addrs);
             PushResponse::Ok
         }
+        // Handled inline in the main loop — needs swarm access to fan out
+        // PeerJoined to other peers.
+        PushRequest::AnnouncePresence { .. } => unreachable!(
+            "AnnouncePresence is handled inline in the swarm event loop, not in handle_push_request"
+        ),
+        // Relay doesn't receive PeerJoined — it only sends it.
+        PushRequest::PeerJoined { .. } => PushResponse::Error {
+            message: "PeerJoined is a relay-to-peer request; peers cannot send it".to_string(),
+        },
     }
+}
+
+/// Build the set of dial multiaddrs advertised for a peer: direct addresses
+/// (if reachable) plus relay circuit addresses constructed from each of the
+/// relay's external addresses. Each entry has a trailing `/p2p/<peer-id>`.
+fn build_peer_addrs(
+    peer_addresses: &HashMap<libp2p::PeerId, Vec<Multiaddr>>,
+    swarm: &libp2p::Swarm<RelayServerBehaviour>,
+    peer: libp2p::PeerId,
+    relay_peer_id: libp2p::PeerId,
+) -> Vec<String> {
+    let mut addrs: Vec<String> = peer_addresses
+        .get(&peer)
+        .into_iter()
+        .flatten()
+        .map(|a| format!("{a}/p2p/{peer}"))
+        .collect();
+    for ext_addr in swarm.external_addresses() {
+        addrs.push(format!(
+            "{ext_addr}/p2p/{relay_peer_id}/p2p-circuit/p2p/{peer}"
+        ));
+    }
+    addrs
 }
 
 fn extract_tcp_port(addr: &Multiaddr) -> Option<u16> {

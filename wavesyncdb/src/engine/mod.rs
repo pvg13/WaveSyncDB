@@ -606,6 +606,9 @@ impl EngineRunner {
 
         // Register push token with relay if configured
         self.maybe_register_push_token(peer_id);
+        // Announce presence so the relay can introduce us to other peers
+        // on the same topic (works for desktop too, no push token needed).
+        self.announce_presence_to_relay(peer_id);
     }
 
     /// Track bootstrap peer, emit event, update last_seen.
@@ -1174,18 +1177,92 @@ impl EngineRunner {
     ) {
         match event {
             request_response::Event::Message {
+                peer,
                 message: request_response::Message::Response { response, .. },
                 ..
             } => match response {
                 push_protocol::PushResponse::Ok => {
-                    log::debug!("Push request acknowledged by relay");
+                    log::debug!("Push request acknowledged by {peer}");
                 }
                 push_protocol::PushResponse::Error { message } => {
-                    log::warn!("Push request error from relay: {message}");
+                    log::warn!("Push request error from {peer}: {message}");
+                }
+                push_protocol::PushResponse::PeerList { peers } => {
+                    log::info!(
+                        "Relay {peer} introduced {} peer(s) on our topic",
+                        peers.len()
+                    );
+                    for addr in peers {
+                        self.dial_introduced_peer(&addr);
+                    }
                 }
             },
-            request_response::Event::OutboundFailure { error, .. } => {
-                log::warn!("Push request failed: {error}");
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            } => {
+                match &request {
+                    push_protocol::PushRequest::PeerJoined { topic, peer_addrs } => {
+                        // Only honour PeerJoined from our relay. Any other
+                        // sender is unexpected — ignore with an error response.
+                        let from_relay = matches!(
+                            self.relay_state,
+                            RelayState::Connected { relay_peer_id, .. }
+                                | RelayState::Listening { relay_peer_id }
+                                if relay_peer_id == peer
+                        );
+                        if !from_relay {
+                            log::warn!("Ignoring PeerJoined from non-relay peer {peer}");
+                            let _ = self.swarm.behaviour_mut().push.send_response(
+                                channel,
+                                push_protocol::PushResponse::Error {
+                                    message: "not your relay".to_string(),
+                                },
+                            );
+                            return;
+                        }
+                        if *topic != self.topic_name {
+                            log::debug!(
+                                "Ignoring PeerJoined for foreign topic (ours vs theirs hash mismatch)"
+                            );
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .push
+                                .send_response(channel, push_protocol::PushResponse::Ok);
+                            return;
+                        }
+                        log::info!(
+                            "Relay announced new peer on topic with {} address(es)",
+                            peer_addrs.len()
+                        );
+                        for addr in peer_addrs {
+                            self.dial_introduced_peer(addr);
+                        }
+                        let _ = self
+                            .swarm
+                            .behaviour_mut()
+                            .push
+                            .send_response(channel, push_protocol::PushResponse::Ok);
+                    }
+                    _ => {
+                        // Peers shouldn't receive RegisterToken / NotifyTopic
+                        // from anywhere. Reject politely.
+                        let _ = self.swarm.behaviour_mut().push.send_response(
+                            channel,
+                            push_protocol::PushResponse::Error {
+                                message: "unsupported request for a peer".to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            request_response::Event::OutboundFailure { error, peer, .. } => {
+                log::warn!("Push request to {peer} failed: {error}");
             }
             _ => {}
         }

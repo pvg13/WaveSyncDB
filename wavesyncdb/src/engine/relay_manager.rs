@@ -341,6 +341,65 @@ impl EngineRunner {
         log::info!("Sent push token registration to relay {relay_peer_id}");
     }
 
+    /// Announce this peer's presence to the relay so it can introduce us
+    /// to other peers on the same topic. Called on every relay connect,
+    /// regardless of whether push notifications are configured — this is
+    /// how two foreground peers behind NAT discover each other without
+    /// running a separate rendezvous server.
+    pub(super) fn announce_presence_to_relay(&mut self, relay_peer_id: libp2p::PeerId) {
+        let req = push_protocol::PushRequest::AnnouncePresence {
+            topic: self.topic_name.clone(),
+        };
+        self.swarm
+            .behaviour_mut()
+            .push
+            .send_request(&relay_peer_id, req);
+        log::info!("Announced presence to relay {relay_peer_id} for topic");
+    }
+
+    /// Dial a peer introduced by the relay (via PeerList response or
+    /// PeerJoined request). Skips self, infra peers, rejected peers, and
+    /// peers we're already connected to or actively dialing.
+    pub(super) fn dial_introduced_peer(&mut self, addr_str: &str) {
+        let addr: libp2p::Multiaddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("Relay introduced unparseable address {addr_str:?}: {e}");
+                return;
+            }
+        };
+        let peer_id = match addr.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+            _ => None,
+        }) {
+            Some(pid) => pid,
+            None => {
+                log::warn!("Relay introduced address with no /p2p/ suffix: {addr}");
+                return;
+            }
+        };
+
+        if peer_id == self.local_peer_id
+            || self.infrastructure_peers.contains(&peer_id)
+            || self.rejected_peers.contains(&peer_id)
+            || self.swarm.is_connected(&peer_id)
+            || self.dialing_peers.contains(&peer_id)
+        {
+            return;
+        }
+
+        log::info!("Dialing relay-introduced peer {peer_id} at {addr}");
+        match self.swarm.dial(addr.clone()) {
+            Ok(()) => {
+                self.dialing_peers.insert(peer_id);
+                self.peers.entry(peer_id).or_insert(addr);
+            }
+            Err(e) => {
+                log::warn!("Failed to dial relay-introduced peer {peer_id}: {e}");
+            }
+        }
+    }
+
     /// Send a NotifyTopic request to the relay after pushing changesets to peers.
     pub(super) fn notify_relay_topic(&mut self) {
         let relay_peer_id = match &self.relay_state {
