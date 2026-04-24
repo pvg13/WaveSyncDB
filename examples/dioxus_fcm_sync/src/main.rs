@@ -84,7 +84,7 @@ const STYLE: &str = r#"
 /// Example: "/ip4/your-server-ip/tcp/4001/p2p/12D3KooW..."
 /// Leave as None for LAN-only mDNS sync (desktop testing).
 const RELAY_SERVER: Option<&str> = Some(
-    "/dns4/relay.roommatesapp.es/tcp/4001/p2p/12D3KooWSH8G4zDwzK2srm8u6DWxvFiY6emuJkKSKswvGiG2i8qh",
+    "/dns4/relay.wavesyncdb.com/tcp/4001/p2p/12D3KooWLQ6kKLQ2BdisJFTCmRB7PHijn1m62VSw2RD1JY58CRAZ",
 );
 
 static DB: OnceLock<WaveSyncDb> = OnceLock::new();

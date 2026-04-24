@@ -1,76 +1,85 @@
-# WaveSyncDB relay — Dokploy-ready Docker Compose.
+# WaveSyncDB relay — Dokploy-ready Docker Compose with file-mounted secrets.
 #
-# Deploy on Dokploy (type: Docker Compose):
+# -- Deploy on Dokploy (type: Docker Compose) --
 #   1. Source: this Git repo.
 #   2. Compose Path: wavesync_relay/docker-compose.yml
 #   3. Base Directory (build context): wavesync_relay
-#      The relay crate is standalone, so the build context only needs
-#      this subdirectory — the full workspace is not required.
-#   4. Environment Variables — set at minimum:
+#
+#   4. Files tab — create one file per secret you use. Dokploy writes each
+#      file into the compose directory on the host, alongside this file, so
+#      the relative bind mounts below pick them up automatically.
+#
+#      File Name              Content
+#      ---------------------  ---------------------------------------------
+#      secrets/fcm.json       FCM service account JSON (full file)
+#      secrets/apns.p8        APNs .p8 private key (entire PEM)
+#      secrets/identity.b64   base64 identity from `--generate-identity`
+#
+#      Leave a file out if you don't need that secret — the matching bind
+#      mount is commented out and stays disabled.
+#
+#   5. Environment Variables — set at minimum:
 #          EXTERNAL_ADDRESS   (REQUIRED — public multiaddr clients dial)
-#          IDENTITY_KEYPAIR   (recommended — pins the relay's PeerId)
-#      Plus any push / tuning vars listed below.
-#   5. Advanced → Mounts: optionally mount secret files and point the
-#      matching env var at the mount path (see "Secret files" below).
+#      Plus the APNs metadata (KEY_ID / TEAM_ID / BUNDLE_ID) if you use APNs.
+#      The *content* env vars (IDENTITY_KEYPAIR / FCM_CREDENTIALS / APNS_KEY_FILE)
+#      are already wired below to point at the mounted file paths — you do
+#      NOT need to set them in the Dokploy UI.
 #
-# For local testing: `docker compose up --build` from this directory.
+#   6. Hit Redeploy (not Restart) so the container picks up new mounts.
 #
-# -- Secret files --
-# IDENTITY_KEYPAIR, FCM_CREDENTIALS, and APNS_KEY_FILE each accept either:
-#   * the raw value inline as an env var, OR
-#   * a filesystem path to a file whose contents are the value.
-# So you can paste secrets into env vars, or mount them as files (Dokploy
-# Advanced → Mounts, Docker secrets, bind mounts — whatever your platform
-# prefers) and point the env var at the mount path.
+# -- Local testing --
+#   Place your secrets under ./secrets/ next to this file and run:
+#     docker compose up --build
 #
 # -- Switching to the prebuilt image --
-# To pull from GHCR instead of building, replace the `build:` block with:
-#     image: ghcr.io/pvg13/wavesync-relay:latest
-# (If the package is private, configure Dokploy → Registry with a GitHub
-# PAT that has `read:packages` scope.)
+#   Replace the `build:` block with `image: ghcr.io/pvg13/wavesync-relay:latest`.
 
 services:
   wavesync-relay:
     build: .
     restart: unless-stopped
     ports:
-      # Dokploy: these need to be exposed at the host level. In the UI,
-      # check "Publish Ports" on this service. Override the host side via
-      # RELAY_TCP_PORT / RELAY_UDP_PORT if running multiple relays on one host.
+      # Dokploy: check "Publish Ports" on this service so these reach the host.
+      # Override the host side via RELAY_TCP_PORT / RELAY_UDP_PORT to run
+      # multiple relays on one host.
       - "${RELAY_TCP_PORT:-4001}:4001/tcp"
       - "${RELAY_UDP_PORT:-4001}:4001/udp"
     volumes:
-      # Persists /data/identity.key (PeerId) and /data/push_tokens.db (push registrations).
+      # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data
+
+      # Secret file mounts — uncomment the ones whose files you've created
+      # in Dokploy's Files tab (or dropped into ./secrets/ locally). The
+      # `:ro` makes the mount read-only inside the container.
+      - ./secrets/identity.b64:/run/secrets/identity.b64:ro
+      - ./secrets/fcm.json:/run/secrets/fcm.json:ro
+      - ./secrets/apns.p8:/run/secrets/apns.p8:ro
     environment:
       # ---------- REQUIRED ----------
       # Public multiaddr advertised to clients. Without it, clients get
       # NoAddressesInReservation and WAN sync is broken.
-      # Examples: /ip4/203.0.113.10/tcp/4001   or   /dns4/relay.example.com/tcp/4001
+      # Examples: /ip4/203.0.113.10/tcp/4001  or  /dns4/relay.example.com/tcp/4001
       EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS}"
 
-      # ---------- Identity (pick one; IDENTITY_KEYPAIR wins if both set) ----------
-      # Base64 keypair string, OR a path to a file containing the base64 string.
-      # Generate once with: `docker run --rm <image> --generate-identity`
-      IDENTITY_KEYPAIR: "${IDENTITY_KEYPAIR:-}"
-      # Fallback persistent-identity file. Default in the Dockerfile is
-      # /data/identity.key — leave unset unless you want a custom path.
-      # IDENTITY_FILE: /data/identity.key
+      # ---------- Paths to mounted secret files ----------
+      # These point at the bind mounts above. The relay reads the file
+      # contents at startup — or falls back to the Dockerfile default
+      # (/data/identity.key) if the file is missing and you haven't mounted it.
+      IDENTITY_KEYPAIR: /run/secrets/identity.b64
+      FCM_CREDENTIALS: /run/secrets/fcm.json
+      APNS_KEY_FILE: /run/secrets/apns.p8
 
-      # ---------- Push notifications (optional) ----------
-      # Enable the push token store; required if any FCM/APNs creds are set.
-      PUSH_DB: /data/push_tokens.db
-      # FCM service account JSON, inline or file path.
-      FCM_CREDENTIALS: "${FCM_CREDENTIALS:-}"
-      # APNs .p8 key PEM, inline or file path.
-      APNS_KEY_FILE: "${APNS_KEY_FILE:-}"
+      # ---------- APNs metadata (set via Dokploy env vars) ----------
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
       APNS_BUNDLE_ID: "${APNS_BUNDLE_ID:-}"
       APNS_SANDBOX: "${APNS_SANDBOX:-}"
+
+      # ---------- Push notification store ----------
+      PUSH_DB: /data/push_tokens.db
       # PUSH_DEBOUNCE_SECS: 2
 
-      # ---------- Tuning (optional; defaults are sensible) ----------
+      # ---------- Tuning (optional) ----------
       # LISTEN_ADDR: /ip4/0.0.0.0/tcp/4001
       # MAX_CIRCUITS: 256
       # MAX_CIRCUIT_DURATION_SECS: 3600
