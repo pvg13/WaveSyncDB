@@ -2,10 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>application-identifier</key>
+	<string>H277SV4HUQ.com.wavesync.mobile-demo</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>H277SV4HUQ</string>
 	<key>aps-environment</key>
 	<string>development</string>
-	<!-- Required for ad-hoc-signed debug builds to launch on iOS Simulator. -->
-	<key>com.apple.security.get-task-allow</key>
+	<key>get-task-allow</key>
 	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>H277SV4HUQ.com.wavesync.mobile-demo</string>
+	</array>
 </dict>
 </plist>

@@ -715,23 +715,59 @@ impl EngineRunner {
         &mut self,
         sync_rx: &mut mpsc::Receiver<SyncChangeset>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!(
+            "DIAG run() entered: relay_server={:?} rendezvous_server={:?} ipv6={} os={}",
+            self.config.relay_server,
+            self.config.rendezvous_server,
+            self.config.ipv6,
+            std::env::consts::OS
+        );
+
+        // iOS (including simulator): libp2p-tcp's `do_listen` instantiates an
+        // `if_watch::tokio::IfWatcher` *only* when the bound IP is unspecified
+        // (`0.0.0.0` / `::`). On iOS that watcher blocks indefinitely inside
+        // `IfWatcher::new`. Binding to loopback skips the watcher path.
+        #[cfg(target_os = "ios")]
+        let (v4_tcp, v4_quic, v6_tcp, v6_quic) = (
+            "/ip4/127.0.0.1/tcp/0",
+            "/ip4/127.0.0.1/udp/0/quic-v1",
+            "/ip6/::1/tcp/0",
+            "/ip6/::1/udp/0/quic-v1",
+        );
+        #[cfg(not(target_os = "ios"))]
+        let (v4_tcp, v4_quic, v6_tcp, v6_quic) = (
+            "/ip4/0.0.0.0/tcp/0",
+            "/ip4/0.0.0.0/udp/0/quic-v1",
+            "/ip6/::/tcp/0",
+            "/ip6/::/udp/0/quic-v1",
+        );
+
         // IPv4 listen addresses — TCP is required, QUIC is best-effort
-        self.swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())?;
-        if let Err(e) = self
-            .swarm
-            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
-        {
+        log::info!("DIAG calling listen_on(TCP)={v4_tcp}");
+        let t0 = std::time::Instant::now();
+        let tcp_res = self.swarm.listen_on(v4_tcp.parse().unwrap());
+        log::info!(
+            "DIAG listen_on(TCP) returned in {:?}: {:?}",
+            t0.elapsed(),
+            tcp_res
+        );
+        tcp_res?;
+        log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
+        let t1 = std::time::Instant::now();
+        let quic_res = self.swarm.listen_on(v4_quic.parse().unwrap());
+        log::info!(
+            "DIAG listen_on(QUIC) returned in {:?}: {:?}",
+            t1.elapsed(),
+            quic_res
+        );
+        if let Err(e) = quic_res {
             log::warn!("QUIC IPv4 listen failed (non-fatal, TCP still active): {e}");
         }
 
         // IPv6 listen addresses (opt-in) — TCP is required, QUIC is best-effort
         if self.config.ipv6 {
-            self.swarm.listen_on("/ip6/::/tcp/0".parse().unwrap())?;
-            if let Err(e) = self
-                .swarm
-                .listen_on("/ip6/::/udp/0/quic-v1".parse().unwrap())
-            {
+            self.swarm.listen_on(v6_tcp.parse().unwrap())?;
+            if let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap()) {
                 log::warn!("QUIC IPv6 listen failed (non-fatal, TCP still active): {e}");
             }
         }
