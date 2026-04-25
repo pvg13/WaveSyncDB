@@ -37,6 +37,11 @@ android {
 dependencies {
     implementation("com.google.firebase:firebase-messaging:24.1.0")
     implementation("com.google.android.gms:play-services-tasks:18.2.0")
+    // For NotificationCompat, used by WaveSyncService.startForeground() to
+    // build the foreground-service notification. Android requires a
+    // notification while a foreground service is running; without one the
+    // OS kills the service immediately.
+    implementation("androidx.core:core-ktx:1.13.1")
 }
 
 tasks.withType<AbstractArchiveTask>().configureEach {

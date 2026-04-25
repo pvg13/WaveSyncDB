@@ -28,6 +28,11 @@ manganis = { version = "0.7.6", optional = true }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
 ndk-context = { version = "0.1", optional = true }
+# android_logger routes `log::*` output to Android's logcat. Without it,
+# engine logs from background_sync (which runs in the FirebaseMessagingService
+# JNI thread, with no env_logger / no stderr redirection) silently disappear,
+# making "no peers found" failures uninvestigable.
+android_logger = { version = "0.14", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = { version = "0.6", optional = true }
@@ -51,5 +56,5 @@ dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-fo
 # Kotlin AAR / Swift Package into consumer apps via manganis; gates the
 # Rust-side token-read helpers and FFI exports. Platform-specific code
 # inside the crate is additionally gated by `#[cfg(target_os = "...")]`.
-push-sync = ["mobile-ffi", "dep:manganis"]
+push-sync = ["mobile-ffi", "dep:manganis", "dep:android_logger"]
 mobile-ffi = []

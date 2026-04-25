@@ -15,6 +15,30 @@ use std::time::Duration;
 
 use crate::background_sync::{self, BackgroundSyncResult};
 
+/// On Android, route `log::*` output through the system logger so background-
+/// sync engine messages show up in `adb logcat` (filterable by tag
+/// `wavesync`). Without this, the FirebaseMessagingService JNI thread has no
+/// log destination — env_logger writes to stderr, and Android discards stderr
+/// from native code — so "no peers found" failures are uninvestigable.
+///
+/// Idempotent: `android_logger::init_once` is documented to be a no-op on
+/// subsequent calls. Safe to call from every JNI entry point.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+fn ensure_android_logger() {
+    use android_logger::{Config, FilterBuilder};
+    let mut filter = FilterBuilder::new();
+    filter.parse("info");
+    for (module, level) in crate::recommended_log_filters() {
+        filter.filter_module(module, level);
+    }
+    android_logger::init_once(
+        Config::default()
+            .with_tag("wavesync")
+            .with_max_level(log::LevelFilter::Info)
+            .with_filter(filter.build()),
+    );
+}
+
 /// Shared sync logic used by both C FFI and JNI entry points.
 fn run_background_sync(database_url: &str, timeout_secs: u32, peer_addrs: &[String]) -> i32 {
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -129,6 +153,13 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
     timeout_secs: jni::sys::jint,
     peer_addrs_json: jni::objects::JString,
 ) -> jni::sys::jint {
+    ensure_android_logger();
+    log::info!(
+        "JNI backgroundSync invoked (timeout={}s, peer_addrs payload present={})",
+        timeout_secs,
+        !peer_addrs_json.is_null()
+    );
+
     let url: String = match env.get_string(&database_url) {
         Ok(s) => s.into(),
         Err(_) => return -5,
@@ -146,5 +177,9 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
         }
     };
 
+    log::info!(
+        "background_sync starting: db={url}, {} bootstrap peer(s) from FCM payload",
+        peer_addrs.len()
+    );
     run_background_sync(&url, timeout_secs as u32, &peer_addrs)
 }
