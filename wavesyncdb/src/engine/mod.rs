@@ -1188,12 +1188,32 @@ impl EngineRunner {
                     log::warn!("Push request error from {peer}: {message}");
                 }
                 push_protocol::PushResponse::PeerList { peers } => {
+                    // PeerList is a flat list of addresses for every existing
+                    // peer on the topic. Group by the /p2p/ suffix so we hand
+                    // each peer's full address set to the dialer at once —
+                    // otherwise libp2p would race only one address per peer
+                    // and a NAT'd peer's direct address would lose to its
+                    // circuit fallback that never got tried.
+                    let mut by_peer: std::collections::HashMap<libp2p::PeerId, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for addr_str in &peers {
+                        let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() else {
+                            continue;
+                        };
+                        let pid = addr.iter().find_map(|p| match p {
+                            libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+                            _ => None,
+                        });
+                        if let Some(pid) = pid {
+                            by_peer.entry(pid).or_default().push(addr_str.clone());
+                        }
+                    }
                     log::info!(
                         "Relay {peer} introduced {} peer(s) on our topic",
-                        peers.len()
+                        by_peer.len()
                     );
-                    for addr in peers {
-                        self.dial_introduced_peer(&addr);
+                    for (_pid, addrs) in by_peer {
+                        self.dial_introduced_peer(&addrs);
                     }
                 }
             },
@@ -1240,9 +1260,9 @@ impl EngineRunner {
                             "Relay announced new peer on topic with {} address(es)",
                             peer_addrs.len()
                         );
-                        for addr in peer_addrs {
-                            self.dial_introduced_peer(addr);
-                        }
+                        // peer_addrs is already a single peer's address set —
+                        // pass them all to the dialer so libp2p races them.
+                        self.dial_introduced_peer(peer_addrs);
                         let _ = self
                             .swarm
                             .behaviour_mut()

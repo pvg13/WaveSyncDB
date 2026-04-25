@@ -358,25 +358,36 @@ impl EngineRunner {
     }
 
     /// Dial a peer introduced by the relay (via PeerList response or
-    /// PeerJoined request). Skips self, infra peers, rejected peers, and
-    /// peers we're already connected to or actively dialing.
-    pub(super) fn dial_introduced_peer(&mut self, addr_str: &str) {
-        let addr: libp2p::Multiaddr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                log::warn!("Relay introduced unparseable address {addr_str:?}: {e}");
-                return;
-            }
-        };
-        let peer_id = match addr.iter().find_map(|p| match p {
-            libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
-            _ => None,
-        }) {
-            Some(pid) => pid,
-            None => {
-                log::warn!("Relay introduced address with no /p2p/ suffix: {addr}");
-                return;
-            }
+    /// PeerJoined request) using *all* of the addresses the relay supplied
+    /// for that peer at once. libp2p races them and connects via whichever
+    /// works first — important because the relay sends both direct addresses
+    /// (often unreachable, since most peers are NAT'd) and a circuit-relay
+    /// fallback. Dialing them one-at-a-time previously meant the direct
+    /// address was tried first and the circuit address never got a turn.
+    ///
+    /// Skips self, infra peers, rejected peers, and peers we're already
+    /// connected to or actively dialing.
+    pub(super) fn dial_introduced_peer(&mut self, addr_strs: &[String]) {
+        let addrs: Vec<libp2p::Multiaddr> = addr_strs
+            .iter()
+            .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    log::warn!("Relay introduced unparseable address {s:?}: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        let peer_id = addrs.iter().find_map(|a| {
+            a.iter().find_map(|p| match p {
+                libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
+                _ => None,
+            })
+        });
+        let Some(peer_id) = peer_id else {
+            log::warn!("Relay introduced peer with no /p2p/ suffix on any address");
+            return;
         };
 
         if peer_id == self.local_peer_id
@@ -388,11 +399,23 @@ impl EngineRunner {
             return;
         }
 
-        log::info!("Dialing relay-introduced peer {peer_id} at {addr}");
-        match self.swarm.dial(addr.clone()) {
+        if addrs.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "Dialing relay-introduced peer {peer_id} with {} address(es): {addrs:?}",
+            addrs.len()
+        );
+        let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+            .addresses(addrs.clone())
+            .build();
+        match self.swarm.dial(dial_opts) {
             Ok(()) => {
                 self.dialing_peers.insert(peer_id);
-                self.peers.entry(peer_id).or_insert(addr);
+                if let Some(first) = addrs.into_iter().next() {
+                    self.peers.entry(peer_id).or_insert(first);
+                }
             }
             Err(e) => {
                 log::warn!("Failed to dial relay-introduced peer {peer_id}: {e}");

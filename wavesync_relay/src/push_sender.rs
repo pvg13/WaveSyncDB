@@ -78,6 +78,12 @@ impl PushSender {
             fcm.project_id
         );
 
+        // `android.priority: "high"` is required for data-only wake-up
+        // messages on Android. Without it FCM treats the message as normal
+        // priority, which Doze mode and App Standby can delay indefinitely
+        // (or drop entirely). Use sparingly — Google rate-limits high-priority
+        // data messages — but here it is exactly the case the policy is for:
+        // a real, user-relevant sync needs to wake a sleeping app.
         let body = serde_json::json!({
             "message": {
                 "token": token,
@@ -85,6 +91,9 @@ impl PushSender {
                     "type": "sync_available",
                     "topic": topic,
                     "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
+                },
+                "android": {
+                    "priority": "high"
                 }
             }
         });
