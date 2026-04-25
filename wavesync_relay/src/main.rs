@@ -799,17 +799,33 @@ async fn handle_push_request(
 /// Build the set of dial multiaddrs advertised for a peer: direct addresses
 /// (if reachable) plus relay circuit addresses constructed from each of the
 /// relay's external addresses. Each entry has a trailing `/p2p/<peer-id>`.
+///
+/// Some inputs already end in `/p2p/<peer>` — notably circuit-relay listener
+/// endpoints reported by `endpoint.get_remote_address()`, which look like
+/// `/ip4/.../tcp/.../p2p/<relay>/p2p-circuit/p2p/<peer>`. Naively appending
+/// another `/p2p/<peer>` produces a duplicate suffix that libp2p rejects with
+/// `MalformedMultiaddr`. Strip the existing suffix first.
 fn build_peer_addrs(
     peer_addresses: &HashMap<libp2p::PeerId, Vec<Multiaddr>>,
     swarm: &libp2p::Swarm<RelayServerBehaviour>,
     peer: libp2p::PeerId,
     relay_peer_id: libp2p::PeerId,
 ) -> Vec<String> {
+    let with_p2p_suffix = |a: &Multiaddr| -> String {
+        let last_is_self =
+            matches!(a.iter().last(), Some(libp2p::multiaddr::Protocol::P2p(p)) if p == peer);
+        if last_is_self {
+            a.to_string()
+        } else {
+            format!("{a}/p2p/{peer}")
+        }
+    };
+
     let mut addrs: Vec<String> = peer_addresses
         .get(&peer)
         .into_iter()
         .flatten()
-        .map(|a| format!("{a}/p2p/{peer}"))
+        .map(with_p2p_suffix)
         .collect();
     for ext_addr in swarm.external_addresses() {
         addrs.push(format!(
