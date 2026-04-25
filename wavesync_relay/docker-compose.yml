@@ -38,13 +38,24 @@ services:
   wavesync-relay:
     build: .
     restart: unless-stopped
-    # Host networking so libp2p sees real client source IPs. With bridge mode
-    # all incoming connections appear to come from the docker bridge gateway,
-    # which makes identify report a private IP back to clients and AutoNAT
-    # then asks the relay to verify that unreachable address — wasted dials
-    # and log noise. Trade-off: the host's 4001/tcp + 4001/udp must be free
-    # and opened in the host firewall.
-    network_mode: host
+    ports:
+      # Long syntax with `mode: host` so dokploy/Swarm publishes these ports
+      # directly on the node instead of through the ingress routing mesh.
+      # Without `mode: host`, Swarm's mesh SNATs incoming connections (source
+      # appears as the 10.0.0.0/24 ingress network), which makes libp2p
+      # `identify` report a private IP back to clients; AutoNAT then asks the
+      # relay to verify that unreachable address — wasted dials and log noise.
+      # `network_mode: host` is NOT a workable alternative: Swarm services
+      # don't support it, and dokploy's compose preprocessor injects a
+      # `networks:` block that conflicts with it anyway.
+      - target: 4001
+        published: ${RELAY_TCP_PORT:-4001}
+        protocol: tcp
+        mode: host
+      - target: 4001
+        published: ${RELAY_UDP_PORT:-4001}
+        protocol: udp
+        mode: host
     volumes:
       # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data
