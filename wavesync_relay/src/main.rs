@@ -150,6 +150,115 @@ fn read_optional_secret(kind: &str, path: &str) -> Option<String> {
     }
 }
 
+/// Standard Docker secret mount points. Docker / Compose / Dokploy / Coolify
+/// all converge on `/run/secrets/<name>` for user-uploaded secret files,
+/// so auto-discovering these paths means a deployer only needs to upload
+/// the file — no extra `FCM_CREDENTIALS=/run/secrets/fcm.json` env var to
+/// keep in sync with the mount.
+const DEFAULT_FCM_SECRET_PATH: &str = "/run/secrets/fcm.json";
+const DEFAULT_APNS_SECRET_PATH: &str = "/run/secrets/apns.p8";
+
+/// Resolve a secret "source" — either an explicit CLI/env value, or, if
+/// that isn't set, the conventional Docker secret mount point. Returns the
+/// string the existing secret-parser logic should consume (an inline blob
+/// from the env var, or a file path the parser will read).
+///
+/// Auto-discovery only kicks in when the file actually exists, so plain
+/// `cargo run` outside Docker keeps the previous behaviour (no FCM unless
+/// you set `FCM_CREDENTIALS`).
+fn resolve_secret_source(
+    kind: &str,
+    cli_value: Option<&String>,
+    default_path: &str,
+) -> Option<String> {
+    if let Some(v) = cli_value {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return Some(v.clone());
+        }
+    }
+    match std::fs::metadata(default_path) {
+        Ok(meta) if meta.is_file() => {
+            log::info!("auto-discovered {kind} at {default_path}");
+            Some(default_path.to_string())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod resolve_secret_source_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "wsync-relay-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        p
+    }
+
+    #[test]
+    fn explicit_cli_value_beats_default_path() {
+        let path = temp_file_path("explicit");
+        std::fs::write(&path, b"{\"x\": 1}").unwrap();
+        let explicit = "{\"inline\": true}".to_string();
+        let got = resolve_secret_source(
+            "test",
+            Some(&explicit),
+            path.to_str().unwrap(),
+        );
+        assert_eq!(got, Some(explicit));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_cli_value_falls_through_to_default() {
+        let path = temp_file_path("fallback");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"{}").unwrap();
+        let blank = "  ".to_string();
+        let got = resolve_secret_source("test", Some(&blank), path.to_str().unwrap());
+        assert_eq!(got.as_deref(), path.to_str());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_default_returns_none() {
+        let path = temp_file_path("missing");
+        // Don't create the file.
+        let got = resolve_secret_source("test", None, path.to_str().unwrap());
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn directory_at_default_path_returns_none() {
+        // Empty bind mount in Docker shows up as a directory — must not be
+        // treated as a valid secret source.
+        let path = temp_file_path("dir");
+        std::fs::create_dir(&path).unwrap();
+        let got = resolve_secret_source("test", None, path.to_str().unwrap());
+        assert_eq!(got, None);
+        let _ = std::fs::remove_dir(&path);
+    }
+
+    #[test]
+    fn existing_default_returns_path_when_cli_is_none() {
+        let path = temp_file_path("default");
+        std::fs::write(&path, b"data").unwrap();
+        let got = resolve_secret_source("test", None, path.to_str().unwrap());
+        assert_eq!(got.as_deref(), path.to_str());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
     if path.exists() {
         let bytes = std::fs::read(path).expect("Failed to read identity file");
@@ -278,12 +387,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("Failed to open push token database"),
         );
 
-        let fcm_config = cli.fcm_credentials.as_ref().and_then(|value| {
+        let fcm_source = resolve_secret_source(
+            "FCM credentials",
+            cli.fcm_credentials.as_ref(),
+            DEFAULT_FCM_SECRET_PATH,
+        );
+        let fcm_config = fcm_source.and_then(|value| {
             // Inline JSON if it starts with '{', otherwise a file path.
             let json = if value.trim_start().starts_with('{') {
                 value.clone()
             } else {
-                read_optional_secret("FCM credentials", value)?
+                read_optional_secret("FCM credentials", &value)?
             };
             match serde_json::from_str::<serde_json::Value>(&json) {
                 Ok(sa) => match sa["project_id"].as_str() {
@@ -303,11 +417,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
+        let apns_key_source = resolve_secret_source(
+            "APNs key",
+            cli.apns_key_file.as_ref(),
+            DEFAULT_APNS_SECRET_PATH,
+        );
         let apns_config = if let (Some(key_source), Some(key_id), Some(team_id), Some(bundle_id)) = (
-            &cli.apns_key_file,
-            &cli.apns_key_id,
-            &cli.apns_team_id,
-            &cli.apns_bundle_id,
+            apns_key_source.as_ref(),
+            cli.apns_key_id.as_ref(),
+            cli.apns_team_id.as_ref(),
+            cli.apns_bundle_id.as_ref(),
         ) {
             // Inline PEM if it contains `-----BEGIN`, otherwise a file path.
             let key_pem = if key_source.contains("-----BEGIN") {
