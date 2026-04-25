@@ -258,12 +258,17 @@ async fn run_engine(
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let keypair = identity::Keypair::generate_ed25519();
+    // Load (or create on first launch) the persistent libp2p keypair from
+    // _wavesync_meta. Stable PeerId across restarts is necessary so the
+    // relay-side push-token store doesn't accumulate stale duplicates and
+    // peer_versions tracking actually points at a stable identity.
+    let keypair = shadow::get_or_create_libp2p_keypair(&db).await?;
     let mdns_config = config.mdns_config();
 
     let swarm = build_swarm(keypair.clone(), mdns_config, config.keep_alive_interval)?;
 
     let local_peer_id = keypair.public().to_peer_id();
+    log::info!("Local libp2p PeerId (persistent): {local_peer_id}");
 
     // Load current db_version
     let local_db_version = shadow::get_db_version(&db).await?;
