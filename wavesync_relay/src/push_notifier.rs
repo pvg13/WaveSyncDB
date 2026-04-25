@@ -147,6 +147,11 @@ async fn fire_notifications(
     };
 
     if tokens.is_empty() {
+        log::info!(
+            "fire_notifications: no registered tokens for topic {topic} — \
+             nothing to push (this is the silent path that masks 'phone never \
+             registered' in production)"
+        );
         return;
     }
 
