@@ -320,6 +320,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // One-shot startup diagnostic: print which env vars are set so a
+    // dokploy/compose deploy that silently drops a variable shows up
+    // immediately in the relay logs instead of looking like a code bug.
+    // Values are masked — only presence and length are reported.
+    for var in [
+        "PUSH_DB",
+        "FCM_CREDENTIALS",
+        "APNS_KEY_FILE",
+        "IDENTITY_KEYPAIR",
+        "IDENTITY_FILE",
+        "EXTERNAL_ADDRESS",
+    ] {
+        match std::env::var(var) {
+            Ok(v) => log::info!(
+                "env {var}: set (len={}, starts_with={:?})",
+                v.len(),
+                v.chars().take(8).collect::<String>()
+            ),
+            Err(_) => log::info!("env {var}: <unset>"),
+        }
+    }
+
     let cli = Cli::parse();
 
     if cli.generate_identity {
