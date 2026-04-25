@@ -5,18 +5,19 @@
 #   2. Compose Path: wavesync_relay/docker-compose.yml
 #   3. Base Directory (build context): wavesync_relay
 #
-#   4. Files tab — create one file per secret you use. Dokploy writes each
-#      file into the compose directory on the host, alongside this file, so
-#      the relative bind mounts below pick them up automatically.
+#   4. Advanced → Mounts — create one File Mount per secret you use. Dokploy
+#      stores file-mount content under <project>/files/ on the host (NOT
+#      alongside this compose file), so the compose-side bind mounts below
+#      would point at the wrong path and conflict. Configure mounts in the
+#      dokploy UI instead and leave the compose volumes section minimal:
 #
-#      File Name              Content
-#      ---------------------  ---------------------------------------------
-#      secrets/fcm.json       FCM service account JSON (full file)
-#      secrets/apns.p8        APNs .p8 private key (entire PEM)
-#      secrets/identity.b64   base64 identity from `--generate-identity`
+#      File Path              Mount Path                 Content
+#      ---------------------  -------------------------  -------------------
+#      secrets/fcm.json       /run/secrets/fcm.json      FCM service-account JSON
+#      secrets/apns.p8        /run/secrets/apns.p8       APNs .p8 PEM
+#      secrets/identity.b64   /run/secrets/identity.b64  base64 identity
 #
-#      Leave a file out if you don't need that secret — the matching bind
-#      mount is commented out and stays disabled.
+#      (Skip the rows for secrets you don't use.)
 #
 #   5. Environment Variables — set at minimum:
 #          EXTERNAL_ADDRESS   (REQUIRED — public multiaddr clients dial)
@@ -24,6 +25,11 @@
 #      The *content* env vars (IDENTITY_KEYPAIR / FCM_CREDENTIALS / APNS_KEY_FILE)
 #      are already wired below to point at the mounted file paths — you do
 #      NOT need to set them in the Dokploy UI.
+#
+#      Alternative for FCM/APNs: paste the JSON / PEM contents directly into
+#      FCM_CREDENTIALS / APNS_KEY_FILE env vars (the relay detects inline JSON
+#      starting with `{` and inline PEM starting with `-----BEGIN`). That
+#      bypasses file mounts entirely and is the simplest dokploy setup.
 #
 #   6. Hit Redeploy (not Restart) so the container picks up new mounts.
 #
@@ -60,12 +66,14 @@ services:
       # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data
 
-      # Secret file mounts — uncomment the ones whose files you've created
-      # in Dokploy's Files tab (or dropped into ./secrets/ locally). The
-      # `:ro` makes the mount read-only inside the container.
-      - ./secrets/identity.b64:/run/secrets/identity.b64:ro
-      - ./secrets/fcm.json:/run/secrets/fcm.json:ro
-      - ./secrets/apns.p8:/run/secrets/apns.p8:ro
+      # NO secret bind mounts here. Dokploy's File Mounts (Advanced → Mounts)
+      # are the canonical mechanism in production — see the deployment notes
+      # at the top of this file. For local docker-compose testing, uncomment
+      # the lines below and place real secret files in ./secrets/.
+      #
+      # - ./secrets/identity.b64:/run/secrets/identity.b64:ro
+      # - ./secrets/fcm.json:/run/secrets/fcm.json:ro
+      # - ./secrets/apns.p8:/run/secrets/apns.p8:ro
     environment:
       # ---------- REQUIRED ----------
       # Public multiaddr advertised to clients. Without it, clients get
