@@ -86,5 +86,15 @@ EXPOSE 4001/tcp 4001/udp
 # Overridable from docker-compose / Dokploy without needing a CMD override.
 ENV IDENTITY_FILE=/data/identity.key
 
+# Push token store location. Setting this enables the push notification
+# subsystem at startup. Bake the default into the image because some
+# orchestrators (notably Dokploy's compose renderer) ignore the
+# `environment:` block of docker-compose.yml and only honour env vars
+# set in the orchestrator's UI — meaning a hardcoded compose value like
+# `PUSH_DB: /data/push_tokens.db` silently doesn't reach the container.
+# An ENV here is image-baked and always present unless explicitly
+# overridden, so push works out-of-the-box on any orchestrator.
+ENV PUSH_DB=/data/push_tokens.db
+
 ENTRYPOINT ["wavesync-relay"]
 CMD []
