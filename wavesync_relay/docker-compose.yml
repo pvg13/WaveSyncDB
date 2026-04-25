@@ -81,13 +81,20 @@ services:
       # Examples: /ip4/203.0.113.10/tcp/4001  or  /dns4/relay.example.com/tcp/4001
       EXTERNAL_ADDRESS: "${EXTERNAL_ADDRESS}"
 
-      # ---------- Paths to mounted secret files ----------
-      # These point at the bind mounts above. The relay reads the file
-      # contents at startup — or falls back to the Dockerfile default
-      # (/data/identity.key) if the file is missing and you haven't mounted it.
-      IDENTITY_KEYPAIR: /run/secrets/identity.b64
-      FCM_CREDENTIALS: /run/secrets/fcm.json
-      APNS_KEY_FILE: /run/secrets/apns.p8
+      # ---------- Secret content paths or inline values ----------
+      # Each accepts EITHER a filesystem path OR the inline content. The relay
+      # auto-detects: FCM/APNS values starting with `{` are treated as inline
+      # JSON; APNs PEM starting with `-----BEGIN` is treated as inline PEM;
+      # IDENTITY values matching the base64 character set are treated as
+      # inline base64 keypair. Anything else is read as a file path.
+      #
+      # Defaults below point at the file-mount paths used when you configure
+      # secrets via dokploy's Advanced → Mounts. To bypass file mounts, set
+      # the env var in dokploy's Environment tab to the raw content instead;
+      # that override wins because of the `${...:-default}` interpolation.
+      IDENTITY_KEYPAIR: "${IDENTITY_KEYPAIR:-/run/secrets/identity.b64}"
+      FCM_CREDENTIALS: "${FCM_CREDENTIALS:-/run/secrets/fcm.json}"
+      APNS_KEY_FILE: "${APNS_KEY_FILE:-/run/secrets/apns.p8}"
 
       # ---------- APNs metadata (set via Dokploy env vars) ----------
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
