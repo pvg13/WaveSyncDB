@@ -170,7 +170,16 @@ fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // The autonat v2 server logs a WARN every time a dial-back times out, which
+    // is the normal mechanism for classifying NAT'd peers — we expect dozens per
+    // hour and they are not actionable. Pin that one module to error-only so it
+    // doesn't drown out real warnings. RUST_LOG can still override.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module(
+            "libp2p_autonat::v2::server::handler::dial_request",
+            log::LevelFilter::Error,
+        )
+        .init();
 
     // Compose interpolation (`${FOO:-}`) leaves unset vars as empty strings in
     // the process env. For string flags that becomes `Some("")` and panics
@@ -553,7 +562,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                log::warn!("Outgoing connection error to {peer_id:?}: {error}");
+                // Almost always an autonat dial-back that timed out because the
+                // probed peer is behind NAT — that is how autonat decides "this
+                // peer is private". Not actionable for the relay; keep at debug.
+                log::debug!("Outgoing connection error to {peer_id:?}: {error}");
             }
             SwarmEvent::ListenerError { listener_id, error } => {
                 log::error!("Listener {listener_id:?} error: {error}");
