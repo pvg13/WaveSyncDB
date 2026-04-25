@@ -605,15 +605,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(
                 identify::Event::Received { info, peer_id, .. },
             )) => {
-                log::debug!("Identify from {peer_id}: {}", info.protocol_version);
-                // Update peer addresses from identify info (includes listen addresses)
-                let addrs = peer_addresses.entry(peer_id).or_default();
-                for addr in &info.listen_addrs {
-                    if !addrs.contains(addr) {
-                        addrs.push(addr.clone());
-                    }
+                log::info!(
+                    "Identify from {peer_id}: {} listen addr(s) ({})",
+                    info.listen_addrs.len(),
+                    info.protocol_version,
+                );
+                // Replace, don't union. Identify is a snapshot of the peer's
+                // current reachable addresses; treating it as additive
+                // accumulates stale entries across reconnects (every NAT-mapped
+                // outbound port that AutoNAT happened to observe at some point
+                // gets stuck in the table forever). Replace-on-identify means
+                // the relay's view tracks the peer's actual current state, so
+                // FCM payloads contain only addresses that are live *right
+                // now*. The peer pushes identify updates on listen-addr change
+                // (with_push_listen_addr_updates(true)), so this stays current
+                // even within a session.
+                peer_addresses.insert(peer_id, info.listen_addrs.clone());
+                if let Some(addrs) = peer_addresses.get_mut(&peer_id) {
+                    cap_peer_addresses(addrs);
                 }
-                cap_peer_addresses(addrs);
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
                 request_response::Event::Message {
@@ -951,6 +961,12 @@ fn build_peer_addrs_for_fcm(
     out.extend(lan);
     out.extend(wan);
     out.extend(circuit);
+    // Dedup while preserving order — `swarm.external_addresses()` can yield
+    // duplicates (e.g. when AutoNAT confirms the same external addr from two
+    // observers), and we don't want the phone dialing the same circuit-relay
+    // multiaddr twice.
+    let mut seen = HashSet::new();
+    out.retain(|a| seen.insert(a.clone()));
     out
 }
 
@@ -994,6 +1010,18 @@ fn classify_v4(ip: std::net::Ipv4Addr) -> AddrClass {
         || ip.is_broadcast()
         || ip.is_documentation()
     {
+        return AddrClass::Drop;
+    }
+    // Docker default bridges allocate from 172.17.0.0/16 through 172.31.0.0/16
+    // (each `docker network create` claims the next free /16). These are
+    // host-only and never reachable from another machine, but identify still
+    // reports them because libp2p binds 0.0.0.0 and enumerates per-interface.
+    // Always-drop them — desktops behind Docker accumulate 4–6 bridges,
+    // multiplied by TCP+QUIC, that's a 8–12-address noise floor in every FCM
+    // payload. The 192.168.0.0/16 range (typical home Wi-Fi) and 10.0.0.0/8
+    // (corporate LAN) remain Private.
+    let octets = ip.octets();
+    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
         return AddrClass::Drop;
     }
     if ip.is_private() {
@@ -1076,13 +1104,30 @@ mod classify_addr_tests {
 
     #[test]
     fn private_v4_ranges_are_private() {
+        // Wi-Fi LAN and corporate LAN remain Private — useful when receiver
+        // happens to be on the same network.
         for s in [
             "/ip4/192.168.1.150/tcp/4001",
             "/ip4/10.0.0.5/tcp/4001",
-            "/ip4/172.16.0.1/tcp/4001",
-            "/ip4/172.31.255.254/tcp/4001",
         ] {
             assert_eq!(classify_addr(&ma(s)), AddrClass::Private, "{s}");
+        }
+    }
+
+    #[test]
+    fn docker_bridge_range_is_dropped() {
+        // 172.16.0.0/12 (Docker default bridges, also some VPNs) are host-only
+        // virtual interfaces. Even though they're RFC1918 Private, including
+        // them in FCM payloads is pure noise: a desktop with 4 Docker bridges
+        // adds 8 useless entries (×TCP+QUIC).
+        for s in [
+            "/ip4/172.16.0.1/tcp/4001",
+            "/ip4/172.17.0.1/tcp/4001",
+            "/ip4/172.18.0.1/tcp/4001",
+            "/ip4/172.20.0.1/tcp/4001",
+            "/ip4/172.31.255.254/tcp/4001",
+        ] {
+            assert_eq!(classify_addr(&ma(s)), AddrClass::Drop, "{s}");
         }
     }
 
@@ -1167,11 +1212,14 @@ mod build_peer_addrs_for_fcm_tests {
         let relay = pid("12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3");
         let known: Vec<Multiaddr> = vec![
             ma("/ip4/127.0.0.1/tcp/39981"),       // dropped (loopback)
-            ma("/ip4/172.18.0.1/tcp/39981"),      // private
-            ma("/ip4/192.168.1.150/tcp/39981"),   // private
+            ma("/ip4/172.18.0.1/tcp/39981"),      // dropped (Docker bridge)
+            ma("/ip4/192.168.1.150/tcp/39981"),   // private (Wi-Fi LAN)
             ma("/ip4/79.116.240.142/tcp/42674"),  // public
         ];
-        let external_addrs: Vec<Multiaddr> = vec![ma("/ip4/77.37.125.212/tcp/4001")];
+        let external_addrs: Vec<Multiaddr> = vec![
+            ma("/ip4/77.37.125.212/tcp/4001"),
+            ma("/ip4/77.37.125.212/tcp/4001"), // duplicate — should be deduped
+        ];
 
         // Re-implement classification + ordering inline (same as production).
         let mut lan: Vec<String> = Vec::new();
@@ -1191,14 +1239,16 @@ mod build_peer_addrs_for_fcm_tests {
         got.extend(lan);
         got.extend(wan);
         got.extend(circuit);
+        // Mirror production dedup
+        let mut seen = HashSet::new();
+        got.retain(|a| seen.insert(a.clone()));
 
-        assert_eq!(got.len(), 4); // 2 LAN + 1 WAN + 1 circuit; loopback dropped
-        // First two entries are the LAN addresses (in original order)
-        assert!(got[0].starts_with("/ip4/172.18.0.1/"));
-        assert!(got[1].starts_with("/ip4/192.168.1.150/"));
-        // Third is WAN
-        assert!(got[2].starts_with("/ip4/79.116.240.142/"));
-        // Fourth is circuit-relay
-        assert!(got[3].contains("/p2p-circuit/"));
+        assert_eq!(got.len(), 3); // 1 LAN + 1 WAN + 1 circuit; loopback + docker + duplicate dropped
+        // First entry is the Wi-Fi LAN address
+        assert!(got[0].starts_with("/ip4/192.168.1.150/"));
+        // Second is WAN
+        assert!(got[1].starts_with("/ip4/79.116.240.142/"));
+        // Third is circuit-relay (only once, not twice)
+        assert!(got[2].contains("/p2p-circuit/"));
     }
 }

@@ -29,10 +29,14 @@ impl EngineRunner {
         let peer = event.remote_peer_id;
         match event.result {
             Ok(_) => {
-                log::info!("DCUtR: direct connection upgrade succeeded with {peer}");
+                log::info!(
+                    "DCUtR: direct connection upgrade succeeded with {peer} (sync now goes peer-to-peer, bypassing the relay)"
+                );
             }
             Err(error) => {
-                log::debug!("DCUtR: direct connection upgrade failed with {peer}: {error}");
+                log::info!(
+                    "DCUtR: direct connection upgrade failed with {peer}: {error} (sync stays on circuit-relay path; expected on symmetric-NAT cellular)"
+                );
             }
         }
     }
