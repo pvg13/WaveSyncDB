@@ -87,8 +87,19 @@ pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
         ("libp2p_quic", log::LevelFilter::Warn),
         ("libp2p_relay", log::LevelFilter::Warn),
         ("libp2p_identify", log::LevelFilter::Warn),
+        ("libp2p_yamux", log::LevelFilter::Warn),
+        ("libp2p_ping", log::LevelFilter::Warn),
+        ("libp2p_request_response", log::LevelFilter::Warn),
         ("multistream_select", log::LevelFilter::Warn),
         ("netlink_proto", log::LevelFilter::Warn),
+        // sqlx logs every query at INFO by default — useful while developing
+        // against a fresh schema, but on Android logcat (and anywhere else
+        // that just wants to see engine-level events) it drowns out the
+        // signal: dozens of SELECT/INSERT/DELETE lines per sync round.
+        // Set RUST_LOG=sqlx::query=info to bring them back when actually
+        // debugging slow queries.
+        ("sqlx::query", log::LevelFilter::Warn),
+        ("sqlx_core::logger", log::LevelFilter::Warn),
     ]
 }
 

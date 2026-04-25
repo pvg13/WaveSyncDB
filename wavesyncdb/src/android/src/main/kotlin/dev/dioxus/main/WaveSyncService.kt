@@ -1,7 +1,14 @@
 package dev.dioxus.main
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
@@ -19,9 +26,18 @@ import java.io.File
  */
 class WaveSyncService : FirebaseMessagingService() {
 
+    /// Held while the foreground sync is running so that mDNS multicast
+    /// sends actually go out on Wi-Fi. Without it, Android silently drops
+    /// outgoing multicast and `libp2p_mdns` logs `Operation not permitted`.
+    /// Released in `stopSyncForeground()`.
+    private var multicastLock: WifiManager.MulticastLock? = null
+
     companion object {
         private const val TAG = "WaveSyncService"
         private const val TOKEN_FILENAME = "wavesync_fcm_token"
+        private const val FG_NOTIFICATION_CHANNEL_ID = "wavesync_sync"
+        private const val FG_NOTIFICATION_ID = 0xC0DEC0DE.toInt()
+        private const val MULTICAST_LOCK_TAG = "wavesync.mdns"
 
         private var nativeLoaded = false
 
@@ -114,21 +130,39 @@ class WaveSyncService : FirebaseMessagingService() {
 
         Log.i(TAG, "Received sync_available push, starting background sync")
 
+        // Promote ourselves to a foreground service BEFORE doing anything else.
+        // Without this, Android's background-app restrictions deny socket I/O
+        // (DNS, TCP, mDNS multicast) with EPERM / ENETUNREACH and the engine
+        // can't reach the relay or peers. FCM-triggered foreground starts are
+        // explicitly exempted from the Android 12+ background-start ban; see
+        // developer.android.com/about/versions/12/foreground-services
+        // #background-start-exceptions.
+        try {
+            startSyncForeground()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to enter foreground: ${e.message}")
+            // Continue anyway — on older OS versions or unusual states the
+            // service may still have network. Better to attempt sync than skip.
+        }
+
         // Extract peer addresses from FCM payload (sent by relay)
         val peerAddrsJson = message.data["peer_addrs"]
         if (peerAddrsJson != null) {
             Log.i(TAG, "FCM includes peer addresses: ${peerAddrsJson.take(100)}...")
         }
 
-        // onMessageReceived runs on a background thread with ~20s budget.
         val dbUrl = findDatabaseUrl()
         if (dbUrl == null) {
             Log.e(TAG, "No WaveSyncDB database found — has the app been launched?")
+            stopSyncForeground()
             return
         }
 
         ensureNativeLoaded()
-        if (!nativeLoaded) return
+        if (!nativeLoaded) {
+            stopSyncForeground()
+            return
+        }
 
         try {
             val result = backgroundSync(dbUrl, 25, peerAddrsJson)
@@ -140,7 +174,113 @@ class WaveSyncService : FirebaseMessagingService() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Background sync exception: ${e.message}")
+        } finally {
+            stopSyncForeground()
         }
+    }
+
+    /**
+     * Promote this service to the foreground. Required for FCM-triggered
+     * sync because regular background services on modern Android are
+     * heavily restricted from network I/O. The notification is intentionally
+     * minimal — Android requires *some* notification while a service runs
+     * in the foreground, but most users won't see it for the brief sync
+     * window (≤25s) and dismissing it has no effect on the sync.
+     */
+    private fun startSyncForeground() {
+        ensureNotificationChannel()
+        val notification: Notification = NotificationCompat.Builder(this, FG_NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("Syncing")
+            .setContentText("Pulling latest changes…")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Android 14+ requires the service-type argument and matching
+            // permission `FOREGROUND_SERVICE_DATA_SYNC`.
+            startForeground(
+                FG_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(FG_NOTIFICATION_ID, notification)
+        }
+
+        acquireMulticastLock()
+    }
+
+    private fun stopSyncForeground() {
+        releaseMulticastLock()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "stopForeground failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Acquire a [WifiManager.MulticastLock] so that libp2p mDNS can actually
+     * send packets while the service runs. Android silently filters
+     * outgoing multicast on Wi-Fi unless a multicast lock is held; the
+     * symptom in `wavesync` logs is `libp2p_mdns: error sending packet on
+     * iface ... Operation not permitted` repeated every few seconds.
+     *
+     * Held only for the duration of one sync (paired with the foreground-
+     * service notification). Idempotent — safe to call multiple times.
+     */
+    private fun acquireMulticastLock() {
+        if (multicastLock?.isHeld == true) return
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            if (wm == null) {
+                Log.w(TAG, "WifiManager unavailable; mDNS multicast may fail")
+                return
+            }
+            val lock = wm.createMulticastLock(MULTICAST_LOCK_TAG).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            multicastLock = lock
+        } catch (e: Exception) {
+            // Acquisition is best-effort — if the device denies it (no Wi-Fi,
+            // or some OEM lockdown), the engine still functions, it just
+            // won't have working mDNS.
+            Log.w(TAG, "Could not acquire MulticastLock: ${e.message}")
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "MulticastLock.release() failed: ${e.message}")
+        } finally {
+            multicastLock = null
+        }
+    }
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(FG_NOTIFICATION_CHANNEL_ID) != null) return
+        val channel = NotificationChannel(
+            FG_NOTIFICATION_CHANNEL_ID,
+            "Sync",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Brief notification shown while WaveSyncDB pulls changes from peers"
+            setShowBadge(false)
+        }
+        nm.createNotificationChannel(channel)
     }
 
     override fun onNewToken(token: String) {

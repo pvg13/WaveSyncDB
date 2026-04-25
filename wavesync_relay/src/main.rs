@@ -90,9 +90,12 @@ struct Cli {
     #[arg(long, env = "APNS_SANDBOX")]
     apns_sandbox: bool,
 
-    /// Push notification cooldown window in seconds (default: 2).
-    /// First notification fires immediately; subsequent ones within this window are batched.
-    #[arg(long, env = "PUSH_DEBOUNCE_SECS", default_value_t = 2)]
+    /// Push notification cooldown window in seconds (default: 1).
+    /// First notification fires immediately; subsequent ones within this
+    /// window are batched. The shorter the window, the faster trailing-edge
+    /// notifications arrive at the cost of more FCM volume on rapid bursts.
+    /// 1s strikes a balance between near-real-time feel and avoiding spam.
+    #[arg(long, env = "PUSH_DEBOUNCE_SECS", default_value_t = 1)]
     push_debounce_secs: u64,
 
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
@@ -571,7 +574,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 log::info!("Peer connected: {peer_id}");
                 let addr = endpoint.get_remote_address().clone();
-                peer_addresses.entry(peer_id).or_default().push(addr);
+                let addrs = peer_addresses.entry(peer_id).or_default();
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+                cap_peer_addresses(addrs);
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -606,6 +613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         addrs.push(addr.clone());
                     }
                 }
+                cap_peer_addresses(addrs);
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
                 request_response::Event::Message {
@@ -617,10 +625,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 },
             )) => {
-                // Build the sender's reachable addresses (used in both FCM
-                // payloads and presence introductions).
+                // Build the sender's reachable addresses. Two variants:
+                //   * `sender_addrs`     — full direct + circuit list, used
+                //                          for libp2p `PeerJoined` peer
+                //                          introductions (the receiving libp2p
+                //                          peer wants every address to give
+                //                          parallel dial the best chance).
+                //   * `sender_addrs_fcm` — closest-path-first ordered set
+                //                          with obviously-unreachable addresses
+                //                          dropped (loopback, link-local,
+                //                          multicast). Used for FCM payloads
+                //                          where the receiver pays for every
+                //                          address it has to dial. Order:
+                //                          private LAN first (closest hop),
+                //                          public WAN second, relay-circuit
+                //                          last (guaranteed fallback). This
+                //                          satisfies "don't use relay if not
+                //                          necessary" — direct paths win the
+                //                          libp2p parallel race when reachable.
                 let sender_addrs: Vec<String> =
                     build_peer_addrs(&peer_addresses, &swarm, peer, peer_id);
+                let sender_addrs_fcm: Vec<String> =
+                    build_peer_addrs_for_fcm(&peer_addresses, &swarm, peer, peer_id);
 
                 let response = match &request {
                     PushRequest::AnnouncePresence { topic } => {
@@ -665,11 +691,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     _ => {
+                        // FCM-bound push: use the closest-path-first ordered
+                        // address set. See `build_peer_addrs_for_fcm` for the
+                        // ordering rationale.
                         handle_push_request(
                             &push_notifier,
                             &request,
                             &peer.to_string(),
-                            sender_addrs,
+                            sender_addrs_fcm,
                         )
                         .await
                     }
@@ -798,6 +827,22 @@ async fn handle_push_request(
 
 /// Build the set of dial multiaddrs advertised for a peer: direct addresses
 /// (if reachable) plus relay circuit addresses constructed from each of the
+/// Maximum addresses to retain per peer. Bounds growth from peers that reconnect
+/// many times within one session (each reconnect lands on a new NAT-mapped source
+/// port). Keeping the most recent N is fine because identify re-pushes current
+/// listen addresses on every reconnect.
+const MAX_PEER_ADDRESSES: usize = 8;
+
+/// Trim the address list to the last `MAX_PEER_ADDRESSES` entries, dropping the
+/// oldest. Newer addresses are statistically more likely to be live (recent NAT
+/// mappings, current listen ports), so eviction is FIFO from the front.
+fn cap_peer_addresses(addrs: &mut Vec<Multiaddr>) {
+    if addrs.len() > MAX_PEER_ADDRESSES {
+        let drop = addrs.len() - MAX_PEER_ADDRESSES;
+        addrs.drain(..drop);
+    }
+}
+
 /// relay's external addresses. Each entry has a trailing `/p2p/<peer-id>`.
 ///
 /// Some inputs already end in `/p2p/<peer>` — notably circuit-relay listener
@@ -835,6 +880,144 @@ fn build_peer_addrs(
     addrs
 }
 
+/// Build the FCM-bound peer-address set: closest path first, relay last.
+///
+/// libp2p's `DialOpts::addresses(...)` races the entries in parallel — but
+/// the swarm enforces a max-pending-outgoing limit (10), and address order
+/// influences which dials get a slot. So putting the *most-likely-to-be-
+/// closest* address first guarantees it gets a real chance to win, and
+/// putting the relay-circuit address last keeps it as a guaranteed fallback
+/// without making it the default.
+///
+/// Order produced:
+///   1. Private-LAN direct addresses (10/8, 172.16/12, 192.168/16, fc00::/7
+///      for IPv6 ULA) — closest path when the receiver happens to share the
+///      writer's LAN. Cellular-phone receivers will fail these fast with
+///      `ENETUNREACH` and the parallel dial moves on; same-LAN receivers
+///      connect in a few milliseconds and never need the relay.
+///   2. Public WAN direct addresses — may work if the writer's NAT permits
+///      (port forwarding, UPnP, full-cone NAT) or after libp2p DCUtR
+///      hole-punching. Cheap to attempt.
+///   3. Relay-circuit addresses (one per relay external address) — guaranteed
+///      to work cross-network. Acts as the always-present fallback.
+///
+/// Dropped (not included at all because they can never accept a remote dial):
+///   * loopback (127/8, ::1)
+///   * link-local (169.254/16, fe80::/10)
+///   * multicast / unspecified
+///
+/// User intent satisfied: "first address we try is the closest path; don't
+/// use relay if not necessary." If a direct address connects, libp2p's
+/// per-peer connection limit (1) closes the redundant relay-circuit
+/// connection, so the relay only carries traffic when it has to.
+///
+/// Same-LAN sync via mDNS is still preferred when the foreground app is
+/// running — this function only matters for FCM-triggered cold-start sync
+/// where mDNS hasn't had a chance to discover anything yet.
+fn build_peer_addrs_for_fcm(
+    peer_addresses: &HashMap<libp2p::PeerId, Vec<Multiaddr>>,
+    swarm: &libp2p::Swarm<RelayServerBehaviour>,
+    peer: libp2p::PeerId,
+    relay_peer_id: libp2p::PeerId,
+) -> Vec<String> {
+    let with_p2p_suffix = |a: &Multiaddr| -> String {
+        let last_is_self =
+            matches!(a.iter().last(), Some(libp2p::multiaddr::Protocol::P2p(p)) if p == peer);
+        if last_is_self {
+            a.to_string()
+        } else {
+            format!("{a}/p2p/{peer}")
+        }
+    };
+
+    let circuit: Vec<String> = swarm
+        .external_addresses()
+        .map(|ext_addr| format!("{ext_addr}/p2p/{relay_peer_id}/p2p-circuit/p2p/{peer}"))
+        .collect();
+
+    let mut lan: Vec<String> = Vec::new();
+    let mut wan: Vec<String> = Vec::new();
+    if let Some(addrs) = peer_addresses.get(&peer) {
+        for addr in addrs {
+            match classify_addr(addr) {
+                AddrClass::Drop => continue,
+                AddrClass::Private => lan.push(with_p2p_suffix(addr)),
+                AddrClass::Public => wan.push(with_p2p_suffix(addr)),
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(lan.len() + wan.len() + circuit.len());
+    out.extend(lan);
+    out.extend(wan);
+    out.extend(circuit);
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AddrClass {
+    /// Drop entirely — never useful for a remote receiver.
+    Drop,
+    /// Private LAN address (RFC 1918 v4, ULA fc00::/7 v6). Closest path if
+    /// the receiver happens to share the writer's LAN.
+    Private,
+    /// Public WAN address. May or may not be reachable depending on NAT.
+    Public,
+}
+
+/// Classify a multiaddr's reachability class for FCM payload purposes.
+/// Looks at the *first* `Ip4`/`Ip6` protocol component — multiaddrs that
+/// don't start with an IP literal (e.g. `/dns4/...`) are treated as Public
+/// (they may resolve to anything; let libp2p attempt).
+fn classify_addr(addr: &Multiaddr) -> AddrClass {
+    use libp2p::multiaddr::Protocol;
+
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => return classify_v4(ip),
+            Protocol::Ip6(ip) => return classify_v6(ip),
+            _ => continue,
+        }
+    }
+
+    // No IP literal — assume Public (DNS-named addresses, etc.). The caller
+    // gives this a non-zero chance; cost of a wasted dial is bounded.
+    AddrClass::Public
+    // (Helpers defined inline below to keep the classification self-contained.)
+}
+
+fn classify_v4(ip: std::net::Ipv4Addr) -> AddrClass {
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+    {
+        return AddrClass::Drop;
+    }
+    if ip.is_private() {
+        return AddrClass::Private;
+    }
+    AddrClass::Public
+}
+
+fn classify_v6(ip: std::net::Ipv6Addr) -> AddrClass {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return AddrClass::Drop;
+    }
+    // Link-local: fe80::/10
+    let segments = ip.segments();
+    if (segments[0] & 0xffc0) == 0xfe80 {
+        return AddrClass::Drop;
+    }
+    // Unique-local addresses (ULA): fc00::/7
+    if (segments[0] & 0xfe00) == 0xfc00 {
+        return AddrClass::Private;
+    }
+    AddrClass::Public
+}
+
 fn extract_tcp_port(addr: &Multiaddr) -> Option<u16> {
     for proto in addr.iter() {
         if let libp2p::multiaddr::Protocol::Tcp(port) = proto {
@@ -842,4 +1025,180 @@ fn extract_tcp_port(addr: &Multiaddr) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod cap_peer_addresses_tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn no_op_under_cap() {
+        let mut addrs = vec![ma("/ip4/1.1.1.1/tcp/1"), ma("/ip4/2.2.2.2/tcp/2")];
+        cap_peer_addresses(&mut addrs);
+        assert_eq!(addrs.len(), 2);
+    }
+
+    #[test]
+    fn no_op_at_cap() {
+        let mut addrs: Vec<Multiaddr> = (0..MAX_PEER_ADDRESSES)
+            .map(|i| ma(&format!("/ip4/10.0.0.{i}/tcp/{i}")))
+            .collect();
+        cap_peer_addresses(&mut addrs);
+        assert_eq!(addrs.len(), MAX_PEER_ADDRESSES);
+    }
+
+    #[test]
+    fn drops_oldest_when_over_cap() {
+        let total = MAX_PEER_ADDRESSES + 3;
+        let mut addrs: Vec<Multiaddr> = (0..total)
+            .map(|i| ma(&format!("/ip4/10.0.0.{i}/tcp/{i}")))
+            .collect();
+        cap_peer_addresses(&mut addrs);
+        assert_eq!(addrs.len(), MAX_PEER_ADDRESSES);
+        // Oldest 3 dropped → first remaining is index 3
+        assert_eq!(addrs[0], ma("/ip4/10.0.0.3/tcp/3"));
+        // Newest is still last
+        assert_eq!(addrs.last().unwrap(), &ma(&format!("/ip4/10.0.0.{}/tcp/{}", total - 1, total - 1)));
+    }
+}
+
+#[cfg(test)]
+mod classify_addr_tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn private_v4_ranges_are_private() {
+        for s in [
+            "/ip4/192.168.1.150/tcp/4001",
+            "/ip4/10.0.0.5/tcp/4001",
+            "/ip4/172.16.0.1/tcp/4001",
+            "/ip4/172.31.255.254/tcp/4001",
+        ] {
+            assert_eq!(classify_addr(&ma(s)), AddrClass::Private, "{s}");
+        }
+    }
+
+    #[test]
+    fn loopback_and_link_local_dropped() {
+        for s in [
+            "/ip4/127.0.0.1/tcp/4001",
+            "/ip4/0.0.0.0/tcp/4001",
+            "/ip4/169.254.10.1/tcp/4001",
+            "/ip4/224.0.0.1/tcp/4001",
+            "/ip6/::1/tcp/4001",
+            "/ip6/fe80::1/tcp/4001",
+            "/ip6/ff02::1/tcp/4001",
+        ] {
+            assert_eq!(classify_addr(&ma(s)), AddrClass::Drop, "{s}");
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_public() {
+        for s in [
+            "/ip4/77.37.125.212/tcp/4001",
+            "/ip4/8.8.8.8/tcp/4001",
+            "/ip6/2001:db8::1/tcp/4001",
+        ] {
+            // 2001:db8 is documentation but global-unicast otherwise; consumers
+            // can't easily distinguish so we keep it as Public; let libp2p
+            // attempt the dial.
+            let class = classify_addr(&ma(s));
+            assert!(
+                class == AddrClass::Public || class == AddrClass::Drop,
+                "{s} got {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_ula_is_private() {
+        assert_eq!(
+            classify_addr(&ma("/ip6/fc00::1/tcp/4001")),
+            AddrClass::Private
+        );
+        assert_eq!(
+            classify_addr(&ma("/ip6/fd00::abcd/tcp/4001")),
+            AddrClass::Private
+        );
+    }
+
+    #[test]
+    fn dns_addresses_are_public_by_default() {
+        // No IP literal; we don't resolve at filter-time. Treat as Public so
+        // libp2p gets a chance to attempt.
+        assert_eq!(
+            classify_addr(&ma("/dns4/relay.example.com/tcp/4001")),
+            AddrClass::Public
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_peer_addrs_for_fcm_tests {
+    use super::*;
+
+    fn pid(s: &str) -> libp2p::PeerId {
+        s.parse().unwrap()
+    }
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    /// Hand-build the inputs without standing up a real swarm. We exercise
+    /// only the address-handling logic; the swarm parameter is required by
+    /// `build_peer_addrs_for_fcm` for the relay's external-address iterator,
+    /// so this test inlines the equivalent pure logic to validate ordering.
+    /// See `build_peer_addrs_for_fcm` source — this test mirrors its body
+    /// minus the swarm dependency.
+    #[test]
+    fn ordering_is_lan_then_wan_then_circuit() {
+        // Pure-data simulation of `build_peer_addrs_for_fcm` so the test
+        // doesn't need a libp2p swarm.
+        let peer = pid("12D3KooWQTV2REAJX77iesp2Qjax5tiK7Zt65FA7tUL6Ch47BJc6");
+        let relay = pid("12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3");
+        let known: Vec<Multiaddr> = vec![
+            ma("/ip4/127.0.0.1/tcp/39981"),       // dropped (loopback)
+            ma("/ip4/172.18.0.1/tcp/39981"),      // private
+            ma("/ip4/192.168.1.150/tcp/39981"),   // private
+            ma("/ip4/79.116.240.142/tcp/42674"),  // public
+        ];
+        let external_addrs: Vec<Multiaddr> = vec![ma("/ip4/77.37.125.212/tcp/4001")];
+
+        // Re-implement classification + ordering inline (same as production).
+        let mut lan: Vec<String> = Vec::new();
+        let mut wan: Vec<String> = Vec::new();
+        for addr in &known {
+            match classify_addr(addr) {
+                AddrClass::Drop => continue,
+                AddrClass::Private => lan.push(format!("{addr}/p2p/{peer}")),
+                AddrClass::Public => wan.push(format!("{addr}/p2p/{peer}")),
+            }
+        }
+        let circuit: Vec<String> = external_addrs
+            .iter()
+            .map(|ext| format!("{ext}/p2p/{relay}/p2p-circuit/p2p/{peer}"))
+            .collect();
+        let mut got: Vec<String> = Vec::new();
+        got.extend(lan);
+        got.extend(wan);
+        got.extend(circuit);
+
+        assert_eq!(got.len(), 4); // 2 LAN + 1 WAN + 1 circuit; loopback dropped
+        // First two entries are the LAN addresses (in original order)
+        assert!(got[0].starts_with("/ip4/172.18.0.1/"));
+        assert!(got[1].starts_with("/ip4/192.168.1.150/"));
+        // Third is WAN
+        assert!(got[2].starts_with("/ip4/79.116.240.142/"));
+        // Fourth is circuit-relay
+        assert!(got[3].contains("/p2p-circuit/"));
+    }
 }

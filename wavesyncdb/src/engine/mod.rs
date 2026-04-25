@@ -821,16 +821,36 @@ impl EngineRunner {
             }
         }
 
-        // Dial bootstrap peers
-        for addr in self.config.bootstrap_peers.clone() {
-            // Extract peer ID from the multiaddr if present
-            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
-                self.bootstrap_peers.insert(peer_id);
+        // Dial bootstrap peers, grouping by peer-id so that multiple
+        // multiaddrs targeting the same peer (a common case when the
+        // FCM payload supplies several candidate addresses for one
+        // remote peer) race in a single libp2p dial via
+        // `DialOpts::peer_id(p).addresses(addrs)`. Without grouping,
+        // each address became a separate `swarm.dial` that libp2p
+        // deduplicates against `PeerCondition::Disconnected` once one
+        // connects — wasting handshake budget on the others.
+        // Multiaddrs without a `/p2p/` suffix fall back to the
+        // single-address dial path.
+        let (grouped, suffixless) = group_bootstrap_addrs(self.config.bootstrap_peers.clone());
+        for peer_id in grouped.keys() {
+            self.bootstrap_peers.insert(*peer_id);
+        }
+        for (peer_id, addrs) in grouped {
+            log::info!(
+                "Dialing bootstrap peer {peer_id} with {} address(es): {addrs:?}",
+                addrs.len()
+            );
+            let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                .addresses(addrs)
+                .build();
+            if let Err(e) = self.swarm.dial(dial_opts) {
+                log::warn!("Failed to dial bootstrap peer {peer_id}: {e}");
             }
+        }
+        for addr in suffixless {
+            log::info!("Dialing bootstrap peer: {addr}");
             if let Err(e) = self.swarm.dial(addr.clone()) {
-                log::warn!("Failed to dial bootstrap peer {}: {}", addr, e);
-            } else {
-                log::info!("Dialing bootstrap peer: {}", addr);
+                log::warn!("Failed to dial bootstrap peer {addr}: {e}");
             }
         }
 
@@ -1369,5 +1389,114 @@ impl EngineRunner {
                 });
             }
         }
+    }
+}
+
+/// Partition a flat list of bootstrap multiaddrs into two buckets:
+///
+///   * Multiaddrs that end in `/p2p/<peer-id>` are grouped by peer-id so a
+///     single `DialOpts::peer_id(p).addresses(addrs)` call can race them.
+///     This matters most when the FCM payload supplies several candidate
+///     addresses for one remote peer.
+///   * Multiaddrs without a `/p2p/` suffix are returned as-is for the
+///     legacy single-address `swarm.dial(addr)` path.
+fn group_bootstrap_addrs(
+    addrs: Vec<libp2p::Multiaddr>,
+) -> (
+    std::collections::HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>>,
+    Vec<libp2p::Multiaddr>,
+) {
+    let mut grouped: std::collections::HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> =
+        std::collections::HashMap::new();
+    let mut suffixless: Vec<libp2p::Multiaddr> = Vec::new();
+    for addr in addrs {
+        if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
+            grouped.entry(peer_id).or_default().push(addr);
+        } else {
+            suffixless.push(addr);
+        }
+    }
+    (grouped, suffixless)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_bootstrap_addrs_collapses_addrs_for_same_peer() {
+        // Same peer_id, three different transport addresses — they should
+        // end up in one HashMap entry that DialOpts can race together.
+        let pid: libp2p::PeerId = "12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3"
+            .parse()
+            .unwrap();
+        let a1: libp2p::Multiaddr = format!("/ip4/79.112.10.59/tcp/42674/p2p/{pid}")
+            .parse()
+            .unwrap();
+        let a2: libp2p::Multiaddr = format!("/ip4/192.168.1.150/tcp/39981/p2p/{pid}")
+            .parse()
+            .unwrap();
+        let a3: libp2p::Multiaddr = format!(
+            "/ip4/77.37.125.212/tcp/4001/p2p/{pid}/p2p-circuit/p2p/{pid}"
+        )
+        .parse()
+        .unwrap();
+
+        let (grouped, suffixless) =
+            group_bootstrap_addrs(vec![a1.clone(), a2.clone(), a3.clone()]);
+
+        assert!(suffixless.is_empty());
+        assert_eq!(grouped.len(), 1);
+        let group = grouped.get(&pid).expect("peer_id should be present");
+        assert_eq!(group.len(), 3);
+        assert!(group.contains(&a1));
+        assert!(group.contains(&a2));
+        assert!(group.contains(&a3));
+    }
+
+    #[test]
+    fn group_bootstrap_addrs_separates_distinct_peers() {
+        let p1: libp2p::PeerId = "12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3"
+            .parse()
+            .unwrap();
+        let p2: libp2p::PeerId = "12D3KooWQTV2REAJX77iesp2Qjax5tiK7Zt65FA7tUL6Ch47BJc6"
+            .parse()
+            .unwrap();
+        let a1: libp2p::Multiaddr = format!("/ip4/1.2.3.4/tcp/1234/p2p/{p1}").parse().unwrap();
+        let a2: libp2p::Multiaddr = format!("/ip4/5.6.7.8/tcp/5678/p2p/{p2}").parse().unwrap();
+
+        let (grouped, suffixless) = group_bootstrap_addrs(vec![a1.clone(), a2.clone()]);
+
+        assert!(suffixless.is_empty());
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[&p1], vec![a1]);
+        assert_eq!(grouped[&p2], vec![a2]);
+    }
+
+    #[test]
+    fn group_bootstrap_addrs_passes_suffixless_through() {
+        // A multiaddr without a /p2p/ suffix can't be batched by peer-id —
+        // it must go through the legacy single-address swarm.dial path.
+        let bare: libp2p::Multiaddr = "/ip4/1.2.3.4/tcp/1234".parse().unwrap();
+        let pid: libp2p::PeerId = "12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3"
+            .parse()
+            .unwrap();
+        let with_pid: libp2p::Multiaddr = format!("/ip4/5.6.7.8/tcp/5678/p2p/{pid}")
+            .parse()
+            .unwrap();
+
+        let (grouped, suffixless) =
+            group_bootstrap_addrs(vec![bare.clone(), with_pid.clone()]);
+
+        assert_eq!(suffixless, vec![bare]);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[&pid], vec![with_pid]);
+    }
+
+    #[test]
+    fn group_bootstrap_addrs_empty_input() {
+        let (grouped, suffixless) = group_bootstrap_addrs(vec![]);
+        assert!(grouped.is_empty());
+        assert!(suffixless.is_empty());
     }
 }

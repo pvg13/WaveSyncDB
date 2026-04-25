@@ -1,7 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Foreground service. WaveSyncService promotes itself to foreground
+         on receiving an FCM `sync_available` push, so the OS allows it to
+         make outbound network connections (DNS, TCP, UDP, multicast). Without
+         this, Android's background-app restrictions deny socket I/O with
+         EPERM / ENETUNREACH and the sync silently fails. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Required on Android 14+ (API 34+). The service type must match the
+         `android:foregroundServiceType` attribute on the <service> below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Required on Android 13+ (API 33+) for the foreground-service
+         notification to actually appear. Without it the notification is
+         dropped silently. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Network access. Already implied by FCM's transitive deps but listing
+         explicitly here documents intent. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- mDNS multicast send. Without this and a runtime MulticastLock, mDNS
+         iface sends fail with EPERM (visible as `libp2p_mdns: error sending
+         packet ... Operation not permitted` in logs). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <application>
-        <service android:name="dev.dioxus.main.WaveSyncService" android:exported="false">
+        <service
+            android:name="dev.dioxus.main.WaveSyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync">
             <intent-filter>
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>

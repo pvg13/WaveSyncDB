@@ -141,6 +141,26 @@ impl EngineRunner {
                                     my_db_version,
                                 );
 
+                                // Emit PeerSynced so subscribers (notably
+                                // background_sync, which polls network_event_rx
+                                // to decide whether the FCM-triggered sync
+                                // actually accomplished anything) see a
+                                // success signal here. Previously this event
+                                // was only emitted on the request-handling
+                                // path, so a peer that *initiated* sync and
+                                // received changes never observed PeerSynced
+                                // for its own counterparty — and
+                                // background_sync would (mis)report
+                                // BackgroundSyncResult::NoPeers despite a
+                                // successful 40-change pull.
+                                self.emit_network_event(
+                                    crate::network_status::NetworkEvent::PeerSynced {
+                                        peer_id: crate::network_status::PeerId(peer.to_string()),
+                                        db_version: my_db_version,
+                                    },
+                                );
+                                self.update_network_status();
+
                                 // Persist Lamport bump and peer version in a spawned task,
                                 // but queue changeset for sequential application in main loop.
                                 let db = self.db.clone();
