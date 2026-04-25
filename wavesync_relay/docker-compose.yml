@@ -38,12 +38,13 @@ services:
   wavesync-relay:
     build: .
     restart: unless-stopped
-    ports:
-      # Dokploy: check "Publish Ports" on this service so these reach the host.
-      # Override the host side via RELAY_TCP_PORT / RELAY_UDP_PORT to run
-      # multiple relays on one host.
-      - "${RELAY_TCP_PORT:-4001}:4001/tcp"
-      - "${RELAY_UDP_PORT:-4001}:4001/udp"
+    # Host networking so libp2p sees real client source IPs. With bridge mode
+    # all incoming connections appear to come from the docker bridge gateway,
+    # which makes identify report a private IP back to clients and AutoNAT
+    # then asks the relay to verify that unreachable address — wasted dials
+    # and log noise. Trade-off: the host's 4001/tcp + 4001/udp must be free
+    # and opened in the host firewall.
+    network_mode: host
     volumes:
       # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data

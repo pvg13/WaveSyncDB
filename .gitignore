@@ -24,6 +24,10 @@ Cargo.lock
 .wavesync_config.json
 **/.wavesync_config.json
 
+# Relay secret files (identity keypair, FCM JSON, APNs .p8). Bind-mounted via
+# docker-compose; paste contents into Dokploy's Files tab, never commit.
+wavesync_relay/secrets/
+
 # Keep CLAUDE.md and doc files tracked — only ignore generated markdown
 **/*.md
 **/*firebase*.json
