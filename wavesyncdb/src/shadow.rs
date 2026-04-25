@@ -117,6 +117,60 @@ pub async fn set_db_version(db: &impl ConnectionTrait, version: u64) -> Result<(
     Ok(())
 }
 
+/// Load the persistent libp2p keypair from `_wavesync_meta`, or generate
+/// and store a fresh one on first call. Persisting the keypair makes the
+/// libp2p PeerId stable across process restarts — without this, every
+/// app launch would create a new identity, which (a) causes the relay's
+/// push-token store to accumulate stale entries (one per peer-id, all
+/// pointing at the same physical FCM token), (b) defeats `last_seen`
+/// tracking in `_wavesync_peer_versions`, and (c) makes log analysis
+/// impossible since the peer-id changes each run.
+///
+/// Stored as protobuf-encoded bytes (the format produced by
+/// `Keypair::to_protobuf_encoding`). If the stored value is corrupt or
+/// no longer parseable, fall back to generating a fresh one — better
+/// than crashing on startup. The corrupted bytes are overwritten.
+pub async fn get_or_create_libp2p_keypair(
+    db: &impl ConnectionTrait,
+) -> Result<libp2p::identity::Keypair, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct MetaRow {
+        value: Vec<u8>,
+    }
+
+    let row = MetaRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT value FROM _wavesync_meta WHERE key = $1",
+        ["libp2p_keypair".into()],
+    ))
+    .one(db)
+    .await?;
+
+    if let Some(row) = row {
+        match libp2p::identity::Keypair::from_protobuf_encoding(&row.value) {
+            Ok(kp) => return Ok(kp),
+            Err(e) => {
+                log::warn!(
+                    "stored libp2p keypair is unparseable ({e}); regenerating. \
+                     PeerId will change once."
+                );
+            }
+        }
+    }
+
+    let keypair = libp2p::identity::Keypair::generate_ed25519();
+    let bytes = keypair.to_protobuf_encoding().map_err(|e| {
+        DbErr::Custom(format!("failed to encode libp2p keypair: {e}"))
+    })?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        ["libp2p_keypair".into(), bytes.into()],
+    ))
+    .await?;
+    Ok(keypair)
+}
+
 /// Get or generate a persistent site_id.
 pub async fn get_site_id(db: &impl ConnectionTrait) -> Result<NodeId, DbErr> {
     #[derive(Debug, FromQueryResult)]

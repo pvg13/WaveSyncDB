@@ -177,10 +177,14 @@ async fn fire_notifications(
 
         match result {
             PushResult::Sent => {
-                log::debug!(
-                    "Push sent to {} ({})",
-                    token_entry.token,
-                    token_entry.platform
+                // Log at info so deploys can confirm FCM/APNs is reaching the
+                // upstream API. Token is truncated to first 20 chars to avoid
+                // dumping full credentials into log aggregators.
+                let short = token_entry.token.chars().take(20).collect::<String>();
+                log::info!(
+                    "Push sent ({}) to token={}...",
+                    token_entry.platform,
+                    short
                 );
             }
             PushResult::TokenInvalid => {
