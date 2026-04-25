@@ -63,10 +63,20 @@ EXPOSE 4001/tcp 4001/udp
 # All secret inputs (IDENTITY_KEYPAIR, FCM_CREDENTIALS, APNS_KEY_FILE) accept
 # either the raw value inline OR a filesystem path to a mounted secret file.
 #
+# FCM_CREDENTIALS and APNS_KEY_FILE are also auto-discovered from the
+# standard Docker secret mount points when not set explicitly:
+#   /run/secrets/fcm.json   → FCM service account JSON
+#   /run/secrets/apns.p8    → APNs signing key (still needs APNS_KEY_ID +
+#                             APNS_TEAM_ID + APNS_BUNDLE_ID env vars)
+# Mount the file at that path in your compose / Dokploy config and the
+# relay picks it up without needing the env var.
+#
 # Push notification environment variables (all optional):
 #   PUSH_DB             - path to push token SQLite DB (e.g., /data/push_tokens.db)
-#   FCM_CREDENTIALS     - FCM service account JSON (inline or file path)
-#   APNS_KEY_FILE       - APNs .p8 key (inline PEM or file path)
+#   FCM_CREDENTIALS     - FCM service account JSON (inline or file path).
+#                         Falls back to /run/secrets/fcm.json.
+#   APNS_KEY_FILE       - APNs .p8 key (inline PEM or file path).
+#                         Falls back to /run/secrets/apns.p8.
 #   APNS_KEY_ID         - APNs key ID
 #   APNS_TEAM_ID        - APNs team ID
 #   APNS_BUNDLE_ID      - APNs app bundle ID (e.g., com.example.myapp)
