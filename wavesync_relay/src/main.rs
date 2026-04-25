@@ -637,7 +637,9 @@ async fn handle_push_request(
             topic,
             sender_site_id,
         } => {
-            log::debug!("Topic notification from {sender_site_id} for {topic}");
+            log::info!(
+                "NotifyTopic received from {peer_id} (sender site={sender_site_id}) for {topic}"
+            );
             notifier.notify(topic.clone(), sender_addrs);
             PushResponse::Ok
         }
