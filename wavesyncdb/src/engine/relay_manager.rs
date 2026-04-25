@@ -314,7 +314,15 @@ impl EngineRunner {
         }
         let (platform, token) = match &self.push_token {
             Some(pt) => pt.clone(),
-            None => return,
+            None => {
+                log::info!(
+                    "maybe_register_push_token skipped: no push_token set — \
+                     either the platform isn't mobile, push-sync feature is off, \
+                     or the FCM/APNs token file wasn't written by the OS service \
+                     in time. Push notifications won't be delivered."
+                );
+                return;
+            }
         };
 
         let push_platform = match platform.as_str() {
@@ -428,7 +436,14 @@ impl EngineRunner {
         let relay_peer_id = match &self.relay_state {
             RelayState::Connected { relay_peer_id, .. }
             | RelayState::Listening { relay_peer_id } => *relay_peer_id,
-            _ => return,
+            other => {
+                log::info!(
+                    "notify_relay_topic skipped: relay_state is {other:?} \
+                     (expected Connected or Listening) — relay won't send FCM \
+                     for this write"
+                );
+                return;
+            }
         };
 
         let req = push_protocol::PushRequest::NotifyTopic {
@@ -441,6 +456,11 @@ impl EngineRunner {
                 .collect::<String>(),
         };
 
+        log::info!(
+            "Sending NotifyTopic to relay {relay_peer_id} for topic {} \
+             (this should produce a 'NotifyTopic received' log on the relay)",
+            self.topic_name
+        );
         self.swarm
             .behaviour_mut()
             .push
