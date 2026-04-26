@@ -194,14 +194,28 @@ fn build_swarm(
     mdns_config: mdns::Config,
     keep_alive_interval: Duration,
 ) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    // Try system DNS first (reads /etc/resolv.conf — works on desktop/server)
+    // QUIC-only (no TCP). Two reasons:
+    //
+    // 1. **Cold-start latency.** QUIC is 1 RTT for fresh handshake and 0-RTT
+    //    on resume; TCP+TLS+yamux is 2–3 RTT. On 100ms cellular, that's a
+    //    ~200ms saving on every FCM-triggered sync — directly visible in
+    //    bg_sync timing.
+    //
+    // 2. **Single transport per peer = single connection per peer.** With
+    //    both TCP and QUIC enabled, every peer dial races both protocols and
+    //    both succeed, leaving us with two simultaneous connections. That
+    //    confused libp2p's relay-client behaviour: circuit-relay dials
+    //    failed with "Response from behaviour was canceled: oneshot
+    //    canceled" on cellular when there were two relay connections. With
+    //    QUIC-only there's exactly one connection per peer, so we can raise
+    //    `max_established_per_peer` to 2 (allowing DCUtR's direct upgrade)
+    //    without breaking circuit-relay.
+    //
+    // The cost: networks that block UDP entirely (corporate firewalls,
+    // captive-portal Wi-Fi) can't sync. In practice this is rare for the
+    // mobile-sync target audience.
     let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
         .with_quic()
         .with_dns();
 
@@ -226,11 +240,6 @@ fn build_swarm(
             let ping_interval = keep_alive_interval;
             Ok(SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_tcp(
-                    Default::default(),
-                    noise::Config::new,
-                    yamux::Config::default,
-                )?
                 .with_quic()
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
@@ -731,53 +740,33 @@ impl EngineRunner {
             std::env::consts::OS
         );
 
+        // QUIC-only listeners. See `build_swarm` for the rationale.
+        //
         // iOS (including simulator): libp2p-tcp's `do_listen` instantiates an
         // `if_watch::tokio::IfWatcher` *only* when the bound IP is unspecified
         // (`0.0.0.0` / `::`). On iOS that watcher blocks indefinitely inside
-        // `IfWatcher::new`. Binding to loopback skips the watcher path.
+        // `IfWatcher::new`. Binding to loopback skips the watcher path. The
+        // same caution applies to QUIC's UDP socket setup.
         #[cfg(target_os = "ios")]
-        let (v4_tcp, v4_quic, v6_tcp, v6_quic) = (
-            "/ip4/127.0.0.1/tcp/0",
+        let (v4_quic, v6_quic) = (
             "/ip4/127.0.0.1/udp/0/quic-v1",
-            "/ip6/::1/tcp/0",
             "/ip6/::1/udp/0/quic-v1",
         );
         #[cfg(not(target_os = "ios"))]
-        let (v4_tcp, v4_quic, v6_tcp, v6_quic) = (
-            "/ip4/0.0.0.0/tcp/0",
+        let (v4_quic, v6_quic) = (
             "/ip4/0.0.0.0/udp/0/quic-v1",
-            "/ip6/::/tcp/0",
             "/ip6/::/udp/0/quic-v1",
         );
 
-        // IPv4 listen addresses — TCP is required, QUIC is best-effort
-        log::info!("DIAG calling listen_on(TCP)={v4_tcp}");
-        let t0 = std::time::Instant::now();
-        let tcp_res = self.swarm.listen_on(v4_tcp.parse().unwrap());
-        log::info!(
-            "DIAG listen_on(TCP) returned in {:?}: {:?}",
-            t0.elapsed(),
-            tcp_res
-        );
-        tcp_res?;
         log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
         let t1 = std::time::Instant::now();
-        let quic_res = self.swarm.listen_on(v4_quic.parse().unwrap());
-        log::info!(
-            "DIAG listen_on(QUIC) returned in {:?}: {:?}",
-            t1.elapsed(),
-            quic_res
-        );
-        if let Err(e) = quic_res {
-            log::warn!("QUIC IPv4 listen failed (non-fatal, TCP still active): {e}");
-        }
+        self.swarm.listen_on(v4_quic.parse().unwrap())?;
+        log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
 
-        // IPv6 listen addresses (opt-in) — TCP is required, QUIC is best-effort
-        if self.config.ipv6 {
-            self.swarm.listen_on(v6_tcp.parse().unwrap())?;
-            if let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap()) {
-                log::warn!("QUIC IPv6 listen failed (non-fatal, TCP still active): {e}");
-            }
+        if self.config.ipv6
+            && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
+        {
+            log::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
         }
 
         // If a relay server is configured, dial it

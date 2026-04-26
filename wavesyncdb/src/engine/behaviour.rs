@@ -93,8 +93,25 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
+        // Up to 2 simultaneous connections per peer.
+        //
+        // Why 2: DCUtR upgrades by dialing a *direct* connection to the same
+        // peer while the circuit-relay one is still alive, then migrating
+        // traffic to the direct connection and closing the relay one. With
+        // max=1, libp2p's connection_limits behaviour rejects the upgrade
+        // dial — DCUtR can never complete and sync is permanently stuck on
+        // the relay path.
+        //
+        // Why this is safe now (it wasn't with TCP+QUIC enabled): when both
+        // TCP and QUIC were active, every relay dial succeeded twice
+        // (once per protocol), giving us two relay connections that
+        // confused the relay-client behaviour and broke circuit-relay dials
+        // with "Response from behaviour was canceled: oneshot canceled" on
+        // cellular. With QUIC-only there's exactly one connection per peer,
+        // so the second slot is reserved for a DCUtR-upgraded direct
+        // connection without contention.
         let conn_limits = connection_limits::ConnectionLimits::default()
-            .with_max_established_per_peer(Some(1))
+            .with_max_established_per_peer(Some(2))
             .with_max_pending_outgoing(Some(10));
 
         Self {

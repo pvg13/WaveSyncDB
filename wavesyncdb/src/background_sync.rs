@@ -93,6 +93,29 @@ pub async fn background_sync_with_peers(
     timeout: Duration,
     peer_addrs: &[String],
 ) -> Result<BackgroundSyncResult, BackgroundSyncError> {
+    // Per-stage timing. When a sync round is slow (sometimes hits the 25s
+    // timeout while typical runs are 2–3s), the question is always "where
+    // did the time go". These markers let logcat show the answer:
+    //
+    //   bg_sync stage=config_loaded elapsed_ms=N
+    //   bg_sync stage=engine_built elapsed_ms=N
+    //   bg_sync stage=registry_ready elapsed_ms=N
+    //   bg_sync stage=relay_listening elapsed_ms=N      (first time)
+    //   bg_sync stage=first_peer elapsed_ms=N           (first time)
+    //   bg_sync stage=sync_requested elapsed_ms=N       (first time)
+    //   bg_sync stage=first_peer_synced elapsed_ms=N    (first time)
+    //   bg_sync stage=shutdown_started elapsed_ms=N
+    //   bg_sync stage=done elapsed_ms=N result=…
+    //
+    // Each is at info so they're visible without a debug RUST_LOG override.
+    let t_start = std::time::Instant::now();
+    let log_stage = |stage: &str| {
+        log::info!(
+            "bg_sync stage={stage} elapsed_ms={}",
+            t_start.elapsed().as_millis()
+        );
+    };
+
     // 1. Load saved config
     let config = SyncConfig::load(database_url).map_err(|e| {
         if e.contains("Failed to read") {
@@ -140,12 +163,14 @@ pub async fn background_sync_with_peers(
     for addr in peer_addrs {
         builder = builder.with_bootstrap_peer(addr);
     }
+    log_stage("config_loaded");
 
     // 3. Build the DB (starts engine)
     let db = builder
         .build()
         .await
         .map_err(|e| BackgroundSyncError::DatabaseError(e.to_string()))?;
+    log_stage("engine_built");
 
     // 4. Initialize schema registry (tables already exist, but registry needs populating)
     if let Some(ref crate_name) = config.crate_name {
@@ -157,6 +182,7 @@ pub async fn background_sync_with_peers(
         // No crate name saved — signal registry ready anyway so engine can proceed
         db.registry_ready();
     }
+    log_stage("registry_ready");
 
     // 5. Wait for peer discovery, then sync.
     // Don't call request_full_sync() immediately — peers haven't been discovered yet.
@@ -168,30 +194,46 @@ pub async fn background_sync_with_peers(
     let mut synced_peers = HashSet::new();
     let mut saw_any_peer = false;
     let mut sync_requested = false;
+    let mut logged_relay_listening = false;
+    let mut logged_first_peer = false;
 
     loop {
         tokio::select! {
             _ = &mut deadline => {
+                log_stage("timeout");
                 break;
             }
             event = events.recv() => {
                 match event {
                     Ok(NetworkEvent::PeerConnected(_)) => {
+                        if !logged_first_peer {
+                            log_stage("first_peer");
+                            logged_first_peer = true;
+                        }
                         saw_any_peer = true;
                         // A peer connected — now request sync if we haven't yet
                         if !sync_requested {
                             db.request_full_sync();
+                            log_stage("sync_requested");
                             sync_requested = true;
                         }
                     }
                     Ok(NetworkEvent::RelayStatusChanged(crate::RelayStatus::Listening)) => {
+                        if !logged_relay_listening {
+                            log_stage("relay_listening");
+                            logged_relay_listening = true;
+                        }
                         // Relay is ready — request sync to discover relay-connected peers
                         if !sync_requested {
                             db.request_full_sync();
+                            log_stage("sync_requested");
                             sync_requested = true;
                         }
                     }
                     Ok(NetworkEvent::PeerSynced { peer_id, .. }) => {
+                        // Always the first time we hit this branch (we break out of
+                        // the loop after a brief grace window), so log unconditionally.
+                        log_stage("first_peer_synced");
                         synced_peers.insert(peer_id);
                         // Give a brief window for additional peers to sync
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -206,15 +248,21 @@ pub async fn background_sync_with_peers(
     }
 
     // 7. Graceful shutdown
+    log_stage("shutdown_started");
     db.shutdown().await;
 
     // 8. Return result
     let peers_synced = synced_peers.len();
-    if peers_synced > 0 {
-        Ok(BackgroundSyncResult::Synced { peers_synced })
+    let result = if peers_synced > 0 {
+        BackgroundSyncResult::Synced { peers_synced }
     } else if saw_any_peer {
-        Ok(BackgroundSyncResult::TimedOut { peers_synced: 0 })
+        BackgroundSyncResult::TimedOut { peers_synced: 0 }
     } else {
-        Ok(BackgroundSyncResult::NoPeers)
-    }
+        BackgroundSyncResult::NoPeers
+    };
+    log::info!(
+        "bg_sync stage=done elapsed_ms={} result={result:?}",
+        t_start.elapsed().as_millis()
+    );
+    Ok(result)
 }

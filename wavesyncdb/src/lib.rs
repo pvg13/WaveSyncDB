@@ -78,10 +78,15 @@ pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
         ("hickory_resolver", log::LevelFilter::Warn),
         ("hickory_proto", log::LevelFilter::Warn),
         ("libp2p_autonat", log::LevelFilter::Warn),
+        ("libp2p_dcutr", log::LevelFilter::Info),
         ("libp2p_mdns", log::LevelFilter::Warn),
         ("libp2p_swarm", log::LevelFilter::Warn),
         ("libp2p_dns", log::LevelFilter::Warn),
         ("libp2p_tcp", log::LevelFilter::Warn),
+        // libp2p_core emits long type-name debug stack traces ("Failed to
+        // listen/dial using libp2p_core::transport::map::Map<...>"). The full
+        // generic type name fills tens of lines per failed dial attempt and
+        // adds nothing actionable. Drop to warn.
         ("libp2p_core", log::LevelFilter::Warn),
         ("libp2p_noise", log::LevelFilter::Warn),
         ("libp2p_quic", log::LevelFilter::Warn),
@@ -92,12 +97,12 @@ pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
         ("libp2p_request_response", log::LevelFilter::Warn),
         ("multistream_select", log::LevelFilter::Warn),
         ("netlink_proto", log::LevelFilter::Warn),
-        // sqlx logs every query at INFO by default — useful while developing
-        // against a fresh schema, but on Android logcat (and anywhere else
-        // that just wants to see engine-level events) it drowns out the
-        // signal: dozens of SELECT/INSERT/DELETE lines per sync round.
-        // Set RUST_LOG=sqlx::query=info to bring them back when actually
-        // debugging slow queries.
+        // sqlx logs every query at INFO by default. We also set
+        // SeaORM's `ConnectOptions::sqlx_logging_level(Debug)` in
+        // `connection.rs` so the events themselves are emitted at debug —
+        // this filter is the second line of defence in case anything routes
+        // through the `log` crate at info regardless. Set
+        // RUST_LOG=sqlx::query=info to re-enable when debugging slow queries.
         ("sqlx::query", log::LevelFilter::Warn),
         ("sqlx_core::logger", log::LevelFilter::Warn),
     ]

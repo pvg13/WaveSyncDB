@@ -508,17 +508,39 @@ impl EngineRunner {
 }
 
 /// Apply a set of remote column changes to the local database.
+///
+/// All shadow + base-table writes for a single changeset commit as one
+/// transaction. Without this, a 30-change sync round did ~120 separate
+/// auto-commits to the SQLite WAL — visible as ~3s of `DELETE`/`INSERT OR
+/// REPLACE` lines in logcat. Batching into one transaction collapses that
+/// to a single commit (~50–200ms wall-clock) and is the load-bearing
+/// latency win for FCM-triggered cold-start sync.
+///
+/// `ChangeNotification`s are buffered during the transaction and emitted
+/// only AFTER commit (Rule 2.12 — subscribers must never observe a
+/// notification before its data is durable).
 pub(super) async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
     registry: &TableRegistry,
     changes: &[ColumnChange],
 ) {
+    use sea_orm::TransactionTrait;
+
+    let txn = match db.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Failed to begin transaction for remote changeset: {e}");
+            return;
+        }
+    };
+
     // Increment local db_version once for the batch of remote changes
-    let local_db_version = match shadow::increment_db_version(db).await {
+    let local_db_version = match shadow::increment_db_version(&txn).await {
         Ok(v) => v,
         Err(e) => {
             log::error!("Failed to increment db_version: {e}");
+            let _ = txn.rollback().await;
             return;
         }
     };
@@ -531,6 +553,9 @@ pub(super) async fn apply_remote_changeset(
             .or_default()
             .push(change);
     }
+
+    // Collect notifications and emit only after commit (Rule 2.12)
+    let mut pending_notifications: Vec<ChangeNotification> = Vec::new();
 
     for ((table, pk), row_changes) in &grouped {
         let meta = match registry.get(table) {
@@ -548,13 +573,13 @@ pub(super) async fn apply_remote_changeset(
         // Check for delete first
         let delete_change = row_changes.iter().find(|c| c.cid.0 == "__deleted");
         if let Some(change) = delete_change {
-            if apply_remote_delete(db, table, pk, change, &meta, local_db_version).await {
+            if apply_remote_delete(&txn, table, pk, change, &meta, local_db_version).await {
                 any_applied = true;
                 is_delete = true;
             }
         } else {
             let (applied, cols) =
-                apply_remote_column_changes(db, table, pk, row_changes, &meta, local_db_version)
+                apply_remote_column_changes(&txn, table, pk, row_changes, &meta, local_db_version)
                     .await;
             if applied {
                 any_applied = true;
@@ -568,7 +593,7 @@ pub(super) async fn apply_remote_changeset(
             } else {
                 WriteKind::Insert
             };
-            let _ = change_tx.send(ChangeNotification {
+            pending_notifications.push(ChangeNotification {
                 table: (*table).into(),
                 kind,
                 primary_key: (*pk).into(),
@@ -580,12 +605,22 @@ pub(super) async fn apply_remote_changeset(
             });
         }
     }
+
+    if let Err(e) = txn.commit().await {
+        log::error!("Failed to commit remote changeset transaction: {e}");
+        // Notifications are not sent — data was rolled back.
+        return;
+    }
+
+    for n in pending_notifications {
+        let _ = change_tx.send(n);
+    }
 }
 
 /// Apply a remote delete: check conflict resolution, delete row, update shadow.
 /// Returns `true` if the delete was applied.
 async fn apply_remote_delete(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     table: &str,
     pk: &str,
     change: &ColumnChange,
@@ -638,7 +673,7 @@ async fn apply_remote_delete(
 /// Apply non-delete column changes: resolve conflicts per-column, write winning values,
 /// update shadow tables. Returns `(applied, changed_column_names)`.
 async fn apply_remote_column_changes(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     table: &str,
     pk: &str,
     row_changes: &[&ColumnChange],
@@ -779,7 +814,7 @@ async fn apply_remote_column_changes(
 
 /// Write pending shadow table clock entries after a successful DB write.
 async fn flush_shadow_updates(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     table: &str,
     pk: &str,
     updates: &[(String, u64, crate::messages::NodeId, u32)],
@@ -793,7 +828,7 @@ async fn flush_shadow_updates(
 
 /// Check if a row exists in a table.
 pub(super) async fn row_exists(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     table: &str,
     pk_col: &str,
     pk: &str,
@@ -834,7 +869,7 @@ pub(super) fn json_to_sea_value(v: Option<&serde_json::Value>) -> sea_orm::Value
 
 /// Fetch the current value of a column as JSON-serialized bytes for conflict tiebreaking.
 pub(super) async fn get_local_value_bytes(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     table: &str,
     pk_col: &str,
     pk: &str,

@@ -1501,7 +1501,12 @@ impl WaveSyncDbBuilder {
             }
         }
 
-        let opts = ConnectOptions::new(&self.database_url);
+        let mut opts = ConnectOptions::new(&self.database_url);
+        // Silence sqlx's per-query INFO logs (one line per SELECT/INSERT/DELETE
+        // — and a sync round can be hundreds of queries). Tracing them at this
+        // verbosity drowns out engine-level events on logcat. Bump to debug if
+        // actually diagnosing slow queries.
+        opts.sqlx_logging_level(log::LevelFilter::Debug);
         let inner = Database::connect(opts).await?;
 
         // Create meta table and get/generate persistent site_id
