@@ -84,13 +84,43 @@ const STYLE: &str = r#"
 /// Example: "/ip4/your-server-ip/tcp/4001/p2p/12D3KooW..."
 /// Leave as None for LAN-only mDNS sync (desktop testing).
 const RELAY_SERVER: Option<&str> = Some(
-    "/dns4/relay.wavesyncdb.com/tcp/4001/p2p/12D3KooWH2ZzVdXehxyNa1QDeWrBLAWKynMVPn8BK2LaDCTiPs4D",
+    "/dns4/relay.wavesyncdb.com/udp/4001/quic-v1/p2p/12D3KooWH2ZzVdXehxyNa1QDeWrBLAWKynMVPn8BK2LaDCTiPs4D",
 );
 
 static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 
 fn main() {
-    // Set up logging with noisy libp2p modules filtered out
+    // Two logging systems flow through this app:
+    //
+    // 1. The `log` crate (env_logger) — used by wavesyncdb's own `log::info!`
+    //    macros. Configured below with the recommended module filters.
+    //
+    // 2. The `tracing` crate (tracing-subscriber, set up by dioxus-logger
+    //    inside `dioxus::launch`) — used by libp2p transports, sqlx, hickory,
+    //    and other deps. dioxus-logger defaults to `DEBUG` in debug builds
+    //    and reads `RUST_LOG` (via `EnvFilter::from_env_lossy`). If we leave
+    //    that alone, libp2p_core/libp2p_dns/sqlx flood stdout with multi-line
+    //    type-name dial errors and per-query SELECT/INSERT/DELETE lines.
+    //
+    // Set RUST_LOG once with the equivalent module filters so BOTH systems
+    // honor them. If the user has already set RUST_LOG, defer to that.
+    if std::env::var_os("RUST_LOG").is_none() {
+        let directives: Vec<String> = std::iter::once("info".to_string())
+            .chain(
+                wavesyncdb::recommended_log_filters()
+                    .into_iter()
+                    .map(|(m, lvl)| format!("{m}={}", lvl.as_str().to_lowercase())),
+            )
+            .collect();
+        // Safety: setting an env var before any threads are spawned is sound.
+        // This must run before `dioxus::launch` (which initializes
+        // tracing-subscriber via dioxus-logger).
+        unsafe {
+            std::env::set_var("RUST_LOG", directives.join(","));
+        }
+    }
+
+    // Set up the `log` crate side (env_logger). dioxus-logger handles tracing.
     let mut log_builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     for (module, level) in wavesyncdb::recommended_log_filters() {

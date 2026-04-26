@@ -58,6 +58,30 @@ struct Cli {
     #[arg(long, env = "MAX_CIRCUIT_BYTES", default_value_t = 0)]
     max_circuit_bytes: u64,
 
+    /// Maximum total relay reservations across all peers (default: 1024).
+    /// libp2p's stock default is 128 — too tight for a mobile-FCM workload
+    /// where the same peer may reconnect dozens of times per hour.
+    #[arg(long, env = "MAX_RESERVATIONS", default_value_t = 1024)]
+    max_reservations: usize,
+
+    /// Maximum reservations per peer (default: 32). libp2p's stock default
+    /// is 4. With FCM-driven reconnect bursts (each new connection asks for
+    /// a fresh reservation while the old one is still in its
+    /// `reservation_duration` window) clients hit the per-peer cap within
+    /// minutes, every subsequent request is denied with
+    /// `ResourceLimitExceeded`, and circuit-relay sync stops working for
+    /// that peer.
+    #[arg(long, env = "MAX_RESERVATIONS_PER_PEER", default_value_t = 32)]
+    max_reservations_per_peer: usize,
+
+    /// Reservation duration in seconds (default: 600 = 10 min). libp2p's
+    /// stock default is 3600 (1 hour). Reservations auto-release when the
+    /// underlying connection closes anyway, so this only matters for clients
+    /// that disconnect uncleanly. A shorter duration limits how long stale
+    /// reservations clog the per-peer cap during rapid reconnect storms.
+    #[arg(long, env = "RESERVATION_DURATION_SECS", default_value_t = 600)]
+    reservation_duration: u64,
+
     /// Path to the push token SQLite database (enables push notifications)
     #[arg(long, env = "PUSH_DB")]
     push_db: Option<String>,
@@ -401,6 +425,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_circuits: cli.max_circuits,
         max_circuit_duration: std::time::Duration::from_secs(cli.max_circuit_duration),
         max_circuit_bytes: cli.max_circuit_bytes,
+        max_reservations: cli.max_reservations,
+        max_reservations_per_peer: cli.max_reservations_per_peer,
+        reservation_duration: std::time::Duration::from_secs(cli.reservation_duration),
         ..Default::default()
     };
 
