@@ -1,0 +1,31 @@
+[application]
+name = "wavesync-website"
+default_platform = "web"
+
+[web.app]
+title = "WaveSyncDB — Local-first SQLite that syncs itself"
+base_path = ""
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets", "content"]
+
+[web.resource]
+# Highlight.js for client-side syntax highlighting of code blocks, plus
+# Mermaid for in-markdown diagrams (flowcharts, sequence diagrams). Both
+# are loaded once per page and triggered after every route change via
+# dioxus::document::eval (see src/pages/docs.rs).
+script = [
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/rust.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/toml.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js",
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/dockerfile.min.js",
+    "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js",
+]
+style = [
+    "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css",
+]
+
+[web.resource.dev]

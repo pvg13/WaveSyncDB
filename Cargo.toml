@@ -3,6 +3,7 @@ members = [
     "wavesyncdb",
     "wavesyncdb_derive",
     "wavesync_relay",
+    "website",
     "examples/*",
 ]
 exclude = [

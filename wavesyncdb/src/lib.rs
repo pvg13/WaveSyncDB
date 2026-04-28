@@ -50,6 +50,7 @@ pub mod protocol;
 pub(crate) mod push;
 pub mod registry;
 pub mod shadow;
+pub mod synced_model;
 
 pub use auth::GroupKey;
 pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
@@ -60,6 +61,7 @@ pub use messages::{
 };
 pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
 pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
+pub use synced_model::SyncedModel;
 
 /// Returns recommended log module filter tuples for silencing noisy dependencies.
 ///
@@ -113,6 +115,11 @@ pub use inventory::submit as register_sync_entity;
 
 // Re-export sea-orm for users of the library
 pub use sea_orm;
+
+// Re-export serde_json so the `SyncEntity` derive macro can reference it
+// at `wavesyncdb::serde_json::*` without forcing every consuming crate to
+// declare serde_json as a direct dependency.
+pub use serde_json;
 
 #[cfg(feature = "derive")]
 pub use wavesyncdb_derive::SyncEntity;

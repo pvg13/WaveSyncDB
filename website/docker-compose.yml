@@ -1,0 +1,43 @@
+# WaveSyncDB website — Dokploy-ready Docker Compose.
+#
+# -- Deploy on Dokploy (type: Docker Compose) --
+#   1. Source: this Git repo.
+#   2. Compose Path: website/docker-compose.yml
+#   3. Base Directory (build context): . (repo root, NOT the website dir)
+#
+#      The Dockerfile uses `cargo-chef` against the full workspace, so
+#      the build context has to be the repo root for the COPY . . step
+#      to see the workspace Cargo.lock and sibling crates. Set the build
+#      context to repo root in Dokploy's UI.
+#
+#   4. Environment Variables — none required. The site is a static
+#      bundle served by nginx; runtime config is the nginx.conf baked
+#      into the image. If you need to change the listen port, change
+#      it in the `ports:` block below.
+#
+#   5. Hit Redeploy on every commit to `website/**` to pick up changes.
+#
+# -- Local testing --
+#   From the repo root:
+#       docker compose -f website/docker-compose.yml up --build
+#   Then open http://localhost:8080.
+#
+# -- Switching to a prebuilt image --
+#   Replace the `build:` block with `image: ghcr.io/pvg13/wavesync-website:latest`
+#   once a CI workflow publishes the image.
+
+services:
+  wavesync-website:
+    build:
+      context: ..
+      dockerfile: website/Dockerfile
+    restart: unless-stopped
+    ports:
+      # The site is HTTP-only inside the container — Dokploy / your
+      # reverse proxy is expected to terminate TLS in front of it.
+      - "${WEBSITE_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

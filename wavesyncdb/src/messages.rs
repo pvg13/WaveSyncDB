@@ -178,6 +178,13 @@ pub struct ChangeNotification {
     pub primary_key: PrimaryKey,
     /// Which columns were changed (if known).
     pub changed_columns: Option<Vec<String>>,
+    /// The post-write value of each column that was changed, as JSON.
+    ///
+    /// `None` for `Delete` and on the rare path where the values
+    /// couldn't be captured (e.g. an unparsed raw `execute_unprepared`).
+    /// Reactive hooks use this to apply changes in place via
+    /// [`SyncedModel`](crate::SyncedModel) without re-querying SeaORM.
+    pub column_values: Option<Vec<(ColumnName, serde_json::Value)>>,
 }
 
 #[cfg(test)]
@@ -276,6 +283,7 @@ mod tests {
             kind: WriteKind::Insert,
             primary_key: "pk-1".into(),
             changed_columns: Some(vec!["title".to_string()]),
+            column_values: None,
         };
         let cloned = notif.clone();
         assert_eq!(format!("{:?}", notif), format!("{:?}", cloned));

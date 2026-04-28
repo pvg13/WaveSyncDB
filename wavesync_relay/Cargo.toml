@@ -2,7 +2,7 @@
 name = "wavesync_relay"
 version = "0.2.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 description = "Relay and rendezvous server for WaveSyncDB WAN peer discovery and NAT traversal"
 
 [[bin]]

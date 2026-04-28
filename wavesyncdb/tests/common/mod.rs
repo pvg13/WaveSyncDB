@@ -62,8 +62,9 @@ pub fn make_node_id(seed: u8) -> wavesyncdb::NodeId {
 /// SeaORM entity for the `tasks` test table.
 pub mod task {
     use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
     #[sea_orm(table_name = "tasks")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -81,8 +82,9 @@ pub mod task {
 /// SeaORM entity for the `notes` test table (second table for multi-table tests).
 pub mod note {
     use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
     #[sea_orm(table_name = "notes")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]

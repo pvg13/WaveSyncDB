@@ -1,0 +1,50 @@
+WaveSyncDB — Dual License
+=========================
+
+WaveSyncDB is dual-licensed. You may use, modify, and distribute it under
+either of the two licenses described below — pick the one that fits your
+project. You are not required to choose: the licenses run in parallel and
+either is sufficient.
+
+  1. Open Source — GNU Affero General Public License, version 3 or later (AGPL-3.0-or-later)
+     SPDX:    AGPL-3.0-or-later
+     Text:    LICENSE-AGPL
+     Use it when:
+       - Your project itself is licensed under an AGPL-compatible
+         open-source license (AGPLv3, GPLv3 with the FSF's compatibility
+         provision, ...).
+       - You are willing to release your derivative work under the AGPL
+         and publish its source code, including modifications used to
+         provide a network service to remote users (AGPL section 13).
+     Cost:    Free.
+
+  2. Commercial — WaveSyncDB Commercial License
+     SPDX:    LicenseRef-Commercial
+     Text:    LICENSE-COMMERCIAL
+     Use it when:
+       - You are building closed-source, proprietary, or otherwise
+         non-AGPL-compatible software (including SaaS products that
+         do not publish their backend source, shipped binaries with
+         restricted source, or apps distributed on commercial app
+         stores under proprietary EULAs).
+       - You do not wish to publish the source of your application
+         under the AGPL — including modifications to a network-facing
+         relay or backend.
+     Cost:    Negotiated per agreement. Contact pablo13vazquez@gmail.com.
+
+You only need to comply with one of the two. Distributing WaveSyncDB
+under the AGPL does not waive your right to subsequently obtain a
+commercial license, and obtaining a commercial license does not require
+you to remove existing AGPL distributions.
+
+Note on AGPL section 13: AGPL extends copyleft to network use. If you
+run a modified version of WaveSyncDB or its relay server as part of a
+service that lets users interact with it remotely, AGPL requires you to
+offer those users the corresponding source. If that requirement does not
+work for your product, you need the commercial license — even if you
+never "ship" a binary in the traditional sense.
+
+If you are unsure which license applies to your situation, please reach
+out before integrating: pablo13vazquez@gmail.com.
+
+Copyright © 2025–present Pablo Vazquez. All rights reserved.
