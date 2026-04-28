@@ -4,7 +4,7 @@ use std::sync::Arc;
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
     EntityTrait, ExecResult, Iterable, PrimaryKeyToColumn, QueryResult, Schema, Statement,
-    sea_query::SqliteQueryBuilder,
+    TransactionTrait, sea_query::SqliteQueryBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
@@ -577,153 +577,175 @@ impl WaveSyncDb {
         // Send change notification IMMEDIATELY — data is already committed.
         // This ensures the notification is sent on the caller's runtime (Dioxus),
         // not from a tokio::spawn which can't reliably wake the Dioxus event loop on mobile.
-        let changed_columns = if matches!(kind, WriteKind::Delete) {
+        let column_values = if matches!(kind, WriteKind::Delete) {
             None
         } else {
-            Some(parsed.columns.iter().map(|(col, _)| col.clone()).collect())
+            Some(
+                parsed
+                    .columns
+                    .iter()
+                    .map(|(col, val)| (crate::ColumnName(col.clone()), val.clone()))
+                    .collect::<Vec<_>>(),
+            )
         };
+        let changed_columns = column_values
+            .as_ref()
+            .map(|cv| cv.iter().map(|(c, _)| c.0.clone()).collect());
         let _ = self.inner.change_tx.send(ChangeNotification {
             table: table.to_string().into(),
             kind: kind.clone(),
             primary_key: parsed.primary_key.clone().into(),
             changed_columns,
+            column_values,
         });
 
         let site_id = self.inner.site_id;
-        let shared = self.inner.clone();
-        let inner = self.inner.inner.clone();
-        let table_owned = table.to_string();
-        let kind_clone = kind.clone();
+        let inner = &self.inner.inner;
+        let table_owned = table;
 
-        // Oneshot channel to report db_version persist result back to the caller.
-        // The spawned task holds the db_version lock for the full operation (shadow
-        // serialization) but signals persist success/failure immediately so the
-        // ConnectionTrait method can propagate errors.
-        let (persist_tx, persist_rx) = tokio::sync::oneshot::channel::<Result<(), DbErr>>();
+        // CRDT bookkeeping + P2P sync, inline. The db_version Mutex serializes
+        // concurrent writes — without it, two rapid writes (INSERT then
+        // UPDATE) race on the shadow read step and produce incorrect
+        // col_versions. The whole bookkeeping runs in one SQLite transaction
+        // so every shadow write commits with a single fsync.
+        let mut ver = self.inner.db_version.lock().await;
+        *ver += 1;
+        let new_db_version = *ver;
 
-        // Async CRDT bookkeeping + P2P sync
-        // The db_version lock is held for the entire operation to serialize
-        // shadow reads/writes. Without this, two rapid writes (INSERT then UPDATE)
-        // can race: the UPDATE task reads shadow before INSERT's task writes it,
-        // producing incorrect col_versions and out-of-order changeset delivery.
-        tokio::spawn(async move {
-            let mut ver = shared.db_version.lock().await;
-            *ver += 1;
-            let new_db_version = *ver;
-            // Persist — if this fails, roll back and report error
-            if let Err(e) = crate::shadow::set_db_version(&inner, new_db_version).await {
+        // Open the bookkeeping transaction. Roll back the in-memory
+        // counter if we can't even start a tx — keeps it in sync with
+        // the persisted state.
+        let txn = match inner.begin().await {
+            Ok(t) => t,
+            Err(e) => {
                 *ver -= 1;
-                let _ = persist_tx.send(Err(e));
-                return;
+                return Err(e);
             }
-            let _ = persist_tx.send(Ok(()));
+        };
 
-            let mut changes = Vec::new();
+        // No `_wavesync_meta.db_version` write here — the shadow upsert(s)
+        // below land with the new db_version in the same tx, and
+        // `shadow::get_db_version` recovers via `MAX(meta, MAX_shadow)` on
+        // engine startup.
 
-            match kind_clone {
-                WriteKind::Delete => {
-                    // For deletes, find max col_version for this row and create tombstone
-                    let entries = crate::shadow::get_clock_entries_for_row(
-                        &inner,
-                        &table_owned,
-                        &parsed.primary_key,
-                    )
-                    .await
-                    .unwrap_or_default();
+        let mut changes = Vec::new();
 
-                    let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
-                    let tombstone_cv = max_cv + 1;
+        match kind {
+            WriteKind::Delete => {
+                // Find max col_version for this row and create tombstone.
+                let entries = crate::shadow::get_clock_entries_for_row(
+                    &txn,
+                    table_owned,
+                    &parsed.primary_key,
+                )
+                .await
+                .unwrap_or_default();
 
-                    if let Err(e) = crate::shadow::insert_tombstone(
-                        &inner,
-                        &table_owned,
-                        &parsed.primary_key,
-                        tombstone_cv,
-                        new_db_version,
-                        &site_id,
-                    )
-                    .await
-                    {
-                        log::error!("Failed to insert tombstone: {}", e);
+                let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
+                let tombstone_cv = max_cv + 1;
+
+                if let Err(e) = crate::shadow::insert_tombstone(
+                    &txn,
+                    table_owned,
+                    &parsed.primary_key,
+                    tombstone_cv,
+                    new_db_version,
+                    &site_id,
+                )
+                .await
+                {
+                    log::error!("Failed to insert tombstone: {e}");
+                }
+
+                changes.push(ColumnChange {
+                    table: table_owned.into(),
+                    pk: parsed.primary_key.clone().into(),
+                    cid: "__deleted".into(),
+                    val: None,
+                    site_id,
+                    col_version: tombstone_cv,
+                    cl: tombstone_cv,
+                    seq: 0,
+                    db_version: new_db_version,
+                });
+            }
+            WriteKind::Insert | WriteKind::Update => {
+                // Clear any tombstone for this row (it's alive again),
+                // but preserve per-column clock entries so col_versions
+                // continue from their previous values.
+                let _ =
+                    crate::shadow::clear_tombstone(&txn, table_owned, &parsed.primary_key).await;
+
+                // Single batched upsert across every changed column.
+                // SQLite's ON CONFLICT DO UPDATE … RETURNING gives us
+                // the resolved col_version per cid in one round trip,
+                // replacing what used to be N reads + N writes.
+                let batch_input: Vec<(String, u32)> = parsed
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(seq, (col, _))| (col.clone(), seq as u32))
+                    .collect();
+                let resolved = match crate::shadow::upsert_clock_entries_batch(
+                    &txn,
+                    table_owned,
+                    &parsed.primary_key,
+                    &batch_input,
+                    new_db_version,
+                    &site_id,
+                )
+                .await
+                {
+                    Ok(map) => map,
+                    Err(e) => {
+                        log::error!("Failed to batch-upsert clock entries: {e}");
+                        *ver -= 1;
+                        let _ = txn.rollback().await;
+                        return Err(e);
                     }
+                };
+
+                for (seq, (col, val)) in parsed.columns.iter().enumerate() {
+                    let new_cv = resolved.get(col).copied().unwrap_or(1);
 
                     changes.push(ColumnChange {
-                        table: table_owned.clone().into(),
+                        table: table_owned.into(),
                         pk: parsed.primary_key.clone().into(),
-                        cid: "__deleted".into(),
-                        val: None,
+                        cid: col.clone().into(),
+                        val: Some(val.clone()),
                         site_id,
-                        col_version: tombstone_cv,
-                        cl: tombstone_cv,
-                        seq: 0,
+                        col_version: new_cv,
+                        cl: new_cv,
+                        seq: seq as u32,
                         db_version: new_db_version,
                     });
                 }
-                WriteKind::Insert | WriteKind::Update => {
-                    // Clear any tombstone for this row (it's alive again),
-                    // but preserve per-column clock entries so col_versions
-                    // continue from their previous values.
-                    let _ =
-                        crate::shadow::clear_tombstone(&inner, &table_owned, &parsed.primary_key)
-                            .await;
-
-                    for (seq, (col, val)) in parsed.columns.iter().enumerate() {
-                        // Get current col_version and increment
-                        let current_cv = crate::shadow::get_col_version(
-                            &inner,
-                            &table_owned,
-                            &parsed.primary_key,
-                            col,
-                        )
-                        .await
-                        .unwrap_or(0);
-                        let new_cv = current_cv + 1;
-
-                        if let Err(e) = crate::shadow::upsert_clock_entry(
-                            &inner,
-                            &table_owned,
-                            &parsed.primary_key,
-                            col,
-                            new_cv,
-                            new_db_version,
-                            &site_id,
-                            seq as u32,
-                        )
-                        .await
-                        {
-                            log::error!("Failed to upsert clock entry: {}", e);
-                        }
-
-                        changes.push(ColumnChange {
-                            table: table_owned.clone().into(),
-                            pk: parsed.primary_key.clone().into(),
-                            cid: col.clone().into(),
-                            val: Some(val.clone()),
-                            site_id,
-                            col_version: new_cv,
-                            cl: new_cv,
-                            seq: seq as u32,
-                            db_version: new_db_version,
-                        });
-                    }
-                }
             }
-
-            let changeset = SyncChangeset {
-                site_id,
-                db_version: new_db_version,
-                changes,
-            };
-
-            let _ = shared.sync_tx.send(changeset).await;
-            drop(ver); // Release lock after changeset is sent
-        });
-
-        match persist_rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(DbErr::Custom("db_version persist task panicked".into())),
         }
+
+        // Commit the whole bookkeeping batch with a single fsync.
+        if let Err(e) = txn.commit().await {
+            *ver -= 1;
+            return Err(e);
+        }
+
+        // Release the lock before sending on sync_tx — we no longer touch
+        // shadow tables, so further writes can proceed concurrently with
+        // the engine consuming this changeset.
+        drop(ver);
+
+        let changeset = SyncChangeset {
+            site_id,
+            db_version: new_db_version,
+            changes,
+        };
+
+        // sync_tx is a bounded mpsc; if the engine is slow we wait. That's
+        // intentional — backpressure into the user write loop is preferable
+        // to dropping changesets.
+        let _ = self.inner.sync_tx.send(changeset).await;
+
+        Ok(())
     }
 }
 

@@ -1,0 +1,101 @@
+WaveSyncDB Commercial License
+=============================
+
+This file describes the commercial-licensing option for WaveSyncDB. It is
+the alternative to the GNU Affero General Public License (see LICENSE-AGPL);
+see LICENSE for the umbrella description of the dual-license offer.
+
+Copyright © 2025–present Pablo Vazquez. All rights reserved.
+
+1. Who needs a commercial license
+---------------------------------
+
+A commercial license is required if **any** of the following is true and
+you do not wish to release your derivative work under AGPL-3.0-or-later:
+
+  (a) You distribute software that incorporates WaveSyncDB — in source
+      or binary form — under a proprietary, closed-source, or otherwise
+      non-AGPL-compatible license.
+  (b) You operate a Software-as-a-Service or other network-facing
+      product whose backend uses (or is derived from) WaveSyncDB or
+      its relay server, and whose end users do not receive corresponding
+      source code as required by AGPL section 13.
+  (c) Your organization's policies prohibit accepting AGPL or other
+      strong copyleft obligations.
+  (d) You ship WaveSyncDB embedded in hardware or a mobile application
+      whose distribution channel imposes terms incompatible with AGPL
+      section 6 (anti-Tivoization).
+
+If none of the above apply — for example, your project is itself
+released under AGPL-3.0-or-later — you may use WaveSyncDB under the
+AGPL at no cost. No commercial license is needed.
+
+2. What a commercial license grants
+-----------------------------------
+
+A commercial license grants the licensee a non-exclusive, non-transferable,
+worldwide right to:
+
+  (a) Use, modify, and integrate WaveSyncDB in proprietary or
+      closed-source applications, including network-facing services.
+  (b) Distribute the resulting binaries and/or source under the
+      licensee's own terms, free of AGPL obligations (including the
+      AGPL section 13 source-disclosure requirement for network use).
+  (c) Sublicense the integrated product to end users without imposing
+      AGPL terms on those end users.
+
+The exact scope (per-product, per-organization, per-seat, royalty-free,
+duration, support level, indemnification, etc.) is negotiated between
+the licensor and the licensee and recorded in a written agreement
+signed by both parties.
+
+3. What a commercial license does NOT grant
+-------------------------------------------
+
+  (a) The right to redistribute WaveSyncDB itself as a standalone
+      product under the licensee's name.
+  (b) The right to remove or alter copyright notices, attribution, or
+      this license file from copies of WaveSyncDB source.
+  (c) Trademark rights to the "WaveSyncDB" name or related marks.
+  (d) Any warranty or merchantability guarantees beyond those agreed
+      in the written commercial agreement.
+
+4. How to obtain a commercial license
+-------------------------------------
+
+Contact:  pablo13vazquez@gmail.com
+
+Please include in your inquiry:
+
+  - Your company / organization name and country of operation.
+  - A short description of the product and how WaveSyncDB will be
+    used (mobile app, server backend, embedded device, ...).
+  - The expected number of end users or installations, if known.
+  - Any specific support, SLA, or indemnification needs.
+
+Pricing is determined case by case based on use, scale, and required
+support level. Most arrangements are royalty-free flat fees.
+
+5. Open source contributions
+----------------------------
+
+By default, contributions to the WaveSyncDB project on GitHub are
+accepted under the AGPL-3.0-or-later license that governs the public
+repository. Contributors retain their copyright. The project maintainer
+reserves the right to relicense aggregate contributions under
+alternative licenses (including this commercial license) only with
+explicit per-contributor permission, recorded in writing.
+
+6. Disclaimer
+-------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+This document is an offer to negotiate a commercial license. It is not
+itself a binding license until a written agreement is executed.

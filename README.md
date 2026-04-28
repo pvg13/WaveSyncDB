@@ -164,4 +164,11 @@ fn App() -> Element {
 
 ## License
 
-GPL-3.0-or-later
+WaveSyncDB is **dual-licensed**:
+
+- **AGPL-3.0-or-later** — free to use in projects that are themselves AGPL-compatible open-source. AGPL extends copyleft to network use: if you run a modified WaveSyncDB (or its relay) as part of a service, you must offer remote users the source.
+- **Commercial license** — for proprietary, closed-source, or SaaS use where AGPL's source-disclosure requirements are not acceptable.
+
+Pick whichever fits your project. See [`LICENSE`](LICENSE) for the umbrella description, [`LICENSE-AGPL`](LICENSE-AGPL) for the open-source terms, and [`LICENSE-COMMERCIAL`](LICENSE-COMMERCIAL) for how to obtain a commercial license.
+
+For commercial licensing inquiries: **pablo13vazquez@gmail.com**.

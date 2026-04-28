@@ -567,7 +567,7 @@ pub(super) async fn apply_remote_changeset(
         };
 
         let mut any_applied = false;
-        let mut changed_columns = Vec::new();
+        let mut changed_pairs: Vec<(String, serde_json::Value)> = Vec::new();
         let mut is_delete = false;
 
         // Check for delete first
@@ -578,12 +578,12 @@ pub(super) async fn apply_remote_changeset(
                 is_delete = true;
             }
         } else {
-            let (applied, cols) =
+            let (applied, pairs) =
                 apply_remote_column_changes(&txn, table, pk, row_changes, &meta, local_db_version)
                     .await;
             if applied {
                 any_applied = true;
-                changed_columns = cols;
+                changed_pairs = pairs;
             }
         }
 
@@ -593,15 +593,22 @@ pub(super) async fn apply_remote_changeset(
             } else {
                 WriteKind::Insert
             };
+            let (changed_columns, column_values) = if is_delete || changed_pairs.is_empty() {
+                (None, None)
+            } else {
+                let cols: Vec<String> = changed_pairs.iter().map(|(c, _)| c.clone()).collect();
+                let vals: Vec<(crate::ColumnName, serde_json::Value)> = changed_pairs
+                    .iter()
+                    .map(|(c, v)| (crate::ColumnName(c.clone()), v.clone()))
+                    .collect();
+                (Some(cols), Some(vals))
+            };
             pending_notifications.push(ChangeNotification {
                 table: (*table).into(),
                 kind,
                 primary_key: (*pk).into(),
-                changed_columns: if changed_columns.is_empty() {
-                    None
-                } else {
-                    Some(changed_columns)
-                },
+                changed_columns,
+                column_values,
             });
         }
     }
@@ -671,7 +678,10 @@ async fn apply_remote_delete(
 }
 
 /// Apply non-delete column changes: resolve conflicts per-column, write winning values,
-/// update shadow tables. Returns `(applied, changed_column_names)`.
+/// update shadow tables. Returns `(applied, changed_column_pairs)` where each pair
+/// is `(column_name, post_write_json_value)` for the columns that actually got
+/// applied. Reactive hooks consume the JSON values to update signal state in place
+/// without re-querying SeaORM.
 async fn apply_remote_column_changes(
     db: &impl ConnectionTrait,
     table: &str,
@@ -679,11 +689,11 @@ async fn apply_remote_column_changes(
     row_changes: &[&ColumnChange],
     meta: &crate::registry::TableMeta,
     local_db_version: u64,
-) -> (bool, Vec<String>) {
+) -> (bool, Vec<(String, serde_json::Value)>) {
     let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
     let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
     let mut pending_shadow_updates: Vec<(String, u64, crate::messages::NodeId, u32)> = Vec::new();
-    let mut changed_columns = Vec::new();
+    let mut changed_columns: Vec<(String, serde_json::Value)> = Vec::new();
 
     for change in row_changes {
         let (local_cv, local_site) =
@@ -713,7 +723,10 @@ async fn apply_remote_column_changes(
 
         if should_apply {
             winning_columns.push((change.cid.0.clone(), json_to_sea_value(change.val.as_ref())));
-            changed_columns.push(change.cid.0.clone());
+            changed_columns.push((
+                change.cid.0.clone(),
+                change.val.clone().unwrap_or(serde_json::Value::Null),
+            ));
             pending_shadow_updates.push((
                 change.cid.0.clone(),
                 change.col_version,

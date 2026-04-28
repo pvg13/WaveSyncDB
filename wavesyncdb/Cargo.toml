@@ -2,7 +2,7 @@
 name = "wavesyncdb"
 version = "0.5.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
 repository = "https://github.com/pvg13/WaveSyncDB"
 readme = "README.md"
@@ -42,6 +42,10 @@ block2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
+# Make the SyncEntity derive available to all test binaries unconditionally,
+# so `tests/common/mod.rs` can use it without forcing every test to enable
+# the `derive` feature on the main crate.
+wavesyncdb_derive = { path = "../wavesyncdb_derive" }
 
 [features]
 default = []
@@ -51,7 +55,7 @@ derive = ["dep:wavesyncdb_derive"]
 # in the `[target.'cfg(...)'.dependencies]` sections above, so enabling `dioxus`
 # on desktop does not pull them in — Cargo silently skips `dep:` references
 # that point at target-gated optional deps on non-matching targets.
-dioxus = ["dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
+dioxus = ["derive", "dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
 # Cold-sync push notifications (FCM on Android, APNs on iOS). Bundles the
 # Kotlin AAR / Swift Package into consumer apps via manganis; gates the
 # Rust-side token-read helpers and FFI exports. Platform-specific code

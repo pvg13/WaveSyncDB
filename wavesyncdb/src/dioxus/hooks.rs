@@ -3,14 +3,16 @@
 //! These hooks provide Dioxus signals that automatically refresh when the underlying
 //! data changes — whether from local writes or remote sync operations. They subscribe
 //! to [`ChangeNotification`](crate::ChangeNotification) events via
-//! [`WaveSyncDb::change_rx()`](crate::WaveSyncDb::change_rx).
+//! [`WaveSyncDb::change_rx()`](crate::WaveSyncDb::change_rx) and apply the carried
+//! `column_values` payload in place via [`SyncedModel`](crate::SyncedModel) — no
+//! per-notification SeaORM round trip on the receive path.
 
 use std::future::Future;
 
 use dioxus::prelude::*;
-use sea_orm::{DbErr, EntityTrait, FromQueryResult};
+use sea_orm::{DbErr, EntityTrait, FromQueryResult, PrimaryKeyTrait};
 
-use crate::{NetworkStatus, WaveSyncDb, WaveSyncDbBuilder};
+use crate::{NetworkStatus, SyncedModel, WaveSyncDb, WaveSyncDbBuilder, WriteKind};
 
 // ---------------------------------------------------------------------------
 // Context providers
@@ -275,22 +277,31 @@ pub fn use_peer_identities(
 
 /// Reactive signal containing all rows in a table.
 ///
-/// Performs an initial `E::find().all(db)` query, then re-queries whenever a
-/// [`ChangeNotification`](crate::ChangeNotification) is received for this table.
+/// Performs an initial `E::find().all(db)` query, then keeps the in-memory
+/// `Vec<E::Model>` in sync with subsequent writes by **applying the
+/// `column_values` payload from each [`ChangeNotification`] in place** via
+/// [`SyncedModel`](crate::SyncedModel). No per-notification SeaORM round
+/// trip is issued unless the payload is missing (older callers, raw SQL),
+/// in which case the hook falls back to a single-row `find_by_id` query.
 ///
-/// Returns a `Signal<Vec<E::Model>>` that Dioxus components can `.read()` to
-/// get the current rows and will automatically re-render when the data changes.
+/// Falls back to a full `find().all()` reload only when the broadcast
+/// channel reports `Lagged` — i.e. the subscriber missed notifications and
+/// can't reconstruct the delta.
 pub fn use_synced_table<E>(db: WaveSyncDb) -> Signal<Vec<E::Model>>
 where
     E: EntityTrait,
-    E::Model: FromQueryResult + Clone + Send + Sync + 'static,
+    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value> + From<String>,
 {
-    let mut signal = use_signal(Vec::new);
+    let mut signal: Signal<Vec<E::Model>> = use_signal(Vec::new);
+    let target_table = E::default().table_name().to_string();
+    let pk_column = pk_column_name::<E>();
 
     // Initial load
-    let db2 = db.clone();
+    let db_init = db.clone();
     use_effect(move || {
-        let db = db2.clone();
+        let db = db_init.clone();
         spawn(async move {
             match E::find().all(&db).await {
                 Ok(rows) => signal.set(rows),
@@ -300,33 +311,258 @@ where
     });
 
     // Subscribe to changes (filtered by table name)
+    let target_table_clone = target_table.clone();
+    let pk_column_clone = pk_column.clone();
     use_effect(move || {
         let mut rx = db.change_rx();
-        let target_table = E::default().table_name().to_string();
+        let target_table = target_table_clone.clone();
+        let pk_column = pk_column_clone.clone();
         let db = db.clone();
         spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(notification) => {
-                        if notification.table != target_table {
-                            continue;
-                        }
-                    }
+                let notif = match rx.recv().await {
+                    Ok(n) => n,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("Missed {} change notifications for {}", n, target_table);
-                        // Fall through to re-query below
+                        // Full reload — we may have missed both inserts and deletes.
+                        if let Ok(rows) = E::find().all(&db).await {
+                            signal.set(rows);
+                        }
+                        continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+
+                if notif.table != target_table {
+                    continue;
                 }
-                match E::find().all(&db).await {
-                    Ok(rows) => signal.set(rows),
-                    Err(e) => log::error!("Failed to refresh table: {}", e),
+
+                let pk_str = notif.primary_key.0.clone();
+
+                match notif.kind {
+                    WriteKind::Delete => {
+                        signal
+                            .write()
+                            .retain(|m| SyncedModel::wavesync_pk_string(m) != pk_str);
+                    }
+                    WriteKind::Update => {
+                        // Try to apply the payload in place. Fall back to a
+                        // single-row query only if the payload is absent.
+                        if let Some(cols) = &notif.column_values {
+                            let mut found = false;
+                            {
+                                let mut rows = signal.write();
+                                if let Some(row) = rows
+                                    .iter_mut()
+                                    .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
+                                {
+                                    for (col, val) in cols {
+                                        SyncedModel::wavesync_apply_change(row, &col.0, val);
+                                    }
+                                    found = true;
+                                }
+                            }
+                            if found {
+                                continue;
+                            }
+                        }
+                        // Either no payload or row not in cache — fall back.
+                        refetch_one_into_vec::<E>(&db, &pk_column, &pk_str, &mut signal).await;
+                    }
+                    WriteKind::Insert => {
+                        if let Some(cols) = &notif.column_values {
+                            let pairs: Vec<(String, serde_json::Value)> = cols
+                                .iter()
+                                .map(|(c, v)| (c.0.clone(), v.clone()))
+                                .collect();
+                            if let Some(model) =
+                                E::Model::wavesync_from_changes(&pk_column, &pk_str, &pairs)
+                            {
+                                let mut rows = signal.write();
+                                if let Some(slot) = rows
+                                    .iter_mut()
+                                    .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
+                                {
+                                    *slot = model;
+                                } else {
+                                    rows.push(model);
+                                }
+                                continue;
+                            }
+                        }
+                        // Payload missing or insufficient — single-row fallback.
+                        refetch_one_into_vec::<E>(&db, &pk_column, &pk_str, &mut signal).await;
+                    }
                 }
             }
         });
     });
 
     signal
+}
+
+/// Reactive signal for a single row, looked up by primary key.
+///
+/// Performs an initial `E::find_by_id(pk).one(db)` query, then watches for
+/// [`ChangeNotification`]s **filtered by the same primary key** — unrelated
+/// row changes never wake this hook. When a relevant notification arrives,
+/// the hook applies its `column_values` payload via
+/// [`SyncedModel`](crate::SyncedModel) without re-querying SeaORM.
+///
+/// Returns a `Signal<Option<E::Model>>` — `None` if the row doesn't exist.
+pub fn use_synced_row<E>(
+    db: WaveSyncDb,
+    pk: <E::PrimaryKey as PrimaryKeyTrait>::ValueType,
+) -> Signal<Option<E::Model>>
+where
+    E: EntityTrait,
+    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value> + std::fmt::Display,
+{
+    let mut signal: Signal<Option<E::Model>> = use_signal(|| None);
+    let pk_init = pk.clone();
+    let pk_string = format!("{}", pk);
+    let target_table = E::default().table_name().to_string();
+    let pk_column = pk_column_name::<E>();
+
+    // Initial load
+    let db_init = db.clone();
+    use_effect(move || {
+        let pk = pk_init.clone();
+        let db = db_init.clone();
+        spawn(async move {
+            match E::find_by_id(pk).one(&db).await {
+                Ok(row) => signal.set(row),
+                Err(e) => log::error!("Failed initial row load: {}", e),
+            }
+        });
+    });
+
+    // Subscribe to changes (filtered by table name AND primary key)
+    let pk_loop = pk.clone();
+    let pk_string_loop = pk_string.clone();
+    let target_table_loop = target_table.clone();
+    let pk_column_loop = pk_column.clone();
+    use_effect(move || {
+        let mut rx = db.change_rx();
+        let pk = pk_loop.clone();
+        let pk_string = pk_string_loop.clone();
+        let target_table = target_table_loop.clone();
+        let pk_column = pk_column_loop.clone();
+        let db = db.clone();
+        spawn(async move {
+            loop {
+                let notif = match rx.recv().await {
+                    Ok(n) => n,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("Missed {} change notifications for {}", n, target_table);
+                        // We may have missed our own row's update — re-query.
+                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                            signal.set(row);
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+
+                if notif.table != target_table || notif.primary_key.0 != pk_string {
+                    continue;
+                }
+
+                match notif.kind {
+                    WriteKind::Delete => {
+                        signal.set(None);
+                    }
+                    WriteKind::Update => {
+                        if let Some(cols) = &notif.column_values {
+                            let current = signal.read().clone();
+                            if let Some(mut model) = current {
+                                for (col, val) in cols {
+                                    SyncedModel::wavesync_apply_change(&mut model, &col.0, val);
+                                }
+                                signal.set(Some(model));
+                                continue;
+                            }
+                        }
+                        // No payload, or row not yet in cache — re-query once.
+                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                            signal.set(row);
+                        }
+                    }
+                    WriteKind::Insert => {
+                        if let Some(cols) = &notif.column_values {
+                            let pairs: Vec<(String, serde_json::Value)> = cols
+                                .iter()
+                                .map(|(c, v)| (c.0.clone(), v.clone()))
+                                .collect();
+                            if let Some(model) =
+                                E::Model::wavesync_from_changes(&pk_column, &pk_string, &pairs)
+                            {
+                                signal.set(Some(model));
+                                continue;
+                            }
+                        }
+                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                            signal.set(row);
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    signal
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Look up the primary-key column name for an entity. Mirrors what the
+/// `SyncEntity` derive emits at registration time.
+fn pk_column_name<E: EntityTrait>() -> String {
+    use sea_orm::{IdenStatic, Iterable, PrimaryKeyToColumn};
+    <E::PrimaryKey as Iterable>::iter()
+        .next()
+        .map(|pk| IdenStatic::as_str(&pk.into_column()).to_string())
+        .unwrap_or_default()
+}
+
+/// Refetch a single row by stringified primary key and merge it into the
+/// existing `Vec<E::Model>`. Replaces any existing entry with the same pk
+/// or appends if not found. Removes the entry if the row no longer exists.
+async fn refetch_one_into_vec<E>(
+    db: &WaveSyncDb,
+    _pk_column: &str,
+    pk_str: &str,
+    signal: &mut Signal<Vec<E::Model>>,
+) where
+    E: EntityTrait,
+    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value> + From<String>,
+{
+    let pk_typed: <E::PrimaryKey as PrimaryKeyTrait>::ValueType = pk_str.to_string().into();
+    match E::find_by_id(pk_typed).one(db).await {
+        Ok(Some(row)) => {
+            let mut rows = signal.write();
+            if let Some(slot) = rows
+                .iter_mut()
+                .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
+            {
+                *slot = row;
+            } else {
+                rows.push(row);
+            }
+        }
+        Ok(None) => {
+            signal
+                .write()
+                .retain(|m| SyncedModel::wavesync_pk_string(m) != pk_str);
+        }
+        Err(e) => log::error!("Failed to refresh row {}: {}", pk_str, e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,67 +660,3 @@ pub fn use_auto_lifecycle(db: WaveSyncDb) {
 /// not break.
 #[deprecated(note = "Push registration is now automatic; remove this call.")]
 pub fn use_auto_push(_db: WaveSyncDb) {}
-
-/// Reactive signal for a single row, looked up by primary key.
-///
-/// Performs an initial `E::find_by_id(pk).one(db)` query, then re-queries whenever
-/// a [`ChangeNotification`](crate::ChangeNotification) is received for this table.
-///
-/// Returns a `Signal<Option<E::Model>>` — `None` if the row doesn't exist.
-pub fn use_synced_row<E>(
-    db: WaveSyncDb,
-    pk: <E::PrimaryKey as sea_orm::PrimaryKeyTrait>::ValueType,
-) -> Signal<Option<E::Model>>
-where
-    E: EntityTrait,
-    E::Model: FromQueryResult + Clone + Send + Sync + 'static,
-    <E::PrimaryKey as sea_orm::PrimaryKeyTrait>::ValueType:
-        Clone + Send + Sync + 'static + Into<sea_orm::Value>,
-{
-    let mut signal: Signal<Option<E::Model>> = use_signal(|| None);
-    let pk_clone = pk.clone();
-
-    // Initial load
-    let db2 = db.clone();
-    use_effect(move || {
-        let pk = pk_clone.clone();
-        let db = db2.clone();
-        spawn(async move {
-            match E::find_by_id(pk).one(&db).await {
-                Ok(row) => signal.set(row),
-                Err(e) => log::error!("Failed initial row load: {}", e),
-            }
-        });
-    });
-
-    // Subscribe to changes (filtered by table name)
-    use_effect(move || {
-        let mut rx = db.change_rx();
-        let pk = pk.clone();
-        let target_table = E::default().table_name().to_string();
-        let db = db.clone();
-        spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(notification) => {
-                        if notification.table != target_table {
-                            continue;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("Missed {} change notifications for {}", n, target_table);
-                        // Fall through to re-query below
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-                let pk = pk.clone();
-                match E::find_by_id(pk).one(&db).await {
-                    Ok(row) => signal.set(row),
-                    Err(e) => log::error!("Failed to refresh row: {}", e),
-                }
-            }
-        });
-    });
-
-    signal
-}

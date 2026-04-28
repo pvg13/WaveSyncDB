@@ -62,10 +62,24 @@ pub async fn create_shadow_table(
     db.execute_unprepared(&idx_sql).await
 }
 
-/// Get the current `db_version` counter from `_wavesync_meta`.
+/// Get the current `db_version` counter.
 ///
-/// Falls back to scanning shadow tables, then 0.
+/// Returns the max of the persisted `_wavesync_meta` value and
+/// `MAX(db_version)` across every existing shadow table. Reading from
+/// both sources is what lets the local-write hot path (`dispatch_sync`)
+/// skip the meta write entirely while still recovering correctly on
+/// startup or whenever the engine refreshes its counter — the shadow
+/// row that *is* fsync'd in the same tx as the entity write carries the
+/// authoritative db_version, so MAX(shadow.db_version) is always
+/// monotonic with respect to actual writes that landed.
 pub async fn get_db_version(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
+    let from_meta = get_db_version_from_meta(db).await?;
+    let from_shadow = max_db_version_across_shadow_tables(db).await?;
+    Ok(from_meta.max(from_shadow))
+}
+
+/// Read just the `_wavesync_meta`-stored value (used internally).
+async fn get_db_version_from_meta(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
     #[derive(Debug, FromQueryResult)]
     struct MetaRow {
         value: Vec<u8>,
@@ -86,6 +100,61 @@ pub async fn get_db_version(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
     }
 
     Ok(0)
+}
+
+/// Compute `MAX(db_version)` across every `_wavesync_*_clock` shadow
+/// table currently in the database. Discovered via `sqlite_master`, so
+/// this works correctly without prior knowledge of which entities are
+/// registered. Returns 0 when no shadow tables exist (fresh database).
+pub async fn max_db_version_across_shadow_tables(
+    db: &impl ConnectionTrait,
+) -> Result<u64, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct TableName {
+        name: String,
+    }
+
+    let tables = TableName::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name LIKE '_wavesync_%_clock'",
+        [],
+    ))
+    .all(db)
+    .await?;
+
+    if tables.is_empty() {
+        return Ok(0);
+    }
+
+    // One UNION ALL keeps SQLite's planner happy and avoids N round trips.
+    let parts: Vec<String> = tables
+        .iter()
+        .map(|t| {
+            format!(
+                "SELECT MAX(db_version) AS m FROM \"{}\"",
+                t.name.replace('"', "\"\"")
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT COALESCE(MAX(m), 0) AS m FROM ({})",
+        parts.join(" UNION ALL ")
+    );
+
+    #[derive(Debug, FromQueryResult)]
+    struct MaxRow {
+        m: i64,
+    }
+    let row = MaxRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        [],
+    ))
+    .one(db)
+    .await?;
+
+    Ok(row.map(|r| r.m as u64).unwrap_or(0))
 }
 
 /// Atomically read, increment, and persist the `db_version` counter.
@@ -315,6 +384,93 @@ pub async fn upsert_clock_entry(
         ],
     ))
     .await
+}
+
+/// Atomically upsert N clock entries for a single (pk, multiple cid) batch
+/// in one statement, returning the resolved `col_version` for each `cid`.
+///
+/// Semantics match the per-column path: if the `(pk, cid)` row doesn't
+/// exist, `col_version = 1`; if it does, `col_version = existing + 1`.
+/// This collapses what used to be N reads + N writes into a single
+/// `INSERT … ON CONFLICT(pk,cid) DO UPDATE … RETURNING`, matching what
+/// the local-write path needs every time it dispatches a sync.
+///
+/// The returned map is keyed by `cid` because SQLite's `RETURNING`
+/// ordering for multi-row inserts is unspecified — never rely on input
+/// order.
+pub async fn upsert_clock_entries_batch(
+    db: &impl ConnectionTrait,
+    table: &str,
+    pk: &str,
+    columns: &[(String, u32)], // (cid, seq)
+    db_version: u64,
+    site_id: &NodeId,
+) -> Result<std::collections::HashMap<String, u64>, DbErr> {
+    if columns.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let shadow_name = format!("_wavesync_{}_clock", table);
+
+    // Build the multi-row VALUES clause with positional placeholders.
+    let mut placeholders = String::new();
+    let mut values: Vec<sea_orm::Value> = Vec::with_capacity(columns.len() * 6);
+    for (i, (cid, seq)) in columns.iter().enumerate() {
+        if i > 0 {
+            placeholders.push(',');
+        }
+        let base = i * 6;
+        placeholders.push_str(&format!(
+            "(${},${},${},${},${},${})",
+            base + 1,
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5,
+            base + 6,
+        ));
+        values.push(pk.into());
+        values.push(cid.clone().into());
+        // Initial col_version for new (pk, cid) pairs. The ON CONFLICT
+        // branch overrides this with `existing.col_version + 1`.
+        values.push(1i64.into());
+        values.push((db_version as i64).into());
+        values.push(site_id.0.to_vec().into());
+        values.push((*seq as i32).into());
+    }
+
+    let sql = format!(
+        r#"INSERT INTO "{shadow}" (pk, cid, col_version, db_version, site_id, seq)
+           VALUES {values}
+           ON CONFLICT(pk, cid) DO UPDATE SET
+               col_version = "{shadow}".col_version + 1,
+               db_version = excluded.db_version,
+               site_id    = excluded.site_id,
+               seq        = excluded.seq
+           RETURNING cid, col_version"#,
+        shadow = shadow_name,
+        values = placeholders,
+    );
+
+    #[derive(Debug, FromQueryResult)]
+    struct Returned {
+        cid: String,
+        col_version: i64,
+    }
+
+    let rows = Returned::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        values,
+    ))
+    .all(db)
+    .await?;
+
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        out.insert(r.cid, r.col_version as u64);
+    }
+    Ok(out)
 }
 
 /// Get all clock entries for a specific row.
