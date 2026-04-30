@@ -4,6 +4,7 @@ members = [
     "wavesyncdb_derive",
     "wavesync_relay",
     "website",
+    "tests-e2e",
     "examples/*",
 ]
 exclude = [

@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-peer image used by the E2E harness. Mirrors the relay's
+# cargo-chef + multistage pattern so dependency layers cache aggressively.
+# Build context is the repo root so cargo-chef can see the workspace
+# Cargo.lock and sibling crates.
+
+FROM rust:1.92-bookworm AS chef
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo install cargo-chef --locked
+WORKDIR /src
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo chef cook --release --recipe-path recipe.json -p wavesyncdb-e2e --bin test-peer
+
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p wavesyncdb-e2e --bin test-peer \
+    && cp /src/target/release/test-peer /usr/local/bin/test-peer
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/test-peer /usr/local/bin/test-peer
+
+# Volume for the SQLite file — keep state outside the image so a
+# scenario can stop+start the container and observe restart durability.
+VOLUME /data
+
+EXPOSE 8080/tcp
+
+ENTRYPOINT ["/usr/local/bin/test-peer"]

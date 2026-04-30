@@ -1,0 +1,84 @@
+name: E2E
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  e2e:
+    # Slower than the unit-test job and depends on the Docker daemon — run
+    # as a separate gate so a daemon flake doesn't block unrelated work.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Cache the cargo-chef cooked-deps layer across runs. Image-build
+      # cache is keyed on Cargo.lock so a dep bump triggers a rebuild;
+      # iterating on src/ alone reuses the warm cache.
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: wavesync_relay/Dockerfile
+          tags: wavesync-relay:e2e
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          load: true
+
+      - name: Build test-peer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tests-e2e/Dockerfile.test-peer
+          tags: wavesync-test-peer:e2e
+          cache-from: type=local,src=/tmp/.buildx-cache-new
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          load: true
+
+      # Atomic cache swap so the next run picks up both stages' layers.
+      - name: Move cache
+        run: rm -rf /tmp/.buildx-cache && mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      - name: Run E2E scenarios
+        run: cargo test -p wavesyncdb-e2e --tests -- --test-threads=2 --nocapture
+
+      # When something fails, dump every container's logs so the failure
+      # is debuggable from the workflow output alone (testcontainers tears
+      # down on Drop; we'd lose the logs otherwise).
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          for c in $(docker ps -a --format '{{.ID}}'); do
+            echo "==== docker logs $c ($(docker inspect --format='{{.Name}}' $c)) ===="
+            docker logs "$c" 2>&1 | tail -200
+          done

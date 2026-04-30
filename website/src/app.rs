@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::components::{Footer, Nav};
-use crate::pages::{DocPage, Home, NotFound, Examples};
+use crate::pages::{DocPage, Examples, Home, NotFound};
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.svg");
