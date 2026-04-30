@@ -19,7 +19,7 @@ jobs:
     - name: Check formatting
       run: cargo fmt --check
     - name: Clippy
-      run: cargo clippy -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay -- -D warnings
+      run: cargo clippy -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay -p wavesync-website -p wavesyncdb-bench -p wavesyncdb-e2e -- -D warnings
     - name: Build
       run: cargo build -p wavesyncdb -p wavesyncdb_derive -p wavesync_relay --verbose
     - name: Run unit tests

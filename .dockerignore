@@ -1,0 +1,57 @@
+# Repo-root .dockerignore — applies to every `docker build` whose
+# context is the repo root (relay, website, test-peer). Without this,
+# the cargo `target/` dir (~86 GB) gets shipped to the daemon as build
+# context on every build, taking minutes and wasting bandwidth.
+#
+# Each subdirectory's Dockerfile is COPY'd in via `COPY . .` after a
+# cargo-chef recipe step, so we only need to exclude things that are
+# never useful inside the build context.
+
+# Cargo build output — by far the largest offender.
+target/
+**/target/
+
+# Dioxus build output for the website.
+**/dist/
+
+# Editor / IDE state
+.idea/
+.vscode/
+*.swp
+
+# Local Docker compose state (relay, etc.)
+**/secrets/
+**/.env
+**/.env.*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Git history is not needed inside the image.
+.git/
+.gitignore
+.gitattributes
+
+# Test scratch + bench outputs
+/tmp_bench_results/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+
+# Markdown is needed for the website (compile-time include_str!) but
+# not for relay or test-peer. We'd rather the website carries its
+# content/ via explicit COPY lines — easier to audit. Default: drop
+# all .md, then re-allow the website's content/ in case someone uses
+# a wildcard COPY in the website Dockerfile.
+*.md
+!README.md
+!website/content/**/*.md
+!website/README.md
+
+# Node / web tooling junk if anything ever lands
+node_modules/
+.cache/
