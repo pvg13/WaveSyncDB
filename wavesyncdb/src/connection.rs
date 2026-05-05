@@ -1645,6 +1645,11 @@ impl WaveSyncDbBuilder {
         // Create peer versions table
         crate::peer_tracker::create_peer_versions_table(&inner).await?;
 
+        // Create cached peer-addresses table (issue #29). Used by the
+        // engine to pre-dial known good peers at startup before discovery
+        // has had time to find them.
+        crate::peer_addrs::create_peer_addrs_table(&inner).await?;
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<crate::engine::EngineCommand>(4);
 
         let network_status = Arc::new(std::sync::RwLock::new(

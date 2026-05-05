@@ -62,6 +62,8 @@ pub mod engine;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod peer_addrs;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod peer_tracker;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod push;

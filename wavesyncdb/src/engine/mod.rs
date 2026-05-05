@@ -991,6 +991,13 @@ impl EngineRunner {
             }
         }
 
+        // Cold-start: dial the addresses we successfully connected to last
+        // run (#29). These dials race in parallel with mDNS / rendezvous
+        // / relay-PeerList discovery; whichever produces a connection
+        // first wins. On a warm cache this typically shaves the discovery
+        // round-trip off the first sync.
+        self.predial_cached_addrs().await;
+
         let mut sync_interval = tokio::time::interval(self.config.sync_interval);
         let mut rendezvous_interval =
             tokio::time::interval(self.config.rendezvous_discover_interval);
@@ -1261,6 +1268,20 @@ impl EngineRunner {
                     self.diagnostics
                         .peer_dial_successes
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    // Cache this (peer_id, multiaddr) so the next cold start
+                    // can dial it directly before discovery (#29). Skip the
+                    // relay so the cache stays a sync-peer set.
+                    let db = self.db.clone();
+                    let peer_str = peer_id.to_string();
+                    let addr_str = endpoint.get_remote_address().to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::peer_addrs::record_success(&db, &peer_str, &addr_str).await
+                        {
+                            log::debug!("peer_addrs::record_success failed: {e}");
+                        }
+                    });
                 }
                 self.handle_connection_established(peer_id, &endpoint).await;
             }
@@ -1332,6 +1353,19 @@ impl EngineRunner {
                     self.diagnostics
                         .peer_dial_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    // Bump fail_count on cached addresses for this peer
+                    // (#29). No-op if the peer isn't cached yet — cache rows
+                    // are only seeded on a successful connection.
+                    let db = self.db.clone();
+                    let peer_str = pid.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::peer_addrs::record_failure_for_peer(&db, &peer_str).await
+                        {
+                            log::debug!("peer_addrs::record_failure_for_peer failed: {e}");
+                        }
+                    });
                 }
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);

@@ -83,6 +83,13 @@ pub(crate) struct Counters {
     /// Peer introductions delivered via `PushRequest::PeerJoined`
     /// (i.e. someone joined the topic *after* we announced).
     pub peerjoined_introductions: AtomicU64,
+
+    /// `swarm.dial` calls fired from the cached-peer-addresses cache at
+    /// engine startup (see [`crate::peer_addrs`]). The success path is
+    /// already counted in `peer_dial_successes` via `ConnectionEstablished`;
+    /// this counter quantifies how much faster cold-start ought to be on
+    /// runs with a warm cache.
+    pub cached_addr_dials: AtomicU64,
 }
 
 impl Counters {
@@ -101,6 +108,7 @@ impl Counters {
             mdns_discoveries: self.mdns_discoveries.load(Ordering::Relaxed),
             peerlist_introductions: self.peerlist_introductions.load(Ordering::Relaxed),
             peerjoined_introductions: self.peerjoined_introductions.load(Ordering::Relaxed),
+            cached_addr_dials: self.cached_addr_dials.load(Ordering::Relaxed),
         }
     }
 }
@@ -120,6 +128,7 @@ pub struct Snapshot {
     pub mdns_discoveries: u64,
     pub peerlist_introductions: u64,
     pub peerjoined_introductions: u64,
+    pub cached_addr_dials: u64,
 }
 
 #[cfg(test)]
