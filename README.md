@@ -2,6 +2,32 @@
 
 **Transparent peer-to-peer sync for SeaORM applications.**
 
+[![CI](https://img.shields.io/github/actions/workflow/status/pvg13/WaveSyncDB/rust.yml?branch=main&label=CI&logo=github)](https://github.com/pvg13/WaveSyncDB/actions/workflows/rust.yml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0%20OR%20Commercial-blue)](LICENSE)
+[![Issues](https://img.shields.io/github/issues/pvg13/WaveSyncDB?logo=github)](https://github.com/pvg13/WaveSyncDB/issues)
+
+### Open issues by priority
+
+[![critical](https://img.shields.io/github/issues/pvg13/WaveSyncDB/priority:critical?label=critical&color=b60205)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22priority%3Acritical%22)
+[![high](https://img.shields.io/github/issues/pvg13/WaveSyncDB/priority:high?label=high&color=d93f0b)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22priority%3Ahigh%22)
+[![medium](https://img.shields.io/github/issues/pvg13/WaveSyncDB/priority:medium?label=medium&color=fbca04)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22priority%3Amedium%22)
+[![low](https://img.shields.io/github/issues/pvg13/WaveSyncDB/priority:low?label=low&color=0e8a16)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22priority%3Alow%22)
+[![design](https://img.shields.io/github/issues/pvg13/WaveSyncDB/priority:design?label=design&color=5319e7)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22priority%3Adesign%22)
+
+### Open issues by topic
+
+[![sync-protocol](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:sync-protocol?label=sync-protocol&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Async-protocol%22)
+[![sql-parsing](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:sql-parsing?label=sql-parsing&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Asql-parsing%22)
+[![shadow-tables](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:shadow-tables?label=shadow-tables&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Ashadow-tables%22)
+[![p2p-networking](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:p2p-networking?label=p2p-networking&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Ap2p-networking%22)
+[![dioxus](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:dioxus?label=dioxus&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Adioxus%22)
+[![relay](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:relay?label=relay&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Arelay%22)
+[![security](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:security?label=security&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Asecurity%22)
+[![performance](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:performance?label=performance&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Aperformance%22)
+[![lifecycle](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:lifecycle?label=lifecycle&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Alifecycle%22)
+[![portability](https://img.shields.io/github/issues/pvg13/WaveSyncDB/topic:portability?label=portability&color=1d76db)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22topic%3Aportability%22)
+[![feature-request](https://img.shields.io/github/issues/pvg13/WaveSyncDB/feature-request?label=feature-request&color=a2eeef)](https://github.com/pvg13/WaveSyncDB/issues?q=is%3Aopen+is%3Aissue+label%3A%22feature-request%22)
+
 WaveSyncDB wraps your SeaORM `DatabaseConnection` and transparently intercepts write operations, replicating them across peers via libp2p gossipsub. Conflicts are resolved automatically using per-column Lamport clocks (CRDTs) — concurrent edits to different columns on the same row both survive, and all nodes converge deterministically. Your application code stays the same — just swap in `WaveSyncDb` and every insert, update, and delete syncs in the background.
 
 ## Quick Start

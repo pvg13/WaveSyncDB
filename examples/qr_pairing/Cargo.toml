@@ -1,0 +1,60 @@
+[package]
+name = "example-qr-pairing"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "qr-pairing"
+path = "src/main.rs"
+
+# Multi-target Dioxus example that builds for both web (wasm32) and
+# native (Android / desktop). Cargo's per-target dependency tables let
+# us pull SeaORM + sqlite-only on native, and pull the wasm32
+# equivalents (BrowserStore, qrcode renderer, browser bindings) only
+# when targeting the browser.
+[dependencies]
+dioxus = "0.7.6"
+serde = { workspace = true }
+serde_json = "1.0"
+log = { workspace = true }
+
+# Native (Android / iOS / desktop): full WaveSyncDb with SeaORM.
+# `derive` exposes the `#[derive(SyncEntity)]` macro the task entity
+# needs; `dioxus` brings in the reactive hooks (`use_synced_table`,
+# `use_wavesync`, etc).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wavesyncdb = { workspace = true, features = ["derive", "dioxus"] }
+sea-orm = { workspace = true }
+tokio = { workspace = true }
+env_logger = "0.11"
+uuid = { workspace = true }
+dioxus-sdk-storage = { git = "https://github.com/DioxusLabs/sdk.git" }
+
+# Android-only logging bridge. `env_logger` writes to stdout, which
+# Android `/dev/null`s for app processes — so without `android_logger`
+# every `log::*!` call disappears. We initialize it before anything
+# else in `native_app::run()` so panics + early errors actually land
+# in `adb logcat`.
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
+# Wasm32 (browser): WebSyncClient + IndexedDB + QR generator. No
+# SeaORM, no sqlx — those don't compile to wasm32. The example's web
+# task entity is a plain struct that `impl BrowserEntity` instead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wavesyncdb = { workspace = true, features = ["web", "dioxus"] }
+# QR generator. Default `image` feature would pull in PNG encoding
+# we don't need — keep just `svg` for inline SVG rendering.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+# `Location.hostname()` for the relay-default — the QR encodes the
+# host the browser is loading the page from, so a phone scanning it
+# from the same LAN reaches the relay without typing.
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+# Bridge `log::*!` calls (the API wavesyncdb uses) to the browser
+# console. Dioxus's own logger captures only `tracing::*!` events;
+# without this, the engine's diagnostic `log::info!("WebSyncClient:
+# …")` lines never reach the Chrome devtools console — making it
+# impossible to debug from outside the running tab.
+wasm-logger = "0.2"

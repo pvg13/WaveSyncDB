@@ -31,6 +31,16 @@ struct Cli {
     #[arg(long, env = "LISTEN_ADDR", default_value = "/ip4/0.0.0.0/tcp/4001")]
     listen_addr: String,
 
+    /// Optional WebSocket listen address for browser peers, e.g.
+    /// `/ip4/0.0.0.0/tcp/4002/ws`. When set, the relay accepts inbound
+    /// libp2p connections over plain WebSocket — wasm32/Dioxus-web peers
+    /// dial this address with `WebSyncClient::connect`. TLS is expected
+    /// to be terminated by a reverse proxy in production (the browser
+    /// then dials `/dns4/<host>/tcp/443/wss/p2p/<peer-id>`); set this
+    /// to empty to disable.
+    #[arg(long, env = "WS_LISTEN_ADDR", default_value = "")]
+    ws_listen_addr: String,
+
     /// Path to a file containing the persistent identity keypair.
     /// If the file does not exist, a new keypair is generated and saved.
     #[arg(long, env = "IDENTITY_FILE")]
@@ -237,11 +247,7 @@ mod resolve_secret_source_tests {
         let path = temp_file_path("explicit");
         std::fs::write(&path, b"{\"x\": 1}").unwrap();
         let explicit = "{\"inline\": true}".to_string();
-        let got = resolve_secret_source(
-            "test",
-            Some(&explicit),
-            path.to_str().unwrap(),
-        );
+        let got = resolve_secret_source("test", Some(&explicit), path.to_str().unwrap());
         assert_eq!(got, Some(explicit));
         let _ = std::fs::remove_file(&path);
     }
@@ -389,27 +395,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // populated file, fall through to IDENTITY_FILE (generate-and-persist)
     // rather than crashing — makes the docker-compose setup forgiving when a
     // user deploys without populating every secret mount.
+    //
+    // Disambiguation: base64's alphabet includes `/`, so a "looks like a
+    // path because it contains a slash" heuristic misclassifies legitimate
+    // base64 strings as paths and drops the keypair. Try parsing the value
+    // *as inline base64-encoded protobuf first*; if that produces a valid
+    // keypair, use it. Only fall back to treating it as a file path when
+    // direct parsing fails — at which point it really must be a path
+    // (or garbage, in which case the file won't exist either).
     let keypair_from_keypair_value = cli.identity_keypair.as_ref().and_then(|value| {
-        let looks_like_path = value.contains('/') || value.contains('\\');
-        let b64 = if looks_like_path {
-            read_optional_secret("IDENTITY_KEYPAIR", value)?
-                .trim()
-                .to_string()
-        } else {
-            value.trim().to_string()
+        let trimmed = value.trim();
+        let try_decode = |b64: &str| -> Option<identity::Keypair> {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+            identity::Keypair::from_protobuf_encoding(&bytes).ok()
         };
-        match base64::engine::general_purpose::STANDARD.decode(&b64) {
-            Ok(bytes) => match identity::Keypair::from_protobuf_encoding(&bytes) {
-                Ok(kp) => Some(kp),
-                Err(e) => {
-                    log::warn!(
-                        "IDENTITY_KEYPAIR not a valid protobuf-encoded keypair ({e}); falling back"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                log::warn!("IDENTITY_KEYPAIR not valid base64 ({e}); falling back");
+        if let Some(kp) = try_decode(trimmed) {
+            return Some(kp);
+        }
+        // Not a valid inline base64 keypair — try as a file path next.
+        let from_file = read_optional_secret("IDENTITY_KEYPAIR", value)?;
+        match try_decode(from_file.trim()) {
+            Some(kp) => Some(kp),
+            None => {
+                log::warn!(
+                    "IDENTITY_KEYPAIR file at {value:?} did not contain a valid base64-encoded protobuf keypair; falling back"
+                );
                 None
             }
         }
@@ -519,6 +529,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             yamux::Config::default,
         )?
         .with_quic()
+        // Stack a WebSocket transport on top so browser peers (libp2p
+        // websocket-websys) can dial the relay. The transport itself is
+        // unconditional — `listen_on(.../ws)` is what actually opens the
+        // server socket, and that's gated on `--ws-listen-addr`.
+        // `with_websocket` lives in `WebsocketPhase`, reachable from
+        // `OtherTransportPhase` via `with_dns()`.
+        .with_dns()?
+        .with_websocket(noise::Config::new, yamux::Config::default)
+        .await?
         .with_behaviour(|key| {
             let identify = identify::Behaviour::new(identify::Config::new(
                 "/wavesync-relay/1.0.0".into(),
@@ -575,6 +594,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?;
         swarm.listen_on(quic_addr.clone())?;
         log::info!("Also listening on {quic_addr}");
+    }
+
+    // Optional WebSocket listener for browser peers. Plain `/ws` is
+    // intended to sit behind a TLS-terminating reverse proxy (nginx,
+    // Caddy) — browsers will dial the public `/wss` address and the
+    // proxy unwraps it to plain WS for the relay. If the deployment
+    // exposes the relay directly to the public Internet, terminate TLS
+    // here instead (libp2p has no built-in `/wss` listener; use a
+    // reverse proxy or the `with_websocket-tls` upgrade variant).
+    if !cli.ws_listen_addr.is_empty() {
+        let ws_addr: Multiaddr = cli.ws_listen_addr.parse()?;
+        swarm.listen_on(ws_addr.clone())?;
+        log::info!("Also listening on WebSocket {ws_addr} (browser peers)");
     }
 
     // Track connected peer addresses for FCM push payloads.
@@ -1117,7 +1149,10 @@ mod cap_peer_addresses_tests {
         // Oldest 3 dropped → first remaining is index 3
         assert_eq!(addrs[0], ma("/ip4/10.0.0.3/tcp/3"));
         // Newest is still last
-        assert_eq!(addrs.last().unwrap(), &ma(&format!("/ip4/10.0.0.{}/tcp/{}", total - 1, total - 1)));
+        assert_eq!(
+            addrs.last().unwrap(),
+            &ma(&format!("/ip4/10.0.0.{}/tcp/{}", total - 1, total - 1))
+        );
     }
 }
 
@@ -1133,10 +1168,7 @@ mod classify_addr_tests {
     fn private_v4_ranges_are_private() {
         // Wi-Fi LAN and corporate LAN remain Private — useful when receiver
         // happens to be on the same network.
-        for s in [
-            "/ip4/192.168.1.150/tcp/4001",
-            "/ip4/10.0.0.5/tcp/4001",
-        ] {
+        for s in ["/ip4/192.168.1.150/tcp/4001", "/ip4/10.0.0.5/tcp/4001"] {
             assert_eq!(classify_addr(&ma(s)), AddrClass::Private, "{s}");
         }
     }
@@ -1238,10 +1270,10 @@ mod build_peer_addrs_for_fcm_tests {
         let peer = pid("12D3KooWQTV2REAJX77iesp2Qjax5tiK7Zt65FA7tUL6Ch47BJc6");
         let relay = pid("12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3");
         let known: Vec<Multiaddr> = vec![
-            ma("/ip4/127.0.0.1/tcp/39981"),       // dropped (loopback)
-            ma("/ip4/172.18.0.1/tcp/39981"),      // dropped (Docker bridge)
-            ma("/ip4/192.168.1.150/tcp/39981"),   // private (Wi-Fi LAN)
-            ma("/ip4/79.116.240.142/tcp/42674"),  // public
+            ma("/ip4/127.0.0.1/tcp/39981"),      // dropped (loopback)
+            ma("/ip4/172.18.0.1/tcp/39981"),     // dropped (Docker bridge)
+            ma("/ip4/192.168.1.150/tcp/39981"),  // private (Wi-Fi LAN)
+            ma("/ip4/79.116.240.142/tcp/42674"), // public
         ];
         let external_addrs: Vec<Multiaddr> = vec![
             ma("/ip4/77.37.125.212/tcp/4001"),

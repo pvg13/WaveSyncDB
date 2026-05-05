@@ -106,9 +106,7 @@ async fn get_db_version_from_meta(db: &impl ConnectionTrait) -> Result<u64, DbEr
 /// table currently in the database. Discovered via `sqlite_master`, so
 /// this works correctly without prior knowledge of which entities are
 /// registered. Returns 0 when no shadow tables exist (fresh database).
-pub async fn max_db_version_across_shadow_tables(
-    db: &impl ConnectionTrait,
-) -> Result<u64, DbErr> {
+pub async fn max_db_version_across_shadow_tables(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
     #[derive(Debug, FromQueryResult)]
     struct TableName {
         name: String,
@@ -228,9 +226,9 @@ pub async fn get_or_create_libp2p_keypair(
     }
 
     let keypair = libp2p::identity::Keypair::generate_ed25519();
-    let bytes = keypair.to_protobuf_encoding().map_err(|e| {
-        DbErr::Custom(format!("failed to encode libp2p keypair: {e}"))
-    })?;
+    let bytes = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| DbErr::Custom(format!("failed to encode libp2p keypair: {e}")))?;
     db.execute_raw(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",

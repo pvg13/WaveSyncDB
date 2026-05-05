@@ -1,0 +1,4 @@
+.test-logs/
+.test-pids/
+node_modules/
+package-lock.json

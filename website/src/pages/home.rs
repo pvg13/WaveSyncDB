@@ -68,12 +68,10 @@ pub fn Home() -> Element {
                             to: Route::DocPage { slug: "quickstart".to_string() },
                             "Get started →"
                         }
-                        a {
+                        Link {
                             class: "btn btn-secondary",
-                            href: "https://github.com/pvg13/WaveSyncDB",
-                            target: "_blank",
-                            rel: "noopener",
-                            "Star on GitHub"
+                            to: Route::TodoDemo {},
+                            "Try the live demo"
                         }
                     }
                     div { class: "hero-install",
@@ -182,11 +180,17 @@ pub fn Home() -> Element {
             div { class: "section-inner",
                 h2 { class: "cta-title", "Ready to make your app local-first?" }
                 p { class: "cta-subtitle",
-                    "Read the quickstart, clone an example, or jump into the docs."
+                    "Read the quickstart, browse the examples, or kick the tires in your "
+                    "browser — the live demo runs the same engine compiled to wasm32."
                 }
                 div { class: "cta-actions",
                     Link {
                         class: "btn btn-primary",
+                        to: Route::TodoDemo {},
+                        "Try the live demo →"
+                    }
+                    Link {
+                        class: "btn btn-secondary",
                         to: Route::DocPage { slug: "quickstart".to_string() },
                         "Quickstart"
                     }

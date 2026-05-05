@@ -40,7 +40,19 @@
 //! }
 //! ```
 
+// Native (non-wasm32) hooks built on top of SeaORM. These pull in
+// `sea_orm` types and a tokio multi-thread runtime, so they cannot
+// compile to wasm32. Browser apps get a parallel `web_hooks` module
+// below that exposes a similarly-shaped reactive API over
+// [`crate::WebSyncClient`] and [`crate::BrowserStore`].
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hooks;
+#[cfg(not(target_arch = "wasm32"))]
 mod lifecycle;
-
+#[cfg(not(target_arch = "wasm32"))]
 pub use hooks::*;
+
+#[cfg(target_arch = "wasm32")]
+pub mod web_hooks;
+#[cfg(target_arch = "wasm32")]
+pub use web_hooks::*;

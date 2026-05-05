@@ -7,3 +7,13 @@ publish = false
 [dependencies]
 dioxus = { version = "0.7.6", features = ["web", "router"] }
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
+# Browser/wasm32 build of wavesyncdb. Exposes the pure-data sync surface,
+# the WebSocket-backed WebSyncClient, and the IndexedDB-backed
+# BrowserStore. The libp2p TCP/QUIC/mDNS engine and sea-orm connection
+# wrapper are gated out for wasm32 in the crate itself.
+wavesyncdb = { workspace = true, features = ["web", "dioxus"] }
+# Used by the todo demo to generate task UUIDs (`crypto.getRandomValues`)
+# and read `Date.now()` for sortable timestamps. Both are wasm-only —
+# the website is wasm-only too.
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"

@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use crate::components::{Footer, Nav};
-use crate::pages::{DocPage, Examples, Home, NotFound};
+use crate::pages::{DocPage, Examples, Home, NotFound, SyncDemo, TodoDemo};
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.svg");
@@ -17,6 +17,10 @@ pub enum Route {
     DocPage { slug: String },
     #[route("/examples")]
     Examples {},
+    #[route("/demo")]
+    TodoDemo {},
+    #[route("/sync-demo")]
+    SyncDemo {},
     #[end_layout]
     #[route("/:..route")]
     NotFound { route: Vec<String> },

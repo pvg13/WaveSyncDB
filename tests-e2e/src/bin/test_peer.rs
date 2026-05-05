@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
     let db_url = std::env::var("DB_URL").context("DB_URL is required")?;
     let topic = std::env::var("TOPIC").context("TOPIC is required")?;
 
-    let mut builder = WaveSyncDbBuilder::new(&db_url, &topic)
-        .with_sync_interval(Duration::from_secs(2));
+    let mut builder =
+        WaveSyncDbBuilder::new(&db_url, &topic).with_sync_interval(Duration::from_secs(2));
 
     if let Ok(p) = std::env::var("PASSPHRASE")
         && !p.is_empty()
@@ -176,11 +176,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         match self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-            AppError::Db(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("db error: {e}"),
-            )
-                .into_response(),
+            AppError::Db(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
+            }
         }
     }
 }
