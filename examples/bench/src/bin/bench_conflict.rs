@@ -120,17 +120,17 @@ async fn main() {
             break a.clone();
         }
         if Instant::now() > deadline {
-            panic!(
-                "convergence timeout: a={:?} b={:?}",
-                a_title, b_title
-            );
+            panic!("convergence timeout: a={:?} b={:?}", a_title, b_title);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let convergence_secs = conv_t.elapsed().as_secs_f64();
     let total = writes_done + convergence_secs;
 
-    println!("  Convergence after concurrent writes: {:.2}s", convergence_secs);
+    println!(
+        "  Convergence after concurrent writes: {:.2}s",
+        convergence_secs
+    );
     println!("  Total (writes + convergence):        {:.2}s", total);
     println!(
         "  Throughput (updates applied / total):    {:.0}/s",
@@ -166,10 +166,7 @@ async fn read_title(peer: &wavesyncdb::WaveSyncDb) -> Option<String> {
 async fn wait_for_seed(peer: &wavesyncdb::WaveSyncDb) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(Some(_)) = task::Entity::find_by_id(ROW_ID.to_string())
-            .one(peer)
-            .await
-        {
+        if let Ok(Some(_)) = task::Entity::find_by_id(ROW_ID.to_string()).one(peer).await {
             return;
         }
         if Instant::now() > deadline {

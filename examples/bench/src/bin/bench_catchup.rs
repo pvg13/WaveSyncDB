@@ -69,9 +69,7 @@ async fn main() {
             break;
         }
         if Instant::now() > deadline {
-            panic!(
-                "timed out after {TIMEOUT_SECS}s — Peer B has only {count}/{N} rows"
-            );
+            panic!("timed out after {TIMEOUT_SECS}s — Peer B has only {count}/{N} rows");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

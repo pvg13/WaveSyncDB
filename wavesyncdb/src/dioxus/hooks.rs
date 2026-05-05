@@ -371,10 +371,8 @@ where
                     }
                     WriteKind::Insert => {
                         if let Some(cols) = &notif.column_values {
-                            let pairs: Vec<(String, serde_json::Value)> = cols
-                                .iter()
-                                .map(|(c, v)| (c.0.clone(), v.clone()))
-                                .collect();
+                            let pairs: Vec<(String, serde_json::Value)> =
+                                cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
                             if let Some(model) =
                                 E::Model::wavesync_from_changes(&pk_column, &pk_str, &pairs)
                             {
@@ -492,10 +490,8 @@ where
                     }
                     WriteKind::Insert => {
                         if let Some(cols) = &notif.column_values {
-                            let pairs: Vec<(String, serde_json::Value)> = cols
-                                .iter()
-                                .map(|(c, v)| (c.0.clone(), v.clone()))
-                                .collect();
+                            let pairs: Vec<(String, serde_json::Value)> =
+                                cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
                             if let Some(model) =
                                 E::Model::wavesync_from_changes(&pk_column, &pk_string, &pairs)
                             {

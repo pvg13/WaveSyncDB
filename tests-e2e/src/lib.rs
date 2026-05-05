@@ -103,8 +103,11 @@ impl WaveSyncE2eHarness {
         //    without a runtime discovery step.
         let relay_keypair = Keypair::generate_ed25519();
         let relay_peer_id = relay_keypair.public().to_peer_id();
-        let relay_identity_b64 =
-            B64.encode(relay_keypair.to_protobuf_encoding().context("encode keypair")?);
+        let relay_identity_b64 = B64.encode(
+            relay_keypair
+                .to_protobuf_encoding()
+                .context("encode keypair")?,
+        );
 
         // 2. Per-harness Docker network.
         let net_name = format!("wavesync-e2e-{suffix}");
@@ -316,12 +319,7 @@ impl RunningPeer {
 
     /// Block until a task with the given pk is visible at this peer, or
     /// time out. Used by scenarios to assert convergence.
-    pub async fn wait_for_task(
-        &self,
-        id: &str,
-        title: &str,
-        timeout: Duration,
-    ) -> Result<()> {
+    pub async fn wait_for_task(&self, id: &str, title: &str, timeout: Duration) -> Result<()> {
         let start = Instant::now();
         let mut interval = Duration::from_millis(50);
         loop {
@@ -356,4 +354,3 @@ pub struct Task {
 struct PeersResponse {
     connected: usize,
 }
-
