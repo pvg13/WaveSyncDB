@@ -67,7 +67,16 @@ impl EngineRunner {
     pub(super) fn handle_mdns(&mut self, event: mdns::Event) {
         match event {
             mdns::Event::Discovered(list) => {
+                // mDNS often produces multiple addresses for the same peer-id
+                // in one event (each network interface that responded). Count
+                // each *peer* once, not each address.
+                let mut counted_peers = std::collections::HashSet::new();
                 for (peer_id, multiaddr) in list {
+                    if counted_peers.insert(peer_id) {
+                        self.diagnostics
+                            .mdns_discoveries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Never re-add peers rejected for topic mismatch
                     if self.rejected_peers.contains(&peer_id) {
                         continue;
@@ -85,10 +94,17 @@ impl EngineRunner {
                     // Dial if not currently connected (handles both new peers and reconnections
                     // after network disruption where the peer is still in self.peers but the
                     // TCP/QUIC connection is dead)
-                    if !self.swarm.is_connected(&peer_id)
-                        && let Err(e) = self.swarm.dial(multiaddr.clone())
-                    {
-                        log::warn!("Failed to dial peer {peer_id}: {e}");
+                    if !self.swarm.is_connected(&peer_id) {
+                        match self.swarm.dial(multiaddr.clone()) {
+                            Ok(()) => {
+                                self.diagnostics
+                                    .peer_dial_attempts
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to dial peer {peer_id}: {e}");
+                            }
+                        }
                     }
                     self.peers.insert(peer_id, multiaddr.clone());
 
