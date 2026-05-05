@@ -129,7 +129,7 @@ impl EngineConfig {
 
 /// Start the P2P sync engine in a background tokio task.
 #[allow(clippy::too_many_arguments)]
-pub fn start_engine(
+pub(crate) fn start_engine(
     db: DatabaseConnection,
     sync_rx: mpsc::Receiver<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
@@ -142,6 +142,7 @@ pub fn start_engine(
     group_key: Option<GroupKey>,
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+    diagnostics: Arc<crate::diagnostics::Counters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let event_tx = network_event_tx.clone();
@@ -158,6 +159,7 @@ pub fn start_engine(
             group_key,
             network_status,
             network_event_tx,
+            diagnostics,
         ))
         .catch_unwind()
         .await;
@@ -266,6 +268,7 @@ async fn run_engine(
     group_key: Option<GroupKey>,
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+    diagnostics: Arc<crate::diagnostics::Counters>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load (or create on first launch) the persistent libp2p keypair from
     // _wavesync_meta. Stable PeerId across restarts is necessary so the
@@ -361,6 +364,7 @@ async fn run_engine(
         circuit_retry_count: 0,
         circuit_listen_pending: false,
         relay_dial_pending: false,
+        diagnostics,
     };
 
     // Set initial network status with local_peer_id and topic
@@ -487,6 +491,11 @@ struct EngineRunner {
     /// 3 reservation requests). Cleared on the connection-established or
     /// dial-failed event for the relay peer.
     pub(crate) relay_dial_pending: bool,
+    /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
+    /// All increments are `Relaxed` atomic ops on the hot path; readers
+    /// (UI / debug panel / test assertions) snapshot via
+    /// [`WaveSyncDb::diagnostics`]. See [`crate::diagnostics`].
+    pub(crate) diagnostics: Arc<crate::diagnostics::Counters>,
 }
 
 impl EngineRunner {
@@ -579,6 +588,9 @@ impl EngineRunner {
         match self.swarm.listen_on(circuit_addr.clone()) {
             Ok(_) => {
                 self.circuit_listen_pending = true;
+                self.diagnostics
+                    .circuit_reservation_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::info!(
                     "Listening on relay circuit ({}): {circuit_addr}",
                     if force_renewal { "renewal" } else { "initial" }
@@ -1242,6 +1254,14 @@ impl EngineRunner {
                 peer_id, endpoint, ..
             } => {
                 log::info!("Connection established with {peer_id}");
+                // Count successful peer dials. Infrastructure peers (relay /
+                // rendezvous) are excluded so the rate reflects sync-peer
+                // discovery health, not infra plumbing.
+                if !self.infrastructure_peers.contains(&peer_id) {
+                    self.diagnostics
+                        .peer_dial_successes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.handle_connection_established(peer_id, &endpoint).await;
             }
             SwarmEvent::ConnectionClosed {
@@ -1302,6 +1322,16 @@ impl EngineRunner {
                     && pid == relay_pid
                 {
                     self.relay_dial_pending = false;
+                }
+                // Count peer dial failures, excluding infrastructure peers so
+                // the metric reflects sync-peer reachability — failed relay
+                // redials are a separate (and noisier) signal.
+                if let Some(pid) = peer_id
+                    && !self.infrastructure_peers.contains(&pid)
+                {
+                    self.diagnostics
+                        .peer_dial_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
@@ -1377,6 +1407,9 @@ impl EngineRunner {
                         "Relay {peer} introduced {} peer(s) on our topic",
                         by_peer.len()
                     );
+                    self.diagnostics
+                        .peerlist_introductions
+                        .fetch_add(by_peer.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for (_pid, addrs) in by_peer {
                         self.dial_introduced_peer(&addrs);
                     }
@@ -1425,6 +1458,9 @@ impl EngineRunner {
                             "Relay announced new peer on topic with {} address(es)",
                             peer_addrs.len()
                         );
+                        self.diagnostics
+                            .peerjoined_introductions
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // peer_addrs is already a single peer's address set —
                         // pass them all to the dialer so libp2p races them.
                         self.dial_introduced_peer(peer_addrs);
