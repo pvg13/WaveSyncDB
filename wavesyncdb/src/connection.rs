@@ -312,6 +312,10 @@ struct WaveSyncDbInner {
     engine_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+    /// Engine-wide diagnostics counters. Shared with the engine task —
+    /// engine writes, [`WaveSyncDb::diagnostics`] reads via lock-free
+    /// atomic loads. See [`crate::diagnostics`] for rationale.
+    diagnostics: Arc<crate::diagnostics::Counters>,
 }
 
 /// A SeaORM connection wrapper that transparently intercepts write operations
@@ -387,6 +391,15 @@ impl WaveSyncDb {
     /// Subscribe to network events (peer connect/disconnect, relay changes, etc.).
     pub fn network_event_rx(&self) -> broadcast::Receiver<crate::network_status::NetworkEvent> {
         self.inner.network_event_tx.subscribe()
+    }
+
+    /// Snapshot the engine's diagnostics counters.
+    ///
+    /// Cheap (a handful of `Relaxed` atomic loads). Counters reset to
+    /// zero on engine restart — see [`crate::diagnostics`] for what each
+    /// counter measures and why this exists.
+    pub fn diagnostics(&self) -> crate::diagnostics::Snapshot {
+        self.inner.diagnostics.snapshot()
     }
 
     /// Get a reference to the sync changeset sender.
@@ -1724,6 +1737,12 @@ impl WaveSyncDbBuilder {
             circuit_max_duration: self.circuit_max_duration,
         };
 
+        // Diagnostics counters are owned jointly by the engine task (writer)
+        // and `WaveSyncDbInner` (reader via `WaveSyncDb::diagnostics`). The
+        // engine clones the Arc, increments through atomic operations, and
+        // never blocks on it.
+        let diagnostics = Arc::new(crate::diagnostics::Counters::default());
+
         // Start the P2P engine in a background task
         let engine_handle = crate::engine::start_engine(
             inner.clone(),
@@ -1738,6 +1757,7 @@ impl WaveSyncDbBuilder {
             self.group_key,
             network_status.clone(),
             network_event_tx.clone(),
+            diagnostics.clone(),
         );
 
         let db = WaveSyncDb {
@@ -1755,6 +1775,7 @@ impl WaveSyncDbBuilder {
                 engine_handle: std::sync::Mutex::new(Some(engine_handle)),
                 network_status,
                 network_event_tx,
+                diagnostics,
             }),
         };
 
