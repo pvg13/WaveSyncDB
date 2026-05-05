@@ -1,0 +1,74 @@
+# Maestro flow that drives the qr-pairing Android app to verify BOTH
+# directions of sync between web and phone via the relay's circuit-relay
+# topic mesh. The web counterpart is `web_driver.js`; together they
+# assert:
+#
+#   1. web → phone — web adds 'from-web', phone sees it
+#      (this flow's `extendedWaitUntil` on 'from-web' succeeds).
+#   2. phone → web — phone adds 'from-phone', web sees it
+#      (verified by web_driver.js's wait at the end).
+#
+# A run is fully green only when both this flow exits 0 AND the
+# parallel web_driver process exits 0. test.sh --full enforces that.
+#
+# Usage:
+#   1. ./test.sh --android        # boots relay + web build + installs APK
+#   2. ./test.sh --full           # everything-in-one orchestrator
+#
+# Notes on the syntax (all hard-won from running this on a real device):
+#   - `extendedWaitUntil` is what supports a custom `timeout` field;
+#     plain `assertVisible` doesn't, and rejects the property.
+#   - `clearState` wipes pairing.json + the SQLite DB so each run starts
+#     from the pairing screen. Without it, a stale pairing from a prior
+#     run skips the form and we miss the assertions below.
+#   - The peer-id input is targeted by its placeholder ("12D3KooW…"),
+#     NOT the "Web peer-id" label — that string also appears in the
+#     panel's help blurb, so the label selector matches the wrong node.
+#   - To dismiss the keyboard we tap the "Topic" label rather than
+#     `hideKeyboard` or `pressKey: Back`. Both keyboard-dismiss commands
+#     send the WebView-backed app to the background on this Android
+#     device (gesture-nav back), which then makes the next tap fail
+#     because the foreground is something else (Telegram, in our case).
+
+appId: com.wavesync.qr_pairing
+---
+- launchApp:
+    clearState: true
+
+- extendedWaitUntil:
+    visible: "Pair this device"
+    timeout: 15000
+
+- tapOn:
+    text: "12D3KooW…"
+- inputText: "12D3KooWtest000000000000000000000000000000000000"
+- tapOn: "Topic"
+- tapOn: "Connect"
+
+- extendedWaitUntil:
+    visible: "Tasks"
+    timeout: 30000
+
+# === Direction 1: web → phone ===
+# Wait for the web side (web_driver.js) to add 'from-web' and have the
+# push fan out to us.
+- extendedWaitUntil:
+    visible: "from-web"
+    timeout: 60000
+
+# === Direction 2: phone → web ===
+# Type 'from-phone' into this app's Tasks input and click Add. The
+# parallel web_driver will assert that this string shows up on its
+# DOM via the inverse Push fan-out.
+#
+# We tap Add directly without dismissing the keyboard first — the
+# input and the Add button live on the same flex row in
+# AddTaskForm, so the button stays visible above the keyboard.
+# The "Topic" label dismiss-trick we use on the pairing screen
+# doesn't exist here (the Tasks screen has no field labelled
+# "Topic"), and `hideKeyboard`/`pressKey: Back` background the
+# WebView app the same way they did during pairing.
+- tapOn:
+    text: "What needs to be done?"
+- inputText: "from-phone"
+- tapOn: "Add"

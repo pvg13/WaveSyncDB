@@ -748,15 +748,9 @@ impl EngineRunner {
         // `IfWatcher::new`. Binding to loopback skips the watcher path. The
         // same caution applies to QUIC's UDP socket setup.
         #[cfg(target_os = "ios")]
-        let (v4_quic, v6_quic) = (
-            "/ip4/127.0.0.1/udp/0/quic-v1",
-            "/ip6/::1/udp/0/quic-v1",
-        );
+        let (v4_quic, v6_quic) = ("/ip4/127.0.0.1/udp/0/quic-v1", "/ip6/::1/udp/0/quic-v1");
         #[cfg(not(target_os = "ios"))]
-        let (v4_quic, v6_quic) = (
-            "/ip4/0.0.0.0/udp/0/quic-v1",
-            "/ip6/::/udp/0/quic-v1",
-        );
+        let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
 
         log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
         let t1 = std::time::Instant::now();
@@ -1208,17 +1202,30 @@ impl EngineRunner {
                     // otherwise libp2p would race only one address per peer
                     // and a NAT'd peer's direct address would lose to its
                     // circuit fallback that never got tried.
+                    //
+                    // Use the **last** `/p2p/` component, not the first.
+                    // For circuit-relay addresses
+                    // (`/.../p2p/<relay>/p2p-circuit/p2p/<dest>`) the first
+                    // is the relay and the last is the actual destination;
+                    // grouping by the first lumps every circuit address
+                    // for every dest into the relay's bucket, and
+                    // `dial_introduced_peer` then sees the relay peer-id,
+                    // observes we're already connected to it, and silently
+                    // drops the dial — circuit-relay addresses from
+                    // PeerList never reach libp2p.
                     let mut by_peer: std::collections::HashMap<libp2p::PeerId, Vec<String>> =
                         std::collections::HashMap::new();
                     for addr_str in &peers {
                         let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() else {
                             continue;
                         };
-                        let pid = addr.iter().find_map(|p| match p {
-                            libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
-                            _ => None,
-                        });
-                        if let Some(pid) = pid {
+                        let mut last_pid = None;
+                        for p in addr.iter() {
+                            if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                                last_pid = Some(pid);
+                            }
+                        }
+                        if let Some(pid) = last_pid {
                             by_peer.entry(pid).or_default().push(addr_str.clone());
                         }
                     }
@@ -1425,14 +1432,12 @@ mod tests {
         let a2: libp2p::Multiaddr = format!("/ip4/192.168.1.150/tcp/39981/p2p/{pid}")
             .parse()
             .unwrap();
-        let a3: libp2p::Multiaddr = format!(
-            "/ip4/77.37.125.212/tcp/4001/p2p/{pid}/p2p-circuit/p2p/{pid}"
-        )
-        .parse()
-        .unwrap();
+        let a3: libp2p::Multiaddr =
+            format!("/ip4/77.37.125.212/tcp/4001/p2p/{pid}/p2p-circuit/p2p/{pid}")
+                .parse()
+                .unwrap();
 
-        let (grouped, suffixless) =
-            group_bootstrap_addrs(vec![a1.clone(), a2.clone(), a3.clone()]);
+        let (grouped, suffixless) = group_bootstrap_addrs(vec![a1.clone(), a2.clone(), a3.clone()]);
 
         assert!(suffixless.is_empty());
         assert_eq!(grouped.len(), 1);
@@ -1470,12 +1475,10 @@ mod tests {
         let pid: libp2p::PeerId = "12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3"
             .parse()
             .unwrap();
-        let with_pid: libp2p::Multiaddr = format!("/ip4/5.6.7.8/tcp/5678/p2p/{pid}")
-            .parse()
-            .unwrap();
+        let with_pid: libp2p::Multiaddr =
+            format!("/ip4/5.6.7.8/tcp/5678/p2p/{pid}").parse().unwrap();
 
-        let (grouped, suffixless) =
-            group_bootstrap_addrs(vec![bare.clone(), with_pid.clone()]);
+        let (grouped, suffixless) = group_bootstrap_addrs(vec![bare.clone(), with_pid.clone()]);
 
         assert_eq!(suffixless, vec![bare]);
         assert_eq!(grouped.len(), 1);

@@ -1,0 +1,19 @@
+[application]
+name = "WaveSyncDB QR Pairing"
+default_platform = "web"
+
+# Custom AndroidManifest declares CAMERA permission for the QR
+# scanner. dx 0.7's bundled template doesn't include CAMERA — without
+# this override the WebView's getUserMedia request gets rejected at
+# the permission-grant step. Path-based; dx replaces the bundled
+# manifest wholesale (no merging).
+android_manifest = "AndroidManifest.xml"
+
+[android]
+min_sdk = 24
+target_sdk = 34
+identifier = "com.wavesync.qr_pairing"
+
+[web.app]
+title = "WaveSyncDB · QR Pairing"
+base_path = ""

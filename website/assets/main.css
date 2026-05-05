@@ -802,6 +802,487 @@ img {
     flex-wrap: wrap;
 }
 
+/* ── two-device demo layout ─────────────────────────────────── */
+
+.local-demo-grid {
+    display: grid;
+    grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+    column-gap: 64px;
+    align-items: start;
+    justify-items: center;
+}
+
+/* ── device frames ──────────────────────────────────────────── */
+
+/* Laptop is the primary "big screen" of the demo — fills its column up
+   to a generous cap so the task list has real estate to breathe. The
+   16:11 aspect ratio gives the screen the proportions of an actual
+   laptop (close to MacBook 16:10 / Surface 3:2). */
+.device-laptop {
+    width: 100%;
+    max-width: 760px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 0 auto;
+}
+.device-laptop-screen {
+    width: 100%;
+    border: 10px solid #2a3242;
+    border-radius: 16px 16px 4px 4px;
+    background: var(--bg);
+    padding: 22px 24px;
+    box-shadow: 0 16px 48px -18px rgba(0, 0, 0, 0.7);
+    aspect-ratio: 16 / 10;
+    display: flex;
+    flex-direction: column;
+}
+.device-laptop-stand {
+    height: 10px;
+    width: 70%;
+    background: #2a3242;
+    border-radius: 0 0 6px 6px;
+}
+.device-laptop-base {
+    height: 8px;
+    width: 100%;
+    background: #1c222d;
+    border-radius: 0 0 16px 16px;
+    margin-top: -1px;
+}
+
+/* ── phone frame ──── */
+.device-phone {
+    width: 100%;
+    max-width: 280px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.device-phone-screen {
+    width: 100%;
+    border: 10px solid #2a3242;
+    border-radius: 36px;
+    background: var(--bg);
+    padding: 22px 14px 14px;
+    box-shadow: 0 12px 40px -16px rgba(0, 0, 0, 0.6);
+    aspect-ratio: 9 / 17;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+}
+.device-phone-screen::before {
+    /* Notch — cosmetic only */
+    content: "";
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 60px;
+    height: 14px;
+    background: #2a3242;
+    border-radius: 0 0 10px 10px;
+}
+
+/* ── per-device internals ──── */
+.device-label {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 8px;
+}
+.device-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+}
+.device-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-dim);
+}
+.device-status-dot.on {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.device-status-dot.offline {
+    background: var(--warning);
+    box-shadow: 0 0 0 3px rgba(247, 200, 124, 0.18);
+}
+.device-status {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+}
+.device-toggle {
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 3px 8px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: color 120ms ease, border-color 120ms ease;
+}
+.device-toggle:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+.device-laptop-screen.offline,
+.device-phone-screen.offline {
+    border-color: #4a3d22;
+    background: linear-gradient(180deg, var(--bg) 0%, #1a1610 100%);
+}
+.device-laptop-screen.offline::after,
+.device-phone-screen.offline::after {
+    content: "OFFLINE";
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    color: var(--warning);
+    letter-spacing: 1.5px;
+    pointer-events: none;
+}
+.device-laptop-screen,
+.device-phone-screen {
+    position: relative;
+}
+
+/* Inside the larger laptop screen, scale up the task UI so the frame
+   doesn't look like it's full of tiny phone-sized text. The phone keeps
+   its compact styling. */
+.device-laptop-screen .device-task {
+    font-size: 0.95rem;
+    padding: 9px 12px;
+    gap: 10px;
+}
+.device-laptop-screen .device-task input[type="checkbox"] {
+    width: 17px;
+    height: 17px;
+}
+.device-laptop-screen .device-task-delete {
+    width: 24px;
+    height: 24px;
+    font-size: 1rem;
+}
+.device-laptop-screen .device-add-row input {
+    padding: 9px 12px;
+    font-size: 0.95rem;
+}
+.device-laptop-screen .device-add-row button {
+    padding: 9px 16px;
+    font-size: 0.9rem;
+}
+.device-laptop-screen .device-status {
+    margin-bottom: 14px;
+    font-size: 0.78rem;
+}
+.device-tasks {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+}
+.device-task {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+}
+.device-task.done .device-task-title {
+    color: var(--text-dim);
+    text-decoration: line-through;
+}
+.device-task input[type="checkbox"] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    cursor: pointer;
+}
+.device-task-title {
+    color: var(--text);
+    word-break: break-word;
+    line-height: 1.3;
+}
+.device-task-delete {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0;
+}
+.device-task-delete:hover {
+    color: var(--warning);
+}
+.device-add-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+    flex-shrink: 0;
+}
+.device-add-row input {
+    flex: 1;
+    padding: 6px 10px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.85rem;
+    min-width: 0;
+}
+.device-add-row input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.device-add-row button {
+    padding: 6px 10px;
+    background: var(--accent);
+    color: #06231f;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+.device-empty {
+    color: var(--text-dim);
+    font-style: italic;
+    text-align: center;
+    padding: 16px 8px;
+    font-size: 0.85rem;
+}
+.device-meta {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    text-align: center;
+}
+
+@media (max-width: 900px) {
+    .local-demo-grid {
+        grid-template-columns: 1fr;
+        gap: 24px;
+    }
+    .device-phone,
+    .device-laptop {
+        max-width: 100%;
+    }
+}
+
+/* ── todo demo ──────────────────────────────────────────────── */
+
+.demo-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 32px;
+    align-items: start;
+}
+.demo-main {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    min-height: 320px;
+}
+.demo-side {
+    display: grid;
+    gap: 16px;
+}
+.demo-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+}
+.demo-card h3 {
+    margin-top: 0;
+    margin-bottom: 12px;
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+}
+.demo-card label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+    margin-top: 10px;
+}
+.demo-card input[type="text"],
+.demo-card input[type="password"] {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 0.95rem;
+}
+.demo-card input[type="text"]:focus,
+.demo-card input[type="password"]:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.demo-status {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    word-break: break-all;
+}
+.demo-status .demo-status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 8px;
+    vertical-align: middle;
+    background: var(--text-dim);
+}
+.demo-status.demo-status-on .demo-status-dot {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.demo-add-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+}
+.demo-add-row input {
+    flex: 1;
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 1rem;
+    font-family: inherit;
+}
+.demo-add-row input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+.demo-tasks {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.demo-task {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.demo-task input[type="checkbox"] {
+    accent-color: var(--accent);
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+}
+.demo-task-title {
+    color: var(--text);
+    word-break: break-word;
+}
+.demo-task.done .demo-task-title {
+    color: var(--text-dim);
+    text-decoration: line-through;
+}
+.demo-task-meta {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    margin-top: 2px;
+}
+.demo-task-delete {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+.demo-task-delete:hover {
+    color: var(--warning);
+    border-color: var(--warning);
+}
+.demo-empty {
+    text-align: center;
+    color: var(--text-dim);
+    padding: 32px 16px;
+    font-style: italic;
+}
+.demo-tip {
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    color: var(--text);
+    font-size: 0.9rem;
+}
+.demo-tip strong {
+    color: var(--accent-strong);
+}
+.demo-error {
+    background: rgba(247, 200, 124, 0.08);
+    border: 1px solid var(--warning);
+    color: var(--warning);
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+    margin-top: 12px;
+}
+
+@media (max-width: 800px) {
+    .demo-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
 /* ── responsive ─────────────────────────────────────────────── */
 
 @media (max-width: 920px) {
