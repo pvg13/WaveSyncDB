@@ -14,6 +14,9 @@ impl EngineRunner {
                 self.relay_state = RelayState::Listening { relay_peer_id };
                 self.circuit_retry_count = 0;
                 self.circuit_accepted_at = Some(tokio::time::Instant::now());
+                self.diagnostics
+                    .circuit_reservations_accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Clear the in-flight flag — the relay accepted our request,
                 // so the next legitimate caller (proactive renewal,
                 // listener-closed re-listen) can issue a fresh one without
@@ -452,6 +455,9 @@ impl EngineRunner {
             .build();
         match self.swarm.dial(dial_opts) {
             Ok(()) => {
+                self.diagnostics
+                    .peer_dial_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.dialing_peers.insert(peer_id);
                 if let Some(first) = addrs.into_iter().next() {
                     self.peers.entry(peer_id).or_insert(first);
