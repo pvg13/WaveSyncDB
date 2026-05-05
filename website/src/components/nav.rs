@@ -16,6 +16,7 @@ pub fn Nav() -> Element {
                 nav { class: "site-nav-links",
                     Link { class: "site-nav-link", to: Route::DocsIndex {}, "Docs" }
                     Link { class: "site-nav-link", to: Route::Examples {}, "Examples" }
+                    Link { class: "site-nav-link", to: Route::TodoDemo {}, "Demo" }
                     a {
                         class: "site-nav-link site-nav-github",
                         href: "https://github.com/pvg13/WaveSyncDB",

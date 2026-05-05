@@ -14,7 +14,7 @@ path = "src/main.rs"
 # the build context to this subdirectory. Keep these versions in sync
 # with the workspace root's `[workspace.dependencies]` on bumps.
 [dependencies]
-libp2p = { version = "0.56.0", features = ["relay", "rendezvous", "identify", "ping", "autonat", "request-response", "tokio", "noise", "yamux", "tcp", "quic"] }
+libp2p = { version = "0.56.0", features = ["relay", "rendezvous", "identify", "ping", "autonat", "request-response", "tokio", "noise", "yamux", "tcp", "quic", "websocket", "dns"] }
 libp2p-swarm-derive = "0.35.1"
 tokio = { version = "1.47", features = ["full"] }
 log = "0.4"

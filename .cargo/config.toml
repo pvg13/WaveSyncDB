@@ -34,3 +34,13 @@ rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
 
 [target.i686-linux-android]
 rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+# Browser/wasm32 build. `getrandom` 0.3 (pulled in via libp2p → yamux →
+# rand 0.9) requires both the `wasm_js` cargo feature *and* the
+# `getrandom_backend="wasm_js"` cfg to actually use the browser's
+# `crypto.getRandomValues` — without the cfg, the crate fails to compile
+# on wasm32 with "cannot find function `inner_u32` in module `backends`".
+# This must be set workspace-wide (not in wavesyncdb/Cargo.toml) because
+# rustflags can't be expressed there.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

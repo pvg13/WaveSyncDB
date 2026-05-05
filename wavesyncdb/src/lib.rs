@@ -36,31 +36,68 @@
 //! - [`SyncChangeset`] — a batch of column-level CRDT changes sent over the network
 //! - [`ChangeNotification`] — lightweight event emitted after every write
 
+// Pure-data modules: types, conflict resolution, HMAC, protocol envelopes.
+// These compile on every target — including wasm32 — and form the surface
+// shared with browser builds.
 pub mod auth;
-pub mod background_sync;
 pub mod conflict;
-pub mod connection;
-pub mod engine;
-#[cfg(feature = "mobile-ffi")]
-mod ffi;
 pub mod messages;
 pub mod network_status;
-pub mod peer_tracker;
 pub mod protocol;
-pub(crate) mod push;
 pub mod registry;
-pub mod shadow;
 pub mod synced_model;
 
+// Native-only modules: anything that touches sea-orm (SQLite), libp2p
+// transports, tokio I/O, the local filesystem, or platform FFI. The
+// browser/wasm32 build skips all of these — a future browser sync path
+// (WebSocket/WebRTC/WebTransport + sqlite-wasm) will live behind its own
+// feature.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod background_sync;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod connection;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod engine;
+#[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]
+mod ffi;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod peer_tracker;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod push;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod shadow;
+
+// Browser/wasm32 engine. Minimal real-time changeset fan-out over a
+// WebSocket libp2p transport — see module docs for what's in scope and
+// what's deferred. Public API: [`web_engine::WebSyncClient`].
+#[cfg(target_arch = "wasm32")]
+pub mod web_engine;
+#[cfg(target_arch = "wasm32")]
+pub mod web_entity;
+#[cfg(target_arch = "wasm32")]
+pub mod web_store;
+#[cfg(target_arch = "wasm32")]
+pub use web_engine::{
+    LoopbackEnd, LoopbackLink, LoopbackPair, WebSyncClient, WebSyncError, WebSyncStatus,
+};
+#[cfg(target_arch = "wasm32")]
+pub use web_entity::BrowserEntity;
+#[cfg(target_arch = "wasm32")]
+pub use web_store::{BrowserStore, ResolvedRow, ShadowRow, StoreError};
+
 pub use auth::GroupKey;
+#[cfg(not(target_arch = "wasm32"))]
 pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
+#[cfg(not(target_arch = "wasm32"))]
 pub use engine::EngineCommand;
 pub use messages::{
     AppId, ChangeNotification, ColumnChange, ColumnName, DeletePolicy, HmacTag, NodeId, PrimaryKey,
     SyncChangeset, TableName, TopicString, WriteKind,
 };
 pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
-pub use registry::{SyncEntityInfo, TableMeta, TableRegistry};
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry::SyncEntityInfo;
+pub use registry::{TableMeta, TableRegistry};
 pub use synced_model::SyncedModel;
 
 /// Returns recommended log module filter tuples for silencing noisy dependencies.
@@ -110,10 +147,20 @@ pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
     ]
 }
 
+/// The crate's semver version string (from `CARGO_PKG_VERSION`).
+///
+/// Available on every target — including wasm32 — so consumer crates (e.g.
+/// the documentation website) can render a single source of truth for the
+/// shipped version without re-declaring it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // Re-export for use by the #[derive(SyncEntity)] macro
 pub use inventory::submit as register_sync_entity;
 
-// Re-export sea-orm for users of the library
+// Re-export sea-orm for users of the library. sea-orm is not available on
+// wasm32 (sqlx-sqlite pulls in libsqlite3-sys, a C library), so this
+// re-export is gated to native targets. The `SyncEntity` derive uses it.
+#[cfg(not(target_arch = "wasm32"))]
 pub use sea_orm;
 
 // Re-export serde_json so the `SyncEntity` derive macro can reference it
@@ -121,7 +168,7 @@ pub use sea_orm;
 // declare serde_json as a direct dependency.
 pub use serde_json;
 
-#[cfg(feature = "derive")]
+#[cfg(all(feature = "derive", not(target_arch = "wasm32")))]
 pub use wavesyncdb_derive::SyncEntity;
 
 #[cfg(feature = "dioxus")]

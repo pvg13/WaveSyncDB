@@ -29,7 +29,8 @@ pub fn Footer() -> Element {
                 }
             }
             div { class: "site-footer-bottom",
-                "© 2026 WaveSyncDB contributors"
+                "© 2026 WaveSyncDB contributors · v"
+                {wavesyncdb::VERSION}
             }
         }
     }
