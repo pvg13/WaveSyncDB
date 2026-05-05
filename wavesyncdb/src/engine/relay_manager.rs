@@ -14,6 +14,11 @@ impl EngineRunner {
                 self.relay_state = RelayState::Listening { relay_peer_id };
                 self.circuit_retry_count = 0;
                 self.circuit_accepted_at = Some(tokio::time::Instant::now());
+                // Clear the in-flight flag — the relay accepted our request,
+                // so the next legitimate caller (proactive renewal,
+                // listener-closed re-listen) can issue a fresh one without
+                // the helper short-circuiting.
+                self.circuit_listen_pending = false;
                 self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
                     crate::network_status::RelayStatus::Listening,
                 ));
@@ -249,64 +254,78 @@ impl EngineRunner {
 
     /// Attempt to reconnect to the relay server if disconnected.
     pub(super) fn maybe_reconnect_relay(&mut self) {
-        match &self.relay_state {
-            RelayState::Connecting { retry_count } => {
-                if let Some(ref relay_addr) = self.config.relay_server {
-                    let count = *retry_count;
-                    // Exponential backoff via tick-skipping: dial every 2^min(count,3) ticks
-                    // With 5s base interval: 5s, 10s, 20s, 40s, 40s, 40s...
-                    let skip = 1u32 << count.min(3); // 1, 2, 4, 8, 8, 8...
-                    if count % skip == 0 {
-                        log::info!("Attempting relay reconnection (attempt {})", count + 1);
-                        if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                            log::warn!("Failed to redial relay server: {}", e);
-                        }
-                    }
-                    self.relay_state = RelayState::Connecting {
-                        retry_count: count + 1,
-                    };
-                }
-            }
+        // Snapshot the state up front so we can call `&mut self` helpers
+        // (try_dial_relay, try_listen_on_circuit) without overlapping with
+        // an immutable borrow of `self.relay_state`.
+        enum Action {
+            None,
+            Connecting(u32),
+            Stuck {
+                relay_peer_id: libp2p::PeerId,
+                stuck_for: Duration,
+            },
+        }
+        let action = match &self.relay_state {
+            RelayState::Connecting { retry_count } => Action::Connecting(*retry_count),
             RelayState::Connected {
                 relay_peer_id,
                 connected_at,
-            } => {
-                // Circuit reservation hasn't completed — retry if stuck for >5s
-                if connected_at.elapsed() > Duration::from_secs(5) {
-                    self.circuit_retry_count += 1;
-                    if self.circuit_retry_count >= 3 {
-                        log::warn!(
-                            "Circuit reservation failed {} times, forcing full relay reconnect",
-                            self.circuit_retry_count
-                        );
-                        let pid = *relay_peer_id;
-                        self.circuit_retry_count = 0;
-                        let _ = self.swarm.disconnect_peer_id(pid);
-                        // ConnectionClosed handler will reset to Connecting and trigger full reconnect
-                    } else {
-                        log::info!(
-                            "Relay stuck in Connected for >5s, retrying circuit reservation (attempt {})",
-                            self.circuit_retry_count
-                        );
-                        if let Some(ref relay_addr) = self.config.relay_server {
-                            let circuit_addr = relay_addr
-                                .clone()
-                                .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                                log::warn!("Retry listen_on relay circuit failed: {e}");
-                            }
-                        }
-                        // Reset connected_at to space out retries
-                        let pid = *relay_peer_id;
-                        self.relay_state = RelayState::Connected {
-                            relay_peer_id: pid,
-                            connected_at: tokio::time::Instant::now(),
-                        };
-                    }
+            } => Action::Stuck {
+                relay_peer_id: *relay_peer_id,
+                stuck_for: connected_at.elapsed(),
+            },
+            RelayState::Disabled | RelayState::Listening { .. } => Action::None,
+        };
+
+        match action {
+            Action::Connecting(count) => {
+                // Exponential backoff via tick-skipping: dial every 2^min(count,3) ticks.
+                // With 5s base interval: 5s, 10s, 20s, 40s, 40s, 40s...
+                let skip = 1u32 << count.min(3); // 1, 2, 4, 8, 8, 8...
+                if count % skip == 0 {
+                    log::info!("Attempting relay reconnection (attempt {})", count + 1);
+                    self.try_dial_relay();
+                }
+                self.relay_state = RelayState::Connecting {
+                    retry_count: count + 1,
+                };
+            }
+            Action::Stuck {
+                relay_peer_id,
+                stuck_for,
+            } if stuck_for > Duration::from_secs(5) => {
+                // Circuit reservation hasn't completed — retry if stuck for >5s.
+                // The retry is also where the renewal storm originated: a stuck
+                // Connected used to fire a fresh `listen_on(circuit)` per tick
+                // even when an earlier request was still in flight. Routing
+                // through `try_listen_on_circuit` makes it a no-op while the
+                // first request is pending.
+                self.circuit_retry_count += 1;
+                if self.circuit_retry_count >= 3 {
+                    log::warn!(
+                        "Circuit reservation failed {} times, forcing full relay reconnect",
+                        self.circuit_retry_count
+                    );
+                    self.circuit_retry_count = 0;
+                    let _ = self.swarm.disconnect_peer_id(relay_peer_id);
+                    // ConnectionClosed handler will reset to Connecting and
+                    // trigger full reconnect
+                } else {
+                    log::info!(
+                        "Relay stuck in Connected for >5s, retrying circuit reservation (attempt {})",
+                        self.circuit_retry_count
+                    );
+                    self.try_listen_on_circuit(false);
+                    // Reset connected_at to space out retries
+                    self.relay_state = RelayState::Connected {
+                        relay_peer_id,
+                        connected_at: tokio::time::Instant::now(),
+                    };
                 }
             }
-            RelayState::Disabled | RelayState::Listening { .. } => {
-                // No action needed
+            Action::Stuck { .. } | Action::None => {
+                // Either we just connected and haven't been stuck long enough,
+                // or relay is Disabled / already Listening — nothing to do.
             }
         }
     }

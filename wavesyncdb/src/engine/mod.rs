@@ -359,6 +359,8 @@ async fn run_engine(
         nat_assumption_deadline: None,
         circuit_accepted_at: None,
         circuit_retry_count: 0,
+        circuit_listen_pending: false,
+        relay_dial_pending: false,
     };
 
     // Set initial network status with local_peer_id and topic
@@ -464,6 +466,27 @@ struct EngineRunner {
     pub(crate) circuit_accepted_at: Option<tokio::time::Instant>,
     /// Number of circuit reservation retries while stuck in `Connected` state.
     pub(crate) circuit_retry_count: u32,
+    /// `true` between calling `swarm.listen_on(circuit_addr)` and the relay
+    /// acknowledging with `ReservationReqAccepted`. Used by
+    /// [`EngineRunner::try_listen_on_circuit`] to dedup concurrent listen
+    /// attempts from the four call sites (eager on first relay-connect,
+    /// retry-while-stuck-in-Connected, listener-closed re-listen, and
+    /// proactive 80%-of-max-duration renewal). Without this, a single
+    /// relay-connect can queue ≥4 reservation requests within seconds —
+    /// each one is one libp2p relay-client request — exhausting the
+    /// relay's `--max-reservations-per-peer` cap and triggering a
+    /// `ResourceLimitExceeded`-cascade that closes the relay connection
+    /// ~15s later. See issue #21.
+    pub(crate) circuit_listen_pending: bool,
+    /// `true` between calling `swarm.dial(relay_addr)` and the resulting
+    /// `ConnectionEstablished` / `OutgoingConnectionError` for the relay
+    /// peer. Used by [`EngineRunner::try_dial_relay`] to prevent
+    /// `NewListenAddr` from triggering N parallel dials to the same
+    /// relay (one per local interface that comes up before the first
+    /// dial completes — e.g. 3 QUIC binds, 3 redials, 3 connections,
+    /// 3 reservation requests). Cleared on the connection-established or
+    /// dial-failed event for the relay peer.
+    pub(crate) relay_dial_pending: bool,
 }
 
 impl EngineRunner {
@@ -518,6 +541,91 @@ impl EngineRunner {
         let _ = self.network_event_tx.send(event);
     }
 
+    /// Idempotently issue `swarm.listen_on(<relay>/p2p-circuit)` against the
+    /// configured relay. Skips the call when a previous request is still in
+    /// flight (`circuit_listen_pending`) or when we're already listening on a
+    /// circuit and `force_renewal` is false.
+    ///
+    /// `force_renewal = true` is the explicit 80%-of-`circuit_max_duration`
+    /// proactive renewal path — it bypasses the "already listening" short-
+    /// circuit so libp2p re-issues a reservation request to keep the entry
+    /// fresh on the relay.
+    ///
+    /// Without this dedup, every site that wants the engine to listen on a
+    /// circuit (eager on first relay-connect, retry-stuck-in-Connected,
+    /// listener-closed re-listen, proactive renewal) issues its own
+    /// `swarm.listen_on` and each one becomes a fresh reservation request to
+    /// the relay. That collides with libp2p's own internal renewal logic and
+    /// blows past the relay's `--max-reservations-per-peer` cap (stock 4)
+    /// within seconds; the resulting `ResourceLimitExceeded` cascade closes
+    /// the relay connection ~15s after pairing. See issue #21.
+    fn try_listen_on_circuit(&mut self, force_renewal: bool) {
+        let Some(ref relay_addr) = self.config.relay_server else {
+            return;
+        };
+        if self.circuit_listen_pending {
+            log::debug!("Skipping listen_on(circuit): a reservation request is already in flight");
+            return;
+        }
+        if !force_renewal && matches!(self.relay_state, RelayState::Listening { .. }) {
+            log::debug!(
+                "Skipping listen_on(circuit): already in Listening state (set force_renewal to refresh the reservation)"
+            );
+            return;
+        }
+        let circuit_addr = relay_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+        match self.swarm.listen_on(circuit_addr.clone()) {
+            Ok(_) => {
+                self.circuit_listen_pending = true;
+                log::info!(
+                    "Listening on relay circuit ({}): {circuit_addr}",
+                    if force_renewal { "renewal" } else { "initial" }
+                );
+            }
+            Err(e) => {
+                log::warn!("listen_on(circuit) failed: {e}");
+            }
+        }
+    }
+
+    /// Idempotently dial the configured relay server. Skips the call when a
+    /// previous dial is in flight (`relay_dial_pending`), when we already
+    /// have a connection (`Connected` / `Listening`), or when no relay is
+    /// configured.
+    ///
+    /// `NewListenAddr` fires once per local interface that comes up — on a
+    /// QUIC-only Android device that's typically ≥3 events (LAN, cellular,
+    /// loopback). Each one used to call `swarm.dial(relay_addr)` directly,
+    /// producing parallel connections to the same relay peer that
+    /// `max_established_per_peer = 1` then thrashes through. See issue #21.
+    fn try_dial_relay(&mut self) {
+        let Some(ref relay_addr) = self.config.relay_server.clone() else {
+            return;
+        };
+        if matches!(
+            self.relay_state,
+            RelayState::Connected { .. } | RelayState::Listening { .. }
+        ) {
+            log::debug!("Skipping relay dial: already connected/listening");
+            return;
+        }
+        if self.relay_dial_pending {
+            log::debug!("Skipping relay dial: a previous dial is still in flight");
+            return;
+        }
+        match self.swarm.dial(relay_addr.clone()) {
+            Ok(_) => {
+                self.relay_dial_pending = true;
+                log::info!("Dialing relay server: {relay_addr}");
+            }
+            Err(e) => {
+                log::warn!("Relay dial failed: {e}");
+            }
+        }
+    }
+
     /// Handle a new connection: relay handshake, rendezvous discovery,
     /// bootstrap peer tracking, or regular peer sync initiation.
     async fn handle_connection_established(
@@ -530,6 +638,9 @@ impl EngineRunner {
             && let Some(libp2p::multiaddr::Protocol::P2p(relay_peer_id)) = relay_addr.iter().last()
             && peer_id == relay_peer_id
         {
+            // Dial concluded — clear the in-flight guard so future
+            // reconnect paths (after a disconnect) can re-arm.
+            self.relay_dial_pending = false;
             self.handle_relay_peer_connected(peer_id, relay_addr.clone());
         }
 
@@ -569,11 +680,46 @@ impl EngineRunner {
     }
 
     /// Set up relay circuit, external address, rendezvous registration, NAT timer.
+    ///
+    /// libp2p sometimes opens additional connections to the same relay
+    /// peer-id after the first one — for example, the relay's AutoNAT v2
+    /// dial-back can hit our QUIC listener and produce a fresh
+    /// `ConnectionEstablished` event for the relay peer-id, even though
+    /// we already have a healthy connection and an active reservation.
+    /// This handler is the relay's "connected" entry point, so without an
+    /// idempotency guard each extra connection re-runs the full setup
+    /// (state reset to `Connected`, `try_listen_on_circuit`, external
+    /// address registration, rendezvous registration, push-token
+    /// re-register, presence re-announce) — and the listen_on triggers
+    /// libp2p's relay-client to issue a fresh reservation request that
+    /// the relay logs as another `ReservationReqAccepted` followed by a
+    /// burst of internal renewals on the new connection. See issue #21.
+    ///
+    /// Skip the setup when we already have a `Connected` / `Listening`
+    /// state for this same relay peer-id — the new connection is just an
+    /// extra channel, not a fresh attach.
     fn handle_relay_peer_connected(
         &mut self,
         peer_id: libp2p::PeerId,
         relay_addr: libp2p::Multiaddr,
     ) {
+        let already_attached = match &self.relay_state {
+            RelayState::Connected {
+                relay_peer_id: existing,
+                ..
+            }
+            | RelayState::Listening {
+                relay_peer_id: existing,
+            } => *existing == peer_id,
+            _ => false,
+        };
+        if already_attached {
+            log::debug!(
+                "ConnectionEstablished for relay {peer_id} ignored — state={:?} already attached, keeping existing reservation",
+                self.relay_state
+            );
+            return;
+        }
         log::info!("Connected to relay server {peer_id}");
         self.infrastructure_peers.insert(peer_id);
         self.circuit_retry_count = 0;
@@ -586,15 +732,11 @@ impl EngineRunner {
         ));
         self.update_network_status();
 
-        // Eagerly listen on relay circuit
-        let circuit_addr = relay_addr
-            .clone()
-            .with(libp2p::multiaddr::Protocol::P2pCircuit);
-        if let Err(e) = self.swarm.listen_on(circuit_addr.clone()) {
-            log::warn!("Failed to listen on relay circuit: {e}");
-        } else {
-            log::info!("Listening on relay circuit (eager): {circuit_addr}");
-        }
+        // Eagerly request a circuit-relay reservation. Idempotent so
+        // subsequent re-connects of the same relay (which fire this
+        // handler again per `max_established_per_peer = 1` selection) don't
+        // pile additional reservation requests onto an already-pending one.
+        self.try_listen_on_circuit(false);
 
         // Manually add circuit address as external
         let my_circuit_addr = relay_addr
@@ -703,6 +845,10 @@ impl EngineRunner {
         self.relay_state = RelayState::Connecting { retry_count: 0 };
         self.circuit_accepted_at = None;
         self.push_registered = false;
+        // The reservation died with the connection; clear both idempotency
+        // flags so the immediate reconnect path below can re-arm.
+        self.circuit_listen_pending = false;
+        self.relay_dial_pending = false;
         self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
             crate::network_status::RelayStatus::Connecting,
         ));
@@ -719,13 +865,10 @@ impl EngineRunner {
         }
         self.update_network_status();
 
-        // Attempt immediate reconnection
-        if let Some(ref relay_addr) = self.config.relay_server {
-            log::info!("Attempting immediate relay reconnection");
-            if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                log::warn!("Immediate relay redial failed: {e}");
-            }
-        }
+        // Attempt immediate reconnection (idempotent — won't pile dials on
+        // top of one another).
+        log::info!("Attempting immediate relay reconnection");
+        self.try_dial_relay();
     }
 
     async fn run(
@@ -763,18 +906,17 @@ impl EngineRunner {
             log::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
         }
 
-        // If a relay server is configured, dial it
-        if let Some(ref relay_addr) = self.config.relay_server.clone() {
-            if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                log::warn!("Failed to dial relay server {}: {}", relay_addr, e);
-            } else {
-                log::info!("Dialing relay server: {}", relay_addr);
-                self.relay_state = RelayState::Connecting { retry_count: 0 };
-                self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
-                    crate::network_status::RelayStatus::Connecting,
-                ));
-                self.update_network_status();
-            }
+        // If a relay server is configured, dial it. Set state to Connecting
+        // first so `try_dial_relay`'s "skip if already Connected/Listening"
+        // guard lets the initial dial through but blocks NewListenAddr-driven
+        // redials that would otherwise race with this one.
+        if self.config.relay_server.is_some() {
+            self.relay_state = RelayState::Connecting { retry_count: 0 };
+            self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
+                crate::network_status::RelayStatus::Connecting,
+            ));
+            self.update_network_status();
+            self.try_dial_relay();
         }
 
         // If a rendezvous server is configured, dial it (unless already dialing as relay)
@@ -936,14 +1078,7 @@ impl EngineRunner {
                     && matches!(self.relay_state, RelayState::Listening { .. }) => {
                     log::info!("Proactively renewing relay circuit (80% of max duration)");
                     self.circuit_accepted_at = None;
-                    if let Some(ref relay_addr) = self.config.relay_server {
-                        let circuit_addr = relay_addr
-                            .clone()
-                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                        if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                            log::warn!("Failed to renew relay circuit: {e}");
-                        }
-                    }
+                    self.try_listen_on_circuit(true);
                 },
                 Some(cmd) = self.cmd_rx.recv() => {
                     if self.handle_command(cmd).await {
@@ -1032,14 +1167,15 @@ impl EngineRunner {
                         self.rendezvous_register(rv_peer_id);
                     }
                 } else {
-                    // Non-circuit address (new network interface) — reconnect relay if needed
-                    if matches!(self.relay_state, RelayState::Connecting { .. })
-                        && let Some(ref relay_addr) = self.config.relay_server
-                    {
-                        log::info!("New listen address detected, attempting relay reconnection");
-                        if let Err(e) = self.swarm.dial(relay_addr.clone()) {
-                            log::warn!("Relay redial on new address failed: {e}");
-                        }
+                    // Non-circuit address (new network interface) — reconnect relay if
+                    // needed. `try_dial_relay` is idempotent, so the typical Android
+                    // pattern of 3 QUIC bind events firing back-to-back during
+                    // startup no longer produces 3 parallel relay connections.
+                    if matches!(self.relay_state, RelayState::Connecting { .. }) {
+                        log::debug!(
+                            "New listen address detected, redial relay if not already in flight"
+                        );
+                        self.try_dial_relay();
                     }
                 }
             }
@@ -1143,15 +1279,11 @@ impl EngineRunner {
                         ),
                     );
                     self.update_network_status();
-                    // Re-request immediately (don't wait for AutoNAT)
-                    if let Some(ref relay_addr) = self.config.relay_server {
-                        let circuit_addr = relay_addr
-                            .clone()
-                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                        if let Err(e) = self.swarm.listen_on(circuit_addr) {
-                            log::warn!("Failed to re-listen on relay circuit: {e}");
-                        }
-                    }
+                    // Re-request immediately (don't wait for AutoNAT). The
+                    // listener that just closed cleared circuit_listen_pending
+                    // already, so this issues a single fresh request.
+                    self.circuit_listen_pending = false;
+                    self.try_listen_on_circuit(false);
                 }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
@@ -1159,6 +1291,18 @@ impl EngineRunner {
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 log::warn!("Outgoing connection error to {peer_id:?}: {error}");
+                // If the failed dial was the relay, clear the in-flight guard
+                // so the next reconnect-tick (or NewListenAddr trigger) can
+                // re-arm. Without this, a single failed dial would lock out
+                // every future relay-dial attempt for the engine's lifetime.
+                if let Some(pid) = peer_id
+                    && let Some(ref relay_addr) = self.config.relay_server
+                    && let Some(libp2p::multiaddr::Protocol::P2p(relay_pid)) =
+                        relay_addr.iter().last()
+                    && pid == relay_pid
+                {
+                    self.relay_dial_pending = false;
+                }
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
                     if !self.swarm.is_connected(&pid) && self.peers.remove(&pid).is_some() {
