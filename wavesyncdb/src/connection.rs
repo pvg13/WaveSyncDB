@@ -61,42 +61,101 @@ pub(crate) struct ParsedWrite {
 
 /// Parse a SQL write statement to extract column names and values.
 ///
-/// For INSERT: pairs column list with VALUES list positionally.
-/// For UPDATE: parses `SET col = val` pairs.
-/// For DELETE: returns empty columns (tombstone handles it).
-pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<ParsedWrite> {
+/// Returns one [`ParsedWrite`] per row affected by the statement:
+/// * single-row `INSERT INTO t (a,b) VALUES (1,2)` → `Vec` of length 1.
+/// * multi-row `INSERT INTO t (a,b) VALUES (1,2),(3,4),(5,6)` → `Vec` of
+///   length 3, one per row, each with its own `primary_key` + columns.
+/// * `UPDATE` / `DELETE` → `Vec` of length 1 (those statements address a
+///   single row by `WHERE pk = …` in the writes wavesyncdb intercepts).
+///
+/// Returns `None` only when [`classify_write`] doesn't recognize the
+/// statement; an empty `Vec` is impossible (every recognized statement
+/// produces at least one parsed row, even if extraction yields empty
+/// columns) — callers may still observe a row whose `primary_key` is
+/// empty when the SQL omits the PK, and should skip it.
+///
+/// Multi-row INSERT is what SeaORM emits for `Entity::insert_many(...)`;
+/// pre-fix, the parser found the first `(` after `VALUES` and the last
+/// `)` in the statement, walked their content as one row, and silently
+/// dropped every subsequent row — see issue #2.
+pub(crate) fn parse_write_full(sql: &str, pk_column: &str) -> Option<Vec<ParsedWrite>> {
     let (kind, _table) = classify_write(sql)?;
 
     match kind {
-        WriteKind::Insert => {
-            let primary_key = extract_pk_from_insert(sql, pk_column);
-            let columns = extract_column_values_insert(sql);
-            Some(ParsedWrite {
-                primary_key,
-                columns,
-            })
-        }
+        WriteKind::Insert => Some(parse_insert_rows(sql, pk_column)),
         WriteKind::Update => {
             let primary_key = extract_pk_from_where(sql, pk_column);
             let columns = extract_column_values_update(sql);
-            Some(ParsedWrite {
+            Some(vec![ParsedWrite {
                 primary_key,
                 columns,
-            })
+            }])
         }
         WriteKind::Delete => {
             let primary_key = extract_pk_from_where(sql, pk_column);
-            Some(ParsedWrite {
+            Some(vec![ParsedWrite {
                 primary_key,
                 columns: vec![],
-            })
+            }])
         }
     }
 }
 
-/// Extract column-value pairs from an INSERT statement.
-fn extract_column_values_insert(sql: &str) -> Vec<(String, serde_json::Value)> {
-    // Find column list between first ( and )
+/// Extract one [`ParsedWrite`] per row in an `INSERT … VALUES (…), (…), …`
+/// statement.
+///
+/// The column list is parsed once and zipped against each row's values
+/// independently. The PK position within the column list is computed
+/// once and used to pull the per-row PK out of each row's values.
+///
+/// Multi-row support is what closes #2: SeaORM's `insert_many` emits a
+/// single `INSERT ... VALUES (...), (...), (...)` statement, which the
+/// older parser flattened into one `ParsedWrite` containing only the
+/// first row's data. All other rows were silently never synced.
+fn parse_insert_rows(sql: &str, pk_column: &str) -> Vec<ParsedWrite> {
+    let columns = extract_insert_column_list(sql);
+    if columns.is_empty() {
+        return vec![ParsedWrite {
+            primary_key: String::new(),
+            columns: vec![],
+        }];
+    }
+    let pk_idx = columns.iter().position(|c| c == pk_column);
+
+    let rows = extract_insert_value_rows(sql);
+    if rows.is_empty() {
+        // Couldn't find any `(…)` row group after `VALUES`. Surface a single
+        // empty parse so the caller's "primary_key is empty → skip" guard
+        // takes over uniformly with the pre-fix behavior.
+        return vec![ParsedWrite {
+            primary_key: String::new(),
+            columns: vec![],
+        }];
+    }
+
+    rows.into_iter()
+        .map(|row| {
+            let values = split_sql_values(row);
+            let primary_key = pk_idx
+                .and_then(|i| values.get(i))
+                .map(|v| v.trim().trim_matches('\'').to_string())
+                .unwrap_or_default();
+            let columns_pairs: Vec<(String, serde_json::Value)> = columns
+                .iter()
+                .zip(values.iter())
+                .map(|(col, val)| (col.clone(), sql_value_to_json(val.trim())))
+                .collect();
+            ParsedWrite {
+                primary_key,
+                columns: columns_pairs,
+            }
+        })
+        .collect()
+}
+
+/// Parse the `(col, col, …)` column list immediately after the table name
+/// in an INSERT. Strips SeaORM's double-quotes and MySQL-style backticks.
+fn extract_insert_column_list(sql: &str) -> Vec<String> {
     let col_start = match sql.find('(') {
         Some(i) => i + 1,
         None => return vec![],
@@ -105,37 +164,85 @@ fn extract_column_values_insert(sql: &str) -> Vec<(String, serde_json::Value)> {
         Some(i) => col_start + i,
         None => return vec![],
     };
-    let columns: Vec<String> = sql[col_start..col_end]
+    sql[col_start..col_end]
         .split(',')
         .map(|c| c.trim().trim_matches('"').trim_matches('`').to_string())
-        .collect();
+        .collect()
+}
 
-    // Find VALUES list
+/// Iterate the parenthesized row groups inside the `VALUES` clause of an
+/// INSERT. Returns one slice per row, each pointing at the content
+/// between the row's own `(` and `)`.
+///
+/// Walks character-by-character so it can:
+/// * respect single-quoted strings (which may contain `,`, `(`, or `)`).
+/// * track parenthesis depth so a row whose value list contains a
+///   parenthesized expression (e.g. `('a', json_array(1, 2))`) doesn't
+///   trick us into ending the row early.
+/// * stop cleanly at trailing clauses like `RETURNING …` or
+///   `ON CONFLICT …` once we're past the last row's closing `)`.
+fn extract_insert_value_rows(sql: &str) -> Vec<&str> {
     let upper = sql.to_uppercase();
     let values_pos = match upper.find("VALUES") {
-        Some(i) => i,
+        Some(i) => i + "VALUES".len(),
         None => return vec![],
     };
-    let val_start = match sql[values_pos..].find('(') {
-        Some(i) => values_pos + i + 1,
-        None => return vec![],
-    };
-    let val_end = match sql[val_start..].rfind(')') {
-        Some(i) => val_start + i,
-        None => return vec![],
-    };
+    let after_values = &sql[values_pos..];
+    let bytes = after_values.as_bytes();
 
-    let values = split_sql_values(&sql[val_start..val_end]);
+    let mut rows: Vec<&str> = Vec::new();
+    let mut in_quote = false;
+    let mut depth: u32 = 0;
+    let mut row_start: Option<usize> = None;
 
-    columns
-        .into_iter()
-        .zip(values)
-        .map(|(col, val)| {
-            let val = val.trim();
-            let json_val = sql_value_to_json(val);
-            (col, json_val)
-        })
-        .collect()
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => {
+                // SQL escapes a single quote inside a string by doubling
+                // it (`'it''s'`), so toggle membership only when we're
+                // not looking at the second quote of an escape pair.
+                if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_quote = !in_quote;
+            }
+            b'(' if !in_quote => {
+                if depth == 0 {
+                    row_start = Some(i + 1);
+                }
+                depth += 1;
+            }
+            b')' if !in_quote => {
+                if depth == 0 {
+                    // Mismatched `)` outside any row — stop, return what
+                    // we have.
+                    break;
+                }
+                depth -= 1;
+                if depth == 0
+                    && let Some(start) = row_start.take()
+                {
+                    rows.push(&after_values[start..i]);
+                }
+            }
+            _ if !in_quote && depth == 0 => {
+                // At depth 0 between rows, only whitespace and `,` are
+                // legal. Anything else (a letter, semicolon, etc.) is a
+                // trailing clause like `RETURNING` or `ON CONFLICT` —
+                // stop scanning so we don't try to parse it as a row.
+                if !b.is_ascii_whitespace() && b != b',' {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    rows
 }
 
 /// Extract column-value pairs from an UPDATE SET clause.
@@ -557,7 +664,7 @@ impl WaveSyncDb {
             return Ok(());
         };
 
-        let parsed = match parse_write_full(resolved_sql, &pk_col) {
+        let parsed_rows = match parse_write_full(resolved_sql, &pk_col) {
             Some(p) => p,
             None => {
                 let truncated: String = resolved_sql.chars().take(200).collect();
@@ -570,34 +677,46 @@ impl WaveSyncDb {
             }
         };
 
-        if parsed.primary_key.is_empty() {
+        // Drop rows whose primary_key didn't parse out (SQL omitted the PK
+        // column, or extraction hit a malformed group). Multi-row inserts
+        // with one bad row continue to sync the rest.
+        let parsed_rows: Vec<_> = parsed_rows
+            .into_iter()
+            .filter(|p| !p.primary_key.is_empty())
+            .collect();
+        if parsed_rows.is_empty() {
             return Ok(());
         }
 
-        // Send change notification IMMEDIATELY — data is already committed.
-        // This ensures the notification is sent on the caller's runtime (Dioxus),
-        // not from a tokio::spawn which can't reliably wake the Dioxus event loop on mobile.
-        let column_values = if matches!(kind, WriteKind::Delete) {
-            None
-        } else {
-            Some(
-                parsed
-                    .columns
-                    .iter()
-                    .map(|(col, val)| (crate::ColumnName(col.clone()), val.clone()))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let changed_columns = column_values
-            .as_ref()
-            .map(|cv| cv.iter().map(|(c, _)| c.0.clone()).collect());
-        let _ = self.inner.change_tx.send(ChangeNotification {
-            table: table.to_string().into(),
-            kind: kind.clone(),
-            primary_key: parsed.primary_key.clone().into(),
-            changed_columns,
-            column_values,
-        });
+        // Send one change notification per row IMMEDIATELY — user-table data
+        // is already committed by the time the interceptor sees the SQL, so
+        // subscribers re-querying are guaranteed to see the new state. We
+        // emit per-row so reactive hooks (`use_synced_table`) wake exactly
+        // once per affected primary key, matching the single-row insert
+        // semantics consumers already build against.
+        for parsed in &parsed_rows {
+            let column_values = if matches!(kind, WriteKind::Delete) {
+                None
+            } else {
+                Some(
+                    parsed
+                        .columns
+                        .iter()
+                        .map(|(col, val)| (crate::ColumnName(col.clone()), val.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let changed_columns = column_values
+                .as_ref()
+                .map(|cv| cv.iter().map(|(c, _)| c.0.clone()).collect());
+            let _ = self.inner.change_tx.send(ChangeNotification {
+                table: table.to_string().into(),
+                kind: kind.clone(),
+                primary_key: parsed.primary_key.clone().into(),
+                changed_columns,
+                column_values,
+            });
+        }
 
         let site_id = self.inner.site_id;
         let inner = &self.inner.inner;
@@ -608,6 +727,10 @@ impl WaveSyncDb {
         // UPDATE) race on the shadow read step and produce incorrect
         // col_versions. The whole bookkeeping runs in one SQLite transaction
         // so every shadow write commits with a single fsync.
+        //
+        // Multi-row INSERT (SeaORM `insert_many`) is one logical operation
+        // → one db_version increment shared by every row. Receivers apply
+        // them as a single changeset.
         let mut ver = self.inner.db_version.lock().await;
         *ver += 1;
         let new_db_version = *ver;
@@ -630,95 +753,97 @@ impl WaveSyncDb {
 
         let mut changes = Vec::new();
 
-        match kind {
-            WriteKind::Delete => {
-                // Find max col_version for this row and create tombstone.
-                let entries = crate::shadow::get_clock_entries_for_row(
-                    &txn,
-                    table_owned,
-                    &parsed.primary_key,
-                )
-                .await
-                .unwrap_or_default();
+        for parsed in &parsed_rows {
+            match kind {
+                WriteKind::Delete => {
+                    // Find max col_version for this row and create tombstone.
+                    let entries = crate::shadow::get_clock_entries_for_row(
+                        &txn,
+                        table_owned,
+                        &parsed.primary_key,
+                    )
+                    .await
+                    .unwrap_or_default();
 
-                let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
-                let tombstone_cv = max_cv + 1;
+                    let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
+                    let tombstone_cv = max_cv + 1;
 
-                if let Err(e) = crate::shadow::insert_tombstone(
-                    &txn,
-                    table_owned,
-                    &parsed.primary_key,
-                    tombstone_cv,
-                    new_db_version,
-                    &site_id,
-                )
-                .await
-                {
-                    log::error!("Failed to insert tombstone: {e}");
-                }
-
-                changes.push(ColumnChange {
-                    table: table_owned.into(),
-                    pk: parsed.primary_key.clone().into(),
-                    cid: "__deleted".into(),
-                    val: None,
-                    site_id,
-                    col_version: tombstone_cv,
-                    cl: tombstone_cv,
-                    seq: 0,
-                    db_version: new_db_version,
-                });
-            }
-            WriteKind::Insert | WriteKind::Update => {
-                // Clear any tombstone for this row (it's alive again),
-                // but preserve per-column clock entries so col_versions
-                // continue from their previous values.
-                let _ =
-                    crate::shadow::clear_tombstone(&txn, table_owned, &parsed.primary_key).await;
-
-                // Single batched upsert across every changed column.
-                // SQLite's ON CONFLICT DO UPDATE … RETURNING gives us
-                // the resolved col_version per cid in one round trip,
-                // replacing what used to be N reads + N writes.
-                let batch_input: Vec<(String, u32)> = parsed
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(seq, (col, _))| (col.clone(), seq as u32))
-                    .collect();
-                let resolved = match crate::shadow::upsert_clock_entries_batch(
-                    &txn,
-                    table_owned,
-                    &parsed.primary_key,
-                    &batch_input,
-                    new_db_version,
-                    &site_id,
-                )
-                .await
-                {
-                    Ok(map) => map,
-                    Err(e) => {
-                        log::error!("Failed to batch-upsert clock entries: {e}");
-                        *ver -= 1;
-                        let _ = txn.rollback().await;
-                        return Err(e);
+                    if let Err(e) = crate::shadow::insert_tombstone(
+                        &txn,
+                        table_owned,
+                        &parsed.primary_key,
+                        tombstone_cv,
+                        new_db_version,
+                        &site_id,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to insert tombstone: {e}");
                     }
-                };
-
-                for (seq, (col, val)) in parsed.columns.iter().enumerate() {
-                    let new_cv = resolved.get(col).copied().unwrap_or(1);
 
                     changes.push(ColumnChange {
                         table: table_owned.into(),
                         pk: parsed.primary_key.clone().into(),
-                        cid: col.clone().into(),
-                        val: Some(val.clone()),
+                        cid: "__deleted".into(),
+                        val: None,
                         site_id,
-                        col_version: new_cv,
-                        cl: new_cv,
-                        seq: seq as u32,
+                        col_version: tombstone_cv,
+                        cl: tombstone_cv,
+                        seq: 0,
                         db_version: new_db_version,
                     });
+                }
+                WriteKind::Insert | WriteKind::Update => {
+                    // Clear any tombstone for this row (it's alive again),
+                    // but preserve per-column clock entries so col_versions
+                    // continue from their previous values.
+                    let _ = crate::shadow::clear_tombstone(&txn, table_owned, &parsed.primary_key)
+                        .await;
+
+                    // Single batched upsert across every changed column.
+                    // SQLite's ON CONFLICT DO UPDATE … RETURNING gives us
+                    // the resolved col_version per cid in one round trip,
+                    // replacing what used to be N reads + N writes.
+                    let batch_input: Vec<(String, u32)> = parsed
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(seq, (col, _))| (col.clone(), seq as u32))
+                        .collect();
+                    let resolved = match crate::shadow::upsert_clock_entries_batch(
+                        &txn,
+                        table_owned,
+                        &parsed.primary_key,
+                        &batch_input,
+                        new_db_version,
+                        &site_id,
+                    )
+                    .await
+                    {
+                        Ok(map) => map,
+                        Err(e) => {
+                            log::error!("Failed to batch-upsert clock entries: {e}");
+                            *ver -= 1;
+                            let _ = txn.rollback().await;
+                            return Err(e);
+                        }
+                    };
+
+                    for (seq, (col, val)) in parsed.columns.iter().enumerate() {
+                        let new_cv = resolved.get(col).copied().unwrap_or(1);
+
+                        changes.push(ColumnChange {
+                            table: table_owned.into(),
+                            pk: parsed.primary_key.clone().into(),
+                            cid: col.clone().into(),
+                            val: Some(val.clone()),
+                            site_id,
+                            col_version: new_cv,
+                            cl: new_cv,
+                            seq: seq as u32,
+                            db_version: new_db_version,
+                        });
+                    }
                 }
             }
         }
@@ -747,47 +872,6 @@ impl WaveSyncDb {
 
         Ok(())
     }
-}
-
-/// Extract the primary key value from an INSERT statement.
-fn extract_pk_from_insert(sql: &str, pk_column: &str) -> String {
-    let col_start = match sql.find('(') {
-        Some(i) => i + 1,
-        None => return String::new(),
-    };
-    let col_end = match sql[col_start..].find(')') {
-        Some(i) => col_start + i,
-        None => return String::new(),
-    };
-    let columns: Vec<&str> = sql[col_start..col_end]
-        .split(',')
-        .map(|c| c.trim().trim_matches('"').trim_matches('`'))
-        .collect();
-
-    let pk_idx = match columns.iter().position(|c| *c == pk_column) {
-        Some(i) => i,
-        None => return String::new(),
-    };
-
-    let upper = sql.to_uppercase();
-    let values_pos = match upper.find("VALUES") {
-        Some(i) => i,
-        None => return String::new(),
-    };
-    let val_start = match sql[values_pos..].find('(') {
-        Some(i) => values_pos + i + 1,
-        None => return String::new(),
-    };
-    let val_end = match sql[val_start..].rfind(')') {
-        Some(i) => val_start + i,
-        None => return String::new(),
-    };
-
-    let values = split_sql_values(&sql[val_start..val_end]);
-    values
-        .get(pk_idx)
-        .map(|v| v.trim().trim_matches('\'').to_string())
-        .unwrap_or_default()
 }
 
 fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
@@ -1728,7 +1812,9 @@ mod tests {
         let (kind, table) = classify_write(sql).unwrap();
         assert_eq!(kind, WriteKind::Insert);
         assert_eq!(table, "tasks");
-        let parsed = parse_write_full(sql, "id").unwrap();
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = &rows[0];
         assert_eq!(parsed.primary_key, "abc");
         assert_eq!(parsed.columns.len(), 3);
         assert_eq!(parsed.columns[0].0, "id");
@@ -1745,7 +1831,9 @@ mod tests {
         let (kind, table) = classify_write(sql).unwrap();
         assert_eq!(kind, WriteKind::Update);
         assert_eq!(table, "tasks");
-        let parsed = parse_write_full(sql, "id").unwrap();
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = &rows[0];
         assert_eq!(parsed.primary_key, "abc");
         assert_eq!(parsed.columns.len(), 2);
         assert_eq!(parsed.columns[0].0, "title");
@@ -1760,9 +1848,10 @@ mod tests {
         let (kind, table) = classify_write(sql).unwrap();
         assert_eq!(kind, WriteKind::Delete);
         assert_eq!(table, "tasks");
-        let parsed = parse_write_full(sql, "id").unwrap();
-        assert_eq!(parsed.primary_key, "abc");
-        assert!(parsed.columns.is_empty());
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].primary_key, "abc");
+        assert!(rows[0].columns.is_empty());
     }
 
     #[test]
@@ -1793,9 +1882,13 @@ mod tests {
 
     #[test]
     fn test_extract_pk_from_insert() {
+        // The dedicated `extract_pk_from_insert` helper was removed in #2 in
+        // favor of `parse_insert_rows` (multi-row aware). The single-row PK
+        // contract is now exercised through `parse_write_full`.
         let sql = r#"INSERT INTO "tasks" ("id", "name") VALUES ('abc-123', 'my task')"#;
-        let pk = extract_pk_from_insert(sql, "id");
-        assert_eq!(pk, "abc-123");
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].primary_key, "abc-123");
     }
 
     #[test]
@@ -1848,16 +1941,20 @@ mod tests {
 
     #[test]
     fn test_extract_pk_insert_no_parens() {
+        // Malformed SQL with no `(` after the table — parse should still
+        // produce a row but with an empty PK so `dispatch_sync` skips it.
         let sql = "INSERT INTO tasks";
-        let pk = extract_pk_from_insert(sql, "id");
-        assert_eq!(pk, "");
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].primary_key, "");
     }
 
     #[test]
     fn test_extract_pk_insert_no_values() {
         let sql = r#"INSERT INTO "tasks" ("id")"#;
-        let pk = extract_pk_from_insert(sql, "id");
-        assert_eq!(pk, "");
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].primary_key, "");
     }
 
     #[test]
@@ -1908,13 +2005,81 @@ mod tests {
 
     // --- Bug regression tests ---
 
-    /// H3: multi-row INSERT — extract_pk_from_insert only returns first PK
+    /// H3 (issue #2): multi-row INSERT must produce one ParsedWrite per row.
+    /// Pre-fix, every row beyond the first was silently dropped — only the
+    /// first row's PK and values made it into the changeset, so a SeaORM
+    /// `insert_many(...)` would partially sync.
     #[test]
-    fn test_h3_multi_row_insert_first_pk_only() {
-        let sql = r#"INSERT INTO "tasks" ("id", "title") VALUES ('a', 'x'), ('b', 'y')"#;
-        let pk = extract_pk_from_insert(sql, "id");
-        // Documents H3 bug: only first row's PK is returned
-        assert_eq!(pk, "a", "H3: only first PK extracted from multi-row INSERT");
+    fn test_h3_multi_row_insert_all_rows_extracted() {
+        let sql =
+            r#"INSERT INTO "tasks" ("id", "title") VALUES ('a', 'x'), ('b', 'y'), ('c', 'z')"#;
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 3, "all three rows must be extracted");
+
+        assert_eq!(rows[0].primary_key, "a");
+        assert_eq!(rows[0].columns[0].1, serde_json::json!("a"));
+        assert_eq!(rows[0].columns[1].1, serde_json::json!("x"));
+
+        assert_eq!(rows[1].primary_key, "b");
+        assert_eq!(rows[1].columns[0].1, serde_json::json!("b"));
+        assert_eq!(rows[1].columns[1].1, serde_json::json!("y"));
+
+        assert_eq!(rows[2].primary_key, "c");
+        assert_eq!(rows[2].columns[0].1, serde_json::json!("c"));
+        assert_eq!(rows[2].columns[1].1, serde_json::json!("z"));
+    }
+
+    /// Multi-row INSERT where a value contains parentheses (e.g. a JSON
+    /// blob, or a function call like `json_array(1, 2)`). The row-splitter
+    /// must track parenthesis depth so the inner `)` doesn't end the row
+    /// early.
+    #[test]
+    fn test_multi_row_insert_value_with_parens() {
+        let sql = r#"INSERT INTO "t" ("id", "v") VALUES ('a', 'foo (bar) baz'), ('b', 'plain')"#;
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].primary_key, "a");
+        assert_eq!(rows[0].columns[1].1, serde_json::json!("foo (bar) baz"));
+        assert_eq!(rows[1].primary_key, "b");
+        assert_eq!(rows[1].columns[1].1, serde_json::json!("plain"));
+    }
+
+    /// Multi-row INSERT where a value contains a comma inside a quoted
+    /// string. The `split_sql_values` helper handles quoted commas, but
+    /// the row-splitter must also treat the row's content as opaque.
+    #[test]
+    fn test_multi_row_insert_value_with_comma_in_string() {
+        let sql =
+            r#"INSERT INTO "t" ("id", "title") VALUES ('a', 'hello, world'), ('b', 'no comma')"#;
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].primary_key, "a");
+        assert_eq!(rows[0].columns[1].1, serde_json::json!("hello, world"));
+        assert_eq!(rows[1].primary_key, "b");
+        assert_eq!(rows[1].columns[1].1, serde_json::json!("no comma"));
+    }
+
+    /// Multi-row INSERT followed by `RETURNING id` (SeaORM emits this for
+    /// inserts that use auto-generated columns). The row-splitter must
+    /// stop at the `RETURNING` keyword and not try to parse it as another
+    /// row.
+    #[test]
+    fn test_multi_row_insert_with_returning_clause() {
+        let sql = r#"INSERT INTO "t" ("id", "title") VALUES ('a', 'x'), ('b', 'y') RETURNING "id""#;
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].primary_key, "a");
+        assert_eq!(rows[1].primary_key, "b");
+    }
+
+    /// Single-row INSERT must still produce exactly one ParsedWrite — the
+    /// fix shouldn't change behavior for the common case.
+    #[test]
+    fn test_single_row_insert_returns_one_row() {
+        let sql = r#"INSERT INTO "tasks" ("id", "title") VALUES ('only', 'row')"#;
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].primary_key, "only");
     }
 
     /// H5: PK with spaces is truncated by extract_pk_from_where
@@ -1947,7 +2112,9 @@ mod tests {
     #[test]
     fn test_m12_unicode_set_clause() {
         let sql = r#"UPDATE "tasks" SET "title" = 'café' WHERE "id" = 'pk1'"#;
-        let parsed = parse_write_full(sql, "id").unwrap();
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = &rows[0];
         assert_eq!(parsed.columns.len(), 1);
         assert_eq!(parsed.columns[0].0, "title");
         assert_eq!(parsed.columns[0].1, serde_json::json!("café"));
@@ -1957,7 +2124,9 @@ mod tests {
     #[test]
     fn test_m5_escaped_quotes_edge() {
         let sql = r#"INSERT INTO "tasks" ("id", "title", "completed") VALUES ('pk1', 'it''s', 0)"#;
-        let parsed = parse_write_full(sql, "id").unwrap();
+        let rows = parse_write_full(sql, "id").unwrap();
+        assert_eq!(rows.len(), 1);
+        let parsed = &rows[0];
         // The split_sql_values should handle the escaped quote
         assert_eq!(parsed.primary_key, "pk1");
         assert_eq!(parsed.columns[1].0, "title");
