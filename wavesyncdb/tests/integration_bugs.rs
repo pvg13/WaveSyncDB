@@ -9,7 +9,16 @@ use common::task;
 use common::{assert_eventually, make_peer, mem_db};
 
 // ---------------------------------------------------------------------------
-// H3 regression: multi-row INSERT only syncs first PK
+// H3 / issue #2 regression: multi-row INSERT must produce one
+// `ChangeNotification` *and* one shadow-table row set per data row, not
+// just the first one.
+//
+// Pre-fix, `parse_write_full` extracted everything between the first `(`
+// and the last `)` after `VALUES` and treated it as a single row, so
+// every row past the first was silently dropped from the changeset that
+// went on the sync wire. The `change_rx` notification stream and the
+// `_wavesync_<table>_clock` shadow table are the two surfaces a
+// downstream consumer relies on, so we verify both.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_h3_multi_row_insert_sync() {
@@ -21,7 +30,6 @@ async fn test_h3_multi_row_insert_sync() {
 
     let mut rx = db.change_rx();
 
-    // Multi-row INSERT
     db.execute_unprepared(
         "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES ('a', 'Task A', 0), ('b', 'Task B', 1)",
     )
@@ -30,22 +38,86 @@ async fn test_h3_multi_row_insert_sync() {
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Collect all notifications
     let mut notifications = Vec::new();
     while let Ok(n) = rx.try_recv() {
         notifications.push(n);
     }
 
-    // H3 bug: currently only the first PK is captured.
-    // This test documents that behavior — when fixed, it should produce 2 notifications.
-    assert!(
-        !notifications.is_empty(),
-        "Should get at least one notification for multi-row INSERT"
-    );
+    // Both rows must produce a notification — pre-fix only one fired.
+    let mut pks: Vec<String> = notifications
+        .iter()
+        .map(|n| n.primary_key.0.clone())
+        .collect();
+    pks.sort();
+    assert_eq!(pks, vec!["a".to_string(), "b".to_string()]);
 
-    // Verify both rows exist in the table
+    // Both rows must land in the user-facing table (this was always true
+    // — wavesyncdb intercepts the SQL but doesn't change semantics).
     let all = task::Entity::find().all(&db).await.unwrap();
-    assert_eq!(all.len(), 2, "Both rows should be inserted");
+    assert_eq!(all.len(), 2);
+
+    // Both rows must land in the shadow table — that's what proves the
+    // CRDT bookkeeping ran for every row, and what makes sync work
+    // end-to-end. Pre-fix the shadow table only had row 'a'.
+    #[derive(FromQueryResult)]
+    struct PkRow {
+        pk: String,
+    }
+    let shadow_pks: Vec<String> = PkRow::find_by_statement(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT DISTINCT pk FROM _wavesync_tasks_clock ORDER BY pk".to_string(),
+    ))
+    .all(&db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| r.pk)
+    .collect();
+    assert_eq!(shadow_pks, vec!["a".to_string(), "b".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #2 acceptance: SeaORM's `Entity::insert_many(...)` is the
+// caller-facing API that produces multi-row VALUES. Verifies the parse
+// fix in `connection.rs` covers the exact SQL SeaORM's SQLite backend
+// emits, and that *every* row reaches a remote peer over the CRDT/sync
+// path.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_seaorm_insert_many_syncs_all_rows() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-insert-many-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let alice = make_peer(&mem_db("im_alice"), &topic, 231).await;
+    let bob = make_peer(&mem_db("im_bob"), &topic, 232).await;
+
+    // Three rows. Pre-fix, `parse_write_full` would have flattened them
+    // into one ParsedWrite via `find('(')..rfind(')')`, so only the
+    // first row's PK and values made it onto the wire — Bob would see
+    // 1 row, not 3.
+    let titles: Vec<String> = vec!["alpha".into(), "beta".into(), "gamma".into()];
+    let rows: Vec<task::ActiveModel> = titles
+        .iter()
+        .map(|t| task::ActiveModel {
+            id: Set(Uuid::new_v4().to_string()),
+            title: Set(t.clone()),
+            completed: Set(false),
+        })
+        .collect();
+
+    task::Entity::insert_many(rows).exec(&alice).await.unwrap();
+
+    // All three rows propagate to Bob.
+    assert_eventually("B has all 3 inserted tasks", timeout, || async {
+        let on_bob = task::Entity::find().all(&bob).await.unwrap_or_default();
+        let mut got: Vec<String> = on_bob.into_iter().map(|t| t.title).collect();
+        got.sort();
+        let mut expected = titles.clone();
+        expected.sort();
+        got == expected
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------
