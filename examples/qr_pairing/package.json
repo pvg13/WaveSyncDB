@@ -1,0 +1,16 @@
+{
+  "name": "qr_pairing",
+  "version": "1.0.0",
+  "description": "Single Cargo crate, two binaries:",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "puppeteer-core": "^24.42.0"
+  }
+}

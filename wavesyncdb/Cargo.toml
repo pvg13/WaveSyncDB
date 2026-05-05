@@ -7,23 +7,61 @@ description = "WaveSyncDB is a lightweight, distributed database synchronization
 repository = "https://github.com/pvg13/WaveSyncDB"
 readme = "README.md"
 
+# Dependencies that work on every target (including wasm32-unknown-unknown).
+# Anything that pulls in OS sockets, native sqlite, or full tokio belongs in
+# the `[target.'cfg(not(target_arch = "wasm32"))']` block below.
 [dependencies]
-sea-orm = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
-libp2p = { workspace = true }
-libp2p-swarm-derive = "0.35.1"
-async-trait = "0.1"
 futures = "0.3"
 log = { workspace = true }
 thiserror = { workspace = true }
 serde_json = "1.0"
-uuid = { workspace = true }
 inventory = { workspace = true }
 blake3 = "1"
+async-trait = "0.1"
 wavesyncdb_derive = { path = "../wavesyncdb_derive", optional = true }
 dioxus = { version = "0.7.6", optional = true }
 manganis = { version = "0.7.6", optional = true }
+
+# Native targets: full sync engine, libp2p transports, sea-orm with sqlx-sqlite,
+# tokio with the OS-I/O surface. None of these compile on wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sea-orm = { workspace = true }
+tokio = { workspace = true }
+libp2p = { workspace = true }
+libp2p-swarm-derive = "0.35.1"
+uuid = { workspace = true }
+
+# Wasm32 (browser): no sqlx, no tokio I/O. Provide a minimal wasm-friendly
+# tokio for `sync` primitives only, uuid with `js` for browser entropy, and
+# a libp2p subset that uses WebSocket-websys as the only transport — the
+# only browser-native libp2p transport with mature support and no
+# certificate-pinning friction. WebTransport/WebRTC could be added later.
+#
+# sea-orm is intentionally absent (libsqlite3-sys is a C dep). Browser
+# storage (IndexedDB-backed shadow tables) is a future opt-in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.47", default-features = false, features = ["sync", "macros"] }
+uuid = { version = "1", features = ["v4", "js"] }
+libp2p = { version = "0.56.0", default-features = false, features = ["websocket-websys", "request-response", "noise", "yamux", "ping", "identify", "serde", "wasm-bindgen", "macros", "relay"] }
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+getrandom = { version = "0.2", features = ["js"] }
+# getrandom 0.3 is pulled in transitively via libp2p → yamux → rand 0.9;
+# enabling its `wasm_js` feature here ensures the browser-entropy backend
+# is selected. The companion `getrandom_backend="wasm_js"` rustflag lives
+# in `.cargo/config.toml`.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# Browser-side persistent storage for identity + shadow tables + db_version.
+# `idb` is a thin async wrapper over the IndexedDB Web API; without it,
+# raw web-sys IDB is event-callback-driven and would require ~200 lines of
+# oneshot-channel plumbing to interact with as `async`. Persistence is
+# what lets a reloaded tab keep its peer identity and conflict-resolution
+# state instead of looking like a fresh peer to the network.
+idb = "0.6"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
@@ -62,3 +100,11 @@ dioxus = ["derive", "dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "de
 # inside the crate is additionally gated by `#[cfg(target_os = "...")]`.
 push-sync = ["mobile-ffi", "dep:manganis", "dep:android_logger"]
 mobile-ffi = []
+# Browser/wasm32 build. Exposes pure-data modules (messages, conflict, auth,
+# protocol types, registry, network_status) so they can be linked from
+# Dioxus web apps. The libp2p-backed sync engine, sea-orm connection wrapper,
+# shadow tables, peer tracker, push helpers, and FFI surface are
+# `cfg(not(target_arch = "wasm32"))`-gated and unavailable in browser builds.
+# Browser-side P2P transports (WebSocket / WebRTC / WebTransport) are a
+# separate, future opt-in.
+web = []

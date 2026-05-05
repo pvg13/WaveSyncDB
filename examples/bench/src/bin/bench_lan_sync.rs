@@ -78,9 +78,8 @@ async fn main() {
     let mut sorted = samples_us.clone();
     let p99 = percentile(&mut sorted, 99.0) as f64 / 1000.0;
     let max = samples_us.iter().copied().max().unwrap_or(0) as f64 / 1000.0;
-    let mean: f64 = samples_us.iter().map(|v| *v as f64).sum::<f64>()
-        / samples_us.len() as f64
-        / 1000.0;
+    let mean: f64 =
+        samples_us.iter().map(|v| *v as f64).sum::<f64>() / samples_us.len() as f64 / 1000.0;
 
     println!(
         "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10}",

@@ -391,11 +391,20 @@ impl EngineRunner {
             })
             .collect();
 
+        // Walk each multiaddr forward and keep the **last** `/p2p/<id>` —
+        // for a circuit-relay address (`/.../p2p/<relay>/p2p-circuit/p2p/<dest>`)
+        // the first /p2p/ is the relay, the last is the actual destination.
+        // Picking the first means every circuit address is mis-attributed
+        // to the relay we're already connected to, and the dial is
+        // silently dropped by the "already connected" guard below.
         let peer_id = addrs.iter().find_map(|a| {
-            a.iter().find_map(|p| match p {
-                libp2p::multiaddr::Protocol::P2p(pid) => Some(pid),
-                _ => None,
-            })
+            let mut last = None;
+            for p in a.iter() {
+                if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                    last = Some(pid);
+                }
+            }
+            last
         });
         let Some(peer_id) = peer_id else {
             log::warn!("Relay introduced peer with no /p2p/ suffix on any address");

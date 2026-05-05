@@ -181,11 +181,7 @@ async fn fire_notifications(
                 // upstream API. Token is truncated to first 20 chars to avoid
                 // dumping full credentials into log aggregators.
                 let short = token_entry.token.chars().take(20).collect::<String>();
-                log::info!(
-                    "Push sent ({}) to token={}...",
-                    token_entry.platform,
-                    short
-                );
+                log::info!("Push sent ({}) to token={}...", token_entry.platform, short);
             }
             PushResult::TokenInvalid => {
                 log::info!(

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+#[cfg(not(target_arch = "wasm32"))]
 use sea_orm::DatabaseBackend;
 
 use crate::messages::DeletePolicy;
@@ -31,6 +32,11 @@ pub struct TableMeta {
 /// global [`inventory`] collection. [`WaveSyncDb::get_schema_registry`](crate::WaveSyncDb::get_schema_registry)
 /// iterates them to auto-discover entities whose `module_path` matches the
 /// given prefix.
+///
+/// Native-only: the `schema_fn` signature is typed against `sea_orm::DatabaseBackend`,
+/// and `sea-orm` is not available on wasm32 builds. Browser apps register
+/// table metadata directly via [`TableRegistry::register`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SyncEntityInfo {
     /// The `module_path!()` of the entity, used for prefix matching.
     pub module_path: &'static str,
@@ -38,6 +44,7 @@ pub struct SyncEntityInfo {
     pub schema_fn: fn(DatabaseBackend) -> (String, TableMeta),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(SyncEntityInfo);
 
 /// Registry of tables that participate in sync.
