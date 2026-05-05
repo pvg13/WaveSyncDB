@@ -51,7 +51,10 @@ async fn peer_restart_then_rejoin_converges() -> Result<()> {
     for i in 0..5 {
         let id = format!("offline-{i}");
         let title = format!("written while bob was offline {i}");
-        harness.peer("alice").insert_task(&id, &title, false).await?;
+        harness
+            .peer("alice")
+            .insert_task(&id, &title, false)
+            .await?;
     }
 
     // Phase 3: start Bob back up. Bob's `/data/peer.db` survives the
