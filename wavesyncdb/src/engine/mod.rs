@@ -680,11 +680,46 @@ impl EngineRunner {
     }
 
     /// Set up relay circuit, external address, rendezvous registration, NAT timer.
+    ///
+    /// libp2p sometimes opens additional connections to the same relay
+    /// peer-id after the first one — for example, the relay's AutoNAT v2
+    /// dial-back can hit our QUIC listener and produce a fresh
+    /// `ConnectionEstablished` event for the relay peer-id, even though
+    /// we already have a healthy connection and an active reservation.
+    /// This handler is the relay's "connected" entry point, so without an
+    /// idempotency guard each extra connection re-runs the full setup
+    /// (state reset to `Connected`, `try_listen_on_circuit`, external
+    /// address registration, rendezvous registration, push-token
+    /// re-register, presence re-announce) — and the listen_on triggers
+    /// libp2p's relay-client to issue a fresh reservation request that
+    /// the relay logs as another `ReservationReqAccepted` followed by a
+    /// burst of internal renewals on the new connection. See issue #21.
+    ///
+    /// Skip the setup when we already have a `Connected` / `Listening`
+    /// state for this same relay peer-id — the new connection is just an
+    /// extra channel, not a fresh attach.
     fn handle_relay_peer_connected(
         &mut self,
         peer_id: libp2p::PeerId,
         relay_addr: libp2p::Multiaddr,
     ) {
+        let already_attached = match &self.relay_state {
+            RelayState::Connected {
+                relay_peer_id: existing,
+                ..
+            }
+            | RelayState::Listening {
+                relay_peer_id: existing,
+            } => *existing == peer_id,
+            _ => false,
+        };
+        if already_attached {
+            log::debug!(
+                "ConnectionEstablished for relay {peer_id} ignored — state={:?} already attached, keeping existing reservation",
+                self.relay_state
+            );
+            return;
+        }
         log::info!("Connected to relay server {peer_id}");
         self.infrastructure_peers.insert(peer_id);
         self.circuit_retry_count = 0;
