@@ -148,6 +148,89 @@ impl EngineRunner {
         }
     }
 
+    /// Pre-dial peers from the local address cache (#29). Called once at
+    /// engine startup, after `listen_on` and bootstrap-peer dials, before
+    /// the main event loop begins.
+    ///
+    /// **Why this matters.** Without the cache, cold-start sync waits for
+    /// at least one of mDNS (~1s on LAN), rendezvous discovery (round-trip
+    /// to the rendezvous server), or the relay's `AnnouncePresence` →
+    /// `PeerList` round-trip — typically 1–10s on cellular. With the
+    /// cache, the dial is in flight before the swarm even processes its
+    /// first event. libp2p races the cached path against discovery and
+    /// keeps whichever connection completes first; failures bump the
+    /// per-row `fail_count` (recorded in `OutgoingConnectionError`) and
+    /// drop out of the next start's load via `MAX_FAIL_COUNT`.
+    ///
+    /// Errors are intentionally swallowed at debug level: this is a
+    /// best-effort optimisation, not part of the connectivity contract.
+    pub(super) async fn predial_cached_addrs(&mut self) {
+        // Tunables. Max age is 7 days (after a week of not seeing a
+        // peer, its address is most likely stale anyway); fail cap is
+        // 10 (matches a rough "circuit-breaker open" threshold used by
+        // gRPC / Envoy for outlier detection).
+        const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+        const MAX_FAIL_COUNT: u32 = 10;
+
+        // Opportunistic GC. Cheap and only runs once per engine lifetime,
+        // so we don't bother throttling it.
+        if let Err(e) = crate::peer_addrs::gc(&self.db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
+            log::debug!("peer_addrs::gc failed: {e}");
+        }
+
+        let cached =
+            match crate::peer_addrs::load_recent(&self.db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::debug!("peer_addrs::load_recent failed: {e}");
+                    return;
+                }
+            };
+
+        if cached.is_empty() {
+            log::debug!("peer_addrs cache empty — no cold-start pre-dials");
+            return;
+        }
+
+        log::info!(
+            "Pre-dialing {} cached peer address(es) from previous session",
+            cached.len()
+        );
+        for entry in cached {
+            // Skip the relay (its dial goes through `try_dial_relay` and
+            // we don't want a second uncoordinated path competing with
+            // the reservation state machine).
+            if let Some(ref relay_addr) = self.config.relay_server
+                && let Some(libp2p::multiaddr::Protocol::P2p(relay_pid)) = relay_addr.iter().last()
+                && entry.peer_id == relay_pid.to_string()
+            {
+                continue;
+            }
+
+            let addr: libp2p::Multiaddr = match entry.multiaddr.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::debug!(
+                        "skipping un-parseable cached multiaddr {}: {e}",
+                        entry.multiaddr
+                    );
+                    continue;
+                }
+            };
+            match self.swarm.dial(addr.clone()) {
+                Ok(()) => {
+                    self.diagnostics
+                        .cached_addr_dials
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .peer_dial_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => log::debug!("cached pre-dial of {addr} failed: {e}"),
+            }
+        }
+    }
+
     pub(super) fn trigger_rediscovery(&mut self) {
         log::info!("Triggering mDNS rediscovery");
         match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
