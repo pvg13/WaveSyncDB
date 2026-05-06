@@ -51,6 +51,19 @@ pub struct NetemProfile {
 }
 
 impl NetemProfile {
+    /// Ideal: zero added latency, no loss, no cap. Baseline for
+    /// "what would convergence look like with no network at all".
+    /// Useful for measuring engine overhead in isolation.
+    pub fn ideal() -> Self {
+        Self {
+            name: "ideal",
+            latency_ms: 0,
+            jitter_ms: 0,
+            loss_pct: 0.0,
+            rate_kbit: None,
+        }
+    }
+
     /// Fast LAN — sub-millisecond latency, no loss, no cap. Sanity
     /// baseline so a netem run can be compared against the unshaped
     /// case without rewiring the harness.
@@ -61,6 +74,86 @@ impl NetemProfile {
             jitter_ms: 0,
             loss_pct: 0.0,
             rate_kbit: None,
+        }
+    }
+
+    /// Wired gigabit Ethernet: 1ms latency, no jitter, 1 Gbps cap.
+    /// Approximates a quiet datacenter link.
+    pub fn ethernet_gigabit() -> Self {
+        Self {
+            name: "ethernet_gigabit",
+            latency_ms: 1,
+            jitter_ms: 0,
+            loss_pct: 0.0,
+            rate_kbit: Some(1_000_000),
+        }
+    }
+
+    /// Home WiFi (typical 5 GHz, close to AP, light contention):
+    /// 5ms latency, 1ms jitter, 50 Mbps cap. The conditions most
+    /// "this app is on my home network" interactions actually face.
+    pub fn wifi_home() -> Self {
+        Self {
+            name: "wifi_home",
+            latency_ms: 5,
+            jitter_ms: 1,
+            loss_pct: 0.0,
+            rate_kbit: Some(50_000),
+        }
+    }
+
+    /// Busy / contended WiFi (open office, coffee shop): 30ms RTT,
+    /// 10ms jitter, 0.1% loss, 10 Mbps. Models the "WiFi works but
+    /// you can feel it" experience that triggers most "is the app
+    /// broken?" support tickets.
+    pub fn wifi_busy() -> Self {
+        Self {
+            name: "wifi_busy",
+            latency_ms: 15,
+            jitter_ms: 10,
+            loss_pct: 0.1,
+            rate_kbit: Some(10_000),
+        }
+    }
+
+    /// Edge-of-coverage WiFi (far from AP, walls in the way):
+    /// 80ms latency, 30ms jitter, 1% loss, 2 Mbps. The hand-off
+    /// boundary where users typically blame the WiFi for the
+    /// app's responsiveness.
+    pub fn wifi_distant() -> Self {
+        Self {
+            name: "wifi_distant",
+            latency_ms: 80,
+            jitter_ms: 30,
+            loss_pct: 1.0,
+            rate_kbit: Some(2_000),
+        }
+    }
+
+    /// Modern 5G (mid-band, good signal): 30ms RTT, 5ms jitter,
+    /// 0.1% loss, 100 Mbps. Increasingly the default for mobile
+    /// in 2026.
+    pub fn mobile_5g() -> Self {
+        Self {
+            name: "mobile_5g",
+            latency_ms: 15,
+            jitter_ms: 5,
+            loss_pct: 0.1,
+            rate_kbit: Some(100_000),
+        }
+    }
+
+    /// Legacy 3G / EDGE-grade mobile: 200ms RTT, 30ms jitter, 1%
+    /// loss, 384 kbps. Still the only choice in many regions; an
+    /// engine that "works" on cellular_fair but melts on 3G is
+    /// rejecting users we care about.
+    pub fn mobile_3g() -> Self {
+        Self {
+            name: "mobile_3g",
+            latency_ms: 100,
+            jitter_ms: 30,
+            loss_pct: 1.0,
+            rate_kbit: Some(384),
         }
     }
 
@@ -582,14 +675,23 @@ impl RunningPeer {
 
     /// Block until a task with the given pk is visible at this peer, or
     /// time out. Used by scenarios to assert convergence.
+    ///
+    /// Transient HTTP errors (connection refused, 5xx) are treated as
+    /// "row not yet available" and retried — they happen routinely
+    /// during scenarios that bring containers up and down, where the
+    /// port forward briefly disappears between `stop` and `start`.
+    /// Only a timeout is fatal.
     pub async fn wait_for_task(&self, id: &str, title: &str, timeout: Duration) -> Result<()> {
         let start = Instant::now();
         let mut interval = Duration::from_millis(50);
         loop {
-            if let Some(t) = self.get_task(id).await?
-                && t.title == title
-            {
-                return Ok(());
+            // Transient HTTP errors must NOT short-circuit the wait
+            // — that's how container-restart scenarios were silently
+            // masking convergence as failure. Treat any error as
+            // "not yet" and retry until the actual timeout.
+            match self.get_task(id).await {
+                Ok(Some(t)) if t.title == title => return Ok(()),
+                _ => {}
             }
             if start.elapsed() >= timeout {
                 bail!(
