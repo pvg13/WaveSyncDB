@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/health", get(health))
         .route("/peers", get(peers))
+        .route("/diagnostics", get(diagnostics))
         .route("/tasks", get(list_tasks).post(insert_task))
         .route("/tasks/:id", get(get_task).put(update_task))
         .with_state(state);
@@ -111,6 +112,10 @@ async fn health() -> impl IntoResponse {
 async fn peers(State(s): State<AppState>) -> impl IntoResponse {
     let n = s.db.network_status().connected_peers.len();
     Json(serde_json::json!({"connected": n}))
+}
+
+async fn diagnostics(State(s): State<AppState>) -> impl IntoResponse {
+    Json(s.db.diagnostics())
 }
 
 async fn list_tasks(State(s): State<AppState>) -> Result<Json<Vec<Task>>, AppError> {
