@@ -696,6 +696,34 @@ async fn apply_remote_column_changes(
     let mut changed_columns: Vec<(String, serde_json::Value)> = Vec::new();
 
     for change in row_changes {
+        // SECURITY (WSDB-PoC-1): the column id arrives unauthenticated
+        // over the network and is interpolated into raw SQL further down
+        // (`format!("\"{}\"", col)` in the UPDATE / INSERT paths). Reject
+        // anything that isn't (a) a registered column name for this
+        // table, and (b) different from the primary-key column — peers
+        // are not allowed to rewrite other peers' PKs via the
+        // column-update path. Both checks must run BEFORE we touch the
+        // shadow clock for this `cid`, otherwise a malicious peer can
+        // corrupt convergence state without producing any user-table
+        // write (the original WSDB-PoC-1).
+        if !meta.columns.iter().any(|c| c == &change.cid.0) {
+            log::warn!(
+                "Rejecting remote change for unregistered column: {}/{}/{}",
+                table,
+                pk,
+                change.cid.0
+            );
+            continue;
+        }
+        if change.cid.0 == meta.primary_key_column {
+            log::warn!(
+                "Rejecting remote change targeting the primary-key column: {}/{}",
+                table,
+                pk
+            );
+            continue;
+        }
+
         let (local_cv, local_site) =
             shadow::get_col_version_with_site(db, table, pk, &change.cid.0)
                 .await
@@ -983,6 +1011,172 @@ mod tests {
     }
 
     // ── apply_remote_changeset tests ──
+
+    /// REGRESSION — WSDB-PoC-1 (was: SQL injection via unsanitised `cid`).
+    ///
+    /// Asserts that `apply_remote_column_changes` rejects a `ColumnChange`
+    /// whose `cid` is not in the registered column set:
+    ///   - the user-data row is not mutated (no malformed SQL ran);
+    ///   - **the shadow clock table has no entry for the bogus cid**
+    ///     (this is what made the original bug a silent state-corruption
+    ///     vulnerability, not just a noisy SQL error).
+    ///
+    /// Originally this test asserted the *opposite* and proved the bug;
+    /// keeping the same setup and flipping the assertions guards the
+    /// fix from regressing.
+    #[tokio::test]
+    async fn regression_wsdb_1_rejects_unknown_column_id() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        db.execute_unprepared("INSERT INTO tasks (id, title, done) VALUES ('r1', 'before', 0)")
+            .await
+            .unwrap();
+
+        let evil_cid = "title\"--";
+
+        let changes = vec![ColumnChange {
+            table: "tasks".into(),
+            pk: "r1".into(),
+            cid: evil_cid.into(),
+            val: Some(serde_json::json!("after")),
+            site_id: NodeId([7u8; 16]),
+            col_version: 1,
+            cl: 1,
+            seq: 0,
+            db_version: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        // Row untouched.
+        use sea_orm::ConnectionTrait;
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'r1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title: String = row.try_get("", "title").unwrap();
+        assert_eq!(title, "before");
+
+        // Shadow clock has NO entry for the bogus cid (the fix.).
+        let shadow_rows = db
+            .query_all_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT cid FROM _wavesync_tasks_clock WHERE pk = 'r1'".to_string(),
+            ))
+            .await
+            .unwrap();
+        let cids: Vec<String> = shadow_rows
+            .iter()
+            .filter_map(|r| r.try_get::<String>("", "cid").ok())
+            .collect();
+        assert!(
+            !cids.iter().any(|c| c == evil_cid),
+            "shadow clock must not contain an entry for the rejected bogus cid; \
+             present cids: {cids:?}"
+        );
+    }
+
+    /// REGRESSION — WSDB-PoC-1b (was: PK rewrite via `cid = "id"`).
+    ///
+    /// `id` is in `meta.columns` (it's a registered column) so the
+    /// whitelist alone wouldn't catch this — the additional PK guard
+    /// rejects the change. After the fix the row's PK is unchanged.
+    #[tokio::test]
+    async fn regression_wsdb_1b_rejects_pk_column_in_update_path() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        db.execute_unprepared("INSERT INTO tasks (id, title, done) VALUES ('r1', 'original', 0)")
+            .await
+            .unwrap();
+        crate::shadow::upsert_clock_entry(&db, "tasks", "r1", "id", 0, 0, &NodeId([0u8; 16]), 0)
+            .await
+            .unwrap();
+
+        let changes = vec![ColumnChange {
+            table: "tasks".into(),
+            pk: "r1".into(),
+            cid: "id".into(),
+            val: Some(serde_json::json!("attacker_chosen_pk")),
+            site_id: NodeId([7u8; 16]),
+            col_version: 99,
+            cl: 1,
+            seq: 0,
+            db_version: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        use sea_orm::ConnectionTrait;
+        // Original row still exists with its real PK.
+        let original = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT id FROM tasks WHERE id = 'r1'".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            original.is_some(),
+            "original row must still exist with its original PK"
+        );
+        // No row created with the attacker-chosen PK.
+        let pwned = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT id FROM tasks WHERE id = 'attacker_chosen_pk'".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            pwned.is_none(),
+            "remote ColumnChange targeting the PK column must be rejected"
+        );
+    }
+
+    /// Sanity test — the fix must not regress the legitimate sync path.
+    /// A `ColumnChange` for a registered non-PK column (`title`) still
+    /// applies normally.
+    #[tokio::test]
+    async fn regression_wsdb_1_legitimate_column_change_still_applies() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        db.execute_unprepared("INSERT INTO tasks (id, title, done) VALUES ('r1', 'before', 0)")
+            .await
+            .unwrap();
+
+        let changes = vec![ColumnChange {
+            table: "tasks".into(),
+            pk: "r1".into(),
+            cid: "title".into(),
+            val: Some(serde_json::json!("after")),
+            site_id: NodeId([7u8; 16]),
+            col_version: 1,
+            cl: 1,
+            seq: 0,
+            db_version: 0,
+        }];
+
+        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+
+        use sea_orm::ConnectionTrait;
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'r1'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let title: String = row.try_get("", "title").unwrap();
+        assert_eq!(title, "after", "legitimate column change must still apply");
+    }
 
     #[tokio::test]
     async fn test_apply_remote_changeset_unregistered_table() {
