@@ -42,15 +42,11 @@ async fn cached_addresses_used_at_cold_start() {
         let alice = make_peer(&alice_db_url, &topic, 200).await;
         let bob = make_peer(&bob_db_url, &topic, 201).await;
 
-        assert_eventually(
-            "alice and bob connect via mDNS",
-            timeout,
-            || async {
-                let a = alice.diagnostics();
-                let b = bob.diagnostics();
-                a.peer_dial_successes >= 1 && b.peer_dial_successes >= 1
-            },
-        )
+        assert_eventually("alice and bob connect via mDNS", timeout, || async {
+            let a = alice.diagnostics();
+            let b = bob.diagnostics();
+            a.peer_dial_successes >= 1 && b.peer_dial_successes >= 1
+        })
         .await;
 
         // Hold both alive briefly so the spawned record_success
