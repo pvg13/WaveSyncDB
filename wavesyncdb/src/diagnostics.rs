@@ -90,6 +90,21 @@ pub(crate) struct Counters {
     /// this counter quantifies how much faster cold-start ought to be on
     /// runs with a warm cache.
     pub cached_addr_dials: AtomicU64,
+
+    /// `dcutr::Event` arrivals — every direct-connection upgrade attempt
+    /// the relay-routed connection produced. Each event resolves to either
+    /// a success (counted in [`Self::dcutr_upgrades_succeeded`]) or a
+    /// failure. Subtraction gives the failure count.
+    pub dcutr_upgrades_attempted: AtomicU64,
+    /// `dcutr::Event` with `Ok(_)` result — successful upgrades from
+    /// circuit-relay to a direct peer-to-peer connection. After a
+    /// successful upgrade, sync traffic flows direct and the relay stops
+    /// being on the data path. The ratio
+    /// `dcutr_upgrades_succeeded / dcutr_upgrades_attempted` tracks how
+    /// often hole-punching wins under the network conditions the engine
+    /// is actually facing — typically ~70% on mixed home / office NATs,
+    /// ~10–30% on cellular (carrier-grade NAT defeats hole punching).
+    pub dcutr_upgrades_succeeded: AtomicU64,
 }
 
 impl Counters {
@@ -109,6 +124,8 @@ impl Counters {
             peerlist_introductions: self.peerlist_introductions.load(Ordering::Relaxed),
             peerjoined_introductions: self.peerjoined_introductions.load(Ordering::Relaxed),
             cached_addr_dials: self.cached_addr_dials.load(Ordering::Relaxed),
+            dcutr_upgrades_attempted: self.dcutr_upgrades_attempted.load(Ordering::Relaxed),
+            dcutr_upgrades_succeeded: self.dcutr_upgrades_succeeded.load(Ordering::Relaxed),
         }
     }
 }
@@ -129,6 +146,8 @@ pub struct Snapshot {
     pub peerlist_introductions: u64,
     pub peerjoined_introductions: u64,
     pub cached_addr_dials: u64,
+    pub dcutr_upgrades_attempted: u64,
+    pub dcutr_upgrades_succeeded: u64,
 }
 
 #[cfg(test)]

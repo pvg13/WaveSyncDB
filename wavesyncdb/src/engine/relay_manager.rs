@@ -34,9 +34,20 @@ impl EngineRunner {
     }
 
     pub(super) fn handle_dcutr(&mut self, event: dcutr::Event) {
+        // Every event is one upgrade attempt that completed (Ok or Err).
+        // Counting at event arrival keeps "attempted = succeeded + failed"
+        // exact, which matters for the success-rate metric in
+        // diagnostics consumers and netem benchmark assertions.
+        self.diagnostics
+            .dcutr_upgrades_attempted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let peer = event.remote_peer_id;
         match event.result {
             Ok(_) => {
+                self.diagnostics
+                    .dcutr_upgrades_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::info!(
                     "DCUtR: direct connection upgrade succeeded with {peer} (sync now goes peer-to-peer, bypassing the relay)"
                 );
