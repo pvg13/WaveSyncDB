@@ -31,8 +31,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
     && rm -rf /var/lib/apt/lists/*
+# iproute2 ships `tc`, used by the netem-profile harness to apply
+# kernel-level traffic shaping (delay / jitter / loss / bandwidth caps)
+# inside each peer container at runtime. The container also needs the
+# NET_ADMIN capability — the harness adds it via docker run --cap-add
+# only for the netem-aware tests.
 
 COPY --from=builder /usr/local/bin/test-peer /usr/local/bin/test-peer
 
