@@ -329,11 +329,7 @@ impl WaveSyncE2eHarness {
     /// Add a peer with an explicit netem profile that overrides the
     /// harness default. Use to model asymmetric scenarios (e.g. one
     /// peer on cellular, one on LAN).
-    pub fn add_peer_with_netem(
-        mut self,
-        name: impl Into<String>,
-        profile: NetemProfile,
-    ) -> Self {
+    pub fn add_peer_with_netem(mut self, name: impl Into<String>, profile: NetemProfile) -> Self {
         let name = name.into();
         let passphrase = self.passphrase.clone();
         self.peers.push(PeerSpec {
@@ -521,7 +517,11 @@ impl RunningPeer {
         // `tc qdisc change` updates an existing root qdisc in place.
         // If there's no root qdisc yet (peer started unshaped), we add
         // it instead.
-        let action = if self.netem.is_some() { "change" } else { "add" };
+        let action = if self.netem.is_some() {
+            "change"
+        } else {
+            "add"
+        };
         run_tc(&self.container, &profile.tc_args(action))
             .await
             .with_context(|| format!("set netem {}", profile.name))?;
@@ -553,12 +553,9 @@ impl RunningPeer {
 /// Run a `tc` invocation inside a container and assert exit-code 0.
 /// Used by the netem helpers in the harness; not directly part of the
 /// scenario API.
-async fn run_tc(
-    container: &ContainerAsync<GenericImage>,
-    argv: &[String],
-) -> Result<()> {
-    let cmd = ExecCommand::new(argv.iter().cloned())
-        .with_cmd_ready_condition(CmdWaitFor::exit_code(0));
+async fn run_tc(container: &ContainerAsync<GenericImage>, argv: &[String]) -> Result<()> {
+    let cmd =
+        ExecCommand::new(argv.iter().cloned()).with_cmd_ready_condition(CmdWaitFor::exit_code(0));
     container
         .exec(cmd)
         .await

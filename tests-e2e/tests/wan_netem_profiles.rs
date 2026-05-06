@@ -179,12 +179,8 @@ async fn run_profile(profile: NetemProfile) -> ProfileResult {
 
 fn print_results_table(rows: &[ProfileResult]) {
     eprintln!("\n=== Netem profile benchmark results ===\n");
-    eprintln!(
-        "| profile        | first-sync | steady p50 | steady p95 | partition recovery |"
-    );
-    eprintln!(
-        "| -------------- | ---------- | ---------- | ---------- | ------------------ |"
-    );
+    eprintln!("| profile        | first-sync | steady p50 | steady p95 | partition recovery |");
+    eprintln!("| -------------- | ---------- | ---------- | ---------- | ------------------ |");
     for r in rows {
         eprintln!(
             "| {:<14} | {:>7} ms | {:>7} ms | {:>7} ms | {:>15} ms |",
@@ -335,20 +331,12 @@ struct ScenarioResult {
 
 fn print_scenario_table(rows: &[ScenarioResult]) {
     eprintln!("\n=== Extended-scenario benchmark results ===\n");
-    eprintln!(
-        "| scenario                  | profile         | recovery   | recovered |"
-    );
-    eprintln!(
-        "| ------------------------- | --------------- | ---------- | --------- |"
-    );
+    eprintln!("| scenario                  | profile         | recovery   | recovered |");
+    eprintln!("| ------------------------- | --------------- | ---------- | --------- |");
     for r in rows {
         eprintln!(
             "| {:<25} | {:<15} | {:>7} ms | {:>4}/{:<4} |",
-            r.scenario,
-            r.profile,
-            r.recovery_ms,
-            r.writes_recovered,
-            r.writes_total,
+            r.scenario, r.profile, r.recovery_ms, r.writes_recovered, r.writes_total,
         );
     }
     eprintln!();
