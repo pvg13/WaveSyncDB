@@ -271,6 +271,79 @@ const RELAY_QUIC_PORT: u16 = 4001;
 /// HTTP port the test-peer listens on inside its container.
 const PEER_HTTP_PORT: u16 = 8080;
 
+/// NAT-topology shape applied to a peer's container via `iptables`.
+///
+/// Real NAT shapes the engine has to deal with in the wild — the
+/// Docker bridge by itself has no NAT, so peers can dial each other's
+/// bridge IPs directly via libp2p `identify` and never exercise the
+/// circuit-relay → direct upgrade path. Applying a NAT profile blocks
+/// the easy path, forcing libp2p to use the relay first and giving
+/// DCUtR something to upgrade.
+///
+/// The simulation is intentionally minimal — we don't need exact
+/// behavioural parity with every router on Earth, only enough to
+/// exercise the engine's NAT-traversal code paths.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NatProfile {
+    /// No NAT (default). Peers connect directly via the Docker bridge.
+    #[default]
+    Open,
+
+    /// Port-restricted cone NAT — the most permissive non-trivial
+    /// shape. Inbound packets are accepted only on flows for which an
+    /// outbound packet has previously been observed (conntrack-based).
+    /// libp2p hole-punching via DCUtR succeeds on this shape because
+    /// both peers initiate near-simultaneously, each side's conntrack
+    /// then accepts the inbound. Implemented as:
+    ///
+    /// ```text
+    /// iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    /// iptables -A INPUT -i lo -j ACCEPT
+    /// iptables -A INPUT -p tcp -j ACCEPT       # leave HTTP forward intact
+    /// iptables -A INPUT -p udp -j DROP         # block unsolicited UDP
+    /// ```
+    PortRestrictedCone,
+}
+
+impl NatProfile {
+    /// Build the iptables command sequence applying this profile.
+    /// Each inner `Vec<String>` is one `iptables` argv. Returns an
+    /// empty list for [`NatProfile::Open`].
+    fn iptables_argvs(&self) -> Vec<Vec<String>> {
+        match self {
+            NatProfile::Open => Vec::new(),
+            NatProfile::PortRestrictedCone => vec![
+                argv(&[
+                    "iptables",
+                    "-A",
+                    "INPUT",
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "ESTABLISHED,RELATED",
+                    "-j",
+                    "ACCEPT",
+                ]),
+                argv(&["iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]),
+                argv(&["iptables", "-A", "INPUT", "-p", "tcp", "-j", "ACCEPT"]),
+                argv(&["iptables", "-A", "INPUT", "-p", "udp", "-j", "DROP"]),
+            ],
+        }
+    }
+
+    /// Short name used in benchmark logs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            NatProfile::Open => "open",
+            NatProfile::PortRestrictedCone => "port_restricted_cone",
+        }
+    }
+}
+
+fn argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
 /// Builder for an end-to-end harness.
 #[derive(Default)]
 pub struct WaveSyncE2eHarness {
@@ -281,6 +354,9 @@ pub struct WaveSyncE2eHarness {
     /// overrides set via [`Self::add_peer_with_netem`] beat this default.
     /// `None` ⇒ no shaping anywhere (today's behaviour).
     default_netem: Option<NetemProfile>,
+    /// Default NAT profile applied to every peer. Per-peer overrides
+    /// set via [`Self::add_peer_with_nat`] beat this default.
+    default_nat: NatProfile,
 }
 
 /// Configuration for a single peer in the harness.
@@ -289,6 +365,8 @@ pub struct PeerSpec {
     pub passphrase: Option<String>,
     /// Per-peer netem override. `None` ⇒ use the harness default.
     pub netem: Option<NetemProfile>,
+    /// Per-peer NAT override. `None` ⇒ use the harness default.
+    pub nat: Option<NatProfile>,
 }
 
 impl WaveSyncE2eHarness {
@@ -301,6 +379,7 @@ impl WaveSyncE2eHarness {
             topic: format!("e2e-{}", Uuid::new_v4().simple()),
             passphrase: None,
             default_netem: None,
+            default_nat: NatProfile::Open,
         }
     }
 
@@ -322,6 +401,7 @@ impl WaveSyncE2eHarness {
             name,
             passphrase,
             netem: None,
+            nat: None,
         });
         self
     }
@@ -336,6 +416,22 @@ impl WaveSyncE2eHarness {
             name,
             passphrase,
             netem: Some(profile),
+            nat: None,
+        });
+        self
+    }
+
+    /// Add a peer with an explicit NAT profile that overrides the
+    /// harness default. Use to model asymmetric scenarios (e.g. one
+    /// peer behind a phone-style NAT, one on a public IP).
+    pub fn add_peer_with_nat(mut self, name: impl Into<String>, nat: NatProfile) -> Self {
+        let name = name.into();
+        let passphrase = self.passphrase.clone();
+        self.peers.push(PeerSpec {
+            name,
+            passphrase,
+            netem: None,
+            nat: Some(nat),
         });
         self
     }
@@ -345,6 +441,14 @@ impl WaveSyncE2eHarness {
     /// [`NetemProfile`] docs for what that does and doesn't model.
     pub fn with_netem(mut self, profile: NetemProfile) -> Self {
         self.default_netem = Some(profile);
+        self
+    }
+
+    /// Apply this NAT profile to every peer (unless a per-peer
+    /// override beats it). Implemented via `iptables` inside each peer
+    /// container — see [`NatProfile`] docs.
+    pub fn with_nat(mut self, nat: NatProfile) -> Self {
+        self.default_nat = nat;
         self
     }
 
@@ -408,6 +512,7 @@ impl WaveSyncE2eHarness {
         for spec in self.peers {
             let container_name = format!("{}-{suffix}", spec.name);
             let effective_netem = spec.netem.clone().or_else(|| self.default_netem.clone());
+            let effective_nat = spec.nat.unwrap_or(self.default_nat);
 
             let mut img = GenericImage::new(
                 PEER_IMAGE.split(':').next().unwrap(),
@@ -427,10 +532,12 @@ impl WaveSyncE2eHarness {
                 img = img.with_env_var("PASSPHRASE", p.clone());
             }
 
-            // `tc qdisc add ... netem` requires NET_ADMIN. We add the
-            // capability only when a profile is present so the unshaped
-            // default keeps the same security posture as before.
-            if effective_netem.is_some() {
+            // `tc qdisc add ... netem` and `iptables -A INPUT ...` both
+            // require NET_ADMIN. Add the capability whenever EITHER
+            // shaping or NAT is configured so the unshaped+open default
+            // keeps the same security posture as before.
+            let needs_netadmin = effective_netem.is_some() || effective_nat != NatProfile::Open;
+            if needs_netadmin {
                 img = img.with_cap_add("NET_ADMIN");
             }
 
@@ -451,6 +558,21 @@ impl WaveSyncE2eHarness {
                     })?;
             }
 
+            // Apply NAT (iptables) rules. Order matters relative to
+            // netem: netem shapes egress, iptables filters ingress —
+            // they don't conflict, so apply order is just informative.
+            if effective_nat != NatProfile::Open {
+                apply_nat_to_container(&container, effective_nat)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "apply NAT profile {} to {}",
+                            effective_nat.name(),
+                            spec.name
+                        )
+                    })?;
+            }
+
             let host_port = container
                 .get_host_port_ipv4(PEER_HTTP_PORT)
                 .await
@@ -462,6 +584,7 @@ impl WaveSyncE2eHarness {
                 base_url,
                 container,
                 netem: effective_netem,
+                nat: effective_nat,
             });
         }
 
@@ -491,6 +614,10 @@ pub struct RunningPeer {
     /// or `None` if unshaped. Use [`Self::set_netem`] /
     /// [`Self::clear_netem`] to change it mid-test.
     pub netem: Option<NetemProfile>,
+    /// NAT profile currently applied to this peer's INPUT chain.
+    /// Set at startup; today there's no API to change mid-test (would
+    /// require careful conntrack-flush handling — add when needed).
+    pub nat: NatProfile,
 }
 
 impl RunningPeer {
@@ -571,6 +698,23 @@ async fn apply_netem_to_container(
     profile: &NetemProfile,
 ) -> Result<()> {
     run_tc(container, &profile.tc_args("add")).await
+}
+
+/// Apply a NAT profile by running its `iptables` argv list against
+/// the container.
+async fn apply_nat_to_container(
+    container: &ContainerAsync<GenericImage>,
+    profile: NatProfile,
+) -> Result<()> {
+    for argv in profile.iptables_argvs() {
+        let cmd = ExecCommand::new(argv.iter().cloned())
+            .with_cmd_ready_condition(CmdWaitFor::exit_code(0));
+        container
+            .exec(cmd)
+            .await
+            .with_context(|| format!("docker exec {:?}", argv))?;
+    }
+    Ok(())
 }
 
 impl RunningHarness {
