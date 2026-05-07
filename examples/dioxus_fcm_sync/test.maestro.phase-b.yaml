@@ -1,0 +1,44 @@
+# Phase B — assert FCM cold-wake delivered the sync. See test.sh
+# for the full sequence.
+#
+# Between phase A and phase B, test.sh:
+#   1. Drives a CLI peer (test-peer binary, connected to the same
+#      relay+topic+passphrase) to add a task with a known title
+#      while the phone is killed.
+#   2. Sleeps up to 90 s so the OS can deliver FCM, wake the
+#      FirebaseMessagingService, run the engine in background,
+#      reconnect to the relay, sync, and shut back down.
+#
+# This phase relaunches the app **without** clearState — we want to
+# inspect what the FCM-woken engine wrote to the local SQLite while
+# the UI was dead. If the row is there at first paint, FCM cold-wake
+# is working. If it isn't there but appears within a few seconds
+# after relaunch, FCM didn't wake the engine but the foreground
+# resume did — note that as a separate failure mode.
+#
+# The writer's task title is provided via WAVESYNC_FCM_REMOTE_TASK
+# (defaults to a fixed string for ad-hoc runs). It must match the
+# string test.sh writes via the writer peer.
+
+appId: com.wavesync.mobile_demo
+---
+- launchApp:
+    clearState: false
+
+# Wait for the engine to come back up after relaunch.
+- extendedWaitUntil:
+    visible: "Tasks"
+    timeout: 30000
+
+# The critical assertion: the writer's row must already be in the
+# local DB at first paint. We give the visibility check a short
+# (5 s) window to absorb UI repaints, but anything longer than that
+# means the engine is fetching the row only NOW (foreground resume)
+# rather than having received it during FCM background-wake.
+- extendedWaitUntil:
+    visible: ${WAVESYNC_FCM_REMOTE_TASK ?? 'from-cli-while-killed'}
+    timeout: 5000
+
+# Sentinel from phase A is still here — proves the DB persisted
+# across kill+relaunch (no clearState).
+- assertVisible: "from-phone-A"

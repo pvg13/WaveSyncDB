@@ -1,0 +1,43 @@
+# Phase A — setup + kill. See test.sh for the full sequence.
+#
+# Sets up a known starting state on the phone:
+#   - Fresh install (clearState wipes the SQLite DB).
+#   - App boots, registers FCM token with the relay, registers
+#     entities, syncs schema. The "Tasks" header is the visible
+#     marker that the engine is up.
+#   - Add a sentinel task ("from-phone-A") so the parallel writer
+#     peer in test.sh can verify the app→relay path is alive
+#     before we kill the app.
+#   - killApp is the realistic shape of "user swiped from recents":
+#     the process exits but Android keeps it FCM-deliverable
+#     (unlike `am force-stop` which puts it in stopped-state).
+#
+# Selectors:
+#   - "What needs to be done?" is the placeholder text on the
+#     AddTaskForm input (see src/main.rs).
+#   - "Add" is the submit button on the same form.
+
+appId: com.wavesync.mobile_demo
+---
+- launchApp:
+    clearState: true
+
+# Wait for the engine to come up and the Tasks panel to render.
+- extendedWaitUntil:
+    visible: "Tasks"
+    timeout: 60000
+
+# Sentinel task: proves the app itself can write while running.
+# The writer peer in test.sh asserts it sees this row before
+# we kill the app, which validates the relay path is alive.
+- tapOn:
+    text: "What needs to be done?"
+- inputText: "from-phone-A"
+- tapOn: "Add"
+- extendedWaitUntil:
+    visible: "from-phone-A"
+    timeout: 15000
+
+# killApp = "swipe from recents". App is fully killed but
+# remains FCM-deliverable; this is the cold-wake test scope.
+- killApp
