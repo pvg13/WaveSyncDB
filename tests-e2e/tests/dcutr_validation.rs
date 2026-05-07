@@ -26,16 +26,17 @@ async fn dcutr_validation_cellular_fair() {
     // path to upgrade. Cellular_fair forces the relay-first path
     // long enough for the DCUtR behaviour to fire its upgrade dial.
     //
-    // We also apply `PortRestrictedCone` NAT to both peers so libp2p
-    // can't direct-dial via bridge IPs from `identify` — without NAT,
-    // the Docker bridge gives peers each other's IP for free and DCUtR
-    // never has a circuit-relay path to upgrade.
+    // NAT shape: `PortRestrictedConeAutoNATOk` — blocks unsolicited
+    // peer-to-peer inbound (so libp2p must use the relay first), but
+    // whitelists the relay's bridge IP so AutoNAT verification dials
+    // succeed and the engine keeps advertising direct addresses
+    // for DCUtR to attempt the hole-punch toward.
     let profile = NetemProfile::cellular_fair();
 
     let harness = WaveSyncE2eHarness::new()
         .with_passphrase("dcutr-bench")
         .with_netem(profile.clone())
-        .with_nat(NatProfile::PortRestrictedCone)
+        .with_nat(NatProfile::PortRestrictedConeAutoNATOk)
         .add_peer("alice")
         .add_peer("bob")
         .start()
@@ -105,13 +106,16 @@ async fn dcutr_validation_cellular_fair() {
     // gap in the bench, not a bug.
     if total_attempted == 0 {
         eprintln!(
-            "Note on PortRestrictedCone: AutoNAT v2 dial-backs are themselves \
-             unsolicited inbound UDP and get blocked by the iptables filter. \
-             That makes the engine downgrade its NAT-status to private, which \
-             then suppresses the hole-punch DCUtR would attempt. To exercise \
-             DCUtR end-to-end, the bench needs an AutoNAT-permissive shape \
-             (allow the AutoNAT server peer-id explicitly, or run autonat \
-             outside the iptables chain). Tracked as a follow-up."
+            "Note: zero DCUtR attempts even with PortRestrictedConeAutoNATOk. \
+             AutoNAT now succeeds (engine reports the address as Public), so \
+             the engine *does* advertise direct addresses. But the conntrack \
+             filter is permissive enough that simultaneous dial-out from both \
+             peers (triggered by the relay's PeerJoined introduction) creates \
+             matching ESTABLISHED entries on both sides — peers form a direct \
+             connection naturally without DCUtR's coordination. To force the \
+             relay path and actually exercise DCUtR, the bench would need a \
+             symmetric-NAT shape (SNAT/DNAT-based per-destination port \
+             rotation) that defeats simultaneous-dial. Tracked as a follow-up."
         );
     }
 }
