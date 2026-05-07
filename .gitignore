@@ -36,3 +36,6 @@ wavesync_relay/secrets/
 **/build/
 **/.build/
 **/.kotlin/
+# Maestro / FCM test harness runtime artifacts
+examples/dioxus_fcm_sync/.test-logs/
+examples/dioxus_fcm_sync/.test-pids/

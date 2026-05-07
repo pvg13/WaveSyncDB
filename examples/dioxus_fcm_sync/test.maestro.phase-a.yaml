@@ -22,20 +22,23 @@ appId: com.wavesync.mobile_demo
 - launchApp:
     clearState: true
 
-# Wait for the engine to come up and the Tasks panel to render.
+# Wait for the app's WebView to render. h1 in src/main.rs is
+# "WaveSyncDB Mobile Demo".
 - extendedWaitUntil:
-    visible: "Tasks"
+    visible: "WaveSyncDB Mobile Demo"
     timeout: 60000
 
-# Sentinel task: proves the app itself can write while running.
-# The writer peer in test.sh asserts it sees this row before
-# we kill the app, which validates the relay path is alive.
+# Sentinel task: proves the app itself can write while running and
+# the relay path delivers it to the writer-peer. The literal title
+# is provided via WAVESYNC_FCM_PHONE_SENTINEL — test.sh sets a
+# UUID-suffixed value per run so prior-run residue can't make the
+# assertion trivially pass.
 - tapOn:
     text: "What needs to be done?"
-- inputText: "from-phone-A"
+- inputText: ${WAVESYNC_FCM_PHONE_SENTINEL ?? 'from-phone-A'}
 - tapOn: "Add"
 - extendedWaitUntil:
-    visible: "from-phone-A"
+    visible: ${WAVESYNC_FCM_PHONE_SENTINEL ?? 'from-phone-A'}
     timeout: 15000
 
 # killApp = "swipe from recents". App is fully killed but

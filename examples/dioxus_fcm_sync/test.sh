@@ -73,12 +73,12 @@ TOPIC="mobile-tasks-demo"
 PASSPHRASE="demo-shared-secret"
 WRITER_HTTP_PORT="${WRITER_HTTP_PORT:-8489}"
 
-# Identity-keypair pinned so the relay's PeerId is stable across runs —
-# the WAVESYNC_RELAY_OVERRIDE we set into the APK build embeds a fixed
-# multiaddr that includes /p2p/<this-peer-id>. Re-running with a
-# different keypair would invalidate the previously-installed APK.
+# Identity-keypair pinned so the relay's PeerId is stable across runs.
+# The actual PeerId derived from this keypair is read from the relay's
+# startup log ("Relay server PeerId: …") and substituted into
+# WAVESYNC_RELAY_OVERRIDE for the APK build — that way we don't have
+# to hand-maintain a peer-id constant that has to match the keypair.
 RELAY_KEY='CAESQGlCc264ZKF3D4l/5VXTLjnGdDKxg0cyX2UosIkZmNAbxV5oeISRfEDIrc/+hdQuqepe9CCCc3M5G3DJBs6N6lE='
-RELAY_PEER_ID='12D3KooWH2ZzVdXehxyNa1QDeWrBLAWKynMVPn8BK2LaDCTiPs4D'
 RELAY_QUIC_PORT="${RELAY_QUIC_PORT:-4001}"
 RELAY_TCP_PORT="${RELAY_TCP_PORT:-4002}"
 
@@ -159,29 +159,70 @@ LAN_IP="$(ip -4 -o addr show scope global 2>/dev/null \
     | awk '{print $4}' | cut -d/ -f1 | head -1 || echo 127.0.0.1)"
 echo "LAN IP: $LAN_IP"
 
-RELAY_ADDR="/ip4/$LAN_IP/udp/$RELAY_QUIC_PORT/quic-v1/p2p/$RELAY_PEER_ID"
+# EXTERNAL_ADDRESS bootstrap: the relay needs to know its own peer-id
+# to print a multiaddr we can dial. We pass it the identity keypair
+# via env, but we don't yet know what peer-id that derives. Start the
+# relay with a placeholder external address pointing at the LAN IP —
+# the relay logs "Relay server PeerId: …" in the first 1-2s of startup,
+# we read it back, and then we have the real RELAY_ADDR to embed in
+# the APK build.
+# Pre-build the relay and writer-peer release binaries up front so
+# the runtime startup timeouts below aren't dominated by `cargo run`
+# compile time on a cold target dir (5+ minutes from scratch).
+echo "==> Pre-building relay + writer (cold compile can take several minutes)"
+(cd "$ROOT" && cargo build --release --quiet -p wavesync_relay)
+(cd "$ROOT" && cargo build --release --quiet -p wavesyncdb-e2e --bin test-peer)
 
-echo "==> Starting relay at $RELAY_ADDR"
+echo "==> Starting relay (peer-id will be read from log)"
 (
     cd "$ROOT"
-    setsid env IDENTITY_KEYPAIR="$RELAY_KEY" \
-        FCM_CREDENTIALS="$FCM_CREDENTIALS" \
-        EXTERNAL_ADDRESS="$RELAY_ADDR" \
-        RUST_LOG=info \
-        cargo run --release -p wavesync_relay -- \
-            --listen-addr "/ip4/0.0.0.0/udp/$RELAY_QUIC_PORT/quic-v1" \
-            --listen-addr "/ip4/0.0.0.0/tcp/$RELAY_TCP_PORT" \
-            --external-address "$RELAY_ADDR" \
-            > "$LOGDIR/relay.log" 2>&1 &
+    setsid env RUST_LOG=info cargo run --release --quiet -p wavesync_relay -- \
+        --identity-keypair="$RELAY_KEY" \
+        --listen-addr "/ip4/0.0.0.0/tcp/$RELAY_TCP_PORT" \
+        --external-address "/ip4/$LAN_IP/tcp/$RELAY_TCP_PORT" \
+        --external-address "/ip4/$LAN_IP/udp/$RELAY_QUIC_PORT/quic-v1" \
+        --max-reservations-per-peer 256 \
+        --fcm-credentials "$FCM_CREDENTIALS" \
+        > "$LOGDIR/relay.log" 2>&1 &
     echo $! > "$PIDDIR/relay.pid"
 )
-sleep 3
-if ! kill -0 "$(cat "$PIDDIR/relay.pid")" 2>/dev/null; then
-    echo "ERROR: relay died at startup. Tail of log:" >&2
-    tail -30 "$LOGDIR/relay.log" >&2
+
+# Wait for the PeerId to appear in the log (or the relay to die).
+RELAY_PEER_ID=""
+for i in {1..120}; do
+    if ! kill -0 "$(cat "$PIDDIR/relay.pid")" 2>/dev/null; then
+        echo "ERROR: relay died at startup. Tail of log:" >&2
+        tail -50 "$LOGDIR/relay.log" >&2
+        exit 1
+    fi
+    RELAY_PEER_ID="$(grep -oP 'Relay server PeerId: \K\S+' "$LOGDIR/relay.log" | head -1 || true)"
+    if [[ -n "$RELAY_PEER_ID" ]]; then
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$RELAY_PEER_ID" ]]; then
+    echo "ERROR: relay did not print 'Relay server PeerId: …' within 120s." >&2
+    tail -50 "$LOGDIR/relay.log" >&2
     exit 1
 fi
-echo "relay pid=$(cat "$PIDDIR/relay.pid")  log=$LOGDIR/relay.log"
+RELAY_ADDR_HOST="/ip4/$LAN_IP/udp/$RELAY_QUIC_PORT/quic-v1/p2p/$RELAY_PEER_ID"
+# Android emulators (`emulator-NNNN`) use a NAT'd network where the
+# host machine appears as `10.0.2.2` — the LAN IP of the host is NOT
+# routable from inside the emulator. For physical devices on the same
+# WiFi as the host, the LAN IP is reachable directly.
+if [[ "$ANDROID_SERIAL" == emulator-* ]]; then
+    APK_RELAY_HOST="10.0.2.2"
+    echo "Detected emulator — APK will dial relay at 10.0.2.2 (Android NAT to host)"
+else
+    APK_RELAY_HOST="$LAN_IP"
+    echo "Detected physical device — APK will dial relay at LAN IP $LAN_IP"
+fi
+APK_RELAY_ADDR="/ip4/$APK_RELAY_HOST/udp/$RELAY_QUIC_PORT/quic-v1/p2p/$RELAY_PEER_ID"
+RELAY_ADDR="$RELAY_ADDR_HOST"  # writer peer on the host uses LAN-IP form
+echo "relay pid=$(cat "$PIDDIR/relay.pid")  peer-id=$RELAY_PEER_ID"
+echo "relay addr (host/writer) = $RELAY_ADDR"
+echo "relay addr (apk/emulator) = $APK_RELAY_ADDR"
 
 # ── 2. Start the writer peer (test-peer binary) ────────────────────
 
@@ -199,8 +240,10 @@ WRITER_DB="$(mktemp -d)/writer.db"
             > "$LOGDIR/writer.log" 2>&1 &
     echo $! > "$PIDDIR/writer.pid"
 )
-# Wait for HTTP up
-for i in {1..20}; do
+# Wait for HTTP up. Writer was pre-built above so this is just
+# binary startup — but we still allow 60s of slack for slow CI
+# machines / cold caches.
+for i in {1..60}; do
     if curl -fs "http://127.0.0.1:$WRITER_HTTP_PORT/health" >/dev/null 2>&1; then
         echo "writer up after ${i}s"
         break
@@ -216,18 +259,24 @@ fi
 # ── 3. Build & install the example APK ─────────────────────────────
 
 if [[ -z "${SKIP_INSTALL:-}" ]]; then
-    echo "==> Building & installing APK with WAVESYNC_RELAY_OVERRIDE=$RELAY_ADDR"
+    echo "==> Building & installing APK with WAVESYNC_RELAY_OVERRIDE=$APK_RELAY_ADDR"
     (
         cd "$HERE"
-        WAVESYNC_RELAY_OVERRIDE="$RELAY_ADDR" \
+        WAVESYNC_RELAY_OVERRIDE="$APK_RELAY_ADDR" \
             dx build --platform android --release 2>&1 \
             | tee "$LOGDIR/dx-build.log"
     )
-    # dx outputs the apk path; the standard Dioxus location:
-    APK="$(find "$HERE/target" -name '*.apk' -path '*release*' 2>/dev/null \
-        | sort | tail -1)"
+    # dx writes the APK under the workspace target dir (CARGO_TARGET_DIR
+    # respected — see ~/.cargo/shared-target). The path is announced at
+    # the end of the build as "path=…/example-dioxus-fcm-sync/release/
+    # android/app"; the actual APK is the Gradle output a few directories
+    # deeper. Even with --release, dx's Android Gradle build emits to the
+    # `debug/` output by default.
+    DX_OUT_BASE="${CARGO_TARGET_DIR:-$HOME/.cargo/shared-target}/dx/example-dioxus-fcm-sync/release/android/app"
+    APK="$(find "$DX_OUT_BASE" -name 'app-debug.apk' -o -name 'app-release*.apk' 2>/dev/null \
+        | head -1)"
     if [[ -z "$APK" ]]; then
-        echo "ERROR: no APK produced; see $LOGDIR/dx-build.log" >&2
+        echo "ERROR: no APK produced under $DX_OUT_BASE; see $LOGDIR/dx-build.log" >&2
         exit 1
     fi
     echo "APK: $APK"
@@ -236,17 +285,30 @@ fi
 
 # ── 4. Maestro phase A — launch, add sentinel, killApp ─────────────
 
-REMOTE_TITLE="from-cli-$(date +%s)-$$"
+# Per-run unique titles. UUID-suffixing makes the assertions
+# idempotent: residual rows from prior runs (the SQLite DB inside
+# the app's data dir survives `clearState` in some Maestro/Dioxus
+# combos) can't make the test trivially pass with an old row.
+RUN_TAG="$(date +%s)-$$"
+PHONE_SENTINEL="from-phone-$RUN_TAG"
+REMOTE_TITLE="from-cli-$RUN_TAG"
+
 echo "==> Maestro phase A (launch + sentinel + killApp)"
-maestro --device "$ANDROID_SERIAL" test "$HERE/test.maestro.phase-a.yaml" \
+echo "    phone sentinel:  $PHONE_SENTINEL"
+maestro --device "$ANDROID_SERIAL" test \
+    --env "WAVESYNC_FCM_PHONE_SENTINEL=$PHONE_SENTINEL" \
+    "$HERE/test.maestro.phase-a.yaml" \
     | tee "$LOGDIR/maestro-a.log"
 
 # ── 5. Verify the writer received the sentinel (app→relay path alive) ─
 
-echo "==> Waiting for writer to see the sentinel from-phone-A..."
+echo "==> Waiting for writer to see the sentinel '$PHONE_SENTINEL'..."
+# The app generates a UUID for `id` on Add, so we can't lookup by
+# the title-as-id. Query the full tasks list and grep by title.
 SENTINEL_OK=0
-for i in {1..30}; do
-    if curl -fs "http://127.0.0.1:$WRITER_HTTP_PORT/tasks/from-phone-A" >/dev/null 2>&1; then
+for i in {1..60}; do
+    if curl -fs "http://127.0.0.1:$WRITER_HTTP_PORT/tasks" 2>/dev/null \
+        | grep -q "\"title\":\"$PHONE_SENTINEL\""; then
         SENTINEL_OK=1
         echo "sentinel reached writer after ${i}s"
         break
@@ -277,10 +339,10 @@ sleep "$WAKE_WAIT"
 # ── 8. Maestro phase B — relaunch and assert the row is present ────
 
 echo "==> Maestro phase B (relaunch + assert)"
-WAVESYNC_FCM_REMOTE_TASK="$REMOTE_TITLE" \
-    maestro --device "$ANDROID_SERIAL" test \
-        --env "WAVESYNC_FCM_REMOTE_TASK=$REMOTE_TITLE" \
-        "$HERE/test.maestro.phase-b.yaml" \
+maestro --device "$ANDROID_SERIAL" test \
+    --env "WAVESYNC_FCM_REMOTE_TASK=$REMOTE_TITLE" \
+    --env "WAVESYNC_FCM_PHONE_SENTINEL=$PHONE_SENTINEL" \
+    "$HERE/test.maestro.phase-b.yaml" \
     | tee "$LOGDIR/maestro-b.log"
 
 echo

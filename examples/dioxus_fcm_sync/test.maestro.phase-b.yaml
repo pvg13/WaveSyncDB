@@ -27,7 +27,7 @@ appId: com.wavesync.mobile_demo
 
 # Wait for the engine to come back up after relaunch.
 - extendedWaitUntil:
-    visible: "Tasks"
+    visible: "WaveSyncDB Mobile Demo"
     timeout: 30000
 
 # The critical assertion: the writer's row must already be in the
@@ -41,4 +41,4 @@ appId: com.wavesync.mobile_demo
 
 # Sentinel from phase A is still here — proves the DB persisted
 # across kill+relaunch (no clearState).
-- assertVisible: "from-phone-A"
+- assertVisible: ${WAVESYNC_FCM_PHONE_SENTINEL ?? 'from-phone-A'}
