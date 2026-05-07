@@ -303,31 +303,73 @@ pub enum NatProfile {
     /// iptables -A INPUT -p udp -j DROP         # block unsolicited UDP
     /// ```
     PortRestrictedCone,
+
+    /// Port-restricted cone NAT, **but with the AutoNAT server's IP
+    /// whitelisted** for unsolicited inbound. Models the realistic
+    /// case where a peer trusts a known-good AutoNAT/relay server to
+    /// dial it back for reachability verification, while still
+    /// blocking arbitrary peer-to-peer unsolicited inbound.
+    ///
+    /// Without this exception the previous shape is too strict for
+    /// libp2p's NAT-traversal flow: AutoNAT v2 dial-backs are
+    /// themselves unsolicited inbound and get dropped, the engine
+    /// then downgrades to private and stops advertising direct
+    /// addresses, and DCUtR loses any direct address to attempt the
+    /// hole-punch toward.
+    ///
+    /// The harness fills the whitelist IP automatically with the
+    /// relay container's bridge address (the relay also acts as the
+    /// AutoNAT server in our setup).
+    ///
+    /// ```text
+    /// iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    /// iptables -A INPUT -i lo -j ACCEPT
+    /// iptables -A INPUT -p tcp -j ACCEPT
+    /// iptables -A INPUT -s <autonat-server-ip> -j ACCEPT  # whitelist
+    /// iptables -A INPUT -p udp -j DROP
+    /// ```
+    PortRestrictedConeAutoNATOk,
 }
 
 impl NatProfile {
     /// Build the iptables command sequence applying this profile.
-    /// Each inner `Vec<String>` is one `iptables` argv. Returns an
-    /// empty list for [`NatProfile::Open`].
-    fn iptables_argvs(&self) -> Vec<Vec<String>> {
+    /// `autonat_server_ip` is whitelisted for unsolicited inbound when
+    /// the variant requires it
+    /// ([`NatProfile::PortRestrictedConeAutoNATOk`]); ignored for
+    /// variants that don't need an AutoNAT exception.
+    /// Returns an empty list for [`NatProfile::Open`].
+    fn iptables_argvs(&self, autonat_server_ip: Option<&str>) -> Vec<Vec<String>> {
+        let conntrack_accept = argv(&[
+            "iptables",
+            "-A",
+            "INPUT",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ]);
+        let lo_accept = argv(&["iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]);
+        let tcp_accept = argv(&["iptables", "-A", "INPUT", "-p", "tcp", "-j", "ACCEPT"]);
+        let udp_drop = argv(&["iptables", "-A", "INPUT", "-p", "udp", "-j", "DROP"]);
         match self {
             NatProfile::Open => Vec::new(),
-            NatProfile::PortRestrictedCone => vec![
-                argv(&[
-                    "iptables",
-                    "-A",
-                    "INPUT",
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "ESTABLISHED,RELATED",
-                    "-j",
-                    "ACCEPT",
-                ]),
-                argv(&["iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]),
-                argv(&["iptables", "-A", "INPUT", "-p", "tcp", "-j", "ACCEPT"]),
-                argv(&["iptables", "-A", "INPUT", "-p", "udp", "-j", "DROP"]),
-            ],
+            NatProfile::PortRestrictedCone => {
+                vec![conntrack_accept, lo_accept, tcp_accept, udp_drop]
+            }
+            NatProfile::PortRestrictedConeAutoNATOk => {
+                let mut rules = vec![conntrack_accept, lo_accept, tcp_accept];
+                if let Some(ip) = autonat_server_ip {
+                    // Whitelist before the catch-all UDP DROP so this
+                    // rule wins for the autonat server's verification
+                    // dials. Without an IP supplied, this variant
+                    // degrades to plain PortRestrictedCone behaviour.
+                    rules.push(argv(&["iptables", "-A", "INPUT", "-s", ip, "-j", "ACCEPT"]));
+                }
+                rules.push(udp_drop);
+                rules
+            }
         }
     }
 
@@ -336,7 +378,15 @@ impl NatProfile {
         match self {
             NatProfile::Open => "open",
             NatProfile::PortRestrictedCone => "port_restricted_cone",
+            NatProfile::PortRestrictedConeAutoNATOk => "port_restricted_cone_autonat_ok",
         }
+    }
+
+    /// Whether the harness needs to look up the AutoNAT-server IP
+    /// before applying this profile. Used to decide if the relay's
+    /// bridge address must be resolved before starting peers.
+    fn needs_autonat_whitelist(&self) -> bool {
+        matches!(self, NatProfile::PortRestrictedConeAutoNATOk)
     }
 }
 
@@ -504,6 +554,27 @@ impl WaveSyncE2eHarness {
             RELAY_QUIC_PORT, relay_peer_id
         );
 
+        // 3b. If any peer's effective NAT profile needs to whitelist
+        //     the AutoNAT server, resolve the relay's bridge IP now.
+        //     The relay also acts as the AutoNAT server in our setup
+        //     (via libp2p autonat::v2::server, transitively).
+        let any_needs_autonat_whitelist = self
+            .peers
+            .iter()
+            .map(|s| s.nat.unwrap_or(self.default_nat))
+            .any(|n| n.needs_autonat_whitelist());
+        let autonat_server_ip = if any_needs_autonat_whitelist {
+            let ip = relay
+                .get_bridge_ip_address()
+                .await
+                .context("resolve relay bridge IP for AutoNAT whitelist")?
+                .to_string();
+            eprintln!("[harness] PortRestrictedConeAutoNATOk: whitelisting relay bridge IP {ip}");
+            Some(ip)
+        } else {
+            None
+        };
+
         // 4. Start each peer with a suffixed container name so
         //    `harness.peer("alice")` still works (we use `spec.name` as
         //    the lookup key, while the container name carries the
@@ -562,7 +633,7 @@ impl WaveSyncE2eHarness {
             // netem: netem shapes egress, iptables filters ingress —
             // they don't conflict, so apply order is just informative.
             if effective_nat != NatProfile::Open {
-                apply_nat_to_container(&container, effective_nat)
+                apply_nat_to_container(&container, effective_nat, autonat_server_ip.as_deref())
                     .await
                     .with_context(|| {
                         format!(
@@ -701,12 +772,14 @@ async fn apply_netem_to_container(
 }
 
 /// Apply a NAT profile by running its `iptables` argv list against
-/// the container.
+/// the container. `autonat_server_ip` is forwarded to variants that
+/// need to whitelist a known-good source IP (see [`NatProfile`]).
 async fn apply_nat_to_container(
     container: &ContainerAsync<GenericImage>,
     profile: NatProfile,
+    autonat_server_ip: Option<&str>,
 ) -> Result<()> {
-    for argv in profile.iptables_argvs() {
+    for argv in profile.iptables_argvs(autonat_server_ip) {
         let cmd = ExecCommand::new(argv.iter().cloned())
             .with_cmd_ready_condition(CmdWaitFor::exit_code(0));
         container
