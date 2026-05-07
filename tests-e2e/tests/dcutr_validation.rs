@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use wavesyncdb_e2e::{NetemProfile, WaveSyncE2eHarness};
+use wavesyncdb_e2e::{NatProfile, NetemProfile, WaveSyncE2eHarness};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "Local-only DCUtR validation; requires Docker + netem."]
@@ -25,11 +25,17 @@ async fn dcutr_validation_cellular_fair() {
     // peers connect directly so fast that DCUtR never has a relay
     // path to upgrade. Cellular_fair forces the relay-first path
     // long enough for the DCUtR behaviour to fire its upgrade dial.
+    //
+    // We also apply `PortRestrictedCone` NAT to both peers so libp2p
+    // can't direct-dial via bridge IPs from `identify` — without NAT,
+    // the Docker bridge gives peers each other's IP for free and DCUtR
+    // never has a circuit-relay path to upgrade.
     let profile = NetemProfile::cellular_fair();
 
     let harness = WaveSyncE2eHarness::new()
         .with_passphrase("dcutr-bench")
         .with_netem(profile.clone())
+        .with_nat(NatProfile::PortRestrictedCone)
         .add_peer("alice")
         .add_peer("bob")
         .start()
@@ -99,11 +105,13 @@ async fn dcutr_validation_cellular_fair() {
     // gap in the bench, not a bug.
     if total_attempted == 0 {
         eprintln!(
-            "Note: zero DCUtR attempts on a relay-routed pair likely means peers \
-             bypassed the relay via direct dial (Docker bridge gives them each \
-             other's address through identify before DCUtR can trigger). To force \
-             DCUtR activity, a future bench iteration could disable direct dial \
-             and only allow circuit-relay addresses."
+            "Note on PortRestrictedCone: AutoNAT v2 dial-backs are themselves \
+             unsolicited inbound UDP and get blocked by the iptables filter. \
+             That makes the engine downgrade its NAT-status to private, which \
+             then suppresses the hole-punch DCUtR would attempt. To exercise \
+             DCUtR end-to-end, the bench needs an AutoNAT-permissive shape \
+             (allow the AutoNAT server peer-id explicitly, or run autonat \
+             outside the iptables chain). Tracked as a follow-up."
         );
     }
 }
