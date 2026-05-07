@@ -670,6 +670,19 @@ impl RunningPeer {
             .connected)
     }
 
+    /// Snapshot of the engine's diagnostics counters at this peer.
+    /// Returns the wire-compatible JSON representation; we re-parse it
+    /// as a typed value so scenarios can assert on specific counters.
+    pub async fn diagnostics(&self) -> Result<DiagnosticsSnapshot> {
+        Ok(reqwest::Client::new()
+            .get(format!("{}/diagnostics", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DiagnosticsSnapshot>()
+            .await?)
+    }
+
     /// Block until a task with the given pk is visible at this peer, or
     /// time out. Used by scenarios to assert convergence.
     ///
@@ -715,4 +728,24 @@ pub struct Task {
 #[derive(Debug, Deserialize)]
 struct PeersResponse {
     connected: usize,
+}
+
+/// Diagnostics counter snapshot returned by `GET /diagnostics`. Field
+/// names mirror `wavesyncdb::diagnostics::Snapshot` exactly so the
+/// JSON returned by the test-peer is wire-compatible. We don't import
+/// `wavesyncdb` here directly — keeping the harness type-only so the
+/// e2e crate doesn't pull the full engine surface.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticsSnapshot {
+    pub circuit_reservation_attempts: u64,
+    pub circuit_reservations_accepted: u64,
+    pub peer_dial_attempts: u64,
+    pub peer_dial_successes: u64,
+    pub peer_dial_failures: u64,
+    pub mdns_discoveries: u64,
+    pub peerlist_introductions: u64,
+    pub peerjoined_introductions: u64,
+    pub cached_addr_dials: u64,
+    pub dcutr_upgrades_attempted: u64,
+    pub dcutr_upgrades_succeeded: u64,
 }
