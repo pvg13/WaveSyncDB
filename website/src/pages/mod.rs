@@ -1,3 +1,4 @@
+mod benchmarks;
 mod docs;
 mod examples;
 mod home;
@@ -14,6 +15,7 @@ mod sync_demo;
 #[cfg(target_arch = "wasm32")]
 mod todo_demo;
 
+pub use benchmarks::Benchmarks;
 pub use docs::DocPage;
 pub use examples::Examples;
 pub use home::Home;
