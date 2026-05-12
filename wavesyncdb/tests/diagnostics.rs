@@ -6,8 +6,8 @@
 //! (timing-sensitive on CI runners) — it's to catch silent regressions
 //! where a future refactor accidentally bypasses the increment site.
 //!
-//! Single-threaded per CLAUDE.md Rule 2.13: mDNS discovery is process-wide
-//! and parallel tests cross-discover.
+//! Must run single-threaded: mDNS discovery is process-wide and parallel
+//! tests cross-discover each other's peers, causing nondeterministic failures.
 //!
 //! Run with `cargo test -p wavesyncdb --test diagnostics -- --test-threads=1`.
 

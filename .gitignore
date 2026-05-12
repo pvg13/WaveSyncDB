@@ -28,7 +28,7 @@ Cargo.lock
 # docker-compose; paste contents into Dokploy's Files tab, never commit.
 wavesync_relay/secrets/
 
-# Keep CLAUDE.md and doc files tracked — only ignore generated markdown
+# Ignore all markdown by default; force-add docs you want tracked with `git add -f`.
 **/*.md
 **/*firebase*.json
 **/*google-services*.json
