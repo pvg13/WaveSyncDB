@@ -9,12 +9,8 @@
 //! the same topic via *its* hardcoded relay, and the two peers
 //! discover each other through the relay's topic mesh.
 
-use std::collections::HashMap;
-
 use dioxus::prelude::*;
-use wavesyncdb::{
-    BrowserEntity, WebSyncClient, WebSyncStatus, dioxus::use_synced_table, serde_json,
-};
+use wavesyncdb::{SyncEntity, WebSyncClient, WebSyncStatus, dioxus::use_synced_table};
 
 use crate::pairing::{PairingParams, build_pairing_url};
 
@@ -42,45 +38,13 @@ fn relay_addr() -> String {
 const DEFAULT_TOPIC: &str = "qr-pairing-demo";
 const DEFAULT_PASS: &str = "demo-shared-secret";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, SyncEntity)]
 struct Task {
+    #[sea_orm(primary_key)]
     id: String,
     title: String,
     done: bool,
     created_at: u64,
-}
-
-impl BrowserEntity for Task {
-    fn from_columns(pk: &str, cols: &HashMap<String, serde_json::Value>) -> Self {
-        Task {
-            id: pk.to_string(),
-            title: cols
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(untitled)")
-                .to_string(),
-            done: cols.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
-            created_at: cols.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-        }
-    }
-
-    fn to_columns(&self) -> Vec<(String, serde_json::Value)> {
-        vec![
-            (
-                "title".to_string(),
-                serde_json::Value::String(self.title.clone()),
-            ),
-            ("done".to_string(), serde_json::Value::Bool(self.done)),
-            (
-                "created_at".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(self.created_at)),
-            ),
-        ]
-    }
-
-    fn pk(&self) -> String {
-        self.id.clone()
-    }
 }
 
 #[component]

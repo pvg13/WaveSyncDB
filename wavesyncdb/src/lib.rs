@@ -171,7 +171,7 @@ pub use sea_orm;
 // declare serde_json as a direct dependency.
 pub use serde_json;
 
-#[cfg(all(feature = "derive", not(target_arch = "wasm32")))]
+#[cfg(feature = "derive")]
 pub use wavesyncdb_derive::SyncEntity;
 
 #[cfg(feature = "dioxus")]

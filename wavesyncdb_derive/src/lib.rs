@@ -2,24 +2,63 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, parse_macro_input, spanned::Spanned};
 
-/// Derive macro that
+/// Derive macro that emits the per-target glue needed to plug a Rust
+/// struct into WaveSyncDB's sync engine.
 ///
-/// 1. registers a SeaORM entity for auto-discovery by
-///    `WaveSyncDb::get_schema_registry`, and
-/// 2. emits an `impl wavesyncdb::SyncedModel for Model` so the Dioxus
-///    reactive hooks can apply per-column changes from `ChangeNotification`
-///    in place — no DB round-trip on the receive path.
+/// **On native targets (`cfg(not(target_arch = "wasm32"))`):**
 ///
-/// Place this alongside `DeriveEntityModel` on your `Model` struct:
+/// 1. Registers a SeaORM entity for auto-discovery by
+///    `WaveSyncDb::get_schema_registry`.
+/// 2. Emits `impl SyncedModel` so the Dioxus reactive hooks can apply
+///    per-column changes from `ChangeNotification` in place — no DB
+///    round-trip on the receive path.
+///
+/// **On wasm32:**
+///
+/// Emits `impl BrowserEntity` so the same struct works with
+/// `WebSyncClient::submit` and the web `use_synced_table` hook.
+/// Field values round-trip through `serde_json::Value`, so each non-PK
+/// field must implement `Serialize + DeserializeOwned + Default`
+/// (primitives, `String`, `Option<T>`, `Vec<u8>`, chrono dates — all
+/// satisfy this out of the box).
+///
+/// ## Patterns
+///
+/// **Wasm-only entity** (e.g. for a browser-only demo):
 ///
 /// ```ignore
-/// #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
-/// #[sea_orm(table_name = "tasks")]
-/// pub struct Model { ... }
+/// #[derive(Clone, Debug, Default, SyncEntity)]
+/// pub struct Task {
+///     #[sea_orm(primary_key)]
+///     pub id: String,
+///     pub title: String,
+///     pub done: bool,
+/// }
+/// ```
+///
+/// **Shared across native and wasm** (one source of truth — the
+/// SeaORM derives are conditional, but `SyncEntity` is unconditional and
+/// claims the `#[sea_orm(...)]` helper attribute on both targets):
+///
+/// ```ignore
+/// #[derive(Clone, Debug, Default, SyncEntity)]
+/// #[cfg_attr(not(target_arch = "wasm32"), derive(sea_orm::DeriveEntityModel))]
+/// #[cfg_attr(not(target_arch = "wasm32"), sea_orm(table_name = "tasks"))]
+/// pub struct Model {
+///     #[sea_orm(primary_key)]
+///     pub id: String,
+///     pub title: String,
+///     pub done: bool,
+/// }
 /// ```
 #[proc_macro_derive(SyncEntity, attributes(sea_orm))]
 pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
+
+    let meta = match collect_field_meta(&input) {
+        Ok(m) => m,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     let inventory_block = quote! {
         wavesyncdb::register_sync_entity! {
@@ -56,28 +95,43 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
         }
     };
 
-    let synced_model_impl = match build_synced_model_impl(&input) {
-        Ok(ts) => ts,
-        Err(e) => return e.to_compile_error().into(),
-    };
+    let synced_model_body = build_synced_model_body(&meta);
+    let browser_entity_body = build_browser_entity_body(&meta);
 
     let model_ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
+        #[cfg(not(target_arch = "wasm32"))]
         #inventory_block
 
+        #[cfg(not(target_arch = "wasm32"))]
         #[automatically_derived]
-        impl #impl_generics wavesyncdb::SyncedModel for #model_ident #ty_generics #where_clause {
-            #synced_model_impl
+        impl #impl_generics ::wavesyncdb::SyncedModel for #model_ident #ty_generics #where_clause {
+            #synced_model_body
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[automatically_derived]
+        impl #impl_generics ::wavesyncdb::BrowserEntity for #model_ident #ty_generics #where_clause {
+            #browser_entity_body
         }
     }
     .into()
 }
 
-/// Walks the struct's named fields, finds the field marked
-/// `#[sea_orm(primary_key)]`, and emits the three trait-method bodies.
-fn build_synced_model_impl(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+struct FieldMeta {
+    field_idents: Vec<syn::Ident>,
+    field_types: Vec<syn::Type>,
+    field_lits: Vec<String>,
+    pk_ident: syn::Ident,
+    pk_type: syn::Type,
+}
+
+/// Walks the struct's named fields and identifies the field marked
+/// `#[sea_orm(primary_key)]`. Shared between the native and wasm
+/// codegen paths.
+fn collect_field_meta(input: &DeriveInput) -> syn::Result<FieldMeta> {
     let fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => &named.named,
@@ -123,6 +177,26 @@ fn build_synced_model_impl(input: &DeriveInput) -> syn::Result<proc_macro2::Toke
         )
     })?;
 
+    Ok(FieldMeta {
+        field_idents,
+        field_types,
+        field_lits,
+        pk_ident,
+        pk_type,
+    })
+}
+
+/// Generates the three `SyncedModel` trait methods used by the native
+/// Dioxus reactive hooks to apply per-column changes in place.
+fn build_synced_model_body(meta: &FieldMeta) -> proc_macro2::TokenStream {
+    let FieldMeta {
+        field_idents,
+        field_types,
+        field_lits,
+        pk_ident,
+        pk_type,
+    } = meta;
+
     // Local binding names used inside `wavesync_from_changes` to avoid
     // shadowing the struct field name when constructing the final value.
     let local_idents: Vec<syn::Ident> = field_idents
@@ -132,11 +206,11 @@ fn build_synced_model_impl(input: &DeriveInput) -> syn::Result<proc_macro2::Toke
     let pk_local = local_idents
         .iter()
         .zip(field_idents.iter())
-        .find(|(_, fi)| **fi == pk_ident)
+        .find(|(_, fi)| *fi == pk_ident)
         .map(|(li, _)| li.clone())
         .expect("pk ident must be in field list");
 
-    Ok(quote! {
+    quote! {
         fn wavesync_apply_change(&mut self, column: &str, value: &::wavesyncdb::serde_json::Value) {
             match column {
                 #(
@@ -191,7 +265,83 @@ fn build_synced_model_impl(input: &DeriveInput) -> syn::Result<proc_macro2::Toke
         fn wavesync_pk_string(&self) -> ::std::string::String {
             ::std::format!("{}", self.#pk_ident)
         }
-    })
+    }
+}
+
+/// Generates `impl BrowserEntity` — bidirectional mapping between a
+/// Rust struct and the engine's column-bag wire shape. Each non-PK field
+/// is serialized via `serde_json::to_value` on submit and deserialized
+/// via `serde_json::from_value` on receive; missing columns fall back to
+/// `Default::default()` so the trait method can return `Self` directly
+/// (the trait has no `Option<Self>` return path).
+fn build_browser_entity_body(meta: &FieldMeta) -> proc_macro2::TokenStream {
+    let pk_ident = &meta.pk_ident;
+    let pk_type = &meta.pk_type;
+
+    // Partition into PK and non-PK fields. `to_columns` deliberately
+    // omits the PK — the trait's contract is that callers pass it
+    // separately via `pk()`.
+    let mut non_pk_idents = Vec::new();
+    let mut non_pk_types = Vec::new();
+    let mut non_pk_lits = Vec::new();
+    for ((id, ty), lit) in meta
+        .field_idents
+        .iter()
+        .zip(meta.field_types.iter())
+        .zip(meta.field_lits.iter())
+    {
+        if id != pk_ident {
+            non_pk_idents.push(id.clone());
+            non_pk_types.push(ty.clone());
+            non_pk_lits.push(lit.clone());
+        }
+    }
+
+    quote! {
+        fn from_columns(
+            pk: &str,
+            cols: &::std::collections::HashMap<::std::string::String, ::wavesyncdb::serde_json::Value>,
+        ) -> Self {
+            // PK parsing chain mirrors the native `wavesync_from_changes`
+            // path: try `from_value(Value::String(...))` first (covers
+            // String and Uuid), then fall back to `from_str` (covers
+            // numeric PKs where serde_json doesn't auto-convert from a
+            // JSON string).
+            let __pk_val: #pk_type = ::wavesyncdb::serde_json::from_value::<#pk_type>(
+                ::wavesyncdb::serde_json::Value::String(pk.to_string()),
+            )
+            .ok()
+            .or_else(|| ::wavesyncdb::serde_json::from_str::<#pk_type>(pk).ok())
+            .unwrap_or_default();
+
+            Self {
+                #pk_ident: __pk_val,
+                #(
+                    #non_pk_idents: cols
+                        .get(#non_pk_lits)
+                        .and_then(|__v| ::wavesyncdb::serde_json::from_value::<#non_pk_types>(__v.clone()).ok())
+                        .unwrap_or_default(),
+                )*
+            }
+        }
+
+        fn to_columns(&self) -> ::std::vec::Vec<(::std::string::String, ::wavesyncdb::serde_json::Value)> {
+            let mut __out: ::std::vec::Vec<(::std::string::String, ::wavesyncdb::serde_json::Value)>
+                = ::std::vec::Vec::new();
+            #(
+                __out.push((
+                    ::std::string::ToString::to_string(#non_pk_lits),
+                    ::wavesyncdb::serde_json::to_value(&self.#non_pk_idents)
+                        .unwrap_or(::wavesyncdb::serde_json::Value::Null),
+                ));
+            )*
+            __out
+        }
+
+        fn pk(&self) -> ::std::string::String {
+            ::std::format!("{}", self.#pk_ident)
+        }
+    }
 }
 
 /// True if the field carries `#[sea_orm(primary_key)]` (with or without
