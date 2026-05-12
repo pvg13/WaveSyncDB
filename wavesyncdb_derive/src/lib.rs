@@ -60,6 +60,11 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    let table_name = match parse_table_name(&input) {
+        Ok(name) => name,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
     let inventory_block = quote! {
         wavesyncdb::register_sync_entity! {
             wavesyncdb::SyncEntityInfo {
@@ -116,8 +121,70 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
         impl #impl_generics ::wavesyncdb::BrowserEntity for #model_ident #ty_generics #where_clause {
             #browser_entity_body
         }
+
+        // The cross-target metadata trait that lets the unified
+        // `wavesyncdb::dioxus::use_synced_table` hook work without
+        // cfg gating at the UI call site. On native it carries the
+        // SeaORM Entity + ActiveModel associations; on wasm it carries
+        // only the table name (the column round-trip lives in
+        // `BrowserEntity`). The sibling identifiers `Entity` and
+        // `ActiveModel` referenced below come from `DeriveEntityModel`
+        // (or any compatible derive) in the same module as the user's
+        // struct.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[automatically_derived]
+        impl #impl_generics ::wavesyncdb::SyncedTableEntity for #model_ident #ty_generics #where_clause {
+            type Entity = Entity;
+            type ActiveModel = ActiveModel;
+            fn table_name() -> &'static str { #table_name }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[automatically_derived]
+        impl #impl_generics ::wavesyncdb::SyncedTableEntity for #model_ident #ty_generics #where_clause {
+            fn table_name() -> &'static str { #table_name }
+        }
     }
     .into()
+}
+
+/// Parse the table name from the struct-level `#[sea_orm(table_name = "...")]`
+/// attribute. Required on both native and wasm32 targets — on wasm there's
+/// no `DeriveEntityModel` to consume it, but `SyncEntity` claims it via
+/// `attributes(sea_orm)` so the compiler accepts it and the macro reads it
+/// to populate `SyncedTableEntity::table_name()`.
+fn parse_table_name(input: &DeriveInput) -> syn::Result<String> {
+    for attr in &input.attrs {
+        if !attr.path().is_ident("sea_orm") {
+            continue;
+        }
+        let mut table_name: Option<String> = None;
+        let mut parse_err: Option<syn::Error> = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("table_name") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                table_name = Some(lit.value());
+            } else if meta.input.peek(syn::Token![=]) {
+                // Skip past any `= ...` value for keys we don't care about
+                // so the parser doesn't error on them.
+                let _: syn::Token![=] = meta.input.parse()?;
+                let _: proc_macro2::TokenStream = meta.input.parse()?;
+            }
+            Ok(())
+        })
+        .map_err(|e| parse_err = Some(e));
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
+        if let Some(name) = table_name {
+            return Ok(name);
+        }
+    }
+    Err(syn::Error::new(
+        input.span(),
+        "SyncEntity requires `#[sea_orm(table_name = \"...\")]` at the struct level — needed to populate `SyncedTableEntity::table_name()`",
+    ))
 }
 
 struct FieldMeta {

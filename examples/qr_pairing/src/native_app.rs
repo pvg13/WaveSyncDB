@@ -26,7 +26,7 @@ use dioxus::prelude::*;
 use sea_orm::{ActiveModelTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::dioxus::{
-    use_network_status, use_synced_table, use_wavesync, use_wavesync_provider,
+    SyncHandle, use_network_status, use_synced_table, use_wavesync, use_wavesync_provider,
 };
 use wavesyncdb::{NatStatus, RelayStatus, WaveSyncDb, WaveSyncDbBuilder};
 
@@ -611,9 +611,10 @@ fn AddTaskForm() -> Element {
 #[component]
 fn TaskList() -> Element {
     let db = use_wavesync();
-    // `use_synced_table` consumes the db value; clone first so we can
-    // still hand it to the per-task toggle handlers below.
-    let tasks = use_synced_table::<task::Entity>(db.clone());
+    // `SyncHandle` consumes the db value; clone first so we can still
+    // hand it to the per-task toggle handlers below (those use the
+    // db directly via SeaORM ActiveModel — native-only escape hatch).
+    let tasks = use_synced_table::<task::Model>(SyncHandle::new(db.clone()));
 
     let mut visible: Vec<task::Model> = tasks().clone();
     visible.sort_by_key(|t| std::cmp::Reverse(t.created_at));

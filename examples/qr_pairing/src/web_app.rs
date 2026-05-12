@@ -10,11 +10,13 @@
 //! discover each other through the relay's topic mesh.
 
 use dioxus::prelude::*;
-use wavesyncdb::{SyncEntity, WebSyncClient, WebSyncStatus, dioxus::use_synced_table};
+use wavesyncdb::{
+    SyncEntity, WebSyncClient, WebSyncStatus,
+    dioxus::{SyncHandle, use_synced_table},
+};
 
 use crate::pairing::{PairingParams, build_pairing_url};
 
-const TASK_TABLE: &str = "tasks";
 const STORE_NAME: &str = "qr-pairing-web";
 
 /// PeerId of the default relay (the one the README's
@@ -39,6 +41,7 @@ const DEFAULT_TOPIC: &str = "qr-pairing-demo";
 const DEFAULT_PASS: &str = "demo-shared-secret";
 
 #[derive(Clone, Debug, Default, SyncEntity)]
+#[sea_orm(table_name = "tasks")]
 struct Task {
     #[sea_orm(primary_key)]
     id: String,
@@ -108,7 +111,7 @@ pub fn App() -> Element {
             if client().is_some() {
                 PairingPanel { client: client, topic: topic(), pass: pass() }
                 DebugPanel { client: client }
-                TaskList { client: client }
+                TaskList { handle: SyncHandle::new(client) }
             } else {
                 div { class: "panel",
                     h2 { "Pair a phone" }
@@ -178,8 +181,8 @@ fn PairingPanel(client: Signal<Option<WebSyncClient>>, topic: String, pass: Stri
 }
 
 #[component]
-fn TaskList(client: Signal<Option<WebSyncClient>>) -> Element {
-    let tasks = use_synced_table::<Task>(client, TASK_TABLE);
+fn TaskList(handle: SyncHandle) -> Element {
+    let tasks = use_synced_table::<Task>(handle);
     let mut new_title = use_signal(String::new);
 
     let do_add = use_callback(move |_: ()| {
@@ -187,7 +190,6 @@ fn TaskList(client: Signal<Option<WebSyncClient>>) -> Element {
         if title.is_empty() {
             return;
         }
-        let Some(c) = client() else { return };
         let task = Task {
             id: uuid_v4_string(),
             title,
@@ -196,15 +198,14 @@ fn TaskList(client: Signal<Option<WebSyncClient>>) -> Element {
         };
         new_title.set(String::new());
         spawn(async move {
-            let _ = c.submit::<Task>(TASK_TABLE, &task).await;
+            let _ = handle.submit(&task).await;
         });
     });
 
     let toggle = move |t: Task| {
-        let Some(c) = client() else { return };
         let updated = Task { done: !t.done, ..t };
         spawn(async move {
-            let _ = c.submit::<Task>(TASK_TABLE, &updated).await;
+            let _ = handle.submit(&updated).await;
         });
     };
 

@@ -52,7 +52,8 @@ use entity::task;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::dioxus::{
-    use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync, use_wavesync_provider,
+    SyncHandle, use_auto_lifecycle, use_network_status, use_synced_table, use_wavesync,
+    use_wavesync_provider,
 };
 use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
 
@@ -355,7 +356,7 @@ fn AddTaskForm() -> Element {
 #[component]
 fn TaskList() -> Element {
     let db = use_wavesync();
-    let tasks = use_synced_table::<task::Entity>(db);
+    let tasks = use_synced_table::<task::Model>(SyncHandle::new(db));
 
     rsx! {
         ul { class: "task-list",
