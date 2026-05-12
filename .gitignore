@@ -28,7 +28,7 @@ Cargo.lock
 # docker-compose; paste contents into Dokploy's Files tab, never commit.
 wavesync_relay/secrets/
 
-# Keep CLAUDE.md and doc files tracked — only ignore generated markdown
+# Ignore all markdown by default; force-add docs you want tracked with `git add -f`.
 **/*.md
 **/*firebase*.json
 **/*google-services*.json
@@ -36,3 +36,6 @@ wavesync_relay/secrets/
 **/build/
 **/.build/
 **/.kotlin/
+# Maestro / FCM test harness runtime artifacts
+examples/dioxus_fcm_sync/.test-logs/
+examples/dioxus_fcm_sync/.test-pids/

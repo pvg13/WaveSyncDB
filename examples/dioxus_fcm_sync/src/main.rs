@@ -83,9 +83,17 @@ const STYLE: &str = r#"
 /// Relay server address. Set this to your relay's multiaddr for WAN sync.
 /// Example: "/ip4/your-server-ip/tcp/4001/p2p/12D3KooW..."
 /// Leave as None for LAN-only mDNS sync (desktop testing).
-const RELAY_SERVER: Option<&str> = Some(
-    "/dns4/relay.wavesyncdb.com/udp/4001/quic-v1/p2p/12D3KooWH2ZzVdXehxyNa1QDeWrBLAWKynMVPn8BK2LaDCTiPs4D",
-);
+///
+/// `WAVESYNC_RELAY_OVERRIDE` lets bench/test scripts (`test.sh`) point the
+/// app at a locally-running relay with controlled FCM credentials,
+/// without modifying this file. `cargo:rerun-if-env-changed` is set in
+/// `build.rs` so changing the env triggers a rebuild.
+const RELAY_SERVER: Option<&str> = match option_env!("WAVESYNC_RELAY_OVERRIDE") {
+    Some(s) => Some(s),
+    None => Some(
+        "/dns4/relay.wavesyncdb.com/udp/4001/quic-v1/p2p/12D3KooWH2ZzVdXehxyNa1QDeWrBLAWKynMVPn8BK2LaDCTiPs4D",
+    ),
+};
 
 static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 

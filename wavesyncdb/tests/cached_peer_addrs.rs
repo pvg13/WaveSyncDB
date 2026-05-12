@@ -13,8 +13,8 @@
 //! 3. The new engine actually dialed a cached address at startup
 //!    (via `predial_cached_addrs`).
 //!
-//! Single-threaded per CLAUDE.md Rule 2.13: mDNS is process-wide and
-//! parallel tests cross-discover.
+//! Must run single-threaded: mDNS discovery is process-wide and parallel
+//! tests cross-discover each other's peers, causing nondeterministic failures.
 //!
 //! Run with `cargo test -p wavesyncdb --test cached_peer_addrs -- --test-threads=1`.
 
