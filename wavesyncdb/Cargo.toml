@@ -106,5 +106,6 @@ mobile-ffi = []
 # shadow tables, peer tracker, push helpers, and FFI surface are
 # `cfg(not(target_arch = "wasm32"))`-gated and unavailable in browser builds.
 # Browser-side P2P transports (WebSocket / WebRTC / WebTransport) are a
-# separate, future opt-in.
-web = []
+# separate, future opt-in. Pulls in `derive` so `#[derive(SyncEntity)]`
+# auto-generates `impl BrowserEntity` on wasm.
+web = ["derive"]

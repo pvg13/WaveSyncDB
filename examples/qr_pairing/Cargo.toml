@@ -39,8 +39,9 @@ dioxus-sdk-storage = { git = "https://github.com/DioxusLabs/sdk.git" }
 android_logger = "0.14"
 
 # Wasm32 (browser): WebSyncClient + IndexedDB + QR generator. No
-# SeaORM, no sqlx — those don't compile to wasm32. The example's web
-# task entity is a plain struct that `impl BrowserEntity` instead.
+# SeaORM, no sqlx — those don't compile to wasm32. The task entity is
+# a plain struct deriving `SyncEntity`; the derive emits an
+# `impl BrowserEntity` for wasm targets (and SeaORM glue on native).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wavesyncdb = { workspace = true, features = ["web", "dioxus"] }
 # QR generator. Default `image` feature would pull in PNG encoding

@@ -47,6 +47,7 @@ pub mod network_status;
 pub mod protocol;
 pub mod registry;
 pub mod synced_model;
+pub mod synced_table;
 
 // Native-only modules: anything that touches sea-orm (SQLite), libp2p
 // transports, tokio I/O, the local filesystem, or platform FFI. The
@@ -102,6 +103,7 @@ pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInf
 pub use registry::SyncEntityInfo;
 pub use registry::{TableMeta, TableRegistry};
 pub use synced_model::SyncedModel;
+pub use synced_table::SyncedTableEntity;
 
 /// Returns recommended log module filter tuples for silencing noisy dependencies.
 ///
@@ -171,7 +173,7 @@ pub use sea_orm;
 // declare serde_json as a direct dependency.
 pub use serde_json;
 
-#[cfg(all(feature = "derive", not(target_arch = "wasm32")))]
+#[cfg(feature = "derive")]
 pub use wavesyncdb_derive::SyncEntity;
 
 #[cfg(feature = "dioxus")]

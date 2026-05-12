@@ -15,63 +15,25 @@
 //! IndexedDB is the single source of truth; the component is a thin
 //! renderer over `Signal<Vec<Task>>`.
 
-use std::collections::HashMap;
-
 use dioxus::prelude::*;
 use wavesyncdb::{
-    BrowserEntity, LoopbackLink, LoopbackPair, WebSyncClient, dioxus::use_synced_table, serde_json,
+    LoopbackLink, LoopbackPair, SyncEntity, WebSyncClient,
+    dioxus::{SyncHandle, use_synced_table},
 };
 
 const TOPIC: &str = "wavesync-local-demo";
 const STORE_LAPTOP: &str = "local-demo-laptop";
 const STORE_PHONE: &str = "local-demo-phone";
-const TASK_TABLE: &str = "tasks";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, SyncEntity)]
+#[sea_orm(table_name = "tasks")]
 struct Task {
+    #[sea_orm(primary_key)]
     id: String,
     title: String,
     done: bool,
     deleted: bool,
     created_at: u64,
-}
-
-impl BrowserEntity for Task {
-    fn from_columns(pk: &str, cols: &HashMap<String, serde_json::Value>) -> Self {
-        Task {
-            id: pk.to_string(),
-            title: cols
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(untitled)")
-                .to_string(),
-            done: cols.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
-            deleted: cols
-                .get("deleted")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            created_at: cols.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-        }
-    }
-
-    fn to_columns(&self) -> Vec<(String, serde_json::Value)> {
-        vec![
-            (
-                "title".to_string(),
-                serde_json::Value::String(self.title.clone()),
-            ),
-            ("done".to_string(), serde_json::Value::Bool(self.done)),
-            ("deleted".to_string(), serde_json::Value::Bool(self.deleted)),
-            (
-                "created_at".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(self.created_at)),
-            ),
-        ]
-    }
-
-    fn pk(&self) -> String {
-        self.id.clone()
-    }
 }
 
 #[component]
@@ -205,7 +167,8 @@ fn DeviceBody(
     // The reactive view: tasks materialize from IndexedDB on first
     // client-ready, then auto-update on every local or remote change
     // via subscribe_resolved. No HashMap, no manual merge.
-    let tasks = use_synced_table::<Task>(client, TASK_TABLE);
+    let handle = SyncHandle::new(client);
+    let tasks = use_synced_table::<Task>(handle);
     let mut new_title = use_signal(String::new);
     let connected = client().is_some();
     let is_online = online();
@@ -223,7 +186,6 @@ fn DeviceBody(
         if title.is_empty() {
             return;
         }
-        let Some(c) = client() else { return };
         let task = Task {
             id: uuid_v4_string(),
             title,
@@ -233,23 +195,21 @@ fn DeviceBody(
         };
         new_title.set(String::new());
         spawn(async move {
-            let _ = c.submit::<Task>(TASK_TABLE, &task).await;
+            let _ = handle.submit(&task).await;
         });
     };
 
     let toggle_done = move |t: Task| {
-        let Some(c) = client() else { return };
         let updated = Task { done: !t.done, ..t };
         spawn(async move {
-            let _ = c.submit::<Task>(TASK_TABLE, &updated).await;
+            let _ = handle.submit(&updated).await;
         });
     };
 
     let delete_task = move |t: Task| {
-        let Some(c) = client() else { return };
         let updated = Task { deleted: true, ..t };
         spawn(async move {
-            let _ = c.submit::<Task>(TASK_TABLE, &updated).await;
+            let _ = handle.submit(&updated).await;
         });
     };
 
