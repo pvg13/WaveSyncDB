@@ -7,8 +7,15 @@
 //! - [`use_wavesync()`] — retrieve the `&'static WaveSyncDb` from context.
 //! - [`use_wavesync_opt()`] — returns `Signal<Option<&'static WaveSyncDb>>`.
 //! - [`use_wavesync_init()`] — returns an [`InitDb`] handle to build the DB at runtime.
-//! - [`use_synced_table`] — reactive signal of all rows in a table, auto-refreshes on writes.
+//! - [`use_synced_table`] — cross-target reactive signal of all rows
+//!   in a table. Takes a [`SyncHandle`] so the same UI component
+//!   compiles on native and wasm32 without cfg gating at the call site.
+//! - [`use_synced_table_db`] / [`use_synced_table_client`] — backend-
+//!   specific escape hatches when a [`SyncHandle`] isn't available.
 //! - [`use_synced_row`] — reactive signal for a single row by primary key.
+//! - [`SyncHandle`] — opaque transport wrapper (`WaveSyncDb` on native,
+//!   `Signal<Option<WebSyncClient>>` on wasm32) with a unified
+//!   [`SyncHandle::submit`] for writes.
 //!
 //! ## Example
 //!
@@ -20,20 +27,17 @@
 //!         .unwrap();
 //!     let _guard = rt.enter();
 //!
-//!     let db: &'static WaveSyncDb = rt.block_on(async {
+//!     let db: WaveSyncDb = rt.block_on(async {
 //!         let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic")
 //!             .build().await.unwrap();
-//!         let db = Box::leak(Box::new(db));
 //!         db.get_schema_registry(module_path!().split("::").next().unwrap())
 //!             .sync().await.unwrap();
 //!         db
 //!     });
 //!
 //!     dioxus::launch(move || {
-//!         wavesyncdb::dioxus::use_wavesync_provider(db);
-//!         let tasks = wavesyncdb::dioxus::use_synced_table::<task::Entity>(
-//!             wavesyncdb::dioxus::use_wavesync()
-//!         );
+//!         let handle = wavesyncdb::dioxus::SyncHandle::new(db.clone());
+//!         let tasks = wavesyncdb::dioxus::use_synced_table::<task::Model>(handle);
 //!         // ... render tasks
 //!         todo!()
 //!     });
@@ -56,3 +60,10 @@ pub use hooks::*;
 pub mod web_hooks;
 #[cfg(target_arch = "wasm32")]
 pub use web_hooks::*;
+
+// Cross-target transport facade. Exposes [`SyncHandle`], the
+// target-agnostic [`use_synced_table`] hook, and [`SyncSubmitError`].
+// Lives outside `hooks` / `web_hooks` so the same definitions are
+// available on both targets.
+pub mod sync_handle;
+pub use sync_handle::{SyncHandle, SyncSubmitError, use_synced_table};

@@ -275,7 +275,14 @@ pub fn use_peer_identities(
 // Reactive table/row hooks
 // ---------------------------------------------------------------------------
 
-/// Reactive signal containing all rows in a table.
+/// Reactive signal containing all rows in a table, keyed by a SeaORM
+/// `Entity` type and operating directly on a [`WaveSyncDb`].
+///
+/// **Most apps should use [`super::use_synced_table`] instead** — the
+/// cross-target hook that takes a [`SyncHandle`](super::SyncHandle) and
+/// works identically on native and wasm32. This `_db` variant is the
+/// native-only escape hatch for code that holds a `WaveSyncDb` directly
+/// (e.g., legacy callers, advanced query setups).
 ///
 /// Performs an initial `E::find().all(db)` query, then keeps the in-memory
 /// `Vec<E::Model>` in sync with subsequent writes by **applying the
@@ -287,7 +294,7 @@ pub fn use_peer_identities(
 /// Falls back to a full `find().all()` reload only when the broadcast
 /// channel reports `Lagged` — i.e. the subscriber missed notifications and
 /// can't reconstruct the delta.
-pub fn use_synced_table<E>(db: WaveSyncDb) -> Signal<Vec<E::Model>>
+pub fn use_synced_table_db<E>(db: WaveSyncDb) -> Signal<Vec<E::Model>>
 where
     E: EntityTrait,
     E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,

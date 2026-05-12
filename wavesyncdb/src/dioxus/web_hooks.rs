@@ -4,7 +4,13 @@
 //! is the single source of truth for application state, and components
 //! drive themselves off a reactive stream of changes.
 //!
-//! [`use_synced_table::<E>(client, table)`] returns a
+//! **Most apps should use the cross-target
+//! [`super::use_synced_table`] instead** — it takes a
+//! [`SyncHandle`](super::SyncHandle) and works identically on native
+//! and wasm32. The hook below is the web-only escape hatch for code
+//! that already holds a `Signal<Option<WebSyncClient>>` directly.
+//!
+//! [`use_synced_table_client::<E>(client, table)`] returns a
 //! `Signal<Vec<E>>` that:
 //!
 //! 1. On the first render where `client` is `Some`, materializes the
@@ -44,7 +50,7 @@ use crate::web_entity::BrowserEntity;
 ///
 /// `table` is captured by value (`String`) so the hook can use it from
 /// the spawned subscription task without lifetime gymnastics.
-pub fn use_synced_table<E: BrowserEntity>(
+pub fn use_synced_table_client<E: BrowserEntity>(
     client: Signal<Option<WebSyncClient>>,
     table: &'static str,
 ) -> Signal<Vec<E>> {
