@@ -160,20 +160,21 @@ fn parse_table_name(input: &DeriveInput) -> syn::Result<String> {
         }
         let mut table_name: Option<String> = None;
         let mut parse_err: Option<syn::Error> = None;
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("table_name") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                table_name = Some(lit.value());
-            } else if meta.input.peek(syn::Token![=]) {
-                // Skip past any `= ...` value for keys we don't care about
-                // so the parser doesn't error on them.
-                let _: syn::Token![=] = meta.input.parse()?;
-                let _: proc_macro2::TokenStream = meta.input.parse()?;
-            }
-            Ok(())
-        })
-        .map_err(|e| parse_err = Some(e));
+        let _ = attr
+            .parse_nested_meta(|meta| {
+                if meta.path.is_ident("table_name") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    table_name = Some(lit.value());
+                } else if meta.input.peek(syn::Token![=]) {
+                    // Skip past any `= ...` value for keys we don't care about
+                    // so the parser doesn't error on them.
+                    let _: syn::Token![=] = meta.input.parse()?;
+                    let _: proc_macro2::TokenStream = meta.input.parse()?;
+                }
+                Ok(())
+            })
+            .map_err(|e| parse_err = Some(e));
         if let Some(e) = parse_err {
             return Err(e);
         }
