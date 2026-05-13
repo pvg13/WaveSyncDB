@@ -1231,6 +1231,67 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
     let _ = out_tx.send(req);
 }
 
+/// Send a `VersionVector` request over the swarm transport to a freshly
+/// connected peer, asking for every shadow change strictly newer than the
+/// last `db_version` we recorded from this peer. Mirrors
+/// [`send_version_vector`] (the loopback variant) but routes via the
+/// `snapshot` request-response behavior.
+///
+/// **Why this exists:** without this trigger, a fresh `WebSyncClient`
+/// joining a relay-mediated mesh receives only *future* writes — any
+/// historical state on the peer never lands in IndexedDB, because the
+/// gossipsub mesh only forwards real-time `Push` envelopes. The
+/// `peer_versions` table in `BrowserStore` was always being written on
+/// successful Push receipt but never read for catch-up. See issue #57.
+///
+/// HMAC: when a passphrase is configured, the `VersionVector` request
+/// MUST carry an HMAC tag — Rule 2.7 in `CLAUDE.md` (HMAC verification
+/// is mandatory on ALL message paths, the catch-up path included).
+/// Peers drop unauthenticated `VersionVector` requests silently.
+///
+/// `db_version=0` semantics (Rule 2.5): if the new peer hasn't been
+/// seen before, `get_peer_version` returns 0 and the peer replies with
+/// the full history. This is the new-peer onboarding signal — do not
+/// change it.
+async fn send_version_vector_swarm(
+    peer: LibPeerId,
+    state: &EngineState,
+    swarm: &mut Swarm<WebBehaviour>,
+) {
+    let store = match &state.store {
+        Some(s) => s,
+        None => return, // ephemeral clients don't track peer versions
+    };
+    let peer_key = peer.to_string();
+    let last_seen = match store.get_peer_version(&peer_key).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("swarm: peer_version read for {peer_key} failed: {e}");
+            0
+        }
+    };
+    let my_db_version = *state.db_version.lock().await;
+    let mut req = SyncRequest::VersionVector {
+        my_db_version,
+        your_last_db_version: last_seen,
+        site_id: state.site_id,
+        topic: state.topic.clone(),
+        hmac: None,
+    };
+    if let Some(gk) = &state.group_key {
+        if let Ok(bytes) = serde_json::to_vec(&req) {
+            let tag = gk.mac(&bytes);
+            if let SyncRequest::VersionVector { ref mut hmac, .. } = req {
+                *hmac = Some(tag);
+            }
+        }
+    }
+    log::debug!(
+        "swarm: requesting catch-up from {peer} since db_version={last_seen} (we are at {my_db_version})"
+    );
+    let _ = swarm.behaviour_mut().snapshot.send_request(&peer, req);
+}
+
 async fn handle_submit_local_loopback(
     state: &EngineState,
     end: &mut LoopbackEnd,
@@ -1544,6 +1605,12 @@ async fn run_swarm(
     // handler — see the comment in `handle_event` for the reentrancy
     // reason. Drained on every loop iteration before re-polling.
     let mut pending_announces: Vec<LibPeerId> = Vec::new();
+    // Sync peers we want to ping with a `VersionVector` catch-up
+    // request as soon as they connect. Deferred for the same
+    // wasm_bindgen_futures executor-reentrancy reason as the relay
+    // announce queue above. Drained right after `pending_announces`.
+    // See issue #57.
+    let mut pending_version_vectors: Vec<LibPeerId> = Vec::new();
 
     loop {
         for peer in pending_announces.drain(..) {
@@ -1552,6 +1619,12 @@ async fn run_swarm(
                 topic: state.topic.clone(),
             };
             let _ = swarm.behaviour_mut().push.send_request(&peer, req);
+        }
+        for peer in pending_version_vectors.drain(..).collect::<Vec<_>>() {
+            // We collect-then-iterate so the borrow of
+            // `pending_version_vectors` released before
+            // `send_version_vector_swarm` takes &mut swarm.
+            send_version_vector_swarm(peer, &state, &mut swarm).await;
         }
 
         tokio::select! {
@@ -1574,7 +1647,15 @@ async fn run_swarm(
                 }
             }
             event = swarm.select_next_some() => {
-                handle_event(event, &mut connected, &mut relay_connected, &mut pending_announces, &state, &mut swarm).await;
+                handle_event(
+                    event,
+                    &mut connected,
+                    &mut relay_connected,
+                    &mut pending_announces,
+                    &mut pending_version_vectors,
+                    &state,
+                    &mut swarm,
+                ).await;
             }
         }
     }
@@ -1681,6 +1762,7 @@ async fn handle_event(
     connected: &mut HashSet<LibPeerId>,
     relay_connected: &mut bool,
     pending_announces: &mut Vec<LibPeerId>,
+    pending_version_vectors: &mut Vec<LibPeerId>,
     state: &EngineState,
     swarm: &mut Swarm<WebBehaviour>,
 ) {
@@ -1728,6 +1810,13 @@ async fn handle_event(
                     },
                     endpoint.get_remote_address()
                 );
+                // Defer the version-vector catch-up `send_request` to
+                // the next loop iteration. Same wasm_bindgen_futures
+                // executor-reentrancy hazard as the relay announce
+                // path. Without this trigger every browser tab would
+                // permanently miss any history the peer already had
+                // — see issue #57.
+                pending_version_vectors.push(peer_id);
             }
             push_status(state, connected, *relay_connected);
         }
