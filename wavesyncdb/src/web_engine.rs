@@ -647,7 +647,14 @@ impl WebSyncClient {
             .with_behaviour(|key, relay_client| WebBehaviour {
                 snapshot: request_response::Behaviour::new(
                     [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
-                    request_response::Config::default(),
+                    // Match the native side (engine/behaviour.rs): a
+                    // catch-up `ChangesetResponse` against a peer with
+                    // months of history can take well over the default
+                    // 10s, especially over a circuit relay. 30s matches
+                    // what the native swarm uses and keeps the two
+                    // sides symmetric. Issue #59 sub-bug 2.
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(30)),
                 ),
                 push: request_response::Behaviour::new(
                     [(PUSH_PROTOCOL, request_response::ProtocolSupport::Full)],
@@ -2224,12 +2231,87 @@ async fn handle_snapshot_event(
                     .send_response(channel, SyncResponse::IdentityAck);
             }
         },
+        // Real-network counterpart of the loopback ChangesetResponse
+        // path. Without this, the catch-up data ships from the peer
+        // and lands in the swarm event loop only to be dropped — see
+        // issue #59. Mirrors the native engine's
+        // `handle_changeset_response` (`engine/sync_handler.rs`):
+        // verify topic, verify HMAC (against bytes that include the
+        // actual `your_last_db_version`, not a placeholder — the
+        // sender computed the tag over the real value), reconstruct a
+        // SyncChangeset so the existing apply path is reused, and
+        // call `apply_remote_changeset`. That function persists each
+        // winning change, broadcasts on `resolved_tx`, and updates
+        // `peer_versions[peer]` — no separate `set_peer_version` call
+        // is needed here.
         Event::Message {
-            message: Message::Response { .. },
+            peer,
+            message: Message::Response { response, .. },
             ..
-        } => {
-            // PushAck etc. — no-op for now.
-        }
+        } => match response {
+            SyncResponse::ChangesetResponse {
+                changes,
+                my_db_version,
+                your_last_db_version,
+                site_id: peer_site_id,
+                topic: peer_topic,
+                hmac,
+            } => {
+                if peer_topic != state.topic {
+                    log::debug!(
+                        "WebSyncClient: dropping ChangesetResponse from {peer} — topic mismatch"
+                    );
+                    return;
+                }
+                if let Some(gk) = &state.group_key {
+                    let verify = SyncResponse::ChangesetResponse {
+                        changes: changes.clone(),
+                        my_db_version,
+                        your_last_db_version,
+                        site_id: peer_site_id,
+                        topic: peer_topic.clone(),
+                        hmac: None,
+                    };
+                    let bytes = match serde_json::to_vec(&verify) {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let tag = match hmac {
+                        Some(t) => t,
+                        None => {
+                            log::debug!(
+                                "WebSyncClient: dropping ChangesetResponse from {peer} — missing HMAC"
+                            );
+                            return;
+                        }
+                    };
+                    if !gk.verify(&bytes, &tag) {
+                        log::debug!(
+                            "WebSyncClient: dropping ChangesetResponse from {peer} — bad HMAC"
+                        );
+                        return;
+                    }
+                }
+                log::info!(
+                    "WebSyncClient: received ChangesetResponse from {peer} with {} changes (their db_version={my_db_version})",
+                    changes.len()
+                );
+                // Reconstruct the same `SyncChangeset` shape the
+                // inbound-Push path constructs, so `apply_remote_changeset`
+                // handles persistence + `resolved_tx` broadcast +
+                // `peer_versions` update uniformly.
+                let changeset = SyncChangeset {
+                    site_id: peer_site_id,
+                    db_version: my_db_version,
+                    changes,
+                };
+                let _ = state.inbound_tx.send(changeset.clone());
+                apply_remote_changeset(state, &peer, &changeset).await;
+            }
+            SyncResponse::PushAck | SyncResponse::IdentityAck => {
+                // Acknowledgements only — nothing to apply.
+            }
+        },
         Event::OutboundFailure { peer, error, .. } => {
             log::warn!("WebSyncClient: outbound to {peer} failed: {error}");
         }
