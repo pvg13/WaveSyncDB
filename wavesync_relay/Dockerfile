@@ -48,7 +48,7 @@ COPY --from=builder /usr/local/bin/wavesync-relay /usr/local/bin/wavesync-relay
 # /data stores persistent identity key and push token database
 VOLUME /data
 
-EXPOSE 4001/tcp 4001/udp
+EXPOSE 4001/tcp 4001/udp 4002/tcp
 
 # Environment variables:
 #   EXTERNAL_ADDRESS    - REQUIRED: public address to advertise to clients
