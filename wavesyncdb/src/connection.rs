@@ -472,6 +472,23 @@ impl WaveSyncDb {
             .try_send(crate::engine::EngineCommand::RequestFullSync);
     }
 
+    /// Enable or disable mDNS LAN discovery at runtime.
+    ///
+    /// Idempotent. When disabling, existing mDNS-discovered peer connections
+    /// are kept — only future announcements and queries are silenced. When
+    /// re-enabling, a fresh mDNS behaviour is built and queries resume on
+    /// the next mDNS tick.
+    ///
+    /// Useful for apps that want to opt into LAN announcements only when
+    /// the user is actively pairing or syncing, instead of broadcasting
+    /// continuously on every network the device joins.
+    pub fn set_mdns_enabled(&self, enabled: bool) {
+        let _ = self
+            .inner
+            .cmd_tx
+            .try_send(crate::engine::EngineCommand::SetMdnsEnabled(enabled));
+    }
+
     /// Register or update the push notification token with the relay server.
     ///
     /// Call this when the app receives a new FCM/APNs device token, or when
@@ -1361,6 +1378,7 @@ pub struct WaveSyncDbBuilder {
     relay_server: Option<String>,
     topic: String,
     sync_interval: std::time::Duration,
+    mdns_enabled: bool,
     mdns_query_interval: std::time::Duration,
     mdns_ttl: std::time::Duration,
     group_key: Option<crate::auth::GroupKey>,
@@ -1387,6 +1405,7 @@ impl WaveSyncDbBuilder {
             relay_server: None,
             topic: topic.to_string(),
             sync_interval: defaults.sync_interval,
+            mdns_enabled: defaults.mdns_enabled,
             mdns_query_interval: defaults.mdns_query_interval,
             mdns_ttl: defaults.mdns_ttl,
             group_key: None,
@@ -1469,6 +1488,18 @@ impl WaveSyncDbBuilder {
 
     pub fn with_sync_interval(mut self, interval: std::time::Duration) -> Self {
         self.sync_interval = interval;
+        self
+    }
+
+    /// Enable or disable mDNS LAN discovery at startup. Default: `true`.
+    ///
+    /// When `false`, the engine never announces itself on the LAN and never
+    /// queries for other peers — useful for apps that want peer discovery
+    /// to go through a private rendezvous server or relay only, without
+    /// broadcasting on every network the device joins. Can be flipped at
+    /// runtime via [`WaveSyncDb::set_mdns_enabled`].
+    pub fn with_mdns_enabled(mut self, enabled: bool) -> Self {
+        self.mdns_enabled = enabled;
         self
     }
 
@@ -1728,6 +1759,7 @@ impl WaveSyncDbBuilder {
 
         let engine_config = crate::engine::EngineConfig {
             sync_interval: self.sync_interval,
+            mdns_enabled: self.mdns_enabled,
             mdns_query_interval: self.mdns_query_interval,
             mdns_ttl: self.mdns_ttl,
             bootstrap_peers,

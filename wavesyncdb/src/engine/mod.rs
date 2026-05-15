@@ -59,6 +59,11 @@ pub enum EngineCommand {
     RegisterPushToken { platform: String, token: String },
     /// Set or clear the local application-level peer identity.
     SetPeerIdentity(Option<String>),
+    /// Enable or disable mDNS LAN discovery at runtime. When disabling,
+    /// existing mDNS-discovered peer connections are kept; only future
+    /// announcements and queries are silenced. When enabling, the mDNS
+    /// behaviour is rebuilt and starts queries immediately.
+    SetMdnsEnabled(bool),
     /// Graceful shutdown — stop the engine loop.
     Shutdown,
 }
@@ -67,6 +72,11 @@ pub enum EngineCommand {
 pub struct EngineConfig {
     /// How often to run periodic version vector sync (default: 30s).
     pub sync_interval: Duration,
+    /// Whether mDNS LAN discovery is announced and queried (default: `true`).
+    /// Apps that don't want to broadcast their presence on every LAN they
+    /// touch can disable this and rely on rendezvous / relay discovery.
+    /// Can be flipped at runtime via [`WaveSyncDb::set_mdns_enabled`].
+    pub mdns_enabled: bool,
     /// How often mDNS sends queries (default: 5s for fast LAN discovery).
     pub mdns_query_interval: Duration,
     /// How long mDNS records stay valid (default: 30s).
@@ -100,6 +110,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             sync_interval: Duration::from_secs(30),
+            mdns_enabled: true,
             mdns_query_interval: Duration::from_secs(5),
             mdns_ttl: Duration::from_secs(30),
             bootstrap_peers: Vec::new(),
@@ -193,7 +204,7 @@ pub(crate) fn start_engine(
 /// via `dns::ResolverConfig::google()`.
 fn build_swarm(
     keypair: identity::Keypair,
-    mdns_config: mdns::Config,
+    mdns_config: Option<mdns::Config>,
     keep_alive_interval: Duration,
 ) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     // QUIC-only (no TCP). Two reasons:
@@ -275,7 +286,11 @@ async fn run_engine(
     // relay-side push-token store doesn't accumulate stale duplicates and
     // peer_versions tracking actually points at a stable identity.
     let keypair = shadow::get_or_create_libp2p_keypair(&db).await?;
-    let mdns_config = config.mdns_config();
+    let mdns_config = if config.mdns_enabled {
+        Some(config.mdns_config())
+    } else {
+        None
+    };
 
     let swarm = build_swarm(keypair.clone(), mdns_config, config.keep_alive_interval)?;
 
@@ -317,6 +332,7 @@ async fn run_engine(
         infrastructure_peers.insert(pid);
     }
 
+    let mdns_enabled = config.mdns_enabled;
     let mut engine = EngineRunner {
         swarm,
         peers: HashMap::new(),
@@ -327,6 +343,7 @@ async fn run_engine(
         site_id,
         topic_name: effective_topic,
         config,
+        mdns_enabled,
         local_db_version,
         peer_db_versions: HashMap::new(),
         peer_reported_versions: HashMap::new(),
@@ -367,8 +384,15 @@ async fn run_engine(
         diagnostics,
     };
 
-    // Set initial network status with local_peer_id and topic
+    // Set initial network status with local_peer_id and topic.
     engine.update_network_status();
+    // Fire the local-data-ready signal BEFORE EngineStarted: by this
+    // point the database connection is open, the keypair and db_version
+    // are loaded, and the registry is wired up — i.e. the application
+    // can already query its data. EngineStarted is reserved for "the
+    // swarm is alive and the network status snapshot is meaningful",
+    // which is a strictly later event.
+    engine.emit_network_event(crate::network_status::NetworkEvent::LocalDataReady);
     engine.emit_network_event(crate::network_status::NetworkEvent::EngineStarted);
 
     engine.run(&mut sync_rx).await
@@ -402,6 +426,10 @@ struct EngineRunner {
     pub(crate) site_id: NodeId,
     pub(crate) topic_name: String,
     pub(crate) config: EngineConfig,
+    /// Mirrors `config.mdns_enabled` but is mutable at runtime via
+    /// `EngineCommand::SetMdnsEnabled`. `trigger_rediscovery` and the
+    /// runtime toggle handler both read this field.
+    pub(crate) mdns_enabled: bool,
     pub(crate) local_db_version: u64,
     pub(crate) peer_db_versions: HashMap<libp2p::PeerId, u64>,
     /// Display-only peer versions from incoming requests (NOT used for sync decisions).

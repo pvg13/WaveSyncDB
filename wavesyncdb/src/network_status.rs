@@ -147,6 +147,17 @@ pub enum NetworkEvent {
     RendezvousStatusChanged { registered: bool },
     /// Version vector sync completed with a peer.
     PeerSynced { peer_id: PeerId, db_version: u64 },
+    /// Local persistent state is loaded — the database is queryable
+    /// independently of any peer connectivity. Fired **before**
+    /// [`Self::EngineStarted`] so subscribers that only care about
+    /// "can I read my data now?" don't have to wait for swarm setup.
+    ///
+    /// This is the symmetric native counterpart of
+    /// `WebSyncStatus.local_ready` in browser builds — UIs that
+    /// subscribe to network events should render local content on this
+    /// signal rather than gating on the first `PeerConnected` /
+    /// `PeerSynced`.
+    LocalDataReady,
     /// Engine has started and initial network status is available.
     EngineStarted,
     /// Engine failed with an error or panic.
