@@ -232,6 +232,10 @@ impl EngineRunner {
     }
 
     pub(super) fn trigger_rediscovery(&mut self) {
+        if !self.mdns_enabled {
+            log::debug!("mDNS rediscovery skipped: mDNS disabled at runtime");
+            return;
+        }
         log::info!("Triggering mDNS rediscovery");
         match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
             Ok(new_mdns) => {
@@ -239,6 +243,38 @@ impl EngineRunner {
                     libp2p::swarm::behaviour::toggle::Toggle::from(Some(new_mdns));
             }
             Err(e) => log::warn!("mDNS unavailable during rediscovery: {e}"),
+        }
+    }
+
+    /// Toggle mDNS at runtime. Idempotent: a no-op when the requested
+    /// state already matches `self.mdns_enabled`.
+    ///
+    /// When enabling, builds a fresh mDNS behaviour with the configured
+    /// query interval / TTL and swaps it into the swarm — the next query
+    /// goes out on the next mDNS tick.
+    ///
+    /// When disabling, replaces the mDNS slot with `Toggle::from(None)`.
+    /// Existing mDNS-discovered peer connections are intentionally NOT
+    /// torn down: they're already authenticated swarm peers and the
+    /// rejection on disable would surprise apps that toggle mid-session
+    /// to stop *future* announcements while keeping existing sync going.
+    pub(super) fn set_mdns_enabled(&mut self, enabled: bool) {
+        if self.mdns_enabled == enabled {
+            return;
+        }
+        self.mdns_enabled = enabled;
+        if enabled {
+            log::info!("mDNS enabled at runtime — starting LAN announcements");
+            match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
+                Ok(new_mdns) => {
+                    self.swarm.behaviour_mut().mdns =
+                        libp2p::swarm::behaviour::toggle::Toggle::from(Some(new_mdns));
+                }
+                Err(e) => log::warn!("mDNS unavailable on enable: {e}"),
+            }
+        } else {
+            log::info!("mDNS disabled at runtime — stopping LAN announcements");
+            self.swarm.behaviour_mut().mdns = libp2p::swarm::behaviour::toggle::Toggle::from(None);
         }
     }
 }

@@ -32,7 +32,7 @@ impl WaveSyncBehaviour {
     pub fn new(
         key: &libp2p::identity::Keypair,
         relay_client: relay::client::Behaviour,
-        mdns_config: mdns::Config,
+        mdns_config: Option<mdns::Config>,
         keep_alive_interval: Duration,
     ) -> Self {
         let identify_behaviour = identify::Behaviour::new(
@@ -53,12 +53,22 @@ impl WaveSyncBehaviour {
 
         let peer_id = key.public().to_peer_id();
 
-        let mdns_behaviour = match mdns::tokio::Behaviour::new(mdns_config, peer_id) {
-            Ok(mdns) => Toggle::from(Some(mdns)),
-            Err(e) => {
-                log::warn!("mDNS unavailable: {e}");
-                Toggle::from(None)
-            }
+        // mDNS is disabled when `mdns_config` is `None`. This is the
+        // builder-level / runtime opt-out path: apps that handle peer
+        // discovery another way (e.g. a private rendezvous server) and
+        // don't want to broadcast their presence on every LAN they touch
+        // can pass `None` here. When `Some(_)`, behave as before — failure
+        // to construct still falls back to `None` so the engine keeps
+        // running on platforms without mDNS support.
+        let mdns_behaviour = match mdns_config {
+            Some(cfg) => match mdns::tokio::Behaviour::new(cfg, peer_id) {
+                Ok(mdns) => Toggle::from(Some(mdns)),
+                Err(e) => {
+                    log::warn!("mDNS unavailable: {e}");
+                    Toggle::from(None)
+                }
+            },
+            None => Toggle::from(None),
         };
 
         let dcutr_behaviour = dcutr::Behaviour::new(peer_id);

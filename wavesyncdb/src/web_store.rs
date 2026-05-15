@@ -1,6 +1,6 @@
 //! Browser-side persistent storage for `web_engine`.
 //!
-//! Backed by IndexedDB via the `idb` crate. Three object stores:
+//! Backed by IndexedDB via the `idb` crate. Four object stores:
 //!
 //! - **`meta`** — singletons keyed by string: `"site_id"` (16-byte array
 //!   serialized as JSON), `"db_version"` (u64), `"keypair"` (libp2p
@@ -17,6 +17,13 @@
 //!   peer-id string. Reserved for a future version-vector catch-up; not
 //!   read on this branch but written on every successful incoming Push so
 //!   the data is ready when catch-up lands.
+//! - **`peer_addrs`** — per-(peer_id, multiaddr) cache of working
+//!   addresses with last-success / last-try timestamps and a fail count.
+//!   Mirrors the native `_wavesync_peer_addrs` table (see
+//!   `peer_addrs.rs`). On cold start the engine pre-dials these as soon
+//!   as the relay is reachable, in parallel with the
+//!   AnnouncePresence → PeerList round-trip — usually saving 1–10s on
+//!   cellular when the cached addrs are still live.
 //!
 //! Key encoding choices follow the same conventions as the native shadow
 //! tables: composite keys are joined with `'|'` (table/pk/cid components
@@ -37,10 +44,16 @@ use crate::messages::NodeId;
 const STORE_META: &str = "meta";
 const STORE_SHADOW: &str = "shadow";
 const STORE_PEER_VERSIONS: &str = "peer_versions";
+const STORE_PEER_ADDRS: &str = "peer_addrs";
 
 const META_SITE_ID: &str = "site_id";
 const META_DB_VERSION: &str = "db_version";
 const META_KEYPAIR: &str = "keypair";
+
+/// IndexedDB schema version. Bump when adding object stores; the
+/// `on_upgrade_needed` callback in [`BrowserStore::open`] creates any
+/// missing stores so older databases migrate forward without losing data.
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -99,12 +112,17 @@ impl BrowserStore {
     pub async fn open(store_name: &str) -> Result<Self, StoreError> {
         let db_name = format!("wavesync-{store_name}");
         let factory = Factory::new()?;
-        let mut request = factory.open(&db_name, Some(1))?;
+        let mut request = factory.open(&db_name, Some(SCHEMA_VERSION))?;
 
         request.on_upgrade_needed(|event| {
             let database = event.database().expect("database");
             let existing = database.store_names();
-            for name in [STORE_META, STORE_SHADOW, STORE_PEER_VERSIONS] {
+            for name in [
+                STORE_META,
+                STORE_SHADOW,
+                STORE_PEER_VERSIONS,
+                STORE_PEER_ADDRS,
+            ] {
                 if !existing.contains(&name.to_string()) {
                     let params = ObjectStoreParams::new();
                     database
@@ -445,8 +463,212 @@ impl BrowserStore {
             _ => Ok(0),
         }
     }
+
+    // ── peer addresses ───────────────────────────────────────────────────
+
+    /// Record a successful dial to `(peer_id, multiaddr)`. Resets
+    /// `fail_count` to 0 and updates both `last_ok_at` and `last_try_at`
+    /// to "now". Mirrors `peer_addrs::record_success` on native.
+    pub async fn record_peer_address_success(
+        &self,
+        peer_id: &str,
+        multiaddr: &str,
+    ) -> Result<(), StoreError> {
+        let now = now_secs();
+        let row = CachedPeerAddr {
+            peer_id: peer_id.to_string(),
+            multiaddr: multiaddr.to_string(),
+            last_ok_at: now,
+            last_try_at: now,
+            fail_count: 0,
+        };
+        self.put_peer_addr(&row).await
+    }
+
+    /// Record a failed dial attempt against `(peer_id, multiaddr)`.
+    /// Increments `fail_count`, refreshes `last_try_at`, preserves
+    /// `last_ok_at`. No-op when the address isn't already cached — we
+    /// don't want one-off failures to populate the cache.
+    pub async fn record_peer_address_failure(
+        &self,
+        peer_id: &str,
+        multiaddr: &str,
+    ) -> Result<(), StoreError> {
+        let key = peer_addr_key(peer_id, multiaddr);
+        let tx = self
+            .db
+            .transaction(&[STORE_PEER_ADDRS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_PEER_ADDRS)?;
+        let existing = store.get(JsValue::from_str(&key))?.await?;
+        let Some(v) = existing else {
+            tx.commit()?.await?;
+            return Ok(());
+        };
+        if v.is_null() || v.is_undefined() {
+            tx.commit()?.await?;
+            return Ok(());
+        }
+        let mut row: CachedPeerAddr =
+            serde_wasm_bindgen::from_value(v).map_err(|e| StoreError::Serde(e.to_string()))?;
+        row.fail_count = row.fail_count.saturating_add(1);
+        row.last_try_at = now_secs();
+        let js =
+            serde_wasm_bindgen::to_value(&row).map_err(|e| StoreError::Serde(e.to_string()))?;
+        store.put(&js, Some(&JsValue::from_str(&key)))?.await?;
+        tx.commit()?.await?;
+        Ok(())
+    }
+
+    /// Bump `fail_count` on every cached address for `peer_id`. Called
+    /// when the swarm reports `OutgoingConnectionError` and we don't
+    /// know which specific address was dialed — failing the whole peer
+    /// is safer than letting all of them stay marked OK.
+    pub async fn record_peer_address_failure_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_PEER_ADDRS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_PEER_ADDRS)?;
+        let prefix = format!("{peer_id}|");
+        let upper = format!("{peer_id}|\u{ffff}");
+        let range = KeyRange::bound(
+            &JsValue::from_str(&prefix),
+            &JsValue::from_str(&upper),
+            None,
+            None,
+        )?;
+        let q = Query::from(range);
+        let keys: Vec<JsValue> = store.get_all_keys(Some(q.clone()), None)?.await?;
+        let values: Vec<JsValue> = store.get_all(Some(q), None)?.await?;
+        let now = now_secs();
+        for (k_js, v_js) in keys.into_iter().zip(values.into_iter()) {
+            let mut row: CachedPeerAddr = match serde_wasm_bindgen::from_value(v_js) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            row.fail_count = row.fail_count.saturating_add(1);
+            row.last_try_at = now;
+            let js =
+                serde_wasm_bindgen::to_value(&row).map_err(|e| StoreError::Serde(e.to_string()))?;
+            store.put(&js, Some(&k_js))?.await?;
+        }
+        tx.commit()?.await?;
+        Ok(())
+    }
+
+    /// Load every cached address last seen within `max_age_secs` AND
+    /// with `fail_count < max_fail_count`. Sorted by `last_ok_at`
+    /// descending so the freshest addresses get dialed first.
+    pub async fn load_recent_peer_addresses(
+        &self,
+        max_age_secs: u64,
+        max_fail_count: u32,
+    ) -> Result<Vec<CachedPeerAddr>, StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_PEER_ADDRS], TransactionMode::ReadOnly)?;
+        let store = tx.object_store(STORE_PEER_ADDRS)?;
+        let values: Vec<JsValue> = store.get_all(None, None)?.await?;
+        tx.commit()?.await?;
+        let cutoff = now_secs().saturating_sub(max_age_secs);
+        let mut out: Vec<CachedPeerAddr> = Vec::with_capacity(values.len());
+        for v in values {
+            let row: CachedPeerAddr = match serde_wasm_bindgen::from_value(v) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if row.fail_count >= max_fail_count {
+                continue;
+            }
+            if row.last_ok_at < cutoff {
+                continue;
+            }
+            out.push(row);
+        }
+        out.sort_by(|a, b| b.last_ok_at.cmp(&a.last_ok_at));
+        Ok(out)
+    }
+
+    /// Delete cached addresses older than `max_age_secs` OR with
+    /// `fail_count >= max_fail_count`. Cheap; called once at engine
+    /// startup, same as the native side.
+    pub async fn gc_peer_addresses(
+        &self,
+        max_age_secs: u64,
+        max_fail_count: u32,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_PEER_ADDRS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_PEER_ADDRS)?;
+        let keys: Vec<JsValue> = store.get_all_keys(None, None)?.await?;
+        let values: Vec<JsValue> = store.get_all(None, None)?.await?;
+        let cutoff = now_secs().saturating_sub(max_age_secs);
+        for (k_js, v_js) in keys.into_iter().zip(values.into_iter()) {
+            let row: CachedPeerAddr = match serde_wasm_bindgen::from_value(v_js) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if row.fail_count >= max_fail_count || row.last_ok_at < cutoff {
+                store.delete(Query::from(k_js))?.await?;
+            }
+        }
+        tx.commit()?.await?;
+        Ok(())
+    }
+
+    async fn put_peer_addr(&self, row: &CachedPeerAddr) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_PEER_ADDRS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_PEER_ADDRS)?;
+        let key = peer_addr_key(&row.peer_id, &row.multiaddr);
+        let js = serde_wasm_bindgen::to_value(row).map_err(|e| StoreError::Serde(e.to_string()))?;
+        store.put(&js, Some(&JsValue::from_str(&key)))?.await?;
+        tx.commit()?.await?;
+        Ok(())
+    }
+}
+
+/// One cached working peer multiaddr. The browser-side analogue of
+/// `peer_addrs::CachedAddr` on native; same fields, JSON-serialized for
+/// IndexedDB instead of stored as SQL columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPeerAddr {
+    pub peer_id: String,
+    pub multiaddr: String,
+    /// Wall-clock seconds since UNIX epoch of the last successful dial.
+    /// Read on cold start to filter out stale entries via `max_age_secs`.
+    pub last_ok_at: u64,
+    /// Wall-clock seconds since UNIX epoch of the most recent dial
+    /// attempt — success or failure. Useful for diagnostics; not used
+    /// in the cache filter today.
+    pub last_try_at: u64,
+    /// How many consecutive failures since the last success. Reset to 0
+    /// on `record_peer_address_success`. Once it reaches the configured
+    /// threshold the entry is excluded from `load_recent_peer_addresses`
+    /// and dropped by the next `gc_peer_addresses`.
+    pub fail_count: u32,
 }
 
 fn shadow_key(table: &str, pk: &str, cid: &str) -> String {
     format!("{table}|{pk}|{cid}")
+}
+
+fn peer_addr_key(peer_id: &str, multiaddr: &str) -> String {
+    format!("{peer_id}|{multiaddr}")
+}
+
+/// Wall-clock seconds since UNIX epoch via `js_sys::Date::now()`.
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown`, so
+/// every timestamp written by this module routes through here.
+fn now_secs() -> u64 {
+    let ms = js_sys::Date::now();
+    if ms.is_finite() && ms >= 0.0 {
+        (ms / 1000.0) as u64
+    } else {
+        0
+    }
 }

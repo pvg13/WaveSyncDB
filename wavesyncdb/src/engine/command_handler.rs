@@ -58,6 +58,10 @@ impl EngineRunner {
                 }
                 false
             }
+            EngineCommand::SetMdnsEnabled(enabled) => {
+                self.set_mdns_enabled(enabled);
+                false
+            }
             EngineCommand::Shutdown => {
                 log::info!("Engine shutdown requested");
                 true

@@ -377,14 +377,42 @@ pub struct WebSyncClient {
 
 /// Live debug snapshot exposed by [`WebSyncClient::subscribe_status`].
 ///
+/// ## Readiness model
+///
+/// There are **two independent readiness states** here, and UIs that
+/// conflate them will appear hung on cold start:
+///
+/// - `local_ready`: the IndexedDB store is open and the persisted
+///   identity (keypair, site_id, db_version) has been restored. Once
+///   `true`, [`BrowserStore::list_table_rows`] returns the same data the
+///   previous session committed — the UI can render its main content.
+///   This is `true` from the moment the [`WebSyncClient`] handle exists,
+///   because the constructors await IndexedDB before returning.
+/// - `relay_connected` / `connected_peer_ids`: peer-discovery state.
+///   These can take **5–30 seconds** on a cold cellular start (relay
+///   dial → AnnouncePresence → PeerList → dial each peer). Showing a
+///   spinner gated on these values blocks the UI on a network round-trip
+///   the user doesn't need to see local data.
+///
+/// **Recommended UI pattern**: render local content as soon as
+/// `local_ready` is `true` (or equivalently, as soon as you hold a
+/// `WebSyncClient`). Show a small "syncing" indicator gated on
+/// `relay_connected` / `connected_peer_ids` next to the data, not
+/// blocking it.
+///
 /// Each field updates on its own rhythm:
 /// - `connected_peer_ids` and `relay_connected` change on every
 ///   `ConnectionEstablished` / `ConnectionClosed` swarm event.
 /// - `local_peer_id` is set once at startup.
 /// - `relay_peer_id` is set once at startup if the client was built
 ///   via `connect_via_relay`.
+/// - `local_ready` is `true` from the first emitted snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct WebSyncStatus {
+    /// `true` once the IndexedDB store is open and persistent identity
+    /// is restored. UIs should render local content as soon as this is
+    /// `true` — do not gate rendering on peer connectivity.
+    pub local_ready: bool,
     pub local_peer_id: String,
     pub relay_peer_id: Option<String>,
     pub relay_connected: bool,
@@ -412,7 +440,8 @@ impl WebSyncClient {
             site_id,
             0,
             None,
-            None, // not relay-mediated discovery
+            None,       // not relay-mediated discovery
+            Vec::new(), // ephemeral — no persistent peer-addr cache
         )
     }
 
@@ -484,6 +513,11 @@ impl WebSyncClient {
             db_version,
             Some(Arc::new(store)),
             None, // not relay-mediated discovery
+            // Single-peer dial: caller already gave us the exact target
+            // multiaddr, so the cache wouldn't add anything. The cache
+            // is for relay-mediated topologies where we don't know the
+            // peer set ahead of time.
+            Vec::new(),
         )
     }
 
@@ -512,6 +546,19 @@ impl WebSyncClient {
     /// browsers block plain `ws://` connections (mixed-content). The
     /// `relay_addr` must use `wss://` (terminated at a reverse proxy)
     /// or the demo must be served over HTTP for development.
+    ///
+    /// ## Cold-start UI guidance
+    ///
+    /// This function returns **as soon as IndexedDB is open and identity
+    /// is restored** — typically <100 ms. The relay dial is fire-and-
+    /// forget, and peer discovery (announce → PeerList → dial each peer)
+    /// can take 5–30 seconds on cellular before the first sync peer
+    /// appears. **Do not gate UI rendering on
+    /// [`WebSyncStatus::relay_connected`] or
+    /// [`WebSyncStatus::connected_peer_ids`]** — show local data the
+    /// moment this function returns. Once you hold a [`WebSyncClient`],
+    /// the IndexedDB store is queryable. See [`WebSyncStatus`] for the
+    /// recommended readiness model.
     pub async fn connect_via_relay(
         relay_addr: &str,
         user_topic: &str,
@@ -573,6 +620,34 @@ impl WebSyncClient {
             .await
             .map_err(|e| WebSyncError::Store(e.to_string()))?;
 
+        // Cache tunables match `peer_addrs.rs` on native: 7-day window
+        // (a peer not seen in a week is most likely gone), fail-count
+        // cap of 10 (matches gRPC/Envoy outlier-detection thresholds).
+        // GC + load are best-effort — the cache is a startup optimisation,
+        // not part of the connectivity contract, so any error here is
+        // logged and swallowed.
+        const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+        const MAX_FAIL_COUNT: u32 = 10;
+        if let Err(e) = store.gc_peer_addresses(MAX_AGE_SECS, MAX_FAIL_COUNT).await {
+            log::debug!("WebSyncClient: peer_addrs gc failed: {e}");
+        }
+        let cached_peer_addrs = match store
+            .load_recent_peer_addresses(MAX_AGE_SECS, MAX_FAIL_COUNT)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("WebSyncClient: peer_addrs load failed: {e}");
+                Vec::new()
+            }
+        };
+        if !cached_peer_addrs.is_empty() {
+            log::info!(
+                "WebSyncClient: loaded {} cached peer address(es) from previous session",
+                cached_peer_addrs.len()
+            );
+        }
+
         Self::start(
             relay_addr,
             user_topic,
@@ -582,6 +657,7 @@ impl WebSyncClient {
             db_version,
             Some(Arc::new(store)),
             Some(relay_peer_id),
+            cached_peer_addrs,
         )
     }
 
@@ -600,6 +676,12 @@ impl WebSyncClient {
         // single-peer-dial behavior used by `connect_persistent` and
         // `connect`.
         relay_peer_id: Option<LibPeerId>,
+        // Pre-loaded peer-address cache (`connect_via_relay` only —
+        // empty for the other constructors). Dialed by `run_swarm` as
+        // soon as the relay is reachable so circuit-relay catch-up can
+        // start before the AnnouncePresence/PeerList round-trip
+        // completes.
+        cached_peer_addrs: Vec<crate::web_store::CachedPeerAddr>,
     ) -> Result<Self, WebSyncError> {
         let group_key = passphrase.map(GroupKey::from_passphrase);
         let effective_topic = group_key
@@ -687,6 +769,11 @@ impl WebSyncClient {
         let (inbound_tx, _) = broadcast::channel(64);
         let (resolved_tx, _) = broadcast::channel(256);
         let (status_tx, status_rx) = watch::channel(WebSyncStatus {
+            // True from the first snapshot: by the time `start()` is
+            // called, the constructors above have already opened
+            // IndexedDB and restored identity. UIs that subscribe before
+            // any peer event still see `local_ready = true` immediately.
+            local_ready: true,
             local_peer_id: local_peer_id.to_string(),
             relay_peer_id: relay_peer_id.map(|p| p.to_string()),
             relay_connected: false,
@@ -707,6 +794,7 @@ impl WebSyncClient {
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
             relay_peer_id,
+            cached_peer_addrs,
             status_tx,
         };
 
@@ -898,6 +986,7 @@ impl WebSyncClient {
         let (inbound_tx, _) = broadcast::channel(64);
         let (resolved_tx, _) = broadcast::channel(256);
         let (status_tx, status_rx) = watch::channel(WebSyncStatus {
+            local_ready: true,
             local_peer_id: format!("loopback-{:02x?}", &site_id.0[..4]),
             relay_peer_id: None,
             relay_connected: false,
@@ -919,6 +1008,7 @@ impl WebSyncClient {
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
             relay_peer_id: None, // loopback transport has no notion of a relay
+            cached_peer_addrs: Vec::new(),
             status_tx,
         };
 
@@ -1040,6 +1130,14 @@ struct EngineState {
     store: Option<Arc<BrowserStore>>,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
+    /// Pre-loaded cache of recently-working peer multiaddrs from
+    /// IndexedDB. `run_swarm` dials these as soon as the relay is
+    /// reachable (circuit-relay addrs need the relay first), in
+    /// parallel with the AnnouncePresence → PeerList round-trip — so
+    /// reload-day-2 sees data sync ~1–10s sooner on cellular than
+    /// reload-day-1. Empty for clients that bypass relay-mediated
+    /// discovery (`connect`, `connect_persistent`, `connect_loopback`).
+    cached_peer_addrs: Vec<crate::web_store::CachedPeerAddr>,
     /// PeerId of the relay we dialed via `connect_via_relay`. Used to:
     /// (1) trigger an `AnnouncePresence` when this specific peer
     /// connects, (2) skip the relay when fan-outing snapshot Push
@@ -1071,14 +1169,24 @@ fn push_status(state: &EngineState, connected: &HashSet<LibPeerId>, relay_connec
     // values *before* calling `send_replace`. Inlining `borrow()` into
     // the `send_replace` argument list keeps the read-guard alive across
     // the write attempt, which races against the watch's internal lock.
-    let (local_peer_id, relay_peer_id) = {
+    // Snapshot all immutable / carry-forward fields before send_replace
+    // — holding the read guard across the write attempt races with the
+    // watch's internal lock (see send_replace docs).
+    let (local_peer_id, relay_peer_id, local_ready) = {
         let snap = state.status_tx.borrow();
-        (snap.local_peer_id.clone(), snap.relay_peer_id.clone())
+        (
+            snap.local_peer_id.clone(),
+            snap.relay_peer_id.clone(),
+            snap.local_ready,
+        )
     };
     // `send_replace` doesn't error on no-subscribers (unlike
     // `broadcast::send`'s SendError) and it overwrites the latest
     // value, which is exactly what watch consumers want.
     state.status_tx.send_replace(WebSyncStatus {
+        // Carried forward from the previous snapshot. Once true at
+        // construction it stays true for the lifetime of the client.
+        local_ready,
         local_peer_id,
         relay_peer_id,
         relay_connected,
@@ -1618,6 +1726,13 @@ async fn run_swarm(
     // announce queue above. Drained right after `pending_announces`.
     // See issue #57.
     let mut pending_version_vectors: Vec<LibPeerId> = Vec::new();
+    // One-shot guard for cached-peer pre-dials: gets flipped on the
+    // first relay `ConnectionEstablished`. We dial cached addresses
+    // there (not at startup) because they're typically circuit-relay
+    // multiaddrs that can't route until the relay leg is alive — the
+    // dials would otherwise fail-fast and bump fail_count for working
+    // entries.
+    let mut cached_predial_done = false;
 
     loop {
         for peer in pending_announces.drain(..) {
@@ -1663,6 +1778,46 @@ async fn run_swarm(
                     &state,
                     &mut swarm,
                 ).await;
+
+                // Pre-dial cached peer addrs the first time the relay
+                // becomes reachable. Skip the relay's own peer-id and
+                // our own. Synchronous dials are fire-and-forget; we
+                // record the attempt so any sync failure that
+                // immediately follows can decrement the entry's
+                // fail_count rather than letting a stale cache rot
+                // forever.
+                if relay_connected && !cached_predial_done {
+                    cached_predial_done = true;
+                    let local_pid = *swarm.local_peer_id();
+                    let mut dialed = 0usize;
+                    for entry in &state.cached_peer_addrs {
+                        let addr: Multiaddr = match entry.multiaddr.parse() {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        let target = match peer_id_from_multiaddr(&addr) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        if target == local_pid || Some(target) == state.relay_peer_id {
+                            continue;
+                        }
+                        if connected.contains(&target) {
+                            continue;
+                        }
+                        match swarm.dial(addr.clone()) {
+                            Ok(()) => dialed += 1,
+                            Err(e) => log::debug!(
+                                "WebSyncClient: cached pre-dial of {addr} failed sync: {e}"
+                            ),
+                        }
+                    }
+                    if dialed > 0 {
+                        log::info!(
+                            "WebSyncClient: pre-dialed {dialed} cached peer address(es)"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1817,6 +1972,22 @@ async fn handle_event(
                     },
                     endpoint.get_remote_address()
                 );
+                // Persist this (peer_id, multiaddr) so the next cold
+                // start can pre-dial it as soon as the relay is
+                // reachable. Mirrors the native side's record_success
+                // call in `engine/mod.rs` on `ConnectionEstablished`.
+                if let Some(store) = state.store.clone() {
+                    let peer_str = peer_id.to_string();
+                    let addr_str = endpoint.get_remote_address().to_string();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Err(e) = store
+                            .record_peer_address_success(&peer_str, &addr_str)
+                            .await
+                        {
+                            log::debug!("WebSyncClient: peer_addrs record_success failed: {e}");
+                        }
+                    });
+                }
                 // Defer the version-vector catch-up `send_request` to
                 // the next loop iteration. Same wasm_bindgen_futures
                 // executor-reentrancy hazard as the relay announce
@@ -1842,6 +2013,23 @@ async fn handle_event(
         }
         SwarmEvent::OutgoingConnectionError { error, peer_id, .. } => {
             log::warn!("WebSyncClient: dial failure ({peer_id:?}): {error}");
+            // Bump fail_count on every cached address for this peer
+            // when libp2p tells us the dial didn't land. We can't tell
+            // *which* multiaddr was attempted from this event, so
+            // failing the whole peer is the conservative choice — it
+            // matches `peer_addrs::record_failure_for_peer` on native.
+            // Skip when the peer was the relay (relay reconnects have
+            // their own state machine) or unknown.
+            if let (Some(store), Some(pid)) = (state.store.clone(), peer_id)
+                && Some(pid) != state.relay_peer_id
+            {
+                let peer_str = pid.to_string();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = store.record_peer_address_failure_for_peer(&peer_str).await {
+                        log::debug!("WebSyncClient: peer_addrs record_failure failed: {e}");
+                    }
+                });
+            }
         }
         SwarmEvent::Behaviour(WebBehaviourEvent::Snapshot(ev)) => {
             handle_snapshot_event(ev, state, swarm).await;
