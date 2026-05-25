@@ -3,51 +3,48 @@ use dioxus::prelude::*;
 use crate::app::Route;
 use crate::components::{CodeBlock, FeatureCard, FlowDiagram};
 
-const QUICKSTART_CODE: &str = r#"use sea_orm::*;
-use wavesyncdb::WaveSyncDbBuilder;
+const BEFORE_CODE: &str = r#"// Plain SeaORM
+let db = Database::connect(
+    "sqlite:./app.db?mode=rwc",
+).await?;
 
-#[tokio::main]
-async fn main() -> Result<(), DbErr> {
-    let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
-        .with_passphrase("shared-secret")
-        .build()
-        .await?;
+let task = task::ActiveModel {
+    id: Set(Uuid::new_v4().to_string()),
+    title: Set("Buy milk".into()),
+    ..Default::default()
+};
+task.insert(&db).await?;"#;
 
-    db.get_schema_registry(module_path!().split("::").next().unwrap())
-        .sync()
-        .await?;
+const AFTER_CODE: &str = r#"// WaveSyncDB — swap the connection
+let db = WaveSyncDbBuilder::new(
+    "sqlite:./app.db?mode=rwc", "my-topic",
+).with_passphrase("secret")
+ .build().await?;
 
-    // Standard SeaORM — sync happens transparently
-    let task = task::ActiveModel {
-        id: Set(Uuid::new_v4().to_string()),
-        title: Set("Buy milk".into()),
-        completed: Set(false),
-        ..Default::default()
-    };
-    task.insert(&db).await?;
+let task = task::ActiveModel {
+    id: Set(Uuid::new_v4().to_string()),
+    title: Set("Buy milk".into()),
+    ..Default::default()
+};
+task.insert(&db).await?; // ← syncs to peers"#;
 
-    Ok(())
-}"#;
-
-const ENTITY_CODE: &str = r#"use sea_orm::entity::prelude::*;
-use wavesyncdb_derive::SyncEntity;
-
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+const ENTITY_CODE: &str = r#"#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
 #[sea_orm(table_name = "tasks")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub title: String,
     pub completed: bool,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}"#;
+}"#;
 
 #[component]
 pub fn Home() -> Element {
+    use_effect(|| {
+        document::eval(
+            r#"(function(){ if(window.hljs) document.querySelectorAll('pre code:not(.hljs)').forEach(function(el){ try{ window.hljs.highlightElement(el); }catch(e){} }); })()"#,
+        );
+    });
+
     rsx! {
         document::Title { "WaveSyncDB — Local-first SQLite that syncs itself" }
         section { class: "hero",
@@ -75,14 +72,58 @@ pub fn Home() -> Element {
                             "Try the live demo"
                         }
                     }
-                    div { class: "hero-install",
-                        code { "cargo add wavesyncdb" }
+                }
+            }
+            div { class: "hero-code-wide",
+                div { class: "hero-code-tabs",
+                    div { class: "hero-code-tab hero-code-tab-muted", "SeaORM" }
+                    div { class: "hero-code-tab hero-code-tab-active", "WaveSyncDB" }
+                }
+                div { class: "hero-code-panels",
+                    div { class: "hero-code-panel hero-code-panel-muted",
+                        CodeBlock { lang: "rust".to_string(), code: BEFORE_CODE.to_string() }
+                    }
+                    div { class: "hero-code-panel",
+                        CodeBlock { lang: "rust".to_string(), code: AFTER_CODE.to_string() }
                     }
                 }
-                div { class: "hero-code",
-                    div { class: "hero-code-tab", "main.rs" }
-                    CodeBlock { lang: "rust".to_string(), code: QUICKSTART_CODE.to_string() }
+            }
+            div { class: "hero-install-wrap",
+              div { class: "hero-install",
+                p { class: "hero-install-label", "Install with Cargo" }
+                div { class: "hero-install-box",
+                    code { class: "hero-install-cmd", "cargo add wavesyncdb --features derive" }
+                    button {
+                        class: "hero-install-copy",
+                        title: "Copy to clipboard",
+                        onclick: |_| {
+                            document::eval(
+                                r#"navigator.clipboard.writeText("cargo add wavesyncdb --features derive")"#,
+                            );
+                        },
+                        "Copy"
+                    }
                 }
+                div { class: "hero-install-links",
+                    Link {
+                        class: "hero-install-link",
+                        to: Route::DocPage { slug: "quickstart".to_string() },
+                        "Quickstart"
+                    }
+                    span { class: "hero-install-sep", "·" }
+                    Link {
+                        class: "hero-install-link",
+                        to: Route::Examples {},
+                        "Examples"
+                    }
+                    span { class: "hero-install-sep", "·" }
+                    Link {
+                        class: "hero-install-link",
+                        to: Route::DocPage { slug: "api-reference".to_string() },
+                        "API reference"
+                    }
+                }
+              }
             }
         }
 

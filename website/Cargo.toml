@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-dioxus = { version = "0.7.6", features = ["web", "router"] }
+dioxus = { version = "0.7.9", features = ["web", "router"] }
 pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
 # Browser/wasm32 build of wavesyncdb. Exposes the pure-data sync surface,
 # the WebSocket-backed WebSyncClient, and the IndexedDB-backed
