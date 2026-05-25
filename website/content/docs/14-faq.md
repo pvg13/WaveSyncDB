@@ -2,10 +2,10 @@
 
 ## When should I *not* use WaveSyncDB?
 
-- **Public, multi-tenant fan-out.** If your data is meant to reach untrusted strangers, this is the wrong tool — every authenticated peer can read and write everything in the topic.
-- **Authoritative central state.** If you need a single source of truth that arbitrates writes (financial transactions, inventory levels), a traditional client-server database with a server-side write API is what you want.
-- **Heavy write throughput** (>1000 writes/s sustained). The protocol is fine for collaborative apps but not optimized for telemetry-style ingest. Use Kafka.
-- **Adversarial peers.** WaveSyncDB has no per-row ACLs. Anyone with the passphrase can write anything.
+- **Public, multi-tenant fan-out.** Every authenticated peer can read and write everything in the topic — there are no per-row ACLs.
+- **Authoritative central state.** If you need a single source of truth (financial transactions, inventory), use a traditional client-server database.
+- **High write throughput** (>1000 sustained writes/s). The protocol is designed for collaborative CRUD apps, not telemetry ingest.
+- **Adversarial peers.** Anyone with the passphrase has full access. The trust model is "small group of known devices".
 
 ## Does it work offline?
 
@@ -118,4 +118,4 @@ Not directly — that's a SQLite concern. Use SQLCipher or filesystem-level encr
 
 ## Is the project production-ready?
 
-It is in production for the project's primary use case (a small-group collaboration app). The core sync engine, conflict resolution, and Dioxus integration are stable. The relay + push-notification integration is stable but newer; if you deploy at significant scale, expect to find rough edges and please open issues. License + commercial-support agreements are available — see the [License](/docs/introduction#licensing) section.
+The core sync engine, conflict resolution, and Dioxus integration are stable and used in production for a small-group collaboration app. The relay + push-notification path is stable but newer. If you deploy at significant scale, expect some rough edges — open issues on GitHub. Commercial support is available (see [Licensing](/docs/introduction#licensing)).

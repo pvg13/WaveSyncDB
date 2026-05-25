@@ -35,7 +35,7 @@ sequenceDiagram
 Enable the `push-sync` feature on `wavesyncdb`:
 
 ```toml
-wavesyncdb = { version = "0.5", features = ["derive", "dioxus", "push-sync"] }
+wavesyncdb = { version = "0.6", features = ["derive", "dioxus", "push-sync"] }
 ```
 
 That feature pulls in the FFI glue used by the platform-side service to call back into the Rust engine when a push arrives.

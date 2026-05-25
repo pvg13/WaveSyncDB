@@ -6,7 +6,7 @@ WaveSyncDB ships first-class Dioxus hooks behind the `dioxus` feature flag. They
 
 ```toml
 [dependencies]
-wavesyncdb = { version = "0.5", features = ["derive", "dioxus"] }
+wavesyncdb = { version = "0.6", features = ["derive", "dioxus"] }
 dioxus = "0.7"
 ```
 

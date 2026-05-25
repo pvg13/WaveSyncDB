@@ -1,12 +1,12 @@
 # Quickstart
 
-Get a sync-aware SeaORM app running in under five minutes.
+Get two peers syncing in under five minutes. By the end of this page you'll have a Rust binary that writes to a local SQLite file and automatically replicates to any other instance on the same network.
 
 ## 1. Add the dependencies
 
 ```toml
 [dependencies]
-wavesyncdb = { version = "0.5", features = ["derive"] }
+wavesyncdb = { version = "0.6", features = ["derive"] }
 sea-orm = { version = "2.0.0-rc", features = ["sqlx-sqlite", "runtime-tokio", "macros"] }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 If you're using Dioxus, also enable the `dioxus` feature:
 
 ```toml
-wavesyncdb = { version = "0.5", features = ["derive", "dioxus"] }
+wavesyncdb = { version = "0.6", features = ["derive", "dioxus"] }
 ```
 
 ## 2. Define a SeaORM entity
@@ -67,11 +67,11 @@ async fn main() -> Result<(), DbErr> {
 }
 ```
 
-That's it. Run two instances of this binary on the same LAN — each one writes to its own SQLite file, but both databases stay in sync via mDNS-discovered peers.
+Run two instances of this binary on the same LAN (each pointing at a different SQLite file) and they'll discover each other via mDNS and stay in sync automatically.
 
 ## 4. Add a passphrase (recommended)
 
-By default, any peer on the same topic can read and write. To restrict your sync mesh to a specific group, add a passphrase:
+Without a passphrase, any peer on the same topic can read and write. For any real deployment, add one:
 
 ```rust
 let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
@@ -80,11 +80,11 @@ let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
     .await?;
 ```
 
-The passphrase is hashed into the topic (so peers without it can't even discover yours) and is used as the HMAC key on every message.
+The passphrase does two things: it's mixed into the topic hash (so peers without it can't even discover you) and it's used as the HMAC key on every message (so they can't inject data).
 
 ## 5. Add WAN sync (optional)
 
-For sync across networks (cellular ↔ home Wi-Fi, etc.), point your peers at a relay server:
+For sync across different networks (e.g., cellular to home Wi-Fi), point peers at a relay server:
 
 ```rust
 let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
@@ -94,10 +94,19 @@ let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
     .await?;
 ```
 
-See [Relay deployment](/docs/relay-deployment) for how to host one.
+The relay bridges peers behind NAT. It never sees your data in plaintext — end-to-end encryption is handled by libp2p's Noise transport. See [Relay deployment](/docs/relay-deployment) for how to host one.
+
+## Try it
+
+The fastest way to see sync in action without building anything:
+
+1. Open the [live demo](/demo) — it runs two virtual devices in your browser using the same engine compiled to wasm32.
+2. Add a task on one device and watch it appear on the other.
+3. Toggle one device offline, make changes on both, then reconnect — conflicts resolve automatically.
 
 ## Where to go from here
 
+- [Architecture](/docs/architecture) — understand the write path end to end.
 - [Dioxus integration](/docs/dioxus-integration) — reactive hooks for UI apps.
+- [Configuration](/docs/configuration) — every builder option explained.
 - [Mobile & push notifications](/docs/mobile-and-push) — wake sleeping phones via FCM/APNs.
-- [API reference](/docs/api-reference) — the public types.

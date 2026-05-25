@@ -8,19 +8,18 @@ use wavesyncdb::WaveSyncDbBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), DbErr> {
-    // Build the connection — starts the P2P engine automatically
     let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-app-topic")
+        .with_passphrase("shared-secret")
         .build()
         .await?;
 
-    // Auto-discover entities annotated with #[derive(SyncEntity)]
     db.get_schema_registry(module_path!().split("::").next().unwrap())
         .sync()
         .await?;
 
-    // Standard SeaORM usage — sync happens transparently
+    // Standard SeaORM — sync happens transparently
     let task = task::ActiveModel {
-        id: Set("1".into()),
+        id: Set(Uuid::new_v4().to_string()),
         title: Set("Buy milk".into()),
         completed: Set(false),
         ..Default::default()
@@ -53,14 +52,15 @@ pub fn Home() -> Element {
         section { class: "hero",
             div { class: "hero-inner",
                 div { class: "hero-copy",
-                    span { class: "hero-eyebrow", "Open-source · Rust · AGPL-3.0 + Commercial" }
+                    span { class: "hero-eyebrow", "Open-source · Rust · Dual-licensed" }
                     h1 { class: "hero-title",
                         "Local-first SQLite "
                         span { class: "hero-title-accent", "that syncs itself." }
                     }
                     p { class: "hero-subtitle",
-                        "Drop-in SeaORM connection. Per-column CRDTs. Peer-to-peer over libp2p. "
-                        "Mobile push wake-up included. Your existing app code keeps working — sync happens in the background."
+                        "A drop-in SeaORM connection that replicates every write to peers "
+                        "automatically. Per-column conflict resolution, P2P networking, "
+                        "offline by default. No server required for LAN; optional relay for WAN."
                     }
                     div { class: "hero-cta",
                         Link {
@@ -87,40 +87,40 @@ pub fn Home() -> Element {
 
         section { class: "features",
             div { class: "section-inner",
-                h2 { class: "section-title", "Why WaveSyncDB" }
+                h2 { class: "section-title", "What you get" }
                 p { class: "section-subtitle",
-                    "Built for apps that want to feel instant offline and converge automatically when peers come back online. Dual-licensed: AGPL-3.0-or-later for open source, commercial license available for proprietary use."
+                    "Built for small-group collaboration apps that need to work offline and converge when peers reconnect. Not a general-purpose database — a sync layer for your existing SeaORM code."
                 }
                 div { class: "feature-grid",
                     FeatureCard {
                         icon: "🪶".to_string(),
                         title: "Drop-in SeaORM".to_string(),
-                        body: "Replace your DatabaseConnection with WaveSyncDb. Every insert, update, and delete syncs in the background — no API changes.".to_string(),
+                        body: "Replace DatabaseConnection with WaveSyncDb. Your existing inserts, updates, and deletes replicate without API changes.".to_string(),
                     }
                     FeatureCard {
                         icon: "🧬".to_string(),
                         title: "Per-column CRDTs".to_string(),
-                        body: "Concurrent edits to different columns of the same row both survive. Lamport clocks give every peer the same final state, deterministically.".to_string(),
+                        body: "Concurrent edits to different columns both survive. Same-column conflicts resolve deterministically — every peer converges to the same state.".to_string(),
                     }
                     FeatureCard {
                         icon: "📱".to_string(),
                         title: "Cross-platform".to_string(),
-                        body: "Desktop, Android, and iOS from one Rust codebase. First-class Dioxus reactive hooks.".to_string(),
+                        body: "Desktop, Android, iOS, and browser (wasm32) from one Rust codebase. Dioxus reactive hooks included.".to_string(),
                     }
                     FeatureCard {
                         icon: "🌐".to_string(),
-                        title: "P2P over libp2p".to_string(),
-                        body: "Direct sync via mDNS on the LAN, AutoNAT and circuit relay for WAN, DCUtR hole-punching for direct connections when possible.".to_string(),
+                        title: "P2P networking".to_string(),
+                        body: "mDNS for LAN discovery. Circuit relay + DCUtR hole-punching for WAN. No central server in the data path.".to_string(),
                     }
                     FeatureCard {
                         icon: "🔔".to_string(),
-                        title: "Push wake-up".to_string(),
-                        body: "Silent FCM and APNs notifications wake sleeping mobile peers so a single desktop write reaches every device in seconds.".to_string(),
+                        title: "Mobile push wake-up".to_string(),
+                        body: "Silent FCM/APNs notifications wake sleeping phones. A desktop write reaches every device in seconds via the relay.".to_string(),
                     }
                     FeatureCard {
                         icon: "🔐".to_string(),
                         title: "Group authentication".to_string(),
-                        body: "A shared passphrase derives the topic and signs every message via HMAC. Peers without the passphrase are silently rejected.".to_string(),
+                        body: "Shared passphrase derives the topic and signs every message with HMAC-BLAKE3. Unauthenticated peers are silently dropped.".to_string(),
                     }
                 }
             }
@@ -130,7 +130,7 @@ pub fn Home() -> Element {
             div { class: "section-inner",
                 h2 { class: "section-title", "How it works" }
                 p { class: "section-subtitle",
-                    "WaveSyncDB wraps the SeaORM connection trait. Writes go to your local SQLite first, then propagate to peers through two complementary paths — real-time fan-out and version-vector catch-up."
+                    "Every write hits local SQLite first (your app never blocks on the network), then propagates to peers via real-time fan-out and periodic version-vector catch-up."
                 }
                 FlowDiagram {}
             }
@@ -138,28 +138,28 @@ pub fn Home() -> Element {
 
         section { class: "perf-strip",
             div { class: "section-inner section-inner-narrow",
-                h2 { class: "section-title", "Built for live collaboration" }
+                h2 { class: "section-title", "Measured performance" }
                 p { class: "section-subtitle",
-                    "Real numbers, measured on a desktop with both peers in process."
+                    "Both peers in process on the same machine, loopback networking. Real WAN adds relay round-trip latency."
                 }
                 div { class: "perf-grid",
                     div { class: "perf-stat",
                         div { class: "perf-value", "0.42 ms" }
-                        div { class: "perf-label", "p50 peer-to-peer write latency" }
+                        div { class: "perf-label", "p50 peer-to-peer latency (loopback)" }
                     }
                     div { class: "perf-stat",
-                        div { class: "perf-value", "10 000+ /s" }
+                        div { class: "perf-value", "~10 000 /s" }
                         div { class: "perf-label", "local writes through WaveSyncDb" }
                     }
                     div { class: "perf-stat",
-                        div { class: "perf-value", "5 900+ /s" }
-                        div { class: "perf-label", "rows reconciled during catch-up" }
+                        div { class: "perf-value", "~5 900 /s" }
+                        div { class: "perf-label", "rows reconciled on catch-up" }
                     }
                 }
                 div { class: "perf-cta",
                     Link {
                         class: "btn btn-secondary",
-                        to: Route::DocPage { slug: "benchmarks".to_string() },
+                        to: Route::Benchmarks {},
                         "See full benchmarks →"
                     }
                 }
@@ -168,9 +168,9 @@ pub fn Home() -> Element {
 
         section { class: "entity-section",
             div { class: "section-inner section-inner-narrow",
-                h2 { class: "section-title", "Plain SeaORM entities, sync-aware" }
+                h2 { class: "section-title", "One derive, full sync" }
                 p { class: "section-subtitle",
-                    "Add a single derive. WaveSyncDB tracks every column at the storage layer; you keep writing the same code."
+                    "Add #[derive(SyncEntity)] to a standard SeaORM entity. WaveSyncDB handles the rest at the storage layer."
                 }
                 CodeBlock { lang: "rust".to_string(), code: ENTITY_CODE.to_string() }
             }
@@ -178,10 +178,10 @@ pub fn Home() -> Element {
 
         section { class: "cta",
             div { class: "section-inner",
-                h2 { class: "cta-title", "Ready to make your app local-first?" }
+                h2 { class: "cta-title", "See it running in your browser" }
                 p { class: "cta-subtitle",
-                    "Read the quickstart, browse the examples, or kick the tires in your "
-                    "browser — the live demo runs the same engine compiled to wasm32."
+                    "The live demo runs the real sync engine compiled to wasm32 with IndexedDB storage. "
+                    "Two virtual devices sync over a loopback channel — try going offline and reconnecting."
                 }
                 div { class: "cta-actions",
                     Link {
@@ -194,7 +194,7 @@ pub fn Home() -> Element {
                         to: Route::DocPage { slug: "quickstart".to_string() },
                         "Quickstart"
                     }
-                    Link { class: "btn btn-secondary", to: Route::Examples {}, "Browse examples" }
+                    Link { class: "btn btn-secondary", to: Route::Examples {}, "Examples" }
                 }
             }
         }

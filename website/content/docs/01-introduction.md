@@ -1,31 +1,35 @@
 # Introduction
 
-**WaveSyncDB** is a transparent peer-to-peer sync layer for SeaORM applications.
+**WaveSyncDB** is a peer-to-peer sync layer for SeaORM applications. It lets you build offline-first apps where every device has a full local copy of the data and changes replicate automatically when peers are connected.
 
-You write your app the way you always have — `#[derive(DeriveEntityModel)]` entities, `ActiveModel::insert(&db)`, the usual SeaORM idioms — and WaveSyncDB makes every write replicate to every peer without changing a line of business logic. Conflicts are resolved automatically using per-column Lamport clocks, so concurrent edits to different columns of the same row both survive and every peer converges to the same final state.
+You keep writing standard SeaORM code — `ActiveModel::insert(&db)`, queries, the usual idioms — and WaveSyncDB handles replication transparently. When two peers edit the same data concurrently, per-column conflict resolution ensures they converge to the same state without manual intervention.
 
 ## What you get
 
-- A drop-in **`WaveSyncDb`** that implements SeaORM's `ConnectionTrait`. Swap your `DatabaseConnection` for it and continue writing normal SeaORM code.
+- **Drop-in connection wrapper** — `WaveSyncDb` implements SeaORM's `ConnectionTrait`. Replace your `DatabaseConnection` and existing code keeps working.
+- **Per-column conflict resolution** — concurrent edits to different columns both survive. Same-column conflicts resolve deterministically; every peer reaches the same final state.
+- **Local-first** — writes commit to local SQLite immediately. The UI never blocks on the network. Sync runs in the background.
+- **P2P networking** — mDNS for same-network discovery, circuit relay for WAN, DCUtR hole-punching when possible.
+- **Mobile push wake-up** — silent FCM/APNs notifications wake sleeping phones so they catch up within seconds.
+- **Group authentication** — a shared passphrase derives the topic and signs every message. Unauthenticated peers are silently dropped.
+- **Cross-platform** — desktop, Android, iOS, and browser (wasm32) from one codebase.
 
-> **License**: WaveSyncDB is dual-licensed. **AGPL-3.0-or-later** is free for use in AGPL-compatible open-source projects. A separate **commercial license** is available for proprietary, closed-source, or SaaS products. See [Licensing](#licensing) at the bottom of this page.
-
-- **Per-column conflict resolution** — concurrent updates to different columns survive; same-column conflicts resolve deterministically using `(col_version → value bytes → site_id)` total ordering.
-- **Local-first by design** — every write hits SQLite first, so the UI never blocks on the network. Sync is opportunistic in the background.
-- **P2P over libp2p** — mDNS for the LAN, AutoNAT + circuit relay for WAN, DCUtR hole-punching for direct connections when both sides are reachable.
-- **First-class mobile** — a relay server can fan out silent FCM and APNs pushes that wake sleeping phones so they catch up within seconds of a desktop write.
-- **Group authentication** — a shared passphrase derives the topic and signs every message via HMAC-BLAKE3. Anything unauthenticated is silently dropped.
+> **License**: WaveSyncDB is dual-licensed. **AGPL-3.0-or-later** for open-source projects; a separate **commercial license** for proprietary or SaaS use. See [Licensing](#licensing) below.
 
 ## When to use it
 
-WaveSyncDB is a good fit when:
+WaveSyncDB is designed for:
 
-- You want offline-first behaviour for a desktop or mobile app.
-- The data is **owned by a small group** of users (collaborators, family, your own devices) rather than being public/multi-tenant.
-- You'd rather avoid running a central API tier just to keep a few clients in sync.
-- You're already happy with SeaORM and SQLite.
+- Offline-first desktop or mobile apps where each device should have the full dataset.
+- **Small groups** — your own devices, a family, a team of collaborators (not thousands of unrelated clients).
+- Apps where you want to avoid running a central API just to keep clients in sync.
+- Projects already using SeaORM and SQLite.
 
-It is not a good fit for fan-out to thousands of unrelated clients, for adversarial multi-tenant scenarios, or for cases where you need a single authoritative central database.
+It is **not** a good fit for:
+
+- Multi-tenant SaaS with per-row access control (every authenticated peer can read/write everything).
+- High-throughput ingest (>1000 writes/s sustained).
+- Scenarios requiring a single authoritative central database.
 
 ## What's next
 

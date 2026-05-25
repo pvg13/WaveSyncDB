@@ -52,7 +52,7 @@ pub fn App() -> Element {
         document::Stylesheet { href: MAIN_CSS }
         document::Meta {
             name: "description",
-            content: "Local-first SQLite that syncs itself. Drop-in SeaORM connection with per-column CRDTs and P2P sync over libp2p.",
+            content: "WaveSyncDB — a local-first SQLite sync layer for SeaORM. Per-column CRDTs, P2P over libp2p, offline by default. Desktop, mobile, and browser.",
         }
         Router::<Route> {}
     }

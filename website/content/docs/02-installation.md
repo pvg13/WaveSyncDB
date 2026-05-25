@@ -1,6 +1,6 @@
 # Installation
 
-WaveSyncDB targets stable Rust 1.85+ (edition 2024) and works on Linux, macOS, Windows, Android, and iOS.
+WaveSyncDB targets stable Rust 1.85+ (edition 2024) and works on Linux, macOS, Windows, Android, iOS, and browser (wasm32).
 
 ## Pick your features
 
@@ -8,9 +8,10 @@ The library is split into [Cargo features](https://doc.rust-lang.org/cargo/refer
 
 | Feature | Pulls in | When to enable |
 |---|---|---|
-| _(default)_ | core sync engine, libp2p, SeaORM connection wrapper | always |
+| _(default)_ | core sync engine, libp2p, SeaORM connection wrapper | always (native targets) |
 | `derive` | the `#[derive(SyncEntity)]` proc macro | almost always — required for entity auto-discovery |
 | `dioxus` | reactive hooks: `use_synced_table`, `use_synced_row`, `use_wavesync_init` | UI apps using Dioxus |
+| `web` | wasm32 engine with WebSocket transport + IndexedDB storage | browser apps via Dioxus web |
 | `push-sync` | mobile FFI + the `background_sync` entry point | Android/iOS apps that wake on FCM/APNs push |
 | `mobile-ffi` | C ABI bindings used by native push handlers | implied by `push-sync`; rarely set directly |
 
@@ -19,15 +20,19 @@ Pick the smallest set that matches your application:
 ```toml
 # A typical desktop app with reactive UI
 [dependencies]
-wavesyncdb = { version = "0.5", features = ["derive", "dioxus"] }
+wavesyncdb = { version = "0.6", features = ["derive", "dioxus"] }
 
 # A cross-platform desktop + mobile app
 [dependencies]
-wavesyncdb = { version = "0.5", features = ["derive", "dioxus", "push-sync"] }
+wavesyncdb = { version = "0.6", features = ["derive", "dioxus", "push-sync"] }
+
+# A browser app (wasm32 target)
+[dependencies]
+wavesyncdb = { version = "0.6", features = ["web", "dioxus"] }
 
 # Headless service (no UI)
 [dependencies]
-wavesyncdb = { version = "0.5", features = ["derive"] }
+wavesyncdb = { version = "0.6", features = ["derive"] }
 ```
 
 ## Companion crates
@@ -92,9 +97,21 @@ You'll need:
 - An **Apple Developer account** (free tier works for sideloading; paid is required for App Store + APNs in production).
 - Push entitlements configured in `Dioxus.toml`. See [Mobile & push notifications](/docs/mobile-and-push).
 
-### Embedded / WASM in the browser
+### Browser (wasm32)
 
-Browser WASM is **not currently supported** as a runtime target for the engine itself. The libp2p stack assumes a Tokio runtime with native TCP/UDP sockets, and WaveSyncDB depends on SeaORM + SQLite which are `no_std`-incompatible. Use the library on a desktop / mobile / server target and have the browser talk to it over HTTP if you need a web frontend.
+Browser WASM is supported via the `web` feature. The engine uses libp2p's WebSocket-websys transport (connecting through a relay server) and IndexedDB for local persistence instead of SQLite.
+
+```toml
+[dependencies]
+wavesyncdb = { version = "0.6", features = ["web", "dioxus"] }
+```
+
+The `web` feature replaces the native libp2p transports (QUIC/UDP) with WebSocket-over-websys and swaps SeaORM/SQLite for an IndexedDB-backed store. The sync protocol is the same — browser peers participate in the same mesh as native peers, connecting through the relay's WebSocket listener.
+
+Limitations compared to native:
+- **No mDNS** — browsers can't send multicast. Discovery requires a relay or rendezvous server.
+- **No background sync** — when the tab is closed, the engine stops. Use a service worker for keep-alive if needed.
+- **IndexedDB storage** — performance characteristics differ from SQLite; fine for typical app workloads.
 
 ## Verify
 
