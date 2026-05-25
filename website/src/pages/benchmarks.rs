@@ -212,6 +212,7 @@ const SCENARIO_ROWS: &[ScenarioRow] = &[
 #[component]
 pub fn Benchmarks() -> Element {
     rsx! {
+        document::Title { "Benchmarks — WaveSyncDB" }
         section { class: "page-header",
             div { class: "section-inner",
                 h1 { class: "page-title", "Benchmarks" }

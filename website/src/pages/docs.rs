@@ -95,7 +95,12 @@ pub fn DocPage(slug: String) -> Element {
         document::eval(POST_RENDER_JS);
     }));
 
+    let title = page
+        .map(|p| format!("{} — WaveSyncDB Docs", p.title))
+        .unwrap_or_else(|| "Not found — WaveSyncDB Docs".to_string());
+
     rsx! {
+        document::Title { "{title}" }
         div { class: "docs-layout",
             DocsSidebar { active_slug: slug.clone() }
             article { class: "docs-content",

@@ -71,6 +71,7 @@ pub fn TodoDemo() -> Element {
     });
 
     rsx! {
+        document::Title { "Live Demo — WaveSyncDB" }
         section { class: "page-header",
             div { class: "section-inner",
                 h1 { class: "page-title", "Live demo · Two devices, one page" }

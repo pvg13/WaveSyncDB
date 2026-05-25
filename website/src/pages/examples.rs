@@ -45,6 +45,7 @@ const EXAMPLES: &[ExampleCard] = &[
 #[component]
 pub fn Examples() -> Element {
     rsx! {
+        document::Title { "Examples — WaveSyncDB" }
         section { class: "page-header",
             div { class: "section-inner",
                 h1 { class: "page-title", "Examples" }

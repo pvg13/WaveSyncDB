@@ -49,6 +49,7 @@ impl ActiveModelBehavior for ActiveModel {}"#;
 #[component]
 pub fn Home() -> Element {
     rsx! {
+        document::Title { "WaveSyncDB — Local-first SQLite that syncs itself" }
         section { class: "hero",
             div { class: "hero-inner",
                 div { class: "hero-copy",
