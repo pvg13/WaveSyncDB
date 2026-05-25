@@ -5,6 +5,9 @@ edition = "2024"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 description = "Proc macro for WaveSyncDB: #[derive(SyncEntity)] auto-registers SeaORM entities for P2P sync"
 repository = "https://github.com/pvg13/WaveSyncDB"
+homepage = "https://wavesyncdb.com"
+keywords = ["sync", "sqlite", "p2p", "crdt", "sea-orm"]
+categories = ["database"]
 
 [lib]
 proc-macro = true
@@ -14,7 +17,11 @@ quote = "1.0"
 syn = { version = "2.0", features = ["full"] }
 proc-macro2 = "1.0"
 
+# Dev-dependencies are workspace-only (not published) — the derive crate's
+# integration tests import wavesyncdb + sea-orm but that creates a circular
+# publish dependency. Local `cargo test` resolves via workspace paths; the
+# published crate on crates.io is a pure proc-macro with no dev-deps.
 [dev-dependencies]
 tokio = { workspace = true }
 sea-orm = { workspace = true }
-wavesyncdb = { workspace = true }
+wavesyncdb = { path = "../wavesyncdb" }

@@ -3,9 +3,12 @@ name = "wavesyncdb"
 version = "0.6.0"
 edition = "2024"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
-description = "WaveSyncDB is a lightweight, distributed database synchronization engine designed to bridge the gap between real-time data streaming and relational storage. It ensures high-consistency data replication across decentralized nodes with a focus on low-latency updates."
+description = "Local-first SQLite that syncs itself — drop-in SeaORM connection with per-column CRDTs and P2P sync over libp2p"
 repository = "https://github.com/pvg13/WaveSyncDB"
+homepage = "https://wavesyncdb.com"
 readme = "README.md"
+keywords = ["sync", "sqlite", "p2p", "crdt", "local-first"]
+categories = ["database", "network-programming"]
 
 # Dependencies that work on every target (including wasm32-unknown-unknown).
 # Anything that pulls in OS sockets, native sqlite, or full tokio belongs in
@@ -19,7 +22,7 @@ serde_json = "1.0"
 inventory = { workspace = true }
 blake3 = "1"
 async-trait = "0.1"
-wavesyncdb_derive = { path = "../wavesyncdb_derive", optional = true }
+wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.2.1", optional = true }
 dioxus = { version = "0.7.6", optional = true }
 manganis = { version = "0.7.6", optional = true }
 
@@ -83,7 +86,7 @@ env_logger = "0.11"
 # Make the SyncEntity derive available to all test binaries unconditionally,
 # so `tests/common/mod.rs` can use it without forcing every test to enable
 # the `derive` feature on the main crate.
-wavesyncdb_derive = { path = "../wavesyncdb_derive" }
+wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.2.1" }
 
 [features]
 default = []

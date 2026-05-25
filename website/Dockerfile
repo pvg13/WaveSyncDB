@@ -1,13 +1,9 @@
 # syntax=docker/dockerfile:1.6
 #
-# Build context: website/ directory (not the repo root).
+# Build context: website/ directory.
 #
-# Stage 1 (builder): rust:bookworm + dioxus-cli + wasm32 target.
-#   - Patches Cargo.toml to use wavesyncdb from crates.io (since the
-#     workspace sibling crates aren't in this context).
-#   - `dx build --platform web --release` produces a static-asset bundle.
-#
-# Stage 2 (runtime): nginx:alpine serving the static bundle.
+# Patches Cargo.toml at build time to pull wavesyncdb from crates.io
+# instead of the workspace path, so sibling crates aren't needed.
 #
 # Usage:
 #   cd website && docker build -t wavesync-website .
@@ -27,12 +23,11 @@ COPY src/ src/
 COPY assets/ assets/
 COPY content/ content/
 
-# Patch Cargo.toml: replace workspace dependency with crates.io version.
-# The website only uses the `web` + `dioxus` features which are published.
+# Replace workspace dep with crates.io version.
 RUN sed -i 's|wavesyncdb = { workspace = true, features = \["web", "dioxus"\] }|wavesyncdb = { version = "0.6", features = ["web", "dioxus"] }|' Cargo.toml \
     && sed -i '/^\[workspace\]/d' Cargo.toml
 
-# Build the WASM bundle. Dioxus.toml sets default_platform = "web".
+# Dioxus.toml sets default_platform = "web"; dx 0.7 uses that automatically.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \

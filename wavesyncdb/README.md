@@ -1,37 +1,57 @@
 # wavesyncdb
 
-Core library for WaveSyncDB — transparent peer-to-peer sync for SeaORM applications.
+Local-first SQLite that syncs itself. A drop-in SeaORM connection wrapper with per-column CRDTs and peer-to-peer sync over libp2p.
 
-## Features
+## What it does
 
-- **Connection wrapper** — `WaveSyncDb` implements SeaORM's `ConnectionTrait`, intercepting writes transparently
-- **P2P sync** — libp2p gossipsub with mDNS discovery, QUIC and TCP transports
-- **LWW conflict resolution** — hybrid logical clocks with deterministic tiebreakers
-- **Persistent sync log** — `_wavesync_log` table tracks all operations for incremental sync
-- **Schema builder** — fluent API to register entities for sync or local-only use
+Replace your `DatabaseConnection` with `WaveSyncDb` and every write replicates to peers automatically. Conflicts resolve deterministically using per-column Lamport clocks — concurrent edits to different columns both survive.
 
-## Usage
+- **Drop-in SeaORM** — implements `ConnectionTrait`, no API changes needed
+- **Per-column CRDTs** — concurrent edits to different columns merge; same-column conflicts resolve deterministically
+- **P2P over libp2p** — mDNS for LAN, circuit relay + DCUtR for WAN
+- **Offline-first** — writes commit locally before any network I/O
+- **Mobile push** — silent FCM/APNs wake sleeping phones for background sync
+- **Group auth** — shared passphrase derives topic + HMAC signs every message
+- **Cross-platform** — desktop, Android, iOS, and browser (wasm32)
+
+## Quick start
 
 ```rust
 use sea_orm::*;
 use wavesyncdb::WaveSyncDbBuilder;
 
 let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic")
+    .with_passphrase("shared-secret")
     .build()
     .await?;
 
-// Register entities for sync
 db.get_schema_registry(module_path!().split("::").next().unwrap())
     .sync()
     .await?;
 
-// Use standard SeaORM operations — sync happens automatically
-let task = task::ActiveModel { /* ... */ };
+// Standard SeaORM — sync happens transparently
+let task = task::ActiveModel {
+    id: Set(Uuid::new_v4().to_string()),
+    title: Set("Buy milk".into()),
+    completed: Set(false),
+    ..Default::default()
+};
 task.insert(&db).await?;
 ```
 
-See the [root README](../README.md) for full documentation, architecture overview, and Dioxus integration.
+## Features
+
+| Feature | Description |
+|---|---|
+| `derive` | `#[derive(SyncEntity)]` proc macro for entity auto-discovery |
+| `dioxus` | Reactive hooks: `use_synced_table`, `use_synced_row` |
+| `web` | wasm32 engine with WebSocket transport + IndexedDB storage |
+| `push-sync` | Mobile background sync via FCM/APNs |
+
+## Documentation
+
+Full docs, architecture guide, and live demo: [wavesyncdb.com](https://wavesyncdb.com)
 
 ## License
 
-GPL-3.0-or-later
+Dual-licensed: [AGPL-3.0-or-later](../LICENSE-AGPL) for open-source use, [commercial license](../LICENSE-COMMERCIAL) for proprietary use. Contact pablo13vazquez@gmail.com for commercial licensing.

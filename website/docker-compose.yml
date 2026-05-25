@@ -1,23 +1,15 @@
 # WaveSyncDB website — Docker Compose.
 #
-# Build context is the website/ directory itself. The Dockerfile patches
-# the workspace dependency to use wavesyncdb from crates.io so no sibling
-# crates are needed in the context.
+# Build context is website/ itself. The Dockerfile patches the workspace
+# dependency to use wavesyncdb from crates.io.
 #
-# -- Local testing --
+# -- Local --
 #   cd website && docker compose up --build
 #   Then open http://localhost:8080.
 #
-# -- Deploy on Dokploy (type: Docker Compose) --
-#   1. Source: this Git repo.
-#   2. Compose Path: website/docker-compose.yml
-#   3. Base Directory: website
-#   4. No environment variables required.
-#   5. Hit Redeploy on commits to `website/**`.
-#
-# -- Switching to a prebuilt image --
-#   Replace the `build:` block with `image: ghcr.io/pvg13/wavesync-website:latest`
-#   once a CI workflow publishes the image.
+# -- Dokploy --
+#   Compose Path: website/docker-compose.yml
+#   Base Directory: website
 
 services:
   wavesync-website:
