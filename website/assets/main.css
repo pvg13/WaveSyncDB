@@ -47,6 +47,7 @@ html,
 body {
     margin: 0;
     padding: 0;
+    overflow-x: hidden;
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
@@ -380,15 +381,6 @@ img {
 .hero-code-panel-muted {
     opacity: 0.5;
     border-right: 1px solid var(--border);
-}
-@media (max-width: 920px) {
-    .hero-code-panels {
-        grid-template-columns: 1fr;
-    }
-    .hero-code-panel-muted {
-        border-right: none;
-        border-bottom: 1px solid var(--border);
-    }
 }
 
 /* ── buttons ────────────────────────────────────────────────── */
@@ -1396,9 +1388,20 @@ img {
 
 @media (max-width: 920px) {
     .hero-inner {
+        padding: 48px 20px 36px;
+    }
+    .hero-code-wide {
+        padding: 0 20px 48px;
+    }
+    .hero-install {
+        padding: 24px 20px 48px;
+    }
+    .hero-code-panels {
         grid-template-columns: 1fr;
-        gap: 40px;
-        padding: 56px 24px 80px;
+    }
+    .hero-code-panel-muted {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
     }
     .docs-layout {
         grid-template-columns: 1fr;
@@ -1409,19 +1412,155 @@ img {
         order: -1;
     }
     .section-inner {
-        padding: 64px 20px;
+        padding: 48px 20px;
     }
 }
 
-@media (max-width: 560px) {
+@media (max-width: 640px) {
+    /* ── nav ── */
+    .site-nav-inner {
+        padding: 10px 16px;
+    }
+    .site-nav-links {
+        gap: 0;
+    }
     .site-nav-link {
-        padding: 6px 10px;
+        padding: 6px 8px;
+        font-size: 0.82rem;
+    }
+    .site-nav-github {
+        margin-left: 4px;
+    }
+
+    /* ── hero ── */
+    .hero-inner {
+        padding: 36px 16px 28px;
+    }
+    .hero-eyebrow {
+        font-size: 0.75rem;
+        padding: 3px 10px;
     }
     .hero-title {
-        font-size: 2.1rem;
+        font-size: 1.8rem;
     }
+    .hero-subtitle {
+        font-size: 1rem;
+    }
+    .hero-cta {
+        gap: 8px;
+    }
+    .btn {
+        padding: 10px 16px;
+        font-size: 0.88rem;
+    }
+
+    /* ── code panels ── */
+    .hero-code-wide {
+        padding: 0 16px 36px;
+    }
+    .hero-code-tab {
+        padding: 8px 12px;
+        font-size: 0.7rem;
+    }
+    .hero-code-panel .code-block {
+        font-size: 0.72rem;
+        padding: 14px 12px;
+        line-height: 1.45;
+    }
+    .hero-code-panel .code-block code {
+        font-size: 0.72rem;
+    }
+
+    /* ── install ── */
+    .hero-install {
+        padding: 20px 16px 40px;
+        gap: 10px;
+    }
+    .hero-install-box {
+        width: 100%;
+    }
+    .hero-install-cmd {
+        font-size: 0.78rem;
+        padding: 10px 12px;
+        flex: 1;
+        min-width: 0;
+    }
+    .hero-install-copy {
+        padding: 10px 12px;
+        font-size: 0.75rem;
+    }
+    .hero-install-links {
+        gap: 6px;
+    }
+    .hero-install-link {
+        font-size: 0.82rem;
+    }
+
+    /* ── section titles ── */
     .section-title {
-        font-size: 1.6rem;
+        font-size: 1.5rem;
+    }
+    .section-subtitle {
+        font-size: 0.95rem;
+    }
+
+    /* ── feature cards ── */
+    .feature-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+    .feature-card {
+        padding: 20px;
+    }
+
+    /* ── perf strip ── */
+    .perf-grid {
+        grid-template-columns: 1fr;
+        gap: 12px;
+    }
+
+    /* ── flow diagram ── */
+    .flow-diagram {
+        padding: 12px;
+        overflow-x: auto;
+    }
+    .flow-diagram svg {
+        min-width: 600px;
+    }
+
+    /* ── code blocks ── */
+    .code-block {
+        padding: 14px 12px;
+        font-size: 0.78rem;
+    }
+
+    /* ── CTA ── */
+    .cta-title {
+        font-size: 1.5rem;
+    }
+    .cta-actions {
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+    }
+    .cta-actions .btn {
+        width: 100%;
+        max-width: 280px;
+    }
+
+    /* ── footer ── */
+    .site-footer-inner {
+        grid-template-columns: 1fr;
+        gap: 28px;
+        padding: 36px 16px 28px;
+    }
+
+    /* ── examples ── */
+    .examples-grid {
+        grid-template-columns: 1fr;
+    }
+    .page-title {
+        font-size: 1.8rem;
     }
 }
 
