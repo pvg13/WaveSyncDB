@@ -14,7 +14,7 @@ ENV CARGO_INCREMENTAL=0 \
     CARGO_TERM_COLOR=always
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install dioxus-cli --version "0.7.0" --locked
+    cargo install dioxus-cli --version "0.7.9" --locked
 RUN rustup target add wasm32-unknown-unknown
 WORKDIR /src
 
