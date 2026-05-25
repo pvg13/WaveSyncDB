@@ -32,11 +32,11 @@ COPY content/ content/
 RUN sed -i 's|wavesyncdb = { workspace = true, features = \["web", "dioxus"\] }|wavesyncdb = { version = "0.6", features = ["web", "dioxus"] }|' Cargo.toml \
     && sed -i '/^\[workspace\]/d' Cargo.toml
 
-# Build the WASM bundle. dx build writes output under target/dx/.
+# Build the WASM bundle. Dioxus.toml sets default_platform = "web".
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    dx build --platform web --release \
+    dx build --release \
     && mkdir -p /out \
     && cp -r /src/target/dx/wavesync-website/release/web/public/. /out/
 
