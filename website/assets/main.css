@@ -1419,32 +1419,49 @@ img {
 @media (max-width: 640px) {
     /* ── nav ── */
     .site-nav-inner {
-        padding: 10px 16px;
+        padding: 10px 12px;
+        gap: 8px;
     }
     .site-nav-links {
         gap: 0;
+        flex-wrap: wrap;
+        justify-content: flex-end;
     }
     .site-nav-link {
-        padding: 6px 8px;
-        font-size: 0.82rem;
+        padding: 5px 7px;
+        font-size: 0.78rem;
     }
     .site-nav-github {
-        margin-left: 4px;
+        margin-left: 2px;
+    }
+    .site-brand-name {
+        font-size: 0.9rem;
+    }
+    .site-brand-logo {
+        height: 22px;
+        width: 22px;
+    }
+
+    /* ── global ── */
+    .section-inner {
+        padding: 40px 16px;
     }
 
     /* ── hero ── */
     .hero-inner {
         padding: 36px 16px 28px;
+        max-width: 100%;
     }
     .hero-eyebrow {
         font-size: 0.75rem;
         padding: 3px 10px;
     }
     .hero-title {
-        font-size: 1.8rem;
+        font-size: 1.65rem;
     }
     .hero-subtitle {
-        font-size: 1rem;
+        font-size: 0.95rem;
+        max-width: 100%;
     }
     .hero-cta {
         gap: 8px;
@@ -1511,6 +1528,13 @@ img {
     }
     .feature-card {
         padding: 20px;
+    }
+    .feature-card-body,
+    .section-subtitle,
+    .hero-subtitle,
+    .cta-subtitle {
+        overflow-wrap: break-word;
+        word-break: break-word;
     }
 
     /* ── perf strip ── */

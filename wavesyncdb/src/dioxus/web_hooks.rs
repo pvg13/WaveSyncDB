@@ -148,6 +148,13 @@ fn apply_change_to<E: BrowserEntity>(entities: &mut Signal<Vec<E>>, change: Colu
     let cid = change.cid.0;
     let val = change.val;
 
+    if cid == "__deleted" {
+        entities.with_mut(|vec| {
+            vec.retain(|e| e.pk() != pk);
+        });
+        return;
+    }
+
     entities.with_mut(|vec| {
         if let Some(idx) = vec.iter().position(|e| e.pk() == pk) {
             let mut cols: HashMap<String, serde_json::Value> =

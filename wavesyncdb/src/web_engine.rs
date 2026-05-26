@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
+use gloo_timers::future::IntervalStream;
 use libp2p::{
     Multiaddr, PeerId as LibPeerId, Swarm, SwarmBuilder, identify, identity, noise, ping,
     request_response,
@@ -1229,6 +1230,7 @@ async fn run_loopback(
     // edits before we ran. Treating the first iteration as an offline →
     // online transition pulls in anything we missed.
     let mut was_online = false;
+    let mut sync_interval = IntervalStream::new(30_000);
 
     loop {
         let now_online = link.is_online();
@@ -1297,6 +1299,11 @@ async fn run_loopback(
                         log::info!("WebSyncClient (loopback): peer channel closed");
                         return;
                     }
+                }
+            }
+            _ = sync_interval.next() => {
+                if link.is_online() {
+                    send_version_vector(&state, &end.out_tx).await;
                 }
             }
             _ = link.notify.notified() => {
@@ -1549,6 +1556,19 @@ async fn handle_loopback_request(
                     return;
                 }
             }
+            // Lamport bump — in loopback, catch-up responses arrive as
+            // Push (not ChangesetResponse), so the bump goes here.
+            {
+                let mut dv = state.db_version.lock().await;
+                if changeset.db_version > *dv {
+                    *dv = changeset.db_version;
+                    if let Some(store) = &state.store {
+                        if let Err(e) = store.put_db_version(*dv).await {
+                            log::warn!("loopback: Lamport bump persist failed: {e}");
+                        }
+                    }
+                }
+            }
             let _ = state.inbound_tx.send(changeset.clone());
             apply_remote_changeset_loopback(state, LOOPBACK_PEER_KEY, &changeset).await;
         }
@@ -1641,6 +1661,16 @@ async fn apply_remote_changeset_loopback(
         }
     };
 
+    let local_db_version = {
+        let mut dv = state.db_version.lock().await;
+        *dv += 1;
+        let v = *dv;
+        if let Err(e) = store.put_db_version(v).await {
+            log::warn!("loopback: db_version persist failed: {e}");
+        }
+        v
+    };
+
     for change in &changeset.changes {
         let local = match store
             .get_shadow(&change.table.0, &change.pk.0, &change.cid.0)
@@ -1687,7 +1717,7 @@ async fn apply_remote_changeset_loopback(
             col_version: change.col_version,
             cl: change.cl,
             seq: change.seq,
-            db_version: change.db_version,
+            db_version: local_db_version,
         };
         if let Err(e) = store
             .put_shadow(&change.table.0, &change.pk.0, &change.cid.0, &new_row)
@@ -1733,6 +1763,7 @@ async fn run_swarm(
     // dials would otherwise fail-fast and bump fail_count for working
     // entries.
     let mut cached_predial_done = false;
+    let mut sync_interval = IntervalStream::new(30_000);
 
     loop {
         for peer in pending_announces.drain(..) {
@@ -1766,6 +1797,11 @@ async fn run_swarm(
                         log::info!("WebSyncClient: command channel closed, exiting");
                         return;
                     }
+                }
+            }
+            _ = sync_interval.next() => {
+                for peer in connected.iter().copied().collect::<Vec<_>>() {
+                    send_version_vector_swarm(peer, &state, &mut swarm).await;
                 }
             }
             event = swarm.select_next_some() => {
@@ -2484,10 +2520,21 @@ async fn handle_snapshot_event(
                     "WebSyncClient: received ChangesetResponse from {peer} with {} changes (their db_version={my_db_version})",
                     changes.len()
                 );
-                // Reconstruct the same `SyncChangeset` shape the
-                // inbound-Push path constructs, so `apply_remote_changeset`
-                // handles persistence + `resolved_tx` broadcast +
-                // `peer_versions` update uniformly.
+                // Lamport bump — the peer's db_version may be ahead of
+                // ours. Mirrors native sync_handler.rs:118-136. Must
+                // happen BEFORE apply_remote_changeset so the increment
+                // inside it starts from the correct base.
+                {
+                    let mut dv = state.db_version.lock().await;
+                    if my_db_version > *dv {
+                        *dv = my_db_version;
+                        if let Some(store) = &state.store {
+                            if let Err(e) = store.put_db_version(*dv).await {
+                                log::warn!("WebSyncClient: Lamport bump persist failed: {e}");
+                            }
+                        }
+                    }
+                }
                 let changeset = SyncChangeset {
                     site_id: peer_site_id,
                     db_version: my_db_version,
@@ -2527,6 +2574,20 @@ async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset
             }
             return;
         }
+    };
+
+    // Increment local db_version once for the batch — mirrors native
+    // `shadow::increment_db_version` (sync_handler.rs:538-546). Shadow
+    // rows must carry the LOCAL engine's version so `get_changes_since`
+    // returns a coherent monotonic sequence for catch-up responses.
+    let local_db_version = {
+        let mut dv = state.db_version.lock().await;
+        *dv += 1;
+        let v = *dv;
+        if let Err(e) = store.put_db_version(v).await {
+            log::warn!("WebSyncClient: db_version persist failed: {e}");
+        }
+        v
     };
 
     for change in &changeset.changes {
@@ -2575,7 +2636,7 @@ async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset
             col_version: change.col_version,
             cl: change.cl,
             seq: change.seq,
-            db_version: change.db_version,
+            db_version: local_db_version,
         };
         if let Err(e) = store
             .put_shadow(&change.table.0, &change.pk.0, &change.cid.0, &new_row)
@@ -2588,9 +2649,6 @@ async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset
         let _ = state.resolved_tx.send(change.clone());
     }
 
-    // Track the highest db_version seen from this peer for a future
-    // version-vector catch-up. Failure here is non-fatal — it just means
-    // catch-up will start from an earlier point next time.
     if let Err(e) = store
         .set_peer_version(&peer.to_string(), changeset.db_version)
         .await

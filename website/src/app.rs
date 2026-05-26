@@ -55,6 +55,9 @@ pub fn App() -> Element {
         document::Link { rel: "icon", href: FAVICON }
         document::Stylesheet { href: MAIN_CSS }
 
+        // Viewport
+        document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
+
         // Primary meta
         document::Meta { name: "description", content: SITE_DESCRIPTION }
 
