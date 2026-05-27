@@ -1,3 +1,5 @@
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -318,6 +320,7 @@ struct WaveSyncDbInner {
     /// engine writes, [`WaveSyncDb::diagnostics`] reads via lock-free
     /// atomic loads. See [`crate::diagnostics`] for rationale.
     diagnostics: Arc<crate::diagnostics::Counters>,
+    table_cache: std::sync::RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
 /// A SeaORM connection wrapper that transparently intercepts write operations
@@ -421,6 +424,31 @@ impl WaveSyncDb {
     /// `apply_remote_changeset`. No database query is performed.
     pub fn db_version(&self) -> u64 {
         self.inner.db_version_cache.load(Ordering::Acquire)
+    }
+
+    /// Return a cached copy of a table's rows if one exists.
+    ///
+    /// Keyed by `TypeId` so different entity types have independent caches.
+    /// Returns `None` on first load (cache miss). The Dioxus hooks call
+    /// this before hitting the database — a cache hit means instant data
+    /// on page navigation.
+    pub fn get_table_cache<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        self.inner
+            .table_cache
+            .read()
+            .unwrap()
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<T>())
+            .cloned()
+    }
+
+    /// Store a snapshot of a table's rows in the in-memory cache.
+    pub fn set_table_cache<T: Send + Sync + 'static>(&self, data: T) {
+        self.inner
+            .table_cache
+            .write()
+            .unwrap()
+            .insert(TypeId::of::<T>(), Box::new(data));
     }
 
     /// Gracefully shut down the engine and close the database connection.
@@ -1834,6 +1862,7 @@ impl WaveSyncDbBuilder {
                 network_status,
                 network_event_tx,
                 diagnostics,
+                table_cache: std::sync::RwLock::new(HashMap::new()),
             }),
         };
 

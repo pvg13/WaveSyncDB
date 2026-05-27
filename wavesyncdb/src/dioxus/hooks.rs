@@ -316,19 +316,25 @@ where
         let pk_column = pk_column.clone();
         let db = db.clone();
         spawn(async move {
-            // Initial load
-            let mut rows: Vec<E::Model> = match E::find().all(&db).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("Failed initial table load: {}", e);
-                    Vec::new()
-                }
-            };
+            // Check in-memory cache first — instant on page re-navigation.
+            let mut rows: Vec<E::Model> =
+                if let Some(cached) = db.get_table_cache::<Vec<E::Model>>() {
+                    cached
+                } else {
+                    match E::find().all(&db).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::error!("Failed initial table load: {}", e);
+                            Vec::new()
+                        }
+                    }
+                };
             let mut pk_index: HashMap<String, usize> = rows
                 .iter()
                 .enumerate()
                 .map(|(i, r)| (SyncedModel::wavesync_pk_string(r), i))
                 .collect();
+            db.set_table_cache(rows.clone());
             signal.set(rows.clone());
 
             let mut last_full_reload = Instant::now();
@@ -343,6 +349,7 @@ where
                         {
                             rows = r;
                             rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                            db.set_table_cache(rows.clone());
                             signal.set(rows.clone());
                             last_full_reload = Instant::now();
                         }
@@ -365,6 +372,7 @@ where
                             {
                                 rows = r;
                                 rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                                db.set_table_cache(rows.clone());
                                 signal.set(rows.clone());
                                 last_full_reload = Instant::now();
                             }
@@ -465,6 +473,7 @@ where
                 }
 
                 if changed || !needs_refetch.is_empty() {
+                    db.set_table_cache(rows.clone());
                     signal.set(rows.clone());
                 }
             }
@@ -506,14 +515,27 @@ where
         let pk_column = pk_column.clone();
         let db = db.clone();
         spawn(async move {
-            // Initial load
-            let mut current: Option<E::Model> = match E::find_by_id(pk.clone()).one(&db).await {
-                Ok(row) => row,
-                Err(e) => {
-                    log::error!("Failed initial row load: {}", e);
+            // Try the table cache first — avoids a DB round trip on
+            // page re-navigation when use_synced_table already loaded.
+            let mut current: Option<E::Model> = db
+                .get_table_cache::<Vec<E::Model>>()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|r| SyncedModel::wavesync_pk_string(r) == pk_string)
+                })
+                .or_else(|| {
+                    // Fallback: query by PK (blocking — runs on first load)
                     None
-                }
-            };
+                });
+            if current.is_none() {
+                current = match E::find_by_id(pk.clone()).one(&db).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        log::error!("Failed initial row load: {}", e);
+                        None
+                    }
+                };
+            }
             signal.set(current.clone());
 
             let mut last_full_reload = Instant::now();
