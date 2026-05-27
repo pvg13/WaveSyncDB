@@ -8,8 +8,7 @@ const FAVICON: Asset = asset!("/assets/favicon.svg");
 const OG_IMAGE: Asset = asset!("/assets/og.png");
 
 const SITE_URL: &str = "https://wavesyncdb.com";
-const SITE_DESCRIPTION: &str =
-    "Local-first SQLite that syncs itself. Drop-in SeaORM connection with per-column CRDTs and P2P sync over libp2p.";
+const SITE_DESCRIPTION: &str = "Local-first SQLite that syncs itself. Drop-in SeaORM connection with per-column CRDTs and P2P sync over libp2p.";
 
 #[derive(Clone, Routable, PartialEq, Debug)]
 pub enum Route {

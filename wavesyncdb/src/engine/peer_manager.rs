@@ -6,9 +6,9 @@ impl EngineRunner {
     pub(super) async fn sync_all_known_peers(&mut self) {
         // Refresh local_db_version from DB before syncing, in case spawned tasks
         // (apply_remote_changeset) have incremented it since we last checked.
-        self.local_db_version = shadow::get_db_version(&self.db)
-            .await
-            .unwrap_or(self.local_db_version);
+        self.local_db_version = self
+            .db_version_cache
+            .load(std::sync::atomic::Ordering::Acquire);
 
         let peer_ids: Vec<libp2p::PeerId> = self
             .peers

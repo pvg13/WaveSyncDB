@@ -7,12 +7,17 @@
 //! `column_values` payload in place via [`SyncedModel`](crate::SyncedModel) — no
 //! per-notification SeaORM round trip on the receive path.
 
+use std::collections::HashMap;
 use std::future::Future;
 
 use dioxus::prelude::*;
 use sea_orm::{DbErr, EntityTrait, FromQueryResult, PrimaryKeyTrait};
+use tokio::time::{Duration, Instant};
 
 use crate::{NetworkStatus, SyncedModel, WaveSyncDb, WaveSyncDbBuilder, WriteKind};
+
+const BATCH_WINDOW: Duration = Duration::from_millis(16);
+const LAGGED_DEBOUNCE: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Context providers
@@ -305,99 +310,162 @@ where
     let target_table = E::default().table_name().to_string();
     let pk_column = pk_column_name::<E>();
 
-    // Initial load
-    let db_init = db.clone();
-    use_effect(move || {
-        let db = db_init.clone();
-        spawn(async move {
-            match E::find().all(&db).await {
-                Ok(rows) => signal.set(rows),
-                Err(e) => log::error!("Failed initial table load: {}", e),
-            }
-        });
-    });
-
-    // Subscribe to changes (filtered by table name)
-    let target_table_clone = target_table.clone();
-    let pk_column_clone = pk_column.clone();
     use_effect(move || {
         let mut rx = db.change_rx();
-        let target_table = target_table_clone.clone();
-        let pk_column = pk_column_clone.clone();
+        let target_table = target_table.clone();
+        let pk_column = pk_column.clone();
         let db = db.clone();
         spawn(async move {
+            // Initial load
+            let mut rows: Vec<E::Model> = match E::find().all(&db).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("Failed initial table load: {}", e);
+                    Vec::new()
+                }
+            };
+            let mut pk_index: HashMap<String, usize> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (SyncedModel::wavesync_pk_string(r), i))
+                .collect();
+            signal.set(rows.clone());
+
+            let mut last_full_reload = Instant::now();
+
             loop {
-                let notif = match rx.recv().await {
+                let first = match rx.recv().await {
                     Ok(n) => n,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("Missed {} change notifications for {}", n, target_table);
-                        // Full reload — we may have missed both inserts and deletes.
-                        if let Ok(rows) = E::find().all(&db).await {
-                            signal.set(rows);
+                        if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
+                            && let Ok(r) = E::find().all(&db).await
+                        {
+                            rows = r;
+                            rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                            signal.set(rows.clone());
+                            last_full_reload = Instant::now();
                         }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
 
-                if notif.table != target_table {
+                // Drain additional notifications within the batch window.
+                let mut batch = vec![first];
+                let deadline = Instant::now() + BATCH_WINDOW;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Ok(n)) => batch.push(n),
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                            log::warn!("Missed {} change notifications for {}", n, target_table);
+                            batch.clear();
+                            if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
+                                && let Ok(r) = E::find().all(&db).await
+                            {
+                                rows = r;
+                                rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                                signal.set(rows.clone());
+                                last_full_reload = Instant::now();
+                            }
+                            break;
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                        Err(_timeout) => break,
+                    }
+                }
+
+                if batch.is_empty() {
                     continue;
                 }
 
-                let pk_str = notif.primary_key.0.clone();
+                let mut needs_refetch: Vec<String> = Vec::new();
+                let mut changed = false;
 
-                match notif.kind {
-                    WriteKind::Delete => {
-                        signal
-                            .write()
-                            .retain(|m| SyncedModel::wavesync_pk_string(m) != pk_str);
+                for notif in batch {
+                    if notif.table != target_table {
+                        continue;
                     }
-                    WriteKind::Update => {
-                        // Try to apply the payload in place. Fall back to a
-                        // single-row query only if the payload is absent.
-                        if let Some(cols) = &notif.column_values {
-                            let mut found = false;
-                            {
-                                let mut rows = signal.write();
-                                if let Some(row) = rows
-                                    .iter_mut()
-                                    .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
-                                {
+                    let pk_str = notif.primary_key.0.clone();
+                    changed = true;
+
+                    match notif.kind {
+                        WriteKind::Delete => {
+                            if let Some(idx) = pk_index.remove(&pk_str) {
+                                rows.swap_remove(idx);
+                                if idx < rows.len() {
+                                    let moved_pk = SyncedModel::wavesync_pk_string(&rows[idx]);
+                                    pk_index.insert(moved_pk, idx);
+                                }
+                            }
+                        }
+                        WriteKind::Update => {
+                            if let Some(cols) = &notif.column_values {
+                                if let Some(&idx) = pk_index.get(&pk_str) {
                                     for (col, val) in cols {
-                                        SyncedModel::wavesync_apply_change(row, &col.0, val);
+                                        SyncedModel::wavesync_apply_change(
+                                            &mut rows[idx],
+                                            &col.0,
+                                            val,
+                                        );
                                     }
-                                    found = true;
-                                }
-                            }
-                            if found {
-                                continue;
-                            }
-                        }
-                        // Either no payload or row not in cache — fall back.
-                        refetch_one_into_vec::<E>(&db, &pk_column, &pk_str, &mut signal).await;
-                    }
-                    WriteKind::Insert => {
-                        if let Some(cols) = &notif.column_values {
-                            let pairs: Vec<(String, serde_json::Value)> =
-                                cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
-                            if let Some(model) =
-                                E::Model::wavesync_from_changes(&pk_column, &pk_str, &pairs)
-                            {
-                                let mut rows = signal.write();
-                                if let Some(slot) = rows
-                                    .iter_mut()
-                                    .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
-                                {
-                                    *slot = model;
                                 } else {
-                                    rows.push(model);
+                                    needs_refetch.push(pk_str);
                                 }
-                                continue;
+                            } else {
+                                needs_refetch.push(pk_str);
                             }
                         }
-                        // Payload missing or insufficient — single-row fallback.
-                        refetch_one_into_vec::<E>(&db, &pk_column, &pk_str, &mut signal).await;
+                        WriteKind::Insert => {
+                            if let Some(cols) = &notif.column_values {
+                                let pairs: Vec<(String, serde_json::Value)> =
+                                    cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
+                                if let Some(model) =
+                                    E::Model::wavesync_from_changes(&pk_column, &pk_str, &pairs)
+                                {
+                                    if let Some(&idx) = pk_index.get(&pk_str) {
+                                        rows[idx] = model;
+                                    } else {
+                                        pk_index.insert(pk_str.clone(), rows.len());
+                                        rows.push(model);
+                                    }
+                                } else {
+                                    needs_refetch.push(pk_str);
+                                }
+                            } else {
+                                needs_refetch.push(pk_str);
+                            }
+                        }
                     }
+                }
+
+                for pk_str in &needs_refetch {
+                    let pk_typed: <E::PrimaryKey as PrimaryKeyTrait>::ValueType =
+                        pk_str.to_string().into();
+                    match E::find_by_id(pk_typed).one(&db).await {
+                        Ok(Some(row)) => {
+                            if let Some(&idx) = pk_index.get(pk_str) {
+                                rows[idx] = row;
+                            } else {
+                                pk_index.insert(pk_str.clone(), rows.len());
+                                rows.push(row);
+                            }
+                        }
+                        Ok(None) => {
+                            if let Some(idx) = pk_index.remove(pk_str) {
+                                rows.swap_remove(idx);
+                                if idx < rows.len() {
+                                    let moved_pk = SyncedModel::wavesync_pk_string(&rows[idx]);
+                                    pk_index.insert(moved_pk, idx);
+                                }
+                            }
+                        }
+                        Err(e) => log::error!("Failed to refresh row {}: {}", pk_str, e),
+                    }
+                }
+
+                if changed || !needs_refetch.is_empty() {
+                    signal.set(rows.clone());
                 }
             }
         });
@@ -426,90 +494,124 @@ where
         Clone + Send + Sync + 'static + Into<sea_orm::Value> + std::fmt::Display,
 {
     let mut signal: Signal<Option<E::Model>> = use_signal(|| None);
-    let pk_init = pk.clone();
     let pk_string = format!("{}", pk);
     let target_table = E::default().table_name().to_string();
     let pk_column = pk_column_name::<E>();
 
-    // Initial load
-    let db_init = db.clone();
-    use_effect(move || {
-        let pk = pk_init.clone();
-        let db = db_init.clone();
-        spawn(async move {
-            match E::find_by_id(pk).one(&db).await {
-                Ok(row) => signal.set(row),
-                Err(e) => log::error!("Failed initial row load: {}", e),
-            }
-        });
-    });
-
-    // Subscribe to changes (filtered by table name AND primary key)
-    let pk_loop = pk.clone();
-    let pk_string_loop = pk_string.clone();
-    let target_table_loop = target_table.clone();
-    let pk_column_loop = pk_column.clone();
     use_effect(move || {
         let mut rx = db.change_rx();
-        let pk = pk_loop.clone();
-        let pk_string = pk_string_loop.clone();
-        let target_table = target_table_loop.clone();
-        let pk_column = pk_column_loop.clone();
+        let pk = pk.clone();
+        let pk_string = pk_string.clone();
+        let target_table = target_table.clone();
+        let pk_column = pk_column.clone();
         let db = db.clone();
         spawn(async move {
+            // Initial load
+            let mut current: Option<E::Model> = match E::find_by_id(pk.clone()).one(&db).await {
+                Ok(row) => row,
+                Err(e) => {
+                    log::error!("Failed initial row load: {}", e);
+                    None
+                }
+            };
+            signal.set(current.clone());
+
+            let mut last_full_reload = Instant::now();
+
             loop {
-                let notif = match rx.recv().await {
+                let first = match rx.recv().await {
                     Ok(n) => n,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("Missed {} change notifications for {}", n, target_table);
-                        // We may have missed our own row's update — re-query.
-                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
-                            signal.set(row);
+                        if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
+                            && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
+                        {
+                            current = row;
+                            signal.set(current.clone());
+                            last_full_reload = Instant::now();
                         }
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
 
-                if notif.table != target_table || notif.primary_key.0 != pk_string {
+                let mut batch = vec![first];
+                let deadline = Instant::now() + BATCH_WINDOW;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Ok(n)) => batch.push(n),
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                            log::warn!("Missed {} change notifications for {}", n, target_table);
+                            batch.clear();
+                            if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
+                                && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
+                            {
+                                current = row;
+                                signal.set(current.clone());
+                                last_full_reload = Instant::now();
+                            }
+                            break;
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                        Err(_timeout) => break,
+                    }
+                }
+
+                if batch.is_empty() {
                     continue;
                 }
 
-                match notif.kind {
-                    WriteKind::Delete => {
-                        signal.set(None);
+                let mut changed = false;
+                let mut needs_refetch = false;
+
+                for notif in batch {
+                    if notif.table != target_table || notif.primary_key.0 != pk_string {
+                        continue;
                     }
-                    WriteKind::Update => {
-                        if let Some(cols) = &notif.column_values {
-                            let current = signal.read().clone();
-                            if let Some(mut model) = current {
-                                for (col, val) in cols {
-                                    SyncedModel::wavesync_apply_change(&mut model, &col.0, val);
+                    changed = true;
+
+                    match notif.kind {
+                        WriteKind::Delete => {
+                            current = None;
+                        }
+                        WriteKind::Update => {
+                            if let Some(cols) = &notif.column_values {
+                                if let Some(ref mut model) = current {
+                                    for (col, val) in cols {
+                                        SyncedModel::wavesync_apply_change(model, &col.0, val);
+                                    }
+                                } else {
+                                    needs_refetch = true;
                                 }
-                                signal.set(Some(model));
-                                continue;
+                            } else {
+                                needs_refetch = true;
                             }
                         }
-                        // No payload, or row not yet in cache — re-query once.
-                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
-                            signal.set(row);
-                        }
-                    }
-                    WriteKind::Insert => {
-                        if let Some(cols) = &notif.column_values {
-                            let pairs: Vec<(String, serde_json::Value)> =
-                                cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
-                            if let Some(model) =
-                                E::Model::wavesync_from_changes(&pk_column, &pk_string, &pairs)
-                            {
-                                signal.set(Some(model));
-                                continue;
+                        WriteKind::Insert => {
+                            if let Some(cols) = &notif.column_values {
+                                let pairs: Vec<(String, serde_json::Value)> =
+                                    cols.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
+                                if let Some(model) =
+                                    E::Model::wavesync_from_changes(&pk_column, &pk_string, &pairs)
+                                {
+                                    current = Some(model);
+                                } else {
+                                    needs_refetch = true;
+                                }
+                            } else {
+                                needs_refetch = true;
                             }
                         }
-                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
-                            signal.set(row);
-                        }
                     }
+                }
+
+                if needs_refetch && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                    current = row;
+                    changed = true;
+                }
+
+                if changed {
+                    signal.set(current.clone());
                 }
             }
         });
@@ -532,39 +634,10 @@ fn pk_column_name<E: EntityTrait>() -> String {
         .unwrap_or_default()
 }
 
-/// Refetch a single row by stringified primary key and merge it into the
-/// existing `Vec<E::Model>`. Replaces any existing entry with the same pk
-/// or appends if not found. Removes the entry if the row no longer exists.
-async fn refetch_one_into_vec<E>(
-    db: &WaveSyncDb,
-    _pk_column: &str,
-    pk_str: &str,
-    signal: &mut Signal<Vec<E::Model>>,
-) where
-    E: EntityTrait,
-    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
-    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
-        Clone + Send + Sync + 'static + Into<sea_orm::Value> + From<String>,
-{
-    let pk_typed: <E::PrimaryKey as PrimaryKeyTrait>::ValueType = pk_str.to_string().into();
-    match E::find_by_id(pk_typed).one(db).await {
-        Ok(Some(row)) => {
-            let mut rows = signal.write();
-            if let Some(slot) = rows
-                .iter_mut()
-                .find(|m| SyncedModel::wavesync_pk_string(*m) == pk_str)
-            {
-                *slot = row;
-            } else {
-                rows.push(row);
-            }
-        }
-        Ok(None) => {
-            signal
-                .write()
-                .retain(|m| SyncedModel::wavesync_pk_string(m) != pk_str);
-        }
-        Err(e) => log::error!("Failed to refresh row {}: {}", pk_str, e),
+fn rebuild_pk_index<M: SyncedModel>(rows: &[M], index: &mut HashMap<String, usize>) {
+    index.clear();
+    for (i, row) in rows.iter().enumerate() {
+        index.insert(SyncedModel::wavesync_pk_string(row), i);
     }
 }
 

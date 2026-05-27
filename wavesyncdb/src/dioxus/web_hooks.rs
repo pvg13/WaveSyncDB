@@ -60,27 +60,25 @@ pub fn use_synced_table_client<E: BrowserEntity>(
         let table = table.to_string();
         let mut entities = entities;
         move || {
-            // `use_effect` re-runs whenever any signal it reads changes.
-            // The only signal we read is `client`, which transitions
-            // None → Some exactly once in the typical setup, so the
-            // effect body fires once with a Some value. If something
-            // re-set client to None and back later, the effect would
-            // re-run and re-spawn the subscriber — that's fine; the old
-            // subscriber's task ends when the broadcast Receiver drops.
             let Some(c) = client.read().clone() else {
                 return;
             };
             let table = table.clone();
             spawn(async move {
                 // Materialize current state from the persisted shadow.
+                let mut rows: Vec<E> = Vec::new();
+                let mut pk_index: HashMap<String, usize> = HashMap::new();
                 if let Some(store) = c.store() {
                     match store.list_table_rows(&table).await {
-                        Ok(rows) => {
-                            let materialized: Vec<E> = rows
+                        Ok(stored) => {
+                            rows = stored
                                 .into_iter()
                                 .map(|r| E::from_columns(&r.pk, &r.columns))
                                 .collect();
-                            entities.set(materialized);
+                            for (i, e) in rows.iter().enumerate() {
+                                pk_index.insert(e.pk().to_string(), i);
+                            }
+                            entities.set(rows.clone());
                         }
                         Err(e) => {
                             log::warn!("use_synced_table({table}): list_table_rows failed: {e}");
@@ -88,37 +86,127 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                     }
                 }
 
-                // Stream subsequent changes into the same signal. The
-                // engine echoes local writes onto resolved_tx after
-                // persistence, so this single loop handles both local
-                // and remote updates uniformly.
                 let mut rx = c.subscribe_resolved();
                 loop {
-                    match rx.recv().await {
-                        Ok(change) => {
-                            if change.table.0 == table {
-                                apply_change_to::<E>(&mut entities, change);
-                            }
-                        }
+                    let first = match rx.recv().await {
+                        Ok(change) => change,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            // Slow subscriber dropped messages. Recover
-                            // by re-materializing from the store, which
-                            // is authoritative.
                             log::warn!("use_synced_table({table}): lagged {n}, re-materializing");
                             if let Some(store) = c.store() {
-                                if let Ok(rows) = store.list_table_rows(&table).await {
-                                    entities.set(
-                                        rows.into_iter()
-                                            .map(|r| E::from_columns(&r.pk, &r.columns))
-                                            .collect(),
-                                    );
+                                if let Ok(stored) = store.list_table_rows(&table).await {
+                                    rows = stored
+                                        .into_iter()
+                                        .map(|r| E::from_columns(&r.pk, &r.columns))
+                                        .collect();
+                                    pk_index.clear();
+                                    for (i, e) in rows.iter().enumerate() {
+                                        pk_index.insert(e.pk().to_string(), i);
+                                    }
+                                    entities.set(rows.clone());
                                 }
                             }
+                            continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             log::info!("use_synced_table({table}): client dropped");
                             return;
                         }
+                    };
+
+                    // Drain all immediately available notifications.
+                    let mut batch = vec![first];
+                    loop {
+                        match rx.try_recv() {
+                            Ok(n) => batch.push(n),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                log::warn!(
+                                    "use_synced_table({table}): lagged {n}, re-materializing"
+                                );
+                                batch.clear();
+                                if let Some(store) = c.store() {
+                                    if let Ok(stored) = store.list_table_rows(&table).await {
+                                        rows = stored
+                                            .into_iter()
+                                            .map(|r| E::from_columns(&r.pk, &r.columns))
+                                            .collect();
+                                        pk_index.clear();
+                                        for (i, e) in rows.iter().enumerate() {
+                                            pk_index.insert(e.pk().to_string(), i);
+                                        }
+                                        entities.set(rows.clone());
+                                    }
+                                }
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    if batch.is_empty() {
+                        continue;
+                    }
+
+                    // Group column changes by PK to minimize ser/deser.
+                    let mut changed = false;
+                    let mut grouped_updates: HashMap<
+                        String,
+                        HashMap<String, Option<serde_json::Value>>,
+                    > = HashMap::new();
+
+                    for change in batch {
+                        if change.table.0 != table {
+                            continue;
+                        }
+                        let pk = change.pk.0;
+                        let cid = change.cid.0;
+
+                        if cid == "__deleted" {
+                            grouped_updates.remove(&pk);
+                            if let Some(idx) = pk_index.remove(&pk) {
+                                rows.swap_remove(idx);
+                                if idx < rows.len() {
+                                    let moved_pk = rows[idx].pk().to_string();
+                                    pk_index.insert(moved_pk, idx);
+                                }
+                            }
+                            changed = true;
+                            continue;
+                        }
+
+                        grouped_updates
+                            .entry(pk)
+                            .or_default()
+                            .insert(cid, change.val);
+                        changed = true;
+                    }
+
+                    for (pk, col_updates) in grouped_updates {
+                        if let Some(&idx) = pk_index.get(&pk) {
+                            let mut cols: HashMap<String, serde_json::Value> =
+                                rows[idx].to_columns().into_iter().collect();
+                            for (cid, val) in col_updates {
+                                match val {
+                                    Some(v) => {
+                                        cols.insert(cid, v);
+                                    }
+                                    None => {
+                                        cols.remove(&cid);
+                                    }
+                                }
+                            }
+                            rows[idx] = E::from_columns(&pk, &cols);
+                        } else {
+                            let cols: HashMap<String, serde_json::Value> = col_updates
+                                .into_iter()
+                                .filter_map(|(k, v)| v.map(|v| (k, v)))
+                                .collect();
+                            pk_index.insert(pk.clone(), rows.len());
+                            rows.push(E::from_columns(&pk, &cols));
+                        }
+                    }
+
+                    if changed {
+                        entities.set(rows.clone());
                     }
                 }
             });
@@ -126,54 +214,4 @@ pub fn use_synced_table_client<E: BrowserEntity>(
     });
 
     entities
-}
-
-/// Fold a single `ColumnChange` into the materialized entity list.
-///
-/// Strategy: find the entity whose `pk` matches; if found, rebuild it
-/// by re-serializing the existing entity (`to_columns`), patching the
-/// affected column, and re-deserializing (`from_columns`). If not
-/// found, the change refers to a row this client hasn't seen before —
-/// build a fresh entity from the single column we just received. The
-/// missing-column slots get the entity's default values via
-/// `from_columns`'s `unwrap_or_default` pattern.
-///
-/// This handles the partial-update case (a single column edit on an
-/// existing row) and the new-row case (first column write for a
-/// previously unseen pk) without the caller having to special-case
-/// either. The cost is one round-trip through `to_columns` /
-/// `from_columns` per change — fine for interactive write rates.
-fn apply_change_to<E: BrowserEntity>(entities: &mut Signal<Vec<E>>, change: ColumnChange) {
-    let pk = change.pk.0;
-    let cid = change.cid.0;
-    let val = change.val;
-
-    if cid == "__deleted" {
-        entities.with_mut(|vec| {
-            vec.retain(|e| e.pk() != pk);
-        });
-        return;
-    }
-
-    entities.with_mut(|vec| {
-        if let Some(idx) = vec.iter().position(|e| e.pk() == pk) {
-            let mut cols: HashMap<String, serde_json::Value> =
-                vec[idx].to_columns().into_iter().collect();
-            match val {
-                Some(v) => {
-                    cols.insert(cid, v);
-                }
-                None => {
-                    cols.remove(&cid);
-                }
-            }
-            vec[idx] = E::from_columns(&pk, &cols);
-        } else {
-            let mut cols = HashMap::new();
-            if let Some(v) = val {
-                cols.insert(cid, v);
-            }
-            vec.push(E::from_columns(&pk, &cols));
-        }
-    });
 }

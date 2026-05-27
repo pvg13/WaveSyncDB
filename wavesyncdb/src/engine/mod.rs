@@ -154,6 +154,7 @@ pub(crate) fn start_engine(
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    db_version_cache: Arc<std::sync::atomic::AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let event_tx = network_event_tx.clone();
@@ -171,6 +172,7 @@ pub(crate) fn start_engine(
             network_status,
             network_event_tx,
             diagnostics,
+            db_version_cache,
         ))
         .catch_unwind()
         .await;
@@ -280,6 +282,7 @@ async fn run_engine(
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    db_version_cache: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load (or create on first launch) the persistent libp2p keypair from
     // _wavesync_meta. Stable PeerId across restarts is necessary so the
@@ -345,6 +348,7 @@ async fn run_engine(
         config,
         mdns_enabled,
         local_db_version,
+        db_version_cache,
         peer_db_versions: HashMap::new(),
         peer_reported_versions: HashMap::new(),
         snapshot_resp_tx,
@@ -431,6 +435,7 @@ struct EngineRunner {
     /// runtime toggle handler both read this field.
     pub(crate) mdns_enabled: bool,
     pub(crate) local_db_version: u64,
+    pub(crate) db_version_cache: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) peer_db_versions: HashMap<libp2p::PeerId, u64>,
     /// Display-only peer versions from incoming requests (NOT used for sync decisions).
     pub(crate) peer_reported_versions: HashMap<libp2p::PeerId, u64>,
@@ -708,10 +713,9 @@ impl EngineRunner {
             self.peers
                 .entry(peer_id)
                 .or_insert_with(|| endpoint.get_remote_address().clone());
-            // Refresh local_db_version in case spawned tasks updated it
-            self.local_db_version = shadow::get_db_version(&self.db)
-                .await
-                .unwrap_or(self.local_db_version);
+            self.local_db_version = self
+                .db_version_cache
+                .load(std::sync::atomic::Ordering::Acquire);
             self.initiate_sync_for_peer(peer_id);
         }
 
@@ -1067,7 +1071,7 @@ impl EngineRunner {
                     }
                 },
                 Some(changes) = self.remote_changeset_rx.recv() => {
-                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &changes).await;
+                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &changes, Some(&self.db_version_cache)).await;
                 },
                 _ = self.registry_ready.notified(), if !self.registry_is_ready => {
                     self.registry_is_ready = true;
