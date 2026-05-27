@@ -375,7 +375,7 @@ pub struct WebSyncClient {
     /// the latest value is what matters; subscribers that fall behind
     /// just get the most recent value next time they read.
     status_rx: watch::Receiver<WebSyncStatus>,
-    table_cache: std::sync::RwLock<HashMap<TypeId, Box<dyn Any>>>,
+    table_cache: Arc<std::sync::RwLock<HashMap<TypeId, Box<dyn Any>>>>,
 }
 
 /// Live debug snapshot exposed by [`WebSyncClient::subscribe_status`].
@@ -809,7 +809,7 @@ impl WebSyncClient {
             resolved_tx,
             store,
             status_rx,
-            table_cache: std::sync::RwLock::new(HashMap::new()),
+            table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -1040,7 +1040,7 @@ impl WebSyncClient {
             resolved_tx,
             store: Some(store_arc),
             status_rx,
-            table_cache: std::sync::RwLock::new(HashMap::new()),
+            table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
