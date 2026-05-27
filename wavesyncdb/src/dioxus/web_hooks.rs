@@ -65,26 +65,29 @@ pub fn use_synced_table_client<E: BrowserEntity>(
             };
             let table = table.clone();
             spawn(async move {
-                // Materialize current state from the persisted shadow.
-                let mut rows: Vec<E> = Vec::new();
-                let mut pk_index: HashMap<String, usize> = HashMap::new();
-                if let Some(store) = c.store() {
+                // Check in-memory cache first — instant on page re-navigation.
+                let mut rows: Vec<E> = if let Some(cached) = c.get_table_cache::<Vec<E>>() {
+                    cached
+                } else if let Some(store) = c.store() {
                     match store.list_table_rows(&table).await {
-                        Ok(stored) => {
-                            rows = stored
-                                .into_iter()
-                                .map(|r| E::from_columns(&r.pk, &r.columns))
-                                .collect();
-                            for (i, e) in rows.iter().enumerate() {
-                                pk_index.insert(e.pk().to_string(), i);
-                            }
-                            entities.set(rows.clone());
-                        }
+                        Ok(stored) => stored
+                            .into_iter()
+                            .map(|r| E::from_columns(&r.pk, &r.columns))
+                            .collect(),
                         Err(e) => {
                             log::warn!("use_synced_table({table}): list_table_rows failed: {e}");
+                            Vec::new()
                         }
                     }
+                } else {
+                    Vec::new()
+                };
+                let mut pk_index: HashMap<String, usize> = HashMap::new();
+                for (i, e) in rows.iter().enumerate() {
+                    pk_index.insert(e.pk().to_string(), i);
                 }
+                c.set_table_cache(rows.clone());
+                entities.set(rows.clone());
 
                 let mut rx = c.subscribe_resolved();
                 loop {
@@ -102,6 +105,7 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                                     for (i, e) in rows.iter().enumerate() {
                                         pk_index.insert(e.pk().to_string(), i);
                                     }
+                                    c.set_table_cache(rows.clone());
                                     entities.set(rows.clone());
                                 }
                             }
@@ -133,6 +137,7 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                                         for (i, e) in rows.iter().enumerate() {
                                             pk_index.insert(e.pk().to_string(), i);
                                         }
+                                        c.set_table_cache(rows.clone());
                                         entities.set(rows.clone());
                                     }
                                 }
@@ -206,6 +211,7 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                     }
 
                     if changed {
+                        c.set_table_cache(rows.clone());
                         entities.set(rows.clone());
                     }
                 }
