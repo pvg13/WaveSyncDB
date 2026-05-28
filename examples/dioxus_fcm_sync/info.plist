@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        iOS 14.5+ requires apps that use the local network (including mDNS
+        / Bonjour discovery) to declare:
+
+        - NSLocalNetworkUsageDescription: a user-facing string shown in the
+          one-time permission prompt the OS displays before any local-network
+          traffic is allowed.
+        - NSBonjourServices: an explicit allowlist of mDNS service types
+          this app may browse for and advertise. Without this entry, iOS
+          silently drops the mDNS queries even if the permission was granted.
+
+        Without both, two iPhones on the same Wi-Fi cannot find each other
+        via libp2p's mDNS discovery — they would have to bounce through the
+        relay server, defeating the "direct P2P when possible" design.
+
+        Service name `_p2p._udp` is libp2p's canonical mDNS service type per
+        https://github.com/libp2p/specs/blob/master/discovery/mdns.md
+        (the `.local` suffix is the DNS domain part, not included in
+        NSBonjourServices).
+
+        dx (Dioxus CLI) 0.7+ merges this file with its generated Info.plist
+        via the `ios_info_plist = "info.plist"` key in Dioxus.toml.
+    -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>WaveSyncDB syncs with nearby devices on your local network without going through a server, so changes you make on one device appear instantly on others on the same Wi-Fi.</string>
+
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_p2p._udp</string>
+    </array>
+</dict>
+</plist>
