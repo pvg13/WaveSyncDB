@@ -300,8 +300,17 @@ impl EngineRunner {
                     log::info!("Attempting relay reconnection (attempt {})", count + 1);
                     self.try_dial_relay();
                 }
+                // Rotate to the next fallback relay after every 4 failed
+                // attempts at the current one (~40s of stale backoff with
+                // base 5s tick). The primary stays at index 0 in the
+                // rotation; on wrap-around we come back to it, which is
+                // what we want if the primary recovered.
+                let next_count = count + 1;
+                if next_count.is_multiple_of(4) && !self.config.relay_fallbacks.is_empty() {
+                    self.rotate_to_next_relay();
+                }
                 self.relay_state = RelayState::Connecting {
-                    retry_count: count + 1,
+                    retry_count: next_count,
                 };
             }
             Action::Stuck {
@@ -341,6 +350,26 @@ impl EngineRunner {
                 // Either we just connected and haven't been stuck long enough,
                 // or relay is Disabled / already Listening — nothing to do.
             }
+        }
+    }
+
+    /// Rotate the primary relay with the next fallback. Called after the
+    /// current relay has failed several consecutive dial attempts. Moves
+    /// the failed primary to the back of the fallback list, so we come
+    /// back to it after exhausting the others — useful when the original
+    /// failure was a transient outage.
+    pub(super) fn rotate_to_next_relay(&mut self) {
+        if self.config.relay_fallbacks.is_empty() {
+            return;
+        }
+        // Swap: old primary → back of fallbacks; first fallback → primary.
+        let new_primary = self.config.relay_fallbacks.remove(0);
+        let old_primary = std::mem::replace(&mut self.config.relay_server, Some(new_primary));
+        if let Some(addr) = old_primary {
+            self.config.relay_fallbacks.push(addr);
+        }
+        if let Some(ref addr) = self.config.relay_server {
+            log::info!("Rotated to next relay fallback: {addr}");
         }
     }
 

@@ -131,6 +131,9 @@ pub async fn background_sync_with_peers(
     if let Some(ref relay) = config.relay_server {
         builder = builder.with_relay_server(relay);
     }
+    if !config.relay_fallbacks.is_empty() {
+        builder = builder.with_relay_fallbacks(&config.relay_fallbacks);
+    }
     if let Some(ref passphrase) = config.passphrase {
         builder = builder.with_passphrase(passphrase);
     }
@@ -145,6 +148,9 @@ pub async fn background_sync_with_peers(
     {
         builder = WaveSyncDbBuilder::new(database_url, &config.topic).managed_relay(relay, api_key);
         // Re-apply other settings
+        if !config.relay_fallbacks.is_empty() {
+            builder = builder.with_relay_fallbacks(&config.relay_fallbacks);
+        }
         if let Some(ref passphrase) = config.passphrase {
             builder = builder.with_passphrase(passphrase);
         }

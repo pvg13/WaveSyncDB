@@ -83,8 +83,13 @@ pub struct EngineConfig {
     pub mdns_ttl: Duration,
     /// Static bootstrap peers to dial on startup.
     pub bootstrap_peers: Vec<Multiaddr>,
-    /// Relay server multiaddr for NAT traversal.
+    /// Relay server multiaddr for NAT traversal (the primary).
     pub relay_server: Option<Multiaddr>,
+    /// Fallback relay servers, tried in order if the primary fails
+    /// repeatedly. Removes the single-point-of-failure for cold-start
+    /// peer discovery without changing the connect-to-one-relay-at-a-time
+    /// data path. See `relay_manager::rotate_to_next_relay`.
+    pub relay_fallbacks: Vec<Multiaddr>,
     /// Rendezvous server multiaddr for WAN peer discovery.
     pub rendezvous_server: Option<Multiaddr>,
     /// How often to discover peers via rendezvous (default: 60s).
@@ -121,6 +126,7 @@ impl Default for EngineConfig {
             mdns_ttl: Duration::from_secs(30),
             bootstrap_peers: Vec::new(),
             relay_server: None,
+            relay_fallbacks: Vec::new(),
             rendezvous_server: None,
             rendezvous_discover_interval: Duration::from_secs(60),
             rendezvous_ttl: 300,

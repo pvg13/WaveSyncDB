@@ -1316,6 +1316,11 @@ pub struct SyncConfig {
     pub database_url: String,
     pub topic: String,
     pub relay_server: Option<String>,
+    /// Additional relay servers tried in order if the primary fails.
+    /// Empty for backward compatibility with single-relay configs written
+    /// before multi-relay fallback shipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_fallbacks: Vec<String>,
     pub passphrase: Option<String>,
     pub rendezvous_server: Option<String>,
     pub bootstrap_peers: Vec<String>,
@@ -1376,6 +1381,7 @@ pub struct WaveSyncDbBuilder {
     database_url: String,
     node_id: Option<NodeId>,
     relay_server: Option<String>,
+    relay_fallbacks: Vec<String>,
     topic: String,
     sync_interval: std::time::Duration,
     mdns_enabled: bool,
@@ -1403,6 +1409,7 @@ impl WaveSyncDbBuilder {
             database_url: url.to_string(),
             node_id: None,
             relay_server: None,
+            relay_fallbacks: Vec::new(),
             topic: topic.to_string(),
             sync_interval: defaults.sync_interval,
             mdns_enabled: defaults.mdns_enabled,
@@ -1433,8 +1440,31 @@ impl WaveSyncDbBuilder {
     ///
     /// The address should include the server's peer ID, e.g.:
     /// `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
+    ///
+    /// To configure fallback relays (recommended for production to remove
+    /// the single-point-of-failure), call [`Self::with_relay_fallback`] one
+    /// or more times after this, or use [`Self::with_relay_fallbacks`].
     pub fn with_relay_server(mut self, addr: &str) -> Self {
         self.relay_server = Some(addr.to_string());
+        self
+    }
+
+    /// Add a fallback relay server. Tried after the primary
+    /// ([`Self::with_relay_server`]) has failed repeatedly. Can be called
+    /// multiple times to add several fallbacks in priority order.
+    pub fn with_relay_fallback(mut self, addr: &str) -> Self {
+        self.relay_fallbacks.push(addr.to_string());
+        self
+    }
+
+    /// Add multiple fallback relays in one call. Preserves order.
+    pub fn with_relay_fallbacks<I, S>(mut self, addrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.relay_fallbacks
+            .extend(addrs.into_iter().map(|s| s.as_ref().to_string()));
         self
     }
 
@@ -1712,6 +1742,17 @@ impl WaveSyncDbBuilder {
             None => None,
         };
 
+        // Resolve fallback relays. Invalid ones are skipped with a warning
+        // rather than failing the whole build — a typo in a fallback
+        // shouldn't take down the primary path.
+        let mut relay_fallbacks: Vec<libp2p::Multiaddr> = Vec::new();
+        for s in &self.relay_fallbacks {
+            match parse_and_resolve_multiaddr(s).await {
+                Ok(addr) => relay_fallbacks.push(addr),
+                Err(e) => log::warn!("Skipping invalid relay fallback address '{s}': {e}"),
+            }
+        }
+
         let rendezvous_server =
             match self.rendezvous_server.as_deref() {
                 Some(s) => Some(parse_and_resolve_multiaddr(s).await.map_err(|e| {
@@ -1749,6 +1790,7 @@ impl WaveSyncDbBuilder {
             database_url: self.database_url.clone(),
             topic: self.topic.clone(),
             relay_server: self.relay_server.clone(),
+            relay_fallbacks: self.relay_fallbacks.clone(),
             passphrase: self.passphrase,
             rendezvous_server: self.rendezvous_server.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
@@ -1770,6 +1812,7 @@ impl WaveSyncDbBuilder {
             mdns_ttl: self.mdns_ttl,
             bootstrap_peers,
             relay_server,
+            relay_fallbacks,
             rendezvous_server,
             rendezvous_discover_interval: self.rendezvous_discover_interval,
             rendezvous_ttl: self.rendezvous_ttl,
