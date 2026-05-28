@@ -1,17 +1,115 @@
 //! FCM and APNs push notification sender.
 
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Result of sending a push notification.
-#[derive(Debug)]
+///
+/// Replaces the prior `Error(String)` catch-all so the retry queue can
+/// make policy decisions (retry vs drop) off the variant alone, without
+/// parsing error message strings. Each call site in this module maps
+/// deterministically to one variant.
+#[derive(Debug, Clone)]
 pub enum PushResult {
-    /// Successfully sent.
+    /// 2xx from the provider — notification accepted.
     Sent,
-    /// Token is invalid/expired — caller should prune it.
-    TokenInvalid,
-    /// Transient error — retry later.
-    Error(String),
+    /// Provider says the token is unusable. Caller prunes it from the
+    /// token store and any pending retries.
+    TokenInvalid { reason: TokenInvalidReason },
+    /// Retryable failure. The retry queue persists this and re-attempts
+    /// with backoff; `retry_after` (if present) overrides the schedule
+    /// for the next attempt.
+    Transient(TransientError),
+    /// Permanent non-token failure (misconfiguration, bad credentials,
+    /// bad request body). Caller logs and drops — retrying won't help
+    /// until config changes.
+    Permanent(PermanentError),
+}
+
+/// Which provider classified the token as invalid, for logging clarity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenInvalidReason {
+    /// APNs returned HTTP 410 Gone, or body said `BadDeviceToken` /
+    /// `Unregistered`. The token has been recycled or the app
+    /// uninstalled.
+    Apns410,
+    /// FCM returned `UNREGISTERED` — token revoked by Firebase.
+    FcmUnregistered,
+    /// FCM returned `INVALID_ARGUMENT` for the token field — malformed
+    /// or wrong-project token.
+    FcmInvalidArgument,
+}
+
+/// Retryable failure carrying enough info for the queue to honor
+/// `Retry-After` and pick the right backoff slot.
+///
+/// Fields are tagged `#[allow(dead_code)]` because they are read by the
+/// persistent retry queue (see commit B5) which lands separately from
+/// this refactor. The compiler can't see those readers yet.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum TransientError {
+    /// HTTP-level failure with a known status. `retry_after` is parsed
+    /// from the `Retry-After` response header when present.
+    HttpStatus {
+        platform: Platform,
+        status: u16,
+        retry_after: Option<Duration>,
+        body: String,
+    },
+    /// Transport-level failure — DNS, connect, TLS, timeout,
+    /// EOF mid-stream. The provider never saw the request.
+    Transport {
+        platform: Platform,
+        message: String,
+    },
+    /// FCM OAuth2 token-exchange failure (network or 5xx from
+    /// `oauth2.googleapis.com`). Treated transient — Google's OAuth
+    /// occasionally 5xxs and recovers quickly.
+    OauthTransport { message: String },
+}
+
+/// Misconfiguration that won't fix itself. Caller drops the send.
+///
+/// Same `#[allow(dead_code)]` reasoning as [`TransientError`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum PermanentError {
+    /// Provider isn't configured for this platform. Won't change
+    /// without restart with new config.
+    NotConfigured { platform: Platform },
+    /// JWT / OAuth credential construction failed (bad PEM, missing
+    /// fields in service-account JSON). Operator action required.
+    CredentialError {
+        platform: Platform,
+        message: String,
+    },
+    /// Provider returned 400/401/403 (or, for FCM, 404) with a
+    /// non-token-related body — malformed payload, bad APNs topic,
+    /// wrong API enabled, etc.
+    BadRequest {
+        platform: Platform,
+        status: u16,
+        body: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Fcm,
+    Apns,
+}
+
+/// Parse the `Retry-After` header into a Duration. Supports integer
+/// seconds only (the format both FCM and APNs actually use); HTTP-date
+/// form is rare in practice and we'd rather honor a missing header by
+/// falling back to the backoff schedule than misparse one.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// Configuration for FCM (Firebase Cloud Messaging) HTTP v1 API.
@@ -65,12 +163,23 @@ impl PushSender {
     pub async fn send_fcm(&self, token: &str, topic: &str, peer_addrs: &[String]) -> PushResult {
         let fcm = match &self.fcm {
             Some(c) => c,
-            None => return PushResult::Error("FCM not configured".to_string()),
+            None => {
+                return PushResult::Permanent(PermanentError::NotConfigured {
+                    platform: Platform::Fcm,
+                });
+            }
         };
 
         let access_token = match self.get_fcm_access_token(fcm).await {
             Ok(t) => t,
-            Err(e) => return PushResult::Error(format!("FCM auth error: {e}")),
+            Err(e) => {
+                // OAuth failures are mostly transient (Google's token
+                // endpoint occasionally 5xxs). The retry budget caps us
+                // if the underlying cause is actually permanent (e.g.
+                // expired service account) — first 7 retries fail, then
+                // the row drops with a clear log line.
+                return PushResult::Transient(TransientError::OauthTransport { message: e });
+            }
         };
 
         let url = format!(
@@ -108,19 +217,43 @@ impl PushSender {
         {
             Ok(resp) => {
                 let status = resp.status();
+                let status_u16 = status.as_u16();
                 if status.is_success() {
                     PushResult::Sent
                 } else {
+                    let retry_after = parse_retry_after(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
-                    if body_text.contains("UNREGISTERED") || body_text.contains("INVALID_ARGUMENT")
-                    {
-                        PushResult::TokenInvalid
+                    if body_text.contains("UNREGISTERED") {
+                        PushResult::TokenInvalid {
+                            reason: TokenInvalidReason::FcmUnregistered,
+                        }
+                    } else if body_text.contains("INVALID_ARGUMENT") {
+                        PushResult::TokenInvalid {
+                            reason: TokenInvalidReason::FcmInvalidArgument,
+                        }
+                    } else if status_u16 == 429 || (500..600).contains(&status_u16) {
+                        PushResult::Transient(TransientError::HttpStatus {
+                            platform: Platform::Fcm,
+                            status: status_u16,
+                            retry_after,
+                            body: body_text,
+                        })
                     } else {
-                        PushResult::Error(format!("FCM {status}: {body_text}"))
+                        // 400/401/403/404 with a body that isn't the
+                        // token-invalid signature — config drift; retry
+                        // won't recover.
+                        PushResult::Permanent(PermanentError::BadRequest {
+                            platform: Platform::Fcm,
+                            status: status_u16,
+                            body: body_text,
+                        })
                     }
                 }
             }
-            Err(e) => PushResult::Error(format!("FCM request error: {e}")),
+            Err(e) => PushResult::Transient(TransientError::Transport {
+                platform: Platform::Fcm,
+                message: e.to_string(),
+            }),
         }
     }
 
@@ -128,12 +261,23 @@ impl PushSender {
     pub async fn send_apns(&self, token: &str, topic: &str, peer_addrs: &[String]) -> PushResult {
         let apns = match &self.apns {
             Some(c) => c,
-            None => return PushResult::Error("APNs not configured".to_string()),
+            None => {
+                return PushResult::Permanent(PermanentError::NotConfigured {
+                    platform: Platform::Apns,
+                });
+            }
         };
 
         let jwt = match self.get_apns_jwt(apns) {
             Ok(t) => t,
-            Err(e) => return PushResult::Error(format!("APNs JWT error: {e}")),
+            // JWT signing failure is purely local — bad PEM, malformed
+            // key. Won't fix without an operator config change.
+            Err(e) => {
+                return PushResult::Permanent(PermanentError::CredentialError {
+                    platform: Platform::Apns,
+                    message: e,
+                });
+            }
         };
 
         let host = if apns.sandbox {
@@ -164,20 +308,42 @@ impl PushSender {
         {
             Ok(resp) => {
                 let status = resp.status();
+                let status_u16 = status.as_u16();
                 if status.is_success() {
                     PushResult::Sent
-                } else if status.as_u16() == 410 {
-                    PushResult::TokenInvalid
+                } else if status_u16 == 410 {
+                    PushResult::TokenInvalid {
+                        reason: TokenInvalidReason::Apns410,
+                    }
                 } else {
+                    let retry_after = parse_retry_after(resp.headers());
                     let body_text = resp.text().await.unwrap_or_default();
                     if body_text.contains("BadDeviceToken") || body_text.contains("Unregistered") {
-                        PushResult::TokenInvalid
+                        PushResult::TokenInvalid {
+                            reason: TokenInvalidReason::Apns410,
+                        }
+                    } else if status_u16 == 429 || (500..600).contains(&status_u16) {
+                        PushResult::Transient(TransientError::HttpStatus {
+                            platform: Platform::Apns,
+                            status: status_u16,
+                            retry_after,
+                            body: body_text,
+                        })
                     } else {
-                        PushResult::Error(format!("APNs {status}: {body_text}"))
+                        // 400/403 with a non-token-related body —
+                        // malformed payload, bad apns-topic, etc.
+                        PushResult::Permanent(PermanentError::BadRequest {
+                            platform: Platform::Apns,
+                            status: status_u16,
+                            body: body_text,
+                        })
                     }
                 }
             }
-            Err(e) => PushResult::Error(format!("APNs request error: {e}")),
+            Err(e) => PushResult::Transient(TransientError::Transport {
+                platform: Platform::Apns,
+                message: e.to_string(),
+            }),
         }
     }
 

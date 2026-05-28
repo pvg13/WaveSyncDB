@@ -183,9 +183,9 @@ async fn fire_notifications(
                 let short = token_entry.token.chars().take(20).collect::<String>();
                 log::info!("Push sent ({}) to token={}...", token_entry.platform, short);
             }
-            PushResult::TokenInvalid => {
+            PushResult::TokenInvalid { reason } => {
                 log::info!(
-                    "Pruning invalid push token {} ({})",
+                    "Pruning invalid push token {} ({}): {reason:?}",
                     token_entry.token,
                     token_entry.platform
                 );
@@ -193,9 +193,22 @@ async fn fire_notifications(
                     log::error!("Failed to remove invalid token: {e}");
                 }
             }
-            PushResult::Error(e) => {
+            PushResult::Transient(err) => {
+                // Preserve today's behavior — log and drop — until B5
+                // wires the persistent retry queue. The structured
+                // variant in place of the old `Error(String)` is what
+                // makes that follow-up possible without grepping
+                // message text.
                 log::warn!(
-                    "Push failed for {} ({}): {e}",
+                    "Push transient failure for {} ({}): {err:?}",
+                    token_entry.token,
+                    token_entry.platform
+                );
+            }
+            PushResult::Permanent(err) => {
+                log::error!(
+                    "Push permanent failure for {} ({}): {err:?} \
+                     (no retry; misconfiguration won't resolve itself)",
                     token_entry.token,
                     token_entry.platform
                 );
