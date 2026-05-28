@@ -115,6 +115,14 @@ pub struct EngineConfig {
     /// Maximum relay circuit duration the server allows (default: 3600s).
     /// The engine proactively renews at 80% of this duration.
     pub circuit_max_duration: Duration,
+    /// Opt-in TCP transport in addition to the default QUIC. Default: `false`.
+    ///
+    /// Enable for deployments where users hit networks that block UDP
+    /// entirely (some corporate firewalls, captive-portal Wi-Fi). Costs
+    /// ~1 extra RTT on cold start and can confuse circuit-relay on
+    /// cellular (see `build_swarm` doc-comment); only flip on if the
+    /// QUIC-only failure mode is actually hurting your users.
+    pub tcp_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -135,6 +143,7 @@ impl Default for EngineConfig {
             api_key: None,
             keep_alive_interval: Duration::from_secs(90),
             circuit_max_duration: Duration::from_secs(3600),
+            tcp_enabled: false,
         }
     }
 }
@@ -214,11 +223,18 @@ pub(crate) fn start_engine(
 /// Tries system DNS first (`/etc/resolv.conf`). If that fails (e.g. on Android
 /// where `/etc/resolv.conf` does not exist), falls back to Google public DNS
 /// via `dns::ResolverConfig::google()`.
+///
+/// When `tcp_enabled = true`, adds TCP as a secondary transport. See
+/// [`build_swarm_with_tcp`] and the `with_tcp_enabled` builder method.
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: Option<mdns::Config>,
     keep_alive_interval: Duration,
+    tcp_enabled: bool,
 ) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    if tcp_enabled {
+        return build_swarm_with_tcp(keypair, mdns_config, keep_alive_interval);
+    }
     // QUIC-only (no TCP). Two reasons:
     //
     // 1. **Cold-start latency.** QUIC is 1 RTT for fresh handshake and 0-RTT
@@ -238,7 +254,8 @@ fn build_swarm(
     //
     // The cost: networks that block UDP entirely (corporate firewalls,
     // captive-portal Wi-Fi) can't sync. In practice this is rare for the
-    // mobile-sync target audience.
+    // mobile-sync target audience — but apps with users on UDP-hostile
+    // networks can opt in via `WaveSyncDbBuilder::with_tcp_enabled(true)`.
     let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_quic()
@@ -265,6 +282,70 @@ fn build_swarm(
             let ping_interval = keep_alive_interval;
             Ok(SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
+                .with_quic()
+                .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build())
+        }
+    }
+}
+
+/// Build the libp2p swarm with both TCP and QUIC transports.
+///
+/// Opt-in path for apps whose users may be on networks that block UDP
+/// entirely (some corporate firewalls, captive-portal Wi-Fi). Pays the
+/// cold-start RTT cost (TCP+TLS+yamux is 2–3 RTT vs QUIC's 1 RTT) and
+/// allows the connection-per-peer limit of 2 to be filled by both
+/// protocols, which the original docs at `build_swarm` flagged as
+/// having broken circuit-relay on cellular. Apps that opt in are
+/// accepting that trade-off.
+fn build_swarm_with_tcp(
+    keypair: identity::Keypair,
+    mdns_config: Option<mdns::Config>,
+    keep_alive_interval: Duration,
+) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    use libp2p::tcp;
+
+    let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_dns();
+
+    match system_result {
+        Ok(builder) => {
+            let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
+            Ok(builder
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build())
+        }
+        Err(e) => {
+            log::warn!(
+                "System DNS resolver failed (expected on Android): {e}. \
+                 Falling back to Google public DNS."
+            );
+            let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
+            Ok(SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
                 .with_quic()
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
@@ -304,7 +385,12 @@ async fn run_engine(
         None
     };
 
-    let swarm = build_swarm(keypair.clone(), mdns_config, config.keep_alive_interval)?;
+    let swarm = build_swarm(
+        keypair.clone(),
+        mdns_config,
+        config.keep_alive_interval,
+        config.tcp_enabled,
+    )?;
 
     let local_peer_id = keypair.public().to_peer_id();
     log::info!("Local libp2p PeerId (persistent): {local_peer_id}");

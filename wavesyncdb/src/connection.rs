@@ -1400,6 +1400,7 @@ pub struct WaveSyncDbBuilder {
     api_key: Option<String>,
     keep_alive_interval: std::time::Duration,
     circuit_max_duration: std::time::Duration,
+    tcp_enabled: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1421,13 +1422,14 @@ impl WaveSyncDbBuilder {
             rendezvous_server: None,
             rendezvous_discover_interval: defaults.rendezvous_discover_interval,
             rendezvous_ttl: defaults.rendezvous_ttl,
-            ipv6: false,
+            ipv6: defaults.ipv6,
             push_token: None,
             #[cfg(feature = "push-sync")]
             fcm_credentials: None,
             api_key: None,
             keep_alive_interval: defaults.keep_alive_interval,
             circuit_max_duration: defaults.circuit_max_duration,
+            tcp_enabled: defaults.tcp_enabled,
         }
     }
 
@@ -1519,6 +1521,22 @@ impl WaveSyncDbBuilder {
     /// disable this if your deployment environment has known-broken v6.
     pub fn with_ipv6(mut self, enabled: bool) -> Self {
         self.ipv6 = enabled;
+        self
+    }
+
+    /// Enable or disable TCP as a secondary transport alongside QUIC.
+    /// Default: `false`.
+    ///
+    /// QUIC-only is the recommended path for ~95% of deployments — it
+    /// has a faster cold start (1 RTT vs 2-3 for TCP+TLS+yamux) and
+    /// avoids a known issue where dual TCP+QUIC dials confused
+    /// circuit-relay on cellular. Enable this only if your users hit
+    /// networks that block UDP entirely (some corporate firewalls,
+    /// captive-portal Wi-Fi). Accepts the cold-start trade-off and
+    /// the cellular-circuit-relay risk; we recommend measuring before
+    /// flipping it on.
+    pub fn with_tcp_enabled(mut self, enabled: bool) -> Self {
+        self.tcp_enabled = enabled;
         self
     }
 
@@ -1821,6 +1839,7 @@ impl WaveSyncDbBuilder {
             api_key: self.api_key,
             keep_alive_interval: self.keep_alive_interval,
             circuit_max_duration: self.circuit_max_duration,
+            tcp_enabled: self.tcp_enabled,
         };
 
         // Diagnostics counters are owned jointly by the engine task (writer)
