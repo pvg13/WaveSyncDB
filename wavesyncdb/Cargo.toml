@@ -34,6 +34,9 @@ tokio = { workspace = true }
 libp2p = { workspace = true }
 libp2p-swarm-derive = "0.35.1"
 uuid = { workspace = true }
+# Used for jitter in DCUtR retry scheduling. Already pulled in
+# transitively via libp2p; declaring here is essentially free.
+rand = "0.8"
 
 # Wasm32 (browser): no sqlx, no tokio I/O. Provide a minimal wasm-friendly
 # tokio for `sync` primitives only, uuid with `js` for browser entropy, and

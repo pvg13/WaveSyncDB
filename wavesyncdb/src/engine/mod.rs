@@ -393,6 +393,7 @@ async fn run_engine(
         circuit_retry_count: 0,
         circuit_listen_pending: false,
         relay_dial_pending: false,
+        dcutr_retries: HashMap::new(),
         diagnostics,
     };
 
@@ -531,6 +532,14 @@ struct EngineRunner {
     /// 3 reservation requests). Cleared on the connection-established or
     /// dial-failed event for the relay peer.
     pub(crate) relay_dial_pending: bool,
+    /// Per-peer DCUtR retry state. Each entry is a peer whose most recent
+    /// direct-connection-upgrade attempt failed; the engine retries with
+    /// bounded exponential backoff so a single transient hole-punch
+    /// failure (very common on cellular, where RTT jitter trips the
+    /// synchronized punch) doesn't permanently strand the connection on
+    /// the relay path. See [`relay_manager::DcutrRetryState`] and
+    /// [`relay_manager::process_dcutr_retries`].
+    pub(crate) dcutr_retries: HashMap<libp2p::PeerId, crate::engine::relay_manager::DcutrRetryState>,
     /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
     /// All increments are `Relaxed` atomic ops on the hot path; readers
     /// (UI / debug panel / test assertions) snapshot via
@@ -857,6 +866,11 @@ impl EngineRunner {
             return;
         }
 
+        // No more connections — drop any pending DCUtR retry for this
+        // peer. Re-attempts only make sense while the relay-circuit
+        // connection is still alive (DCUtR coordinates through it).
+        self.dcutr_retries.remove(&peer_id);
+
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
             &self.relay_state
@@ -1072,6 +1086,11 @@ impl EngineRunner {
                 },
                 _ = relay_reconnect.tick(), if has_relay => {
                     self.maybe_reconnect_relay();
+                    // Same tick handles DCUtR retries. Both are
+                    // infrastructure-paths book-keeping; aligning them on
+                    // one 5s timer keeps the wakeup count low (saves a
+                    // bit of mobile battery vs. running two timers).
+                    self.process_dcutr_retries();
                 },
                 Some((channel, response)) = self.snapshot_resp_rx.recv() => {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {
@@ -1329,6 +1348,12 @@ impl EngineRunner {
                 peer_id, endpoint, ..
             } => {
                 log::info!("Connection established with {peer_id}");
+                // Clear any pending DCUtR retry for this peer: a direct
+                // connection just succeeded, so the hole-punch problem is
+                // resolved (even if this connection happens to be via
+                // circuit-relay; libp2p's DCUtR will upgrade later, and
+                // we don't want stale retry timers firing redundantly).
+                self.dcutr_retries.remove(&peer_id);
                 // Count successful peer dials. Infrastructure peers (relay /
                 // rendezvous) are excluded so the rate reflects sync-peer
                 // discovery health, not infra plumbing.

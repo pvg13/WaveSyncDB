@@ -7939,6 +7939,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-ui-kit",
+ "rand 0.8.5",
  "sea-orm",
  "serde",
  "serde-wasm-bindgen",
