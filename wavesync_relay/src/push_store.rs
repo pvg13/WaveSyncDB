@@ -32,6 +32,10 @@ pub struct RetryRow {
     /// fires the dial, this is the attempt number passed to
     /// `compute_delay`.
     pub attempts: u32,
+    /// Read in tests and used inside SQLite ordering; production code
+    /// doesn't read this back into a variable but the column itself is
+    /// load-bearing for `fetch_due_retries`.
+    #[allow(dead_code)]
     pub next_attempt_at: i64,
     pub first_failed_at: i64,
 }
