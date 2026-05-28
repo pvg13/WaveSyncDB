@@ -1291,6 +1291,34 @@ impl EngineRunner {
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::AuthResult(event)) => {
                 self.handle_auth_result(event);
             }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Upnp(event)) => {
+                // libp2p auto-adds mapped addresses to the swarm's external
+                // addresses; we just log for observability. Useful signal that
+                // a residential router accepted our port-mapping request,
+                // which means peers on other networks can now dial us
+                // directly without DCUtR coordination.
+                use libp2p::upnp::Event as UpnpEvent;
+                match event {
+                    UpnpEvent::NewExternalAddr(addr) => {
+                        log::info!("UPnP: gateway mapped external address {addr}");
+                    }
+                    UpnpEvent::ExpiredExternalAddr(addr) => {
+                        log::info!("UPnP: gateway expired external address {addr}");
+                    }
+                    UpnpEvent::GatewayNotFound => {
+                        log::debug!(
+                            "UPnP: no IGD-capable gateway on this network \
+                             (expected on cellular/CGNAT/enterprise)"
+                        );
+                    }
+                    UpnpEvent::NonRoutableGateway => {
+                        log::debug!(
+                            "UPnP: gateway is itself behind NAT (CGNAT or \
+                             double-NAT); port mapping wouldn't help"
+                        );
+                    }
+                }
+            }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use libp2p::{
     autonat, connection_limits, dcutr, identify, mdns, ping, relay, rendezvous, request_response,
-    swarm::behaviour::toggle::Toggle,
+    swarm::behaviour::toggle::Toggle, upnp,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 
@@ -26,6 +26,12 @@ pub struct WaveSyncBehaviour {
     pub rendezvous: rendezvous::client::Behaviour,
     pub auth: request_response::Behaviour<AuthChallengeCodec>,
     pub auth_result: request_response::Behaviour<AuthResultCodec>,
+    /// UPnP / NAT-PMP port mapping. Asks the local gateway to forward
+    /// our QUIC port so other peers can dial us directly without
+    /// hole-punching. Free win on residential routers; silently no-ops
+    /// on networks without UPnP/PCP support (CGNAT, enterprise, etc.).
+    /// Disabled in tests via `Toggle::from(None)`.
+    pub upnp: Toggle<upnp::tokio::Behaviour>,
 }
 
 impl WaveSyncBehaviour {
@@ -72,6 +78,15 @@ impl WaveSyncBehaviour {
         };
 
         let dcutr_behaviour = dcutr::Behaviour::new(peer_id);
+
+        // UPnP/NAT-PMP port mapping. The libp2p behaviour queries the
+        // default gateway via SSDP (UPnP) and adds any successfully-mapped
+        // port to the swarm's external addresses, which Identify then
+        // propagates to peers. Failure to find a gateway or map a port is
+        // silent — UPnP doesn't help CGNAT (the carrier's gateway isn't
+        // ours to control) but does help the home-network case where
+        // residential routers happily forward an inbound UDP port.
+        let upnp_behaviour = Toggle::from(Some(upnp::tokio::Behaviour::default()));
 
         let autonat_behaviour = autonat::v2::client::Behaviour::default();
 
@@ -137,6 +152,7 @@ impl WaveSyncBehaviour {
             rendezvous: rendezvous_behaviour,
             auth: auth_behaviour,
             auth_result: auth_result_behaviour,
+            upnp: upnp_behaviour,
         }
     }
 }
