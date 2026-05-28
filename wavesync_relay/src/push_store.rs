@@ -1,6 +1,12 @@
 //! SQLite-backed storage for push notification tokens using sqlx.
 
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use std::str::FromStr;
+use std::time::Duration;
+
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use sqlx::{ConnectOptions, Row, SqlitePool};
 
 /// A registered push token entry.
 #[derive(Debug, Clone)]
@@ -16,6 +22,13 @@ pub struct PushStore {
 
 impl PushStore {
     /// Open (or create) the push token database at the given path.
+    ///
+    /// PRAGMAs and pool sizing target the upcoming retry-queue workload
+    /// (commit B4/B5): WAL so retry-loop reads don't block fresh-send
+    /// writes; 5s busy_timeout to survive burst contention; pool size 8
+    /// (up from 4) since the retry queue ~doubles the concurrent reader
+    /// count (peek_next_attempt_at + fetch_due_retries alongside the
+    /// existing get_tokens_for_topic).
     pub async fn open(path: &str) -> Result<Self, sqlx::Error> {
         let url = if path == ":memory:" {
             "sqlite::memory:".to_string()
@@ -23,9 +36,22 @@ impl PushStore {
             format!("sqlite:{path}?mode=rwc")
         };
 
+        // SqliteConnectOptions lets us set per-connection PRAGMAs that
+        // SqlitePoolOptions::connect(url) doesn't expose. WAL is a no-op
+        // on `:memory:` databases (sqlite returns the journal mode as
+        // `memory`), so existing in-memory tests are unaffected.
+        let connect_opts = SqliteConnectOptions::from_str(&url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
+            .create_if_missing(true)
+            // sqlx logs every query at INFO by default. Drop to debug so
+            // a chatty retry loop doesn't drown out actual signals.
+            .log_statements(log::LevelFilter::Debug);
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
+            .max_connections(8)
+            .connect_with(connect_opts)
             .await?;
 
         sqlx::query(
