@@ -1480,7 +1480,13 @@ impl WaveSyncDbBuilder {
         self
     }
 
-    /// Enable IPv6 listen addresses in addition to IPv4.
+    /// Enable or disable IPv6 listen addresses in addition to IPv4.
+    /// Default: `true`.
+    ///
+    /// IPv6 sidesteps CGNAT — most modern cellular carriers (T-Mobile,
+    /// Verizon, Jio, etc.) ship IPv6 by default, eliminating the need for
+    /// hole-punching or circuit relay for peers on those networks. Only
+    /// disable this if your deployment environment has known-broken v6.
     pub fn with_ipv6(mut self, enabled: bool) -> Self {
         self.ipv6 = enabled;
         self

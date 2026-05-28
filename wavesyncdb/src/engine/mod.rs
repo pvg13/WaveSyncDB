@@ -91,7 +91,13 @@ pub struct EngineConfig {
     pub rendezvous_discover_interval: Duration,
     /// TTL for rendezvous registration in seconds (default: 300s).
     pub rendezvous_ttl: u64,
-    /// Whether to listen on IPv6 in addition to IPv4.
+    /// Whether to listen on IPv6 in addition to IPv4. Default: `true`.
+    ///
+    /// IPv6 sidesteps CGNAT entirely — when both peers have native v6
+    /// (now the case on T-Mobile, Verizon, Jio, and most modern cellular
+    /// carriers per Google's 2026 stats showing >50% global IPv6 traffic),
+    /// the relay is no longer on the critical path for connection
+    /// establishment. Falls back to IPv4 transparently via Happy Eyeballs.
     pub ipv6: bool,
     /// Push notification token: (platform, device_token).
     /// Platform is "Fcm" or "Apns".
@@ -118,7 +124,7 @@ impl Default for EngineConfig {
             rendezvous_server: None,
             rendezvous_discover_interval: Duration::from_secs(60),
             rendezvous_ttl: 300,
-            ipv6: false,
+            ipv6: true,
             push_token: None,
             api_key: None,
             keep_alive_interval: Duration::from_secs(90),
