@@ -8,7 +8,7 @@
 # Docker layer push.
 
 # -- Plan stage (cargo-chef) --
-FROM rust:1.92-bookworm AS chef
+FROM rust:1.95-bookworm AS chef
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install cargo-chef --locked
