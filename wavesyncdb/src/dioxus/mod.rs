@@ -54,7 +54,11 @@ pub mod hooks;
 #[cfg(not(target_arch = "wasm32"))]
 mod lifecycle;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod notifications;
+#[cfg(not(target_arch = "wasm32"))]
 pub use hooks::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use notifications::{use_sync_notifications, use_sync_notifications_with};
 
 #[cfg(target_arch = "wasm32")]
 pub mod web_hooks;

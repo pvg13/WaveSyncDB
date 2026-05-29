@@ -32,6 +32,7 @@ async fn test_change_rx_table_filter_pattern() {
         .send(ChangeNotification {
             table: "notes".into(),
             kind: WriteKind::Insert,
+            source: wavesyncdb::ChangeSource::Local,
             primary_key: "note-1".into(),
             changed_columns: Some(vec!["id".to_string(), "body".to_string()]),
             column_values: None,
@@ -43,6 +44,7 @@ async fn test_change_rx_table_filter_pattern() {
         .send(ChangeNotification {
             table: "tasks".into(),
             kind: WriteKind::Insert,
+            source: wavesyncdb::ChangeSource::Local,
             primary_key: "task-1".into(),
             changed_columns: Some(vec!["id".to_string(), "title".to_string()]),
             column_values: None,
@@ -81,6 +83,7 @@ async fn test_change_rx_lagged_triggers_requery() {
         let _ = db.change_tx().send(ChangeNotification {
             table: "tasks".into(),
             kind: WriteKind::Insert,
+            source: wavesyncdb::ChangeSource::Local,
             primary_key: format!("task-{}", i).into(),
             changed_columns: None,
             column_values: None,
@@ -272,6 +275,7 @@ async fn row_hook_filter_by_pk_pattern() {
         .send(ChangeNotification {
             table: "tasks".into(),
             kind: WriteKind::Update,
+            source: wavesyncdb::ChangeSource::Local,
             primary_key: "task-other".into(),
             changed_columns: Some(vec!["title".into()]),
             column_values: Some(vec![(
@@ -286,6 +290,7 @@ async fn row_hook_filter_by_pk_pattern() {
         .send(ChangeNotification {
             table: "tasks".into(),
             kind: WriteKind::Update,
+            source: wavesyncdb::ChangeSource::Local,
             primary_key: target_pk.into(),
             changed_columns: Some(vec!["title".into()]),
             column_values: Some(vec![(

@@ -164,6 +164,25 @@ pub struct SyncChangeset {
     pub changes: Vec<ColumnChange>,
 }
 
+/// Where a [`ChangeNotification`] originated.
+///
+/// Lets subscribers distinguish a write the local user made from one that
+/// arrived from a peer during sync. User-facing notifications (the
+/// "you got new data" / WhatsApp-style surface) must only fire for
+/// [`Remote`](ChangeSource::Remote) changes — never echo the user's own writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// A write made locally through this `WaveSyncDb` handle.
+    Local,
+    /// A change applied from a remote peer during sync. `peer_site` is the
+    /// originating node's stable site id — useful for de-duplication and
+    /// "from X" display.
+    Remote {
+        /// The originating node's site id.
+        peer_site: NodeId,
+    },
+}
+
 /// Lightweight notification emitted after every local or remote write.
 ///
 /// Subscribe via [`WaveSyncDb::change_rx()`](crate::WaveSyncDb::change_rx) to receive
@@ -174,6 +193,8 @@ pub struct ChangeNotification {
     pub table: TableName,
     /// Type of write that occurred.
     pub kind: WriteKind,
+    /// Whether this change originated locally or was applied from a peer.
+    pub source: ChangeSource,
     /// Primary key of the affected row.
     pub primary_key: PrimaryKey,
     /// Which columns were changed (if known).
@@ -281,6 +302,7 @@ mod tests {
         let notif = ChangeNotification {
             table: "tasks".into(),
             kind: WriteKind::Insert,
+            source: ChangeSource::Local,
             primary_key: "pk-1".into(),
             changed_columns: Some(vec!["title".to_string()]),
             column_values: None,

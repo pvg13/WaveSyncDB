@@ -86,6 +86,129 @@ impl TableRegistry {
     }
 }
 
+/// Registry of per-table user-notification policies, plus the anti-spam gate.
+///
+/// Each `#[derive(SyncNotify)]` entity contributes a type-erased dispatch
+/// closure (keyed by table name) that reconstructs the typed row and calls the
+/// entity's `on_sync` policy. Stored separately from [`TableRegistry`] because
+/// the closures are not `Clone`/`Debug`. Native-only — the dispatch runs in the
+/// engine's remote-apply path.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct NotificationRegistry {
+    dispatch: RwLock<HashMap<String, crate::notify::NotifyDispatch>>,
+    gate: NotificationGate,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for NotificationRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.dispatch.read().map(|d| d.len()).unwrap_or(0);
+        f.debug_struct("NotificationRegistry")
+            .field("policies", &n)
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for NotificationRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NotificationRegistry {
+    /// Create an empty registry with the default coalescing interval (~2s).
+    pub fn new() -> Self {
+        Self {
+            dispatch: RwLock::new(HashMap::new()),
+            gate: NotificationGate::new(std::time::Duration::from_secs(2)),
+        }
+    }
+
+    /// Register a per-table dispatch closure. Replaces any existing entry.
+    pub fn register(&self, table_name: String, dispatch: crate::notify::NotifyDispatch) {
+        self.dispatch.write().unwrap().insert(table_name, dispatch);
+    }
+
+    /// Whether any notification policy is registered (lets the engine skip work).
+    pub fn is_empty(&self) -> bool {
+        self.dispatch.read().unwrap().is_empty()
+    }
+
+    /// Run the policy for this change (if the table has one), then apply the
+    /// anti-spam gate. Returns the notification to surface, or `None` if the
+    /// policy declined or the change was coalesced away.
+    pub fn dispatch(
+        &self,
+        change: &crate::messages::ChangeNotification,
+    ) -> Option<crate::notify::Notification> {
+        let notif = {
+            let map = self.dispatch.read().unwrap();
+            let policy = map.get(&change.table.0)?;
+            policy(change)?
+        };
+        let key = notif
+            .coalesce_key
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", notif.table, notif.primary_key));
+        if self.gate.allow(&key) {
+            Some(notif)
+        } else {
+            None
+        }
+    }
+}
+
+/// Coalescing gate: drops a notification whose coalescing key was emitted within
+/// `min_interval`. This collapses bursts — a catch-up sync that applies many rows
+/// to the same conversation produces one notification, not dozens. Exact
+/// re-delivery of an already-applied change is separately suppressed upstream:
+/// the engine only emits a `ChangeNotification` when a change actually altered
+/// local state (CRDT conflict resolution), so identical re-applies never reach
+/// here.
+#[cfg(not(target_arch = "wasm32"))]
+struct NotificationGate {
+    last_emit: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    min_interval: std::time::Duration,
+    /// Bound on retained keys; oldest are pruned when exceeded.
+    max_entries: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NotificationGate {
+    fn new(min_interval: std::time::Duration) -> Self {
+        Self {
+            last_emit: std::sync::Mutex::new(HashMap::new()),
+            min_interval,
+            max_entries: 4096,
+        }
+    }
+
+    /// Returns `true` if a notification for `key` may be emitted now, recording
+    /// the emission. Returns `false` if one was emitted within `min_interval`.
+    fn allow(&self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.last_emit.lock().unwrap();
+        if let Some(&last) = map.get(key)
+            && now.duration_since(last) < self.min_interval
+        {
+            return false;
+        }
+        if map.len() >= self.max_entries {
+            // Cheap bound: drop entries older than the interval; if that frees
+            // nothing (all recent), clear to avoid unbounded growth.
+            let cutoff = self.min_interval;
+            map.retain(|_, &mut t| now.duration_since(t) < cutoff);
+            if map.len() >= self.max_entries {
+                map.clear();
+            }
+        }
+        map.insert(key.to_string(), now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +244,18 @@ mod tests {
     fn test_get_missing_returns_none() {
         let registry = TableRegistry::new();
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_notification_gate_coalesces_within_interval() {
+        // Long interval so timing isn't flaky: the second emit for the same key
+        // is always within the window.
+        let gate = NotificationGate::new(std::time::Duration::from_secs(3600));
+        assert!(gate.allow("chat:1"), "first emit for a key is allowed");
+        assert!(!gate.allow("chat:1"), "repeat within interval is coalesced");
+        assert!(gate.allow("chat:2"), "a different key is independent");
+        assert!(!gate.allow("chat:2"), "and is then coalesced too");
     }
 
     #[test]

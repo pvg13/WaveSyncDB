@@ -194,6 +194,8 @@ pub(crate) fn start_engine(
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
     db_version_cache: Arc<std::sync::atomic::AtomicU64>,
+    notification_tx: broadcast::Sender<crate::notify::Notification>,
+    notification_registry: Arc<crate::registry::NotificationRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let event_tx = network_event_tx.clone();
@@ -212,6 +214,8 @@ pub(crate) fn start_engine(
             network_event_tx,
             diagnostics,
             db_version_cache,
+            notification_tx,
+            notification_registry,
         ))
         .catch_unwind()
         .await;
@@ -394,6 +398,8 @@ async fn run_engine(
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
     db_version_cache: Arc<std::sync::atomic::AtomicU64>,
+    notification_tx: broadcast::Sender<crate::notify::Notification>,
+    notification_registry: Arc<crate::registry::NotificationRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load (or create on first launch) the persistent libp2p keypair from
     // _wavesync_meta. Stable PeerId across restarts is necessary so the
@@ -476,6 +482,8 @@ async fn run_engine(
         db,
         change_tx,
         registry,
+        notification_tx,
+        notification_registry,
         local_peer_id,
         site_id,
         topic_name: effective_topic,
@@ -561,6 +569,8 @@ struct EngineRunner {
     pub(crate) db: DatabaseConnection,
     pub(crate) change_tx: broadcast::Sender<ChangeNotification>,
     pub(crate) registry: Arc<TableRegistry>,
+    pub(crate) notification_tx: broadcast::Sender<crate::notify::Notification>,
+    pub(crate) notification_registry: Arc<crate::registry::NotificationRegistry>,
     pub(crate) local_peer_id: libp2p::PeerId,
     pub(crate) site_id: NodeId,
     pub(crate) topic_name: String,
@@ -666,7 +676,8 @@ struct EngineRunner {
     /// synchronized punch) doesn't permanently strand the connection on
     /// the relay path. See [`relay_manager::DcutrRetryState`] and
     /// [`relay_manager::process_dcutr_retries`].
-    pub(crate) dcutr_retries: HashMap<libp2p::PeerId, crate::engine::relay_manager::DcutrRetryState>,
+    pub(crate) dcutr_retries:
+        HashMap<libp2p::PeerId, crate::engine::relay_manager::DcutrRetryState>,
     /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
     /// All increments are `Relaxed` atomic ops on the hot path; readers
     /// (UI / debug panel / test assertions) snapshot via
@@ -1224,7 +1235,13 @@ impl EngineRunner {
                     }
                 },
                 Some(rc) = self.remote_changeset_rx.recv() => {
-                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &rc.changes, Some(&self.db_version_cache)).await;
+                    let change_source =
+                        crate::messages::ChangeSource::Remote { peer_site: rc.peer_site };
+                    let notify_ctx = sync_handler::NotifyCtx {
+                        registry: &self.notification_registry,
+                        tx: &self.notification_tx,
+                    };
+                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &rc.changes, Some(&self.db_version_cache), change_source, Some(notify_ctx)).await;
                     // Record our knowledge of the sender's db_version only now,
                     // after the changes are durably committed — never at receive
                     // time. This guarantees the persisted peer version is always

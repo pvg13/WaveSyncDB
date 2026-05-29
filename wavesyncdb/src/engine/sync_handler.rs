@@ -547,12 +547,23 @@ const CHANGESET_CHUNK_SIZE: usize = 50;
 /// `ChangeNotification`s are buffered during each transaction and emitted
 /// only AFTER commit (Rule 2.12 — subscribers must never observe a
 /// notification before its data is durable).
+/// Handles needed to run per-table notification policies as remote changes are
+/// applied. Bundled so the apply functions take one optional parameter; `None`
+/// in unit tests and whenever no `#[derive(SyncNotify)]` policy is registered.
+#[derive(Clone, Copy)]
+pub(super) struct NotifyCtx<'a> {
+    pub registry: &'a crate::registry::NotificationRegistry,
+    pub tx: &'a broadcast::Sender<crate::notify::Notification>,
+}
+
 pub(super) async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
     registry: &TableRegistry,
     changes: &[ColumnChange],
     db_version_cache: Option<&std::sync::atomic::AtomicU64>,
+    source: crate::messages::ChangeSource,
+    notify: Option<NotifyCtx<'_>>,
 ) {
     // Group changes by (table, pk) so a single row is never split across chunks.
     let mut grouped: Vec<((&str, &str), Vec<&ColumnChange>)> = {
@@ -567,7 +578,16 @@ pub(super) async fn apply_remote_changeset(
 
     // Small changesets: single transaction (no chunking overhead).
     if grouped.len() <= CHANGESET_CHUNK_SIZE {
-        apply_changeset_chunk(db, change_tx, registry, &grouped, db_version_cache).await;
+        apply_changeset_chunk(
+            db,
+            change_tx,
+            registry,
+            &grouped,
+            db_version_cache,
+            source,
+            notify,
+        )
+        .await;
         return;
     }
 
@@ -575,7 +595,16 @@ pub(super) async fn apply_remote_changeset(
     while !grouped.is_empty() {
         let chunk_end = grouped.len().min(CHANGESET_CHUNK_SIZE);
         let chunk: Vec<_> = grouped.drain(..chunk_end).collect();
-        apply_changeset_chunk(db, change_tx, registry, &chunk, db_version_cache).await;
+        apply_changeset_chunk(
+            db,
+            change_tx,
+            registry,
+            &chunk,
+            db_version_cache,
+            source,
+            notify,
+        )
+        .await;
     }
 }
 
@@ -585,6 +614,8 @@ async fn apply_changeset_chunk<'a>(
     registry: &TableRegistry,
     grouped: &[((&'a str, &'a str), Vec<&'a ColumnChange>)],
     db_version_cache: Option<&std::sync::atomic::AtomicU64>,
+    source: crate::messages::ChangeSource,
+    notify: Option<NotifyCtx<'_>>,
 ) {
     use sea_orm::TransactionTrait;
 
@@ -655,6 +686,7 @@ async fn apply_changeset_chunk<'a>(
             pending_notifications.push(ChangeNotification {
                 table: (*table).into(),
                 kind,
+                source,
                 primary_key: (*pk).into(),
                 changed_columns,
                 column_values,
@@ -672,6 +704,13 @@ async fn apply_changeset_chunk<'a>(
     }
 
     for n in pending_notifications {
+        // Run the per-table notification policy (remote-only) before broadcasting
+        // the raw change. The gate inside `dispatch` de-spams bursts.
+        if let Some(ctx) = notify
+            && let Some(user_notif) = ctx.registry.dispatch(&n)
+        {
+            let _ = ctx.tx.send(user_notif);
+        }
         let _ = change_tx.send(n);
     }
 }
@@ -1099,7 +1138,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Row untouched.
         use sea_orm::ConnectionTrait;
@@ -1162,7 +1210,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         use sea_orm::ConnectionTrait;
         // Original row still exists with its real PK.
@@ -1215,7 +1272,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         use sea_orm::ConnectionTrait;
         let row = db
@@ -1247,7 +1313,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
         assert!(
             rx.try_recv().is_err(),
             "Should not receive notification for unregistered table"
@@ -1295,7 +1370,16 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let notif = rx.try_recv().expect("Expected a ChangeNotification");
         assert_eq!(notif.table, "tasks");
@@ -1336,7 +1420,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let notif = rx.try_recv().expect("Expected a ChangeNotification");
         assert_eq!(notif.table, "tasks");
@@ -1391,7 +1484,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1440,7 +1542,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1506,7 +1617,16 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1557,7 +1677,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Row should still exist
         let exists = row_exists(&db, "tasks", "id", "dlcl-1").await;
@@ -1606,7 +1735,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let exists = row_exists(&db, "tasks", "id", "dw-1").await;
         assert!(!exists, "DeleteWins: tie should delete the row");
@@ -1655,7 +1793,16 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         let exists = row_exists(&db, "tasks", "id", "aw-1").await;
         assert!(exists, "AddWins: tie should keep the row");
@@ -1695,7 +1842,16 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db, &tx, &registry, &delete_changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &delete_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
         assert!(!row_exists(&db, "tasks", "id", "iad-1").await);
 
         // Now apply remote insert with higher versions (N3 regression)
@@ -1734,7 +1890,16 @@ mod tests {
                 db_version: 0,
             },
         ];
-        apply_remote_changeset(&db, &tx, &registry, &insert_changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &insert_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         assert!(
             row_exists(&db, "tasks", "id", "iad-1").await,
@@ -1826,7 +1991,16 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         assert!(row_exists(&db, "tasks", "id", "mr-1").await);
         assert!(row_exists(&db, "tasks", "id", "mr-2").await);
@@ -1869,7 +2043,16 @@ mod tests {
             seq: 1,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes, None).await;
+        apply_remote_changeset(
+            &db_a,
+            &tx_a,
+            &registry_a,
+            &b_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Simulate Peer B's DB: has B's data locally, receives A's data
         let (db_b, registry_b) = setup_engine_test_db().await;
@@ -1901,7 +2084,16 @@ mod tests {
             seq: 1,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes, None).await;
+        apply_remote_changeset(
+            &db_b,
+            &tx_b,
+            &registry_b,
+            &a_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Both peers should converge to the same value
         let result_a = db_a
@@ -1972,7 +2164,16 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes, None).await;
+        apply_remote_changeset(
+            &db_a,
+            &tx_a,
+            &registry_a,
+            &b_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // A's changes arrive at B (col_version=3 > 2, should win)
         let a_changes = vec![ColumnChange {
@@ -1986,7 +2187,16 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes, None).await;
+        apply_remote_changeset(
+            &db_b,
+            &tx_b,
+            &registry_b,
+            &a_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Both should converge to A-latest (higher col_version)
         let result_a = db_a
@@ -2060,7 +2270,16 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db, &tx, &registry, &update_changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &update_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Row should NOT exist
         assert!(
@@ -2116,7 +2335,16 @@ mod tests {
                 db_version: 0,
             },
         ];
-        apply_remote_changeset(&db, &tx, &registry, &insert_changes, None).await;
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &insert_changes,
+            None,
+            crate::messages::ChangeSource::Local,
+            None,
+        )
+        .await;
 
         // Row should now exist with INSERT's values (shadow was clean, so cv=1 wins)
         assert!(

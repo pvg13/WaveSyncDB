@@ -69,6 +69,13 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 
+# Desktop OS notifications for the `use_sync_notifications` Dioxus hook. Pulled
+# only on desktop targets; on Android/iOS the `dioxus` feature's `dep:notify-rust`
+# reference is silently skipped (target-gated), and display there is handled by
+# platform-native code (a follow-up) or an app-supplied callback.
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
+notify-rust = { version = "4", optional = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
 ndk-context = { version = "0.1", optional = true }
@@ -99,7 +106,7 @@ derive = ["dep:wavesyncdb_derive"]
 # in the `[target.'cfg(...)'.dependencies]` sections above, so enabling `dioxus`
 # on desktop does not pull them in — Cargo silently skips `dep:` references
 # that point at target-gated optional deps on non-matching targets.
-dioxus = ["derive", "dep:dioxus", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
+dioxus = ["derive", "dep:dioxus", "dep:notify-rust", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
 # Cold-sync push notifications (FCM on Android, APNs on iOS). Bundles the
 # Kotlin AAR / Swift Package into consumer apps via manganis; gates the
 # Rust-side token-read helpers and FFI exports. Platform-specific code

@@ -306,6 +306,10 @@ struct WaveSyncDbInner {
     database_url: String,
     sync_tx: mpsc::Sender<SyncChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
+    /// User-facing notifications produced by `#[derive(SyncNotify)]` policies on
+    /// incoming remote changes. Drained by `use_sync_notifications`. The
+    /// matching registry of policies lives in the engine task.
+    notification_tx: broadcast::Sender<crate::notify::Notification>,
     site_id: NodeId,
     db_version: Mutex<u64>,
     db_version_cache: Arc<AtomicU64>,
@@ -384,6 +388,17 @@ impl WaveSyncDb {
     /// Get a reference to the change notification sender.
     pub fn change_tx(&self) -> &broadcast::Sender<ChangeNotification> {
         &self.inner.change_tx
+    }
+
+    /// Subscribe to user-facing sync notifications.
+    ///
+    /// Emits a [`Notification`](crate::Notification) for each *incoming remote*
+    /// change whose entity declares a policy via `#[derive(SyncNotify)]` and
+    /// whose `on_sync` returns `Some`, after de-duplication/coalescing. Never
+    /// fires for the local user's own writes. Drain this with the
+    /// `use_sync_notifications` Dioxus hook, or directly to render OS toasts.
+    pub fn notification_rx(&self) -> broadcast::Receiver<crate::notify::Notification> {
+        self.inner.notification_tx.subscribe()
     }
 
     /// Get a snapshot of the current network status.
@@ -781,6 +796,7 @@ impl WaveSyncDb {
             let _ = self.inner.change_tx.send(ChangeNotification {
                 table: table.to_string().into(),
                 kind: kind.clone(),
+                source: crate::messages::ChangeSource::Local,
                 primary_key: parsed.primary_key.clone().into(),
                 changed_columns,
                 column_values,
@@ -1768,8 +1784,19 @@ impl WaveSyncDbBuilder {
 
         let (sync_tx, sync_rx) = mpsc::channel::<SyncChangeset>(256);
         let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
+        // Smaller than change_tx: notifications are post-policy + post-coalesce,
+        // so far fewer than raw change events.
+        let (notification_tx, _) = broadcast::channel::<crate::notify::Notification>(256);
 
         let registry = Arc::new(TableRegistry::new());
+        // Populate per-table notification policies from every #[derive(SyncNotify)]
+        // entity linked into the binary (mirrors SyncEntityInfo discovery). Keyed
+        // by table name; only fires for tables that actually emit changes.
+        let notification_registry = Arc::new(crate::registry::NotificationRegistry::new());
+        for info in inventory::iter::<crate::notify::NotifyEntityInfo> {
+            let (table_name, dispatch) = (info.make)();
+            notification_registry.register(table_name, dispatch);
+        }
         let registry_ready = Arc::new(Notify::new());
 
         // Create peer versions table
@@ -1911,6 +1938,8 @@ impl WaveSyncDbBuilder {
             network_event_tx.clone(),
             diagnostics.clone(),
             db_version_cache.clone(),
+            notification_tx.clone(),
+            notification_registry,
         );
 
         let db = WaveSyncDb {
@@ -1919,6 +1948,7 @@ impl WaveSyncDbBuilder {
                 database_url: self.database_url,
                 sync_tx,
                 change_tx,
+                notification_tx,
                 site_id,
                 db_version: Mutex::new(db_version),
                 db_version_cache,

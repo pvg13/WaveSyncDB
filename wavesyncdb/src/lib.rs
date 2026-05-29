@@ -63,6 +63,8 @@ pub mod engine;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod notify;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod peer_addrs;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod peer_tracker;
@@ -95,10 +97,12 @@ pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::EngineCommand;
 pub use messages::{
-    AppId, ChangeNotification, ColumnChange, ColumnName, DeletePolicy, HmacTag, NodeId, PrimaryKey,
-    SyncChangeset, TableName, TopicString, WriteKind,
+    AppId, ChangeNotification, ChangeSource, ColumnChange, ColumnName, DeletePolicy, HmacTag,
+    NodeId, PrimaryKey, SyncChangeset, TableName, TopicString, WriteKind,
 };
 pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
+#[cfg(not(target_arch = "wasm32"))]
+pub use notify::{Notification, NotifyEntityInfo, SyncEvent, SyncNotify};
 #[cfg(not(target_arch = "wasm32"))]
 pub use registry::SyncEntityInfo;
 pub use registry::{TableMeta, TableRegistry};
@@ -175,6 +179,8 @@ pub use serde_json;
 
 #[cfg(feature = "derive")]
 pub use wavesyncdb_derive::SyncEntity;
+#[cfg(all(feature = "derive", not(target_arch = "wasm32")))]
+pub use wavesyncdb_derive::SyncNotify;
 
 #[cfg(feature = "dioxus")]
 pub mod dioxus;

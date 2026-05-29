@@ -148,6 +148,55 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Derive macro that registers a per-table user-notification policy.
+///
+/// Add `#[derive(SyncNotify)]` to a synced entity and implement
+/// [`SyncNotify`](wavesyncdb::SyncNotify) for its model; the library then calls
+/// your `on_sync` for every *incoming remote* change to that table and surfaces
+/// the returned notification (after de-duplication/coalescing) on
+/// [`WaveSyncDb::notification_rx`](wavesyncdb::WaveSyncDb::notification_rx). No
+/// registration call and no table-name strings are needed.
+///
+/// ```ignore
+/// #[derive(Clone, Debug, Default, DeriveEntityModel, SyncEntity, SyncNotify)]
+/// #[sea_orm(table_name = "messages")]
+/// pub struct Model { #[sea_orm(primary_key)] pub id: String, pub text: String }
+///
+/// impl wavesyncdb::SyncNotify for message::Model {
+///     fn on_sync(ev: &SyncEvent<Self>) -> Option<Notification> {
+///         matches!(ev.op, WriteKind::Insert)
+///             .then(|| ev.row.as_ref().map(|m| Notification::new("New message", &m.text)))
+///             .flatten()
+///     }
+/// }
+/// ```
+///
+/// Native-only: the dispatch runs in the engine's remote-apply path. On wasm32
+/// the macro expands to nothing (the trait/dispatch types don't exist there).
+#[proc_macro_derive(SyncNotify)]
+pub fn derive_sync_notify(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let model_ident = &input.ident;
+
+    quote! {
+        // Register the policy at link time, keyed by the entity's table name.
+        // `make_dispatch::<#model_ident>` requires `#model_ident: SyncNotify`,
+        // so forgetting `impl SyncNotify` is a compile error — the type-safety
+        // guarantee. Mirrors the `SyncEntityInfo` submission in `SyncEntity`.
+        #[cfg(not(target_arch = "wasm32"))]
+        wavesyncdb::register_sync_entity! {
+            wavesyncdb::NotifyEntityInfo {
+                module_path: module_path!(),
+                make: || (
+                    <#model_ident as ::wavesyncdb::SyncedTableEntity>::table_name().to_string(),
+                    ::wavesyncdb::notify::make_dispatch::<#model_ident>(),
+                ),
+            }
+        }
+    }
+    .into()
+}
+
 /// Parse the table name from the struct-level `#[sea_orm(table_name = "...")]`
 /// attribute. Required on both native and wasm32 targets — on wasm there's
 /// no `DeriveEntityModel` to consume it, but `SyncEntity` claims it via
