@@ -103,8 +103,11 @@ impl EngineRunner {
                                 return;
                             }
 
-                            // Update our knowledge of this peer's version
-                            self.peer_db_versions.insert(peer, my_db_version);
+                            // Track the display-only "reported" version now. The
+                            // authoritative peer_db_versions entry is recorded
+                            // after the changes commit (or immediately, in the
+                            // no-changes branch below) so it never runs ahead of
+                            // data we have actually applied.
                             let reported = self.peer_reported_versions.entry(peer).or_insert(0);
                             *reported = (*reported).max(my_db_version);
                             self.emit_network_event(
@@ -127,19 +130,29 @@ impl EngineRunner {
                                 log::info!(
                                     "Version vector sync with peer {peer}: already up to date"
                                 );
-                                if lamport_bump {
-                                    let db = self.db.clone();
-                                    let cache = self.db_version_cache.clone();
-                                    tokio::spawn(async move {
-                                        if shadow::set_db_version(&db, my_db_version).await.is_ok()
-                                        {
-                                            cache.fetch_max(
-                                                my_db_version,
-                                                std::sync::atomic::Ordering::Release,
-                                            );
-                                        }
-                                    });
-                                }
+                                // Nothing to apply, so it is safe to record the
+                                // peer's version (and any Lamport bump) right away.
+                                self.peer_db_versions.insert(peer, my_db_version);
+                                let db = self.db.clone();
+                                let cache = self.db_version_cache.clone();
+                                let peer_str = peer.to_string();
+                                tokio::spawn(async move {
+                                    if lamport_bump
+                                        && shadow::set_db_version(&db, my_db_version).await.is_ok()
+                                    {
+                                        cache.fetch_max(
+                                            my_db_version,
+                                            std::sync::atomic::Ordering::Release,
+                                        );
+                                    }
+                                    let _ = peer_tracker::upsert_peer_version(
+                                        &db,
+                                        &peer_str,
+                                        &peer_site_id,
+                                        my_db_version,
+                                    )
+                                    .await;
+                                });
                             } else {
                                 log::info!(
                                     "Received {} changes from peer {peer} (their db_version: {})",
@@ -167,32 +180,30 @@ impl EngineRunner {
                                 );
                                 self.update_network_status();
 
-                                // Persist Lamport bump and peer version in a spawned task,
-                                // but queue changeset for sequential application in main loop.
-                                let db = self.db.clone();
-                                let peer_str = peer.to_string();
-                                let cache = self.db_version_cache.clone();
-                                tokio::spawn(async move {
-                                    if lamport_bump
-                                        && shadow::set_db_version(&db, my_db_version).await.is_ok()
-                                    {
-                                        cache.fetch_max(
-                                            my_db_version,
-                                            std::sync::atomic::Ordering::Release,
-                                        );
-                                    }
+                                // Persist the Lamport bump now — it reflects our
+                                // own clock, not unapplied peer data. The peer's
+                                // db_version is recorded only after these changes
+                                // commit; see the remote_changeset_rx handler.
+                                if lamport_bump {
+                                    let db = self.db.clone();
+                                    let cache = self.db_version_cache.clone();
+                                    tokio::spawn(async move {
+                                        if shadow::set_db_version(&db, my_db_version).await.is_ok()
+                                        {
+                                            cache.fetch_max(
+                                                my_db_version,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                        }
+                                    });
+                                }
 
-                                    // Persist peer version
-                                    let _ = peer_tracker::upsert_peer_version(
-                                        &db,
-                                        &peer_str,
-                                        &peer_site_id,
-                                        my_db_version,
-                                    )
-                                    .await;
-                                });
-
-                                if let Err(e) = self.remote_changeset_tx.try_send(changes) {
+                                if let Err(e) = self.remote_changeset_tx.try_send(RemoteChangeset {
+                                    peer,
+                                    peer_site: peer_site_id,
+                                    peer_db_version: Some(my_db_version),
+                                    changes,
+                                }) {
                                     log::warn!(
                                         "Remote changeset queue full, dropping sync response: {e}"
                                     );
@@ -444,8 +455,15 @@ impl EngineRunner {
             }
         });
 
-        // Queue changeset for sequential application in the main loop
-        if let Err(e) = self.remote_changeset_tx.try_send(changeset.changes) {
+        // Queue changeset for sequential application in the main loop. Real-time
+        // push only updates peer_db_versions in-memory via max() (above), so no
+        // version is persisted from this path — peer_db_version is None.
+        if let Err(e) = self.remote_changeset_tx.try_send(RemoteChangeset {
+            peer,
+            peer_site: changeset.site_id,
+            peer_db_version: None,
+            changes: changeset.changes,
+        }) {
             log::warn!("Remote changeset queue full, dropping push: {e}");
         }
     }

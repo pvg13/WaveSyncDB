@@ -45,6 +45,24 @@ use crate::protocol::SyncRequest;
 use crate::registry::TableRegistry;
 use crate::shadow;
 
+/// A remote changeset queued for sequential application in the main event loop.
+///
+/// Carries the context needed to record our knowledge of the sender's
+/// `db_version` *after* the changes durably commit — never before. Persisting
+/// the peer version ahead of the commit risks claiming a version whose changes
+/// we never actually applied (e.g. the process is torn down between queueing
+/// and applying). On the next launch that peer would be told to send only
+/// changes *above* the claimed version, silently skipping the dropped range.
+pub(crate) struct RemoteChangeset {
+    pub peer: libp2p::PeerId,
+    pub peer_site: NodeId,
+    /// `Some(version)` for version-vector responses: record this once the
+    /// changes are applied. `None` for real-time `Push` frames, whose version
+    /// is only tracked in-memory via `max()` and is not persisted from here.
+    pub peer_db_version: Option<u64>,
+    pub changes: Vec<ColumnChange>,
+}
+
 /// Commands sent from the application to the P2P engine.
 #[derive(Debug)]
 pub enum EngineCommand {
@@ -401,12 +419,30 @@ async fn run_engine(
     // Load current db_version
     let local_db_version = shadow::get_db_version(&db).await?;
 
+    // Hydrate our last-known db_version for each peer from the persistent
+    // _wavesync_peer_versions table. Without this the map starts empty every
+    // launch, so the first version-vector request to each peer would carry
+    // your_last_db_version=0 and force a full re-sync of the entire database —
+    // on every cold start and every push-triggered background sync. The
+    // persisted value is always <= what we durably applied (it is written only
+    // after a changeset commits), so requesting changes strictly above it never
+    // skips data. Peer IDs are stable across restarts (persistent libp2p
+    // keypair), so the rows still point at the right peers.
+    let peer_db_versions: HashMap<libp2p::PeerId, u64> =
+        match peer_tracker::get_all_peer_versions(&db).await {
+            Ok(rows) => peer_tracker::parse_peer_versions(rows),
+            Err(e) => {
+                log::warn!("Failed to hydrate peer versions from disk: {e}");
+                HashMap::new()
+            }
+        };
+
     let (snapshot_resp_tx, snapshot_resp_rx) = mpsc::channel::<(
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
     )>(8);
 
-    let (remote_changeset_tx, remote_changeset_rx) = mpsc::channel::<Vec<ColumnChange>>(32);
+    let (remote_changeset_tx, remote_changeset_rx) = mpsc::channel::<RemoteChangeset>(32);
 
     let effective_topic = match &group_key {
         Some(gk) => gk.derive_topic(&topic_name),
@@ -447,7 +483,7 @@ async fn run_engine(
         mdns_enabled,
         local_db_version,
         db_version_cache,
-        peer_db_versions: HashMap::new(),
+        peer_db_versions,
         peer_reported_versions: HashMap::new(),
         snapshot_resp_tx,
         snapshot_resp_rx,
@@ -547,8 +583,8 @@ struct EngineRunner {
         crate::protocol::SyncResponse,
     )>,
     /// Channel for queuing remote changesets to be applied sequentially.
-    pub(crate) remote_changeset_tx: mpsc::Sender<Vec<ColumnChange>>,
-    pub(crate) remote_changeset_rx: mpsc::Receiver<Vec<ColumnChange>>,
+    pub(crate) remote_changeset_tx: mpsc::Sender<RemoteChangeset>,
+    pub(crate) remote_changeset_rx: mpsc::Receiver<RemoteChangeset>,
     pub(crate) registry_ready: Arc<Notify>,
     pub(crate) registry_is_ready: bool,
     pub(crate) cmd_rx: mpsc::Receiver<EngineCommand>,
@@ -1187,8 +1223,22 @@ impl EngineRunner {
                         log::error!("Failed to send sync response: {:?}", resp);
                     }
                 },
-                Some(changes) = self.remote_changeset_rx.recv() => {
-                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &changes, Some(&self.db_version_cache)).await;
+                Some(rc) = self.remote_changeset_rx.recv() => {
+                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &rc.changes, Some(&self.db_version_cache)).await;
+                    // Record our knowledge of the sender's db_version only now,
+                    // after the changes are durably committed — never at receive
+                    // time. This guarantees the persisted peer version is always
+                    // <= what we have actually applied, so a restart can hydrate
+                    // it without risking a silently-skipped change range.
+                    if let Some(version) = rc.peer_db_version {
+                        self.peer_db_versions.insert(rc.peer, version);
+                        let peer_str = rc.peer.to_string();
+                        if let Err(e) =
+                            peer_tracker::upsert_peer_version(&self.db, &peer_str, &rc.peer_site, version).await
+                        {
+                            log::warn!("Failed to persist peer version for {peer_str}: {e}");
+                        }
+                    }
                 },
                 _ = self.registry_ready.notified(), if !self.registry_is_ready => {
                     self.registry_is_ready = true;

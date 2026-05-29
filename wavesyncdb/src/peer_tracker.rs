@@ -94,6 +94,27 @@ pub async fn get_all_peer_versions(
         .collect())
 }
 
+/// Parse a raw `(peer_id string -> db_version)` map (as returned by
+/// [`get_all_peer_versions`]) into libp2p [`PeerId`](libp2p::PeerId)s, used to
+/// hydrate the engine's in-memory peer-version map at startup. Rows whose
+/// `peer_id` does not parse (e.g. left over from before persistent keypairs)
+/// are skipped with a debug log rather than failing the whole hydration.
+pub fn parse_peer_versions(raw: HashMap<String, u64>) -> HashMap<libp2p::PeerId, u64> {
+    raw.into_iter()
+        .filter_map(
+            |(peer_id, version)| match peer_id.parse::<libp2p::PeerId>() {
+                Ok(pid) => Some((pid, version)),
+                Err(e) => {
+                    log::debug!(
+                        "Skipping unparseable peer_id '{peer_id}' during version hydration: {e}"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
 /// Update the last_seen timestamp for a peer.
 pub async fn update_last_seen(
     db: &impl ConnectionTrait,
@@ -175,6 +196,40 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions["peer-1"], 10);
         assert_eq!(versions["peer-2"], 20);
+    }
+
+    #[test]
+    fn test_parse_peer_versions_skips_unparseable() {
+        // A real libp2p PeerId string parses; junk is skipped, not fatal.
+        let real = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let mut raw = HashMap::new();
+        raw.insert(real.clone(), 7u64);
+        raw.insert("not-a-peer-id".to_string(), 99u64);
+
+        let parsed = parse_peer_versions(raw);
+
+        assert_eq!(parsed.len(), 1, "the unparseable row must be dropped");
+        let pid: libp2p::PeerId = real.parse().unwrap();
+        assert_eq!(parsed[&pid], 7);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_peer_versions_roundtrips_into_parsed_map() {
+        // End-to-end: write a real PeerId's version, read it back, and confirm
+        // it survives the String -> PeerId hydration mapping.
+        let db = setup_db().await;
+        let pid = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        upsert_peer_version(&db, &pid.to_string(), &NodeId([3u8; 16]), 123)
+            .await
+            .unwrap();
+
+        let parsed = parse_peer_versions(get_all_peer_versions(&db).await.unwrap());
+        assert_eq!(parsed[&pid], 123);
     }
 
     #[tokio::test]

@@ -832,3 +832,75 @@ async fn test_out_of_order_insert_update_convergence() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Peer-version hydration regression (seeds 190–191).
+//
+// Two intertwined guarantees:
+//   1. After B restarts, it hydrates its last-known db_version for A from
+//      `_wavesync_peer_versions`, so the next sync is incremental rather than
+//      a forced full re-sync.
+//   2. Crucially, that hydrated value must never run ahead of what B actually
+//      applied — otherwise B would ask A for changes *above* a version whose
+//      rows it never committed, silently skipping them. The persisted peer
+//      version is written only after a changeset commits, so a write A makes
+//      while B is down must still reach B after restart. This test fails if
+//      the version were persisted before apply (the pre-fix behavior).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_peer_version_hydration_no_missed_changes_across_restart() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-hydrate-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(20);
+
+    let url_a = mem_db("hydrate_a");
+    let url_b = mem_db("hydrate_b");
+
+    let peer_a = make_peer(&url_a, &topic, 190).await;
+    let peer_b = make_peer(&url_b, &topic, 191).await;
+
+    // A writes three rows; B must receive all of them.
+    for id in ["a", "b", "c"] {
+        task::ActiveModel {
+            id: Set(id.to_string()),
+            title: Set(format!("task-{id}")),
+            completed: Set(false),
+            ..Default::default()
+        }
+        .insert(&peer_a)
+        .await
+        .unwrap();
+    }
+
+    assert_eventually("B has initial 3 rows", timeout, || async {
+        task::Entity::find().all(&peer_b).await.map(|r| r.len()) == Ok(3)
+    })
+    .await;
+
+    // Restart B: shut down the engine and drop the handle so the SQLite file
+    // (with the persisted peer-version row + libp2p keypair) can be reopened.
+    peer_b.shutdown().await;
+    drop(peer_b);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // While B is down, A makes another write. This is the change that the
+    // pre-fix code could skip: B had persisted A's version optimistically.
+    task::ActiveModel {
+        id: Set("d".to_string()),
+        title: Set("task-d".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&peer_a)
+    .await
+    .unwrap();
+
+    // Reopen B against the same database (same libp2p PeerId → A's persisted
+    // peer-version row still applies). It must converge to all four rows.
+    let peer_b2 = make_peer(&url_b, &topic, 191).await;
+
+    assert_eventually("restarted B converges to all 4 rows", timeout, || async {
+        task::Entity::find().all(&peer_b2).await.map(|r| r.len()) == Ok(4)
+    })
+    .await;
+}

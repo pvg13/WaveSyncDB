@@ -190,16 +190,33 @@ pub async fn background_sync_with_peers(
     }
     log_stage("registry_ready");
 
-    // 5. Wait for peer discovery, then sync.
-    // Don't call request_full_sync() immediately — peers haven't been discovered yet.
-    // Instead, wait for PeerConnected events and trigger sync when peers appear.
+    // 5. Wait for peer discovery and let the engine sync on its own.
+    //
+    // We deliberately do NOT call request_full_sync() here. With peer versions
+    // hydrated from disk, the automatic version-vector sync the engine fires on
+    // ConnectionEstablished / registry-ready pulls only the delta since our last
+    // sync — fast, and the whole point of waking incrementally. Forcing a full
+    // sync would re-pull the entire database on every wake.
+    //
+    // Two timers bound the wait:
+    //   * COMPLETION_GRACE — after the first PeerSynced, linger briefly so a
+    //     second/third peer can also finish before we tear down.
+    //   * FALLBACK_AFTER — if a peer connected but no incremental sync has
+    //     completed by then (first-ever contact, or our persisted view of the
+    //     peer was somehow ahead), ask for a full sync once. Preserves new-peer
+    //     onboarding (db_version=0 semantics) without making it the default.
+    const COMPLETION_GRACE: Duration = Duration::from_millis(500);
+    const FALLBACK_AFTER: Duration = Duration::from_secs(5);
+
     let mut events = db.network_event_rx();
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    let fallback = tokio::time::sleep(FALLBACK_AFTER);
+    tokio::pin!(fallback);
 
     let mut synced_peers = HashSet::new();
     let mut saw_any_peer = false;
-    let mut sync_requested = false;
+    let mut full_sync_fallback_done = false;
     let mut logged_relay_listening = false;
     let mut logged_first_peer = false;
 
@@ -209,6 +226,15 @@ pub async fn background_sync_with_peers(
                 log_stage("timeout");
                 break;
             }
+            _ = &mut fallback,
+                if saw_any_peer && synced_peers.is_empty() && !full_sync_fallback_done =>
+            {
+                // A peer connected but no incremental sync completed in time —
+                // fall back to a one-shot full sync before the hard timeout.
+                log_stage("full_sync_fallback");
+                db.request_full_sync();
+                full_sync_fallback_done = true;
+            }
             event = events.recv() => {
                 match event {
                     Ok(NetworkEvent::PeerConnected(_)) => {
@@ -217,23 +243,14 @@ pub async fn background_sync_with_peers(
                             logged_first_peer = true;
                         }
                         saw_any_peer = true;
-                        // A peer connected — now request sync if we haven't yet
-                        if !sync_requested {
-                            db.request_full_sync();
-                            log_stage("sync_requested");
-                            sync_requested = true;
-                        }
+                        // No explicit sync trigger — the engine initiates an
+                        // incremental version-vector sync for this peer on its
+                        // own, seeded with the hydrated peer version.
                     }
                     Ok(NetworkEvent::RelayStatusChanged(crate::RelayStatus::Listening)) => {
                         if !logged_relay_listening {
                             log_stage("relay_listening");
                             logged_relay_listening = true;
-                        }
-                        // Relay is ready — request sync to discover relay-connected peers
-                        if !sync_requested {
-                            db.request_full_sync();
-                            log_stage("sync_requested");
-                            sync_requested = true;
                         }
                     }
                     Ok(NetworkEvent::PeerSynced { peer_id, .. }) => {
@@ -242,7 +259,7 @@ pub async fn background_sync_with_peers(
                         log_stage("first_peer_synced");
                         synced_peers.insert(peer_id);
                         // Give a brief window for additional peers to sync
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(COMPLETION_GRACE).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
