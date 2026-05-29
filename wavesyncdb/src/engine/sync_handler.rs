@@ -127,11 +127,17 @@ impl EngineRunner {
                                 log::info!(
                                     "Version vector sync with peer {peer}: already up to date"
                                 );
-                                // Still need to persist the Lamport bump even if no changes
                                 if lamport_bump {
                                     let db = self.db.clone();
+                                    let cache = self.db_version_cache.clone();
                                     tokio::spawn(async move {
-                                        let _ = shadow::set_db_version(&db, my_db_version).await;
+                                        if shadow::set_db_version(&db, my_db_version).await.is_ok()
+                                        {
+                                            cache.fetch_max(
+                                                my_db_version,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                        }
                                     });
                                 }
                             } else {
@@ -165,11 +171,15 @@ impl EngineRunner {
                                 // but queue changeset for sequential application in main loop.
                                 let db = self.db.clone();
                                 let peer_str = peer.to_string();
+                                let cache = self.db_version_cache.clone();
                                 tokio::spawn(async move {
-                                    // Persist Lamport bump BEFORE applying changes so
-                                    // increment_db_version reads the adjusted base value.
-                                    if lamport_bump {
-                                        let _ = shadow::set_db_version(&db, my_db_version).await;
+                                    if lamport_bump
+                                        && shadow::set_db_version(&db, my_db_version).await.is_ok()
+                                    {
+                                        cache.fetch_max(
+                                            my_db_version,
+                                            std::sync::atomic::Ordering::Release,
+                                        );
                                     }
 
                                     // Persist peer version
@@ -507,16 +517,16 @@ impl EngineRunner {
     }
 }
 
+const CHANGESET_CHUNK_SIZE: usize = 50;
+
 /// Apply a set of remote column changes to the local database.
 ///
-/// All shadow + base-table writes for a single changeset commit as one
-/// transaction. Without this, a 30-change sync round did ~120 separate
-/// auto-commits to the SQLite WAL — visible as ~3s of `DELETE`/`INSERT OR
-/// REPLACE` lines in logcat. Batching into one transaction collapses that
-/// to a single commit (~50–200ms wall-clock) and is the load-bearing
-/// latency win for FCM-triggered cold-start sync.
+/// Small changesets (up to `CHANGESET_CHUNK_SIZE` rows) run in a single
+/// transaction for minimal fsync overhead. Larger changesets are split
+/// into chunks so the SQLite write lock is released between batches,
+/// allowing local writes (e.g. from Dioxus hooks) to proceed.
 ///
-/// `ChangeNotification`s are buffered during the transaction and emitted
+/// `ChangeNotification`s are buffered during each transaction and emitted
 /// only AFTER commit (Rule 2.12 — subscribers must never observe a
 /// notification before its data is durable).
 pub(super) async fn apply_remote_changeset(
@@ -524,6 +534,39 @@ pub(super) async fn apply_remote_changeset(
     change_tx: &broadcast::Sender<ChangeNotification>,
     registry: &TableRegistry,
     changes: &[ColumnChange],
+    db_version_cache: Option<&std::sync::atomic::AtomicU64>,
+) {
+    // Group changes by (table, pk) so a single row is never split across chunks.
+    let mut grouped: Vec<((&str, &str), Vec<&ColumnChange>)> = {
+        let mut map: HashMap<(&str, &str), Vec<&ColumnChange>> = HashMap::new();
+        for change in changes {
+            map.entry((&change.table.0, &change.pk.0))
+                .or_default()
+                .push(change);
+        }
+        map.into_iter().collect()
+    };
+
+    // Small changesets: single transaction (no chunking overhead).
+    if grouped.len() <= CHANGESET_CHUNK_SIZE {
+        apply_changeset_chunk(db, change_tx, registry, &grouped, db_version_cache).await;
+        return;
+    }
+
+    // Large changesets: split into chunks.
+    while !grouped.is_empty() {
+        let chunk_end = grouped.len().min(CHANGESET_CHUNK_SIZE);
+        let chunk: Vec<_> = grouped.drain(..chunk_end).collect();
+        apply_changeset_chunk(db, change_tx, registry, &chunk, db_version_cache).await;
+    }
+}
+
+async fn apply_changeset_chunk<'a>(
+    db: &DatabaseConnection,
+    change_tx: &broadcast::Sender<ChangeNotification>,
+    registry: &TableRegistry,
+    grouped: &[((&'a str, &'a str), Vec<&'a ColumnChange>)],
+    db_version_cache: Option<&std::sync::atomic::AtomicU64>,
 ) {
     use sea_orm::TransactionTrait;
 
@@ -535,7 +578,6 @@ pub(super) async fn apply_remote_changeset(
         }
     };
 
-    // Increment local db_version once for the batch of remote changes
     let local_db_version = match shadow::increment_db_version(&txn).await {
         Ok(v) => v,
         Err(e) => {
@@ -545,19 +587,9 @@ pub(super) async fn apply_remote_changeset(
         }
     };
 
-    // Group changes by (table, pk) for efficient processing
-    let mut grouped: HashMap<(&str, &str), Vec<&ColumnChange>> = HashMap::new();
-    for change in changes {
-        grouped
-            .entry((&change.table.0, &change.pk.0))
-            .or_default()
-            .push(change);
-    }
-
-    // Collect notifications and emit only after commit (Rule 2.12)
     let mut pending_notifications: Vec<ChangeNotification> = Vec::new();
 
-    for ((table, pk), row_changes) in &grouped {
+    for ((table, pk), row_changes) in grouped {
         let meta = match registry.get(table) {
             Some(m) => m,
             None => {
@@ -570,7 +602,6 @@ pub(super) async fn apply_remote_changeset(
         let mut changed_pairs: Vec<(String, serde_json::Value)> = Vec::new();
         let mut is_delete = false;
 
-        // Check for delete first
         let delete_change = row_changes.iter().find(|c| c.cid.0 == "__deleted");
         if let Some(change) = delete_change {
             if apply_remote_delete(&txn, table, pk, change, &meta, local_db_version).await {
@@ -615,8 +646,11 @@ pub(super) async fn apply_remote_changeset(
 
     if let Err(e) = txn.commit().await {
         log::error!("Failed to commit remote changeset transaction: {e}");
-        // Notifications are not sent — data was rolled back.
         return;
+    }
+
+    if let Some(cache) = db_version_cache {
+        cache.fetch_max(local_db_version, std::sync::atomic::Ordering::Release);
     }
 
     for n in pending_notifications {
@@ -1047,7 +1081,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         // Row untouched.
         use sea_orm::ConnectionTrait;
@@ -1110,7 +1144,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         use sea_orm::ConnectionTrait;
         // Original row still exists with its real PK.
@@ -1163,7 +1197,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         use sea_orm::ConnectionTrait;
         let row = db
@@ -1195,7 +1229,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
         assert!(
             rx.try_recv().is_err(),
             "Should not receive notification for unregistered table"
@@ -1243,7 +1277,7 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let notif = rx.try_recv().expect("Expected a ChangeNotification");
         assert_eq!(notif.table, "tasks");
@@ -1284,7 +1318,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let notif = rx.try_recv().expect("Expected a ChangeNotification");
         assert_eq!(notif.table, "tasks");
@@ -1339,7 +1373,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1388,7 +1422,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1454,7 +1488,7 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let result = db
             .query_one_raw(sea_orm::Statement::from_string(
@@ -1505,7 +1539,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         // Row should still exist
         let exists = row_exists(&db, "tasks", "id", "dlcl-1").await;
@@ -1554,7 +1588,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let exists = row_exists(&db, "tasks", "id", "dw-1").await;
         assert!(!exists, "DeleteWins: tie should delete the row");
@@ -1603,7 +1637,7 @@ mod tests {
             db_version: 0,
         }];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         let exists = row_exists(&db, "tasks", "id", "aw-1").await;
         assert!(exists, "AddWins: tie should keep the row");
@@ -1643,7 +1677,7 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db, &tx, &registry, &delete_changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &delete_changes, None).await;
         assert!(!row_exists(&db, "tasks", "id", "iad-1").await);
 
         // Now apply remote insert with higher versions (N3 regression)
@@ -1682,7 +1716,7 @@ mod tests {
                 db_version: 0,
             },
         ];
-        apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &insert_changes, None).await;
 
         assert!(
             row_exists(&db, "tasks", "id", "iad-1").await,
@@ -1774,7 +1808,7 @@ mod tests {
             },
         ];
 
-        apply_remote_changeset(&db, &tx, &registry, &changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &changes, None).await;
 
         assert!(row_exists(&db, "tasks", "id", "mr-1").await);
         assert!(row_exists(&db, "tasks", "id", "mr-2").await);
@@ -1817,7 +1851,7 @@ mod tests {
             seq: 1,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes).await;
+        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes, None).await;
 
         // Simulate Peer B's DB: has B's data locally, receives A's data
         let (db_b, registry_b) = setup_engine_test_db().await;
@@ -1849,7 +1883,7 @@ mod tests {
             seq: 1,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes).await;
+        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes, None).await;
 
         // Both peers should converge to the same value
         let result_a = db_a
@@ -1920,7 +1954,7 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes).await;
+        apply_remote_changeset(&db_a, &tx_a, &registry_a, &b_changes, None).await;
 
         // A's changes arrive at B (col_version=3 > 2, should win)
         let a_changes = vec![ColumnChange {
@@ -1934,7 +1968,7 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes).await;
+        apply_remote_changeset(&db_b, &tx_b, &registry_b, &a_changes, None).await;
 
         // Both should converge to A-latest (higher col_version)
         let result_a = db_a
@@ -2008,7 +2042,7 @@ mod tests {
             seq: 0,
             db_version: 0,
         }];
-        apply_remote_changeset(&db, &tx, &registry, &update_changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &update_changes, None).await;
 
         // Row should NOT exist
         assert!(
@@ -2064,7 +2098,7 @@ mod tests {
                 db_version: 0,
             },
         ];
-        apply_remote_changeset(&db, &tx, &registry, &insert_changes).await;
+        apply_remote_changeset(&db, &tx, &registry, &insert_changes, None).await;
 
         // Row should now exist with INSERT's values (shadow was clean, so cv=1 wins)
         assert!(

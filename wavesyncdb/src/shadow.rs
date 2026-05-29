@@ -523,6 +523,8 @@ pub async fn get_clock_entries_for_row(
 ///
 /// Joins shadow clock tables with actual user tables to get current column values.
 /// Returns changes ordered by (db_version, seq).
+///
+/// Uses a single JOIN query per table instead of per-row lookups.
 pub async fn get_changes_since(
     db: &impl ConnectionTrait,
     registry: &TableRegistry,
@@ -534,85 +536,74 @@ pub async fn get_changes_since(
         let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
         let pk_col = &meta.primary_key_column;
 
-        // Get all clock entries newer than since_db_version
-        #[derive(Debug, FromQueryResult)]
-        struct ChangeRow {
-            pk: String,
-            cid: String,
-            col_version: i64,
-            db_version: i64,
-            seq: i32,
-            site_id: Vec<u8>,
-        }
+        // Build json_object() with all columns so the JOIN returns all
+        // values in a single round trip — O(1) queries per table vs the
+        // old O(rows) approach.
+        let json_cols: String = meta
+            .columns
+            .iter()
+            .map(|c| format!("'{}', t.\"{}\"", c, c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let sql = format!(
-            "SELECT pk, cid, col_version, db_version, seq, site_id FROM \"{}\" WHERE db_version > $1 ORDER BY db_version, seq",
-            shadow_name
+            "SELECT s.pk, s.cid, s.col_version, s.db_version, s.seq, s.site_id, \
+             json_object({json_cols}) as row_json \
+             FROM \"{shadow_name}\" s \
+             LEFT JOIN \"{table}\" t ON t.\"{pk_col}\" = s.pk \
+             WHERE s.db_version > $1 \
+             ORDER BY s.db_version, s.seq",
+            table = meta.table_name,
         );
 
-        let rows = ChangeRow::find_by_statement(Statement::from_sql_and_values(
+        let stmt = Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             &sql,
             [(since_db_version as i64).into()],
-        ))
-        .all(db)
-        .await?;
+        );
+        let rows = db.query_all_raw(stmt).await?;
 
         for row in rows {
-            // For __deleted entries, val is None
-            let val = if row.cid == "__deleted" {
+            let pk: String = row.try_get("", "pk")?;
+            let cid: String = row.try_get("", "cid")?;
+            let col_version: i64 = row.try_get("", "col_version")?;
+            let db_version: i64 = row.try_get("", "db_version")?;
+            let seq: i32 = row.try_get("", "seq")?;
+            let site_id_bytes: Vec<u8> = row.try_get("", "site_id")?;
+
+            let val = if cid == "__deleted" {
                 None
             } else {
-                // Look up the current value from the actual table.
-                // Use json_object to get the value as a properly typed JSON value.
-                let val_result = db
-                    .query_one_raw(Statement::from_sql_and_values(
-                        DatabaseBackend::Sqlite,
-                        format!(
-                            "SELECT json_object('v', \"{}\") as json_val FROM \"{}\" WHERE \"{}\" = $1",
-                            row.cid, meta.table_name, pk_col
-                        ),
-                        [row.pk.clone().into()],
-                    ))
-                    .await?;
-
-                match val_result {
-                    Some(qr) => {
-                        let raw: Option<String> = qr.try_get("", "json_val").ok();
-                        raw.and_then(|s| {
-                            let obj: serde_json::Value = serde_json::from_str(&s).ok()?;
-                            Some(obj.get("v")?.clone())
-                        })
-                    }
-                    None => None,
-                }
+                let raw: Option<String> = row.try_get("", "row_json").ok();
+                raw.and_then(|s| {
+                    let obj: serde_json::Value = serde_json::from_str(&s).ok()?;
+                    let v = obj.get(&cid)?.clone();
+                    if v.is_null() { None } else { Some(v) }
+                })
             };
 
-            // Skip non-delete entries where the row was concurrently deleted.
-            // The __deleted tombstone handles the delete correctly.
-            if val.is_none() && row.cid != "__deleted" {
+            if val.is_none() && cid != "__deleted" {
                 continue;
             }
 
             let mut id = [0u8; 16];
-            let len = row.site_id.len().min(16);
-            id[..len].copy_from_slice(&row.site_id[..len]);
+            let len = site_id_bytes.len().min(16);
+            id[..len].copy_from_slice(&site_id_bytes[..len]);
 
             all_changes.push(ColumnChange {
                 table: meta.table_name.clone().into(),
-                pk: row.pk.into(),
-                cid: row.cid.into(),
+                pk: pk.into(),
+                cid: cid.into(),
                 val,
                 site_id: NodeId(id),
-                col_version: row.col_version as u64,
-                cl: row.col_version as u64, // causal length = col_version for non-deletes
-                seq: row.seq as u32,
-                db_version: row.db_version as u64,
+                col_version: col_version as u64,
+                cl: col_version as u64,
+                seq: seq as u32,
+                db_version: db_version as u64,
             });
         }
     }
 
-    // Sort by (db_version, seq) for correct causal ordering across tables
     all_changes.sort_by_key(|c| (c.db_version, c.seq));
 
     Ok(all_changes)

@@ -1,5 +1,8 @@
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
@@ -305,6 +308,7 @@ struct WaveSyncDbInner {
     change_tx: broadcast::Sender<ChangeNotification>,
     site_id: NodeId,
     db_version: Mutex<u64>,
+    db_version_cache: Arc<AtomicU64>,
     node_id: NodeId,
     registry: Arc<TableRegistry>,
     registry_ready: Arc<Notify>,
@@ -316,6 +320,7 @@ struct WaveSyncDbInner {
     /// engine writes, [`WaveSyncDb::diagnostics`] reads via lock-free
     /// atomic loads. See [`crate::diagnostics`] for rationale.
     diagnostics: Arc<crate::diagnostics::Counters>,
+    table_cache: std::sync::RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
 /// A SeaORM connection wrapper that transparently intercepts write operations
@@ -410,6 +415,40 @@ impl WaveSyncDb {
     /// Get a reference to the table registry.
     pub fn registry(&self) -> &Arc<TableRegistry> {
         &self.inner.registry
+    }
+
+    /// Current `db_version` from the in-memory cache.
+    ///
+    /// Lock-free: reads an `AtomicU64` that is kept in sync with the
+    /// Mutex-guarded counter by `dispatch_sync` and
+    /// `apply_remote_changeset`. No database query is performed.
+    pub fn db_version(&self) -> u64 {
+        self.inner.db_version_cache.load(Ordering::Acquire)
+    }
+
+    /// Return a cached copy of a table's rows if one exists.
+    ///
+    /// Keyed by `TypeId` so different entity types have independent caches.
+    /// Returns `None` on first load (cache miss). The Dioxus hooks call
+    /// this before hitting the database — a cache hit means instant data
+    /// on page navigation.
+    pub fn get_table_cache<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        self.inner
+            .table_cache
+            .read()
+            .unwrap()
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<T>())
+            .cloned()
+    }
+
+    /// Store a snapshot of a table's rows in the in-memory cache.
+    pub fn set_table_cache<T: Send + Sync + 'static>(&self, data: T) {
+        self.inner
+            .table_cache
+            .write()
+            .unwrap()
+            .insert(TypeId::of::<T>(), Box::new(data));
     }
 
     /// Gracefully shut down the engine and close the database connection.
@@ -764,6 +803,9 @@ impl WaveSyncDb {
         let mut ver = self.inner.db_version.lock().await;
         *ver += 1;
         let new_db_version = *ver;
+        self.inner
+            .db_version_cache
+            .store(new_db_version, Ordering::Release);
 
         // Open the bookkeeping transaction. Roll back the in-memory
         // counter if we can't even start a tx — keeps it in sync with
@@ -772,6 +814,7 @@ impl WaveSyncDb {
             Ok(t) => t,
             Err(e) => {
                 *ver -= 1;
+                self.inner.db_version_cache.store(*ver, Ordering::Release);
                 return Err(e);
             }
         };
@@ -854,6 +897,7 @@ impl WaveSyncDb {
                         Err(e) => {
                             log::error!("Failed to batch-upsert clock entries: {e}");
                             *ver -= 1;
+                            self.inner.db_version_cache.store(*ver, Ordering::Release);
                             let _ = txn.rollback().await;
                             return Err(e);
                         }
@@ -881,6 +925,7 @@ impl WaveSyncDb {
         // Commit the whole bookkeeping batch with a single fsync.
         if let Err(e) = txn.commit().await {
             *ver -= 1;
+            self.inner.db_version_cache.store(*ver, Ordering::Release);
             return Err(e);
         }
 
@@ -1848,6 +1893,8 @@ impl WaveSyncDbBuilder {
         // never blocks on it.
         let diagnostics = Arc::new(crate::diagnostics::Counters::default());
 
+        let db_version_cache = Arc::new(AtomicU64::new(db_version));
+
         // Start the P2P engine in a background task
         let engine_handle = crate::engine::start_engine(
             inner.clone(),
@@ -1863,6 +1910,7 @@ impl WaveSyncDbBuilder {
             network_status.clone(),
             network_event_tx.clone(),
             diagnostics.clone(),
+            db_version_cache.clone(),
         );
 
         let db = WaveSyncDb {
@@ -1873,6 +1921,7 @@ impl WaveSyncDbBuilder {
                 change_tx,
                 site_id,
                 db_version: Mutex::new(db_version),
+                db_version_cache,
                 node_id,
                 registry,
                 registry_ready,
@@ -1881,6 +1930,7 @@ impl WaveSyncDbBuilder {
                 network_status,
                 network_event_tx,
                 diagnostics,
+                table_cache: std::sync::RwLock::new(HashMap::new()),
             }),
         };
 

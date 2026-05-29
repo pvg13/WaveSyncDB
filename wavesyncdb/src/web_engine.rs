@@ -43,7 +43,8 @@
 //!   `SyncChangeset` with `__deleted` columns by hand and call
 //!   [`WebSyncClient::publish`].
 
-use std::collections::{HashSet, VecDeque};
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -374,6 +375,7 @@ pub struct WebSyncClient {
     /// the latest value is what matters; subscribers that fall behind
     /// just get the most recent value next time they read.
     status_rx: watch::Receiver<WebSyncStatus>,
+    table_cache: Arc<std::sync::RwLock<HashMap<TypeId, Box<dyn Any>>>>,
 }
 
 /// Live debug snapshot exposed by [`WebSyncClient::subscribe_status`].
@@ -807,6 +809,7 @@ impl WebSyncClient {
             resolved_tx,
             store,
             status_rx,
+            table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -905,6 +908,22 @@ impl WebSyncClient {
     /// initial state on mount via `list_table_rows`.
     pub fn store(&self) -> Option<Arc<BrowserStore>> {
         self.store.clone()
+    }
+
+    pub fn get_table_cache<T: Clone + 'static>(&self) -> Option<T> {
+        self.table_cache
+            .read()
+            .unwrap()
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<T>())
+            .cloned()
+    }
+
+    pub fn set_table_cache<T: 'static>(&self, data: T) {
+        self.table_cache
+            .write()
+            .unwrap()
+            .insert(TypeId::of::<T>(), Box::new(data));
     }
 
     /// Connect via an in-process loopback channel. **Demo/test path only.**
@@ -1021,6 +1040,7 @@ impl WebSyncClient {
             resolved_tx,
             store: Some(store_arc),
             status_rx,
+            table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
