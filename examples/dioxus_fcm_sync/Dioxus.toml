@@ -2,6 +2,12 @@
 name = "WaveSyncDB FCM Sync"
 default_platform = "android"
 
+# Custom Info.plist to merge with dx's generated one. Declares
+# NSLocalNetworkUsageDescription + NSBonjourServices, which iOS 14.5+
+# requires for libp2p mDNS discovery (peers on the same Wi-Fi finding
+# each other directly, no relay involved). See info.plist for details.
+ios_info_plist = "info.plist"
+
 # Request background execution for silent push notifications on both
 # platforms. dx maps this to `UIBackgroundModes = [remote-notification]`
 # in the iOS Info.plist and to the Firebase Cloud Messaging service in

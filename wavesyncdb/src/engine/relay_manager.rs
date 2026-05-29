@@ -6,6 +6,49 @@ use super::*;
 /// Remaining peers are queued and drained as connections complete or fail.
 const MAX_CONCURRENT_RENDEZVOUS_DIALS: usize = 5;
 
+/// DCUtR retry schedule. Index = attempt count (1-based). Values are base
+/// delays in seconds; actual delay adds ±25% jitter to break thundering
+/// herds when many peers fail in lockstep after a network blip.
+///
+/// libp2p's measured DCUtR success rate (~70% across 4.4M attempts per
+/// arxiv 2510.27500) is roughly 20pp below Tailscale's (~90%); one of
+/// the known gaps is no retry on transient hole-punch failures (RTT
+/// jitter trips the synchronized punch, especially on cellular). This
+/// implements the simplest version of that — re-dial after a short
+/// delay, up to a small cap.
+pub(super) const DCUTR_RETRY_DELAYS_SECS: &[u64] = &[2, 8, 30];
+pub(super) const DCUTR_MAX_ATTEMPTS: u32 = DCUTR_RETRY_DELAYS_SECS.len() as u32;
+
+/// Per-peer DCUtR retry book-keeping. Created when a hole-punch attempt
+/// fails; cleared on success (direct connection established) or on peer
+/// disconnect.
+#[derive(Debug, Clone)]
+pub(crate) struct DcutrRetryState {
+    /// 1-based — `attempts == 1` means "one failure, retry #1 pending."
+    pub(super) attempts: u32,
+    /// When the next dial should fire. `process_dcutr_retries` drains
+    /// entries whose time has passed.
+    pub(super) next_attempt: tokio::time::Instant,
+}
+
+impl DcutrRetryState {
+    fn schedule(attempts: u32) -> Option<Self> {
+        if attempts > DCUTR_MAX_ATTEMPTS {
+            return None;
+        }
+        let base = DCUTR_RETRY_DELAYS_SECS[(attempts - 1) as usize];
+        // ±25% jitter. Uses the OS RNG once per scheduling — cheap.
+        let jitter_range = (base as f64) * 0.25;
+        let jitter = (rand::random::<f64>() * 2.0 - 1.0) * jitter_range;
+        let delay_secs = (base as f64) + jitter;
+        let delay = std::time::Duration::from_secs_f64(delay_secs.max(0.5));
+        Some(Self {
+            attempts,
+            next_attempt: tokio::time::Instant::now() + delay,
+        })
+    }
+}
+
 impl EngineRunner {
     pub(super) fn handle_relay_client(&mut self, event: relay::client::Event) {
         match event {
@@ -53,9 +96,69 @@ impl EngineRunner {
                 );
             }
             Err(error) => {
-                log::info!(
-                    "DCUtR: direct connection upgrade failed with {peer}: {error} (sync stays on circuit-relay path; expected on symmetric-NAT cellular)"
-                );
+                let current_attempts = self
+                    .dcutr_retries
+                    .get(&peer)
+                    .map(|s| s.attempts)
+                    .unwrap_or(0);
+                let next_attempts = current_attempts + 1;
+                match DcutrRetryState::schedule(next_attempts) {
+                    Some(state) => {
+                        log::info!(
+                            "DCUtR: upgrade failed with {peer}: {error} \
+                             (scheduling retry #{next_attempts}/{DCUTR_MAX_ATTEMPTS} \
+                             in ~{:?})",
+                            state.next_attempt.duration_since(tokio::time::Instant::now())
+                        );
+                        self.dcutr_retries.insert(peer, state);
+                    }
+                    None => {
+                        log::info!(
+                            "DCUtR: upgrade failed with {peer}: {error} \
+                             (retry budget exhausted after {DCUTR_MAX_ATTEMPTS} attempts; \
+                             sync stays on circuit-relay path)"
+                        );
+                        self.dcutr_retries.remove(&peer);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Walk the DCUtR retry map and fire a dial for any peer whose
+    /// `next_attempt` has elapsed. Called from the engine's periodic tick.
+    ///
+    /// Dialing the peer (without specifying an explicit address) triggers
+    /// the libp2p DCUtR Behaviour to attempt another hole-punch through
+    /// the existing circuit-relay connection — exactly what we want.
+    pub(super) fn process_dcutr_retries(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<libp2p::PeerId> = self
+            .dcutr_retries
+            .iter()
+            .filter(|(_, s)| s.next_attempt <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            log::info!("DCUtR: re-attempting direct upgrade with {peer}");
+            // Mark the next slot in advance. If this dial also fails, the
+            // dcutr event handler will overwrite with a fresh schedule
+            // (or remove the entry if max attempts exceeded).
+            if let Some(state) = self.dcutr_retries.get_mut(&peer) {
+                let next_attempts = state.attempts + 1;
+                match DcutrRetryState::schedule(next_attempts) {
+                    Some(new) => *state = new,
+                    None => {
+                        self.dcutr_retries.remove(&peer);
+                    }
+                }
+            }
+            // Use DialOpts::peer_id so libp2p picks the peer's known
+            // direct addresses (from identify); the relay path is
+            // implicitly held open by the existing connection.
+            let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer).build();
+            if let Err(e) = self.swarm.dial(dial_opts) {
+                log::debug!("DCUtR retry dial for {peer} failed to enqueue: {e}");
             }
         }
     }
@@ -300,8 +403,17 @@ impl EngineRunner {
                     log::info!("Attempting relay reconnection (attempt {})", count + 1);
                     self.try_dial_relay();
                 }
+                // Rotate to the next fallback relay after every 4 failed
+                // attempts at the current one (~40s of stale backoff with
+                // base 5s tick). The primary stays at index 0 in the
+                // rotation; on wrap-around we come back to it, which is
+                // what we want if the primary recovered.
+                let next_count = count + 1;
+                if next_count.is_multiple_of(4) && !self.config.relay_fallbacks.is_empty() {
+                    self.rotate_to_next_relay();
+                }
                 self.relay_state = RelayState::Connecting {
-                    retry_count: count + 1,
+                    retry_count: next_count,
                 };
             }
             Action::Stuck {
@@ -341,6 +453,26 @@ impl EngineRunner {
                 // Either we just connected and haven't been stuck long enough,
                 // or relay is Disabled / already Listening — nothing to do.
             }
+        }
+    }
+
+    /// Rotate the primary relay with the next fallback. Called after the
+    /// current relay has failed several consecutive dial attempts. Moves
+    /// the failed primary to the back of the fallback list, so we come
+    /// back to it after exhausting the others — useful when the original
+    /// failure was a transient outage.
+    pub(super) fn rotate_to_next_relay(&mut self) {
+        if self.config.relay_fallbacks.is_empty() {
+            return;
+        }
+        // Swap: old primary → back of fallbacks; first fallback → primary.
+        let new_primary = self.config.relay_fallbacks.remove(0);
+        let old_primary = std::mem::replace(&mut self.config.relay_server, Some(new_primary));
+        if let Some(addr) = old_primary {
+            self.config.relay_fallbacks.push(addr);
+        }
+        if let Some(ref addr) = self.config.relay_server {
+            log::info!("Rotated to next relay fallback: {addr}");
         }
     }
 

@@ -1361,6 +1361,11 @@ pub struct SyncConfig {
     pub database_url: String,
     pub topic: String,
     pub relay_server: Option<String>,
+    /// Additional relay servers tried in order if the primary fails.
+    /// Empty for backward compatibility with single-relay configs written
+    /// before multi-relay fallback shipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_fallbacks: Vec<String>,
     pub passphrase: Option<String>,
     pub rendezvous_server: Option<String>,
     pub bootstrap_peers: Vec<String>,
@@ -1421,6 +1426,7 @@ pub struct WaveSyncDbBuilder {
     database_url: String,
     node_id: Option<NodeId>,
     relay_server: Option<String>,
+    relay_fallbacks: Vec<String>,
     topic: String,
     sync_interval: std::time::Duration,
     mdns_enabled: bool,
@@ -1439,6 +1445,7 @@ pub struct WaveSyncDbBuilder {
     api_key: Option<String>,
     keep_alive_interval: std::time::Duration,
     circuit_max_duration: std::time::Duration,
+    tcp_enabled: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1448,6 +1455,7 @@ impl WaveSyncDbBuilder {
             database_url: url.to_string(),
             node_id: None,
             relay_server: None,
+            relay_fallbacks: Vec::new(),
             topic: topic.to_string(),
             sync_interval: defaults.sync_interval,
             mdns_enabled: defaults.mdns_enabled,
@@ -1459,13 +1467,14 @@ impl WaveSyncDbBuilder {
             rendezvous_server: None,
             rendezvous_discover_interval: defaults.rendezvous_discover_interval,
             rendezvous_ttl: defaults.rendezvous_ttl,
-            ipv6: false,
+            ipv6: defaults.ipv6,
             push_token: None,
             #[cfg(feature = "push-sync")]
             fcm_credentials: None,
             api_key: None,
             keep_alive_interval: defaults.keep_alive_interval,
             circuit_max_duration: defaults.circuit_max_duration,
+            tcp_enabled: defaults.tcp_enabled,
         }
     }
 
@@ -1478,8 +1487,31 @@ impl WaveSyncDbBuilder {
     ///
     /// The address should include the server's peer ID, e.g.:
     /// `/ip4/1.2.3.4/tcp/4001/p2p/12D3Koo...`
+    ///
+    /// To configure fallback relays (recommended for production to remove
+    /// the single-point-of-failure), call [`Self::with_relay_fallback`] one
+    /// or more times after this, or use [`Self::with_relay_fallbacks`].
     pub fn with_relay_server(mut self, addr: &str) -> Self {
         self.relay_server = Some(addr.to_string());
+        self
+    }
+
+    /// Add a fallback relay server. Tried after the primary
+    /// ([`Self::with_relay_server`]) has failed repeatedly. Can be called
+    /// multiple times to add several fallbacks in priority order.
+    pub fn with_relay_fallback(mut self, addr: &str) -> Self {
+        self.relay_fallbacks.push(addr.to_string());
+        self
+    }
+
+    /// Add multiple fallback relays in one call. Preserves order.
+    pub fn with_relay_fallbacks<I, S>(mut self, addrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.relay_fallbacks
+            .extend(addrs.into_iter().map(|s| s.as_ref().to_string()));
         self
     }
 
@@ -1525,9 +1557,31 @@ impl WaveSyncDbBuilder {
         self
     }
 
-    /// Enable IPv6 listen addresses in addition to IPv4.
+    /// Enable or disable IPv6 listen addresses in addition to IPv4.
+    /// Default: `true`.
+    ///
+    /// IPv6 sidesteps CGNAT — most modern cellular carriers (T-Mobile,
+    /// Verizon, Jio, etc.) ship IPv6 by default, eliminating the need for
+    /// hole-punching or circuit relay for peers on those networks. Only
+    /// disable this if your deployment environment has known-broken v6.
     pub fn with_ipv6(mut self, enabled: bool) -> Self {
         self.ipv6 = enabled;
+        self
+    }
+
+    /// Enable or disable TCP as a secondary transport alongside QUIC.
+    /// Default: `false`.
+    ///
+    /// QUIC-only is the recommended path for ~95% of deployments — it
+    /// has a faster cold start (1 RTT vs 2-3 for TCP+TLS+yamux) and
+    /// avoids a known issue where dual TCP+QUIC dials confused
+    /// circuit-relay on cellular. Enable this only if your users hit
+    /// networks that block UDP entirely (some corporate firewalls,
+    /// captive-portal Wi-Fi). Accepts the cold-start trade-off and
+    /// the cellular-circuit-relay risk; we recommend measuring before
+    /// flipping it on.
+    pub fn with_tcp_enabled(mut self, enabled: bool) -> Self {
+        self.tcp_enabled = enabled;
         self
     }
 
@@ -1751,6 +1805,17 @@ impl WaveSyncDbBuilder {
             None => None,
         };
 
+        // Resolve fallback relays. Invalid ones are skipped with a warning
+        // rather than failing the whole build — a typo in a fallback
+        // shouldn't take down the primary path.
+        let mut relay_fallbacks: Vec<libp2p::Multiaddr> = Vec::new();
+        for s in &self.relay_fallbacks {
+            match parse_and_resolve_multiaddr(s).await {
+                Ok(addr) => relay_fallbacks.push(addr),
+                Err(e) => log::warn!("Skipping invalid relay fallback address '{s}': {e}"),
+            }
+        }
+
         let rendezvous_server =
             match self.rendezvous_server.as_deref() {
                 Some(s) => Some(parse_and_resolve_multiaddr(s).await.map_err(|e| {
@@ -1788,6 +1853,7 @@ impl WaveSyncDbBuilder {
             database_url: self.database_url.clone(),
             topic: self.topic.clone(),
             relay_server: self.relay_server.clone(),
+            relay_fallbacks: self.relay_fallbacks.clone(),
             passphrase: self.passphrase,
             rendezvous_server: self.rendezvous_server.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
@@ -1809,6 +1875,7 @@ impl WaveSyncDbBuilder {
             mdns_ttl: self.mdns_ttl,
             bootstrap_peers,
             relay_server,
+            relay_fallbacks,
             rendezvous_server,
             rendezvous_discover_interval: self.rendezvous_discover_interval,
             rendezvous_ttl: self.rendezvous_ttl,
@@ -1817,6 +1884,7 @@ impl WaveSyncDbBuilder {
             api_key: self.api_key,
             keep_alive_interval: self.keep_alive_interval,
             circuit_max_duration: self.circuit_max_duration,
+            tcp_enabled: self.tcp_enabled,
         };
 
         // Diagnostics counters are owned jointly by the engine task (writer)

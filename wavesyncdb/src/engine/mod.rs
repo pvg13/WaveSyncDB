@@ -83,15 +83,26 @@ pub struct EngineConfig {
     pub mdns_ttl: Duration,
     /// Static bootstrap peers to dial on startup.
     pub bootstrap_peers: Vec<Multiaddr>,
-    /// Relay server multiaddr for NAT traversal.
+    /// Relay server multiaddr for NAT traversal (the primary).
     pub relay_server: Option<Multiaddr>,
+    /// Fallback relay servers, tried in order if the primary fails
+    /// repeatedly. Removes the single-point-of-failure for cold-start
+    /// peer discovery without changing the connect-to-one-relay-at-a-time
+    /// data path. See `relay_manager::rotate_to_next_relay`.
+    pub relay_fallbacks: Vec<Multiaddr>,
     /// Rendezvous server multiaddr for WAN peer discovery.
     pub rendezvous_server: Option<Multiaddr>,
     /// How often to discover peers via rendezvous (default: 60s).
     pub rendezvous_discover_interval: Duration,
     /// TTL for rendezvous registration in seconds (default: 300s).
     pub rendezvous_ttl: u64,
-    /// Whether to listen on IPv6 in addition to IPv4.
+    /// Whether to listen on IPv6 in addition to IPv4. Default: `true`.
+    ///
+    /// IPv6 sidesteps CGNAT entirely — when both peers have native v6
+    /// (now the case on T-Mobile, Verizon, Jio, and most modern cellular
+    /// carriers per Google's 2026 stats showing >50% global IPv6 traffic),
+    /// the relay is no longer on the critical path for connection
+    /// establishment. Falls back to IPv4 transparently via Happy Eyeballs.
     pub ipv6: bool,
     /// Push notification token: (platform, device_token).
     /// Platform is "Fcm" or "Apns".
@@ -104,6 +115,14 @@ pub struct EngineConfig {
     /// Maximum relay circuit duration the server allows (default: 3600s).
     /// The engine proactively renews at 80% of this duration.
     pub circuit_max_duration: Duration,
+    /// Opt-in TCP transport in addition to the default QUIC. Default: `false`.
+    ///
+    /// Enable for deployments where users hit networks that block UDP
+    /// entirely (some corporate firewalls, captive-portal Wi-Fi). Costs
+    /// ~1 extra RTT on cold start and can confuse circuit-relay on
+    /// cellular (see `build_swarm` doc-comment); only flip on if the
+    /// QUIC-only failure mode is actually hurting your users.
+    pub tcp_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -115,14 +134,16 @@ impl Default for EngineConfig {
             mdns_ttl: Duration::from_secs(30),
             bootstrap_peers: Vec::new(),
             relay_server: None,
+            relay_fallbacks: Vec::new(),
             rendezvous_server: None,
             rendezvous_discover_interval: Duration::from_secs(60),
             rendezvous_ttl: 300,
-            ipv6: false,
+            ipv6: true,
             push_token: None,
             api_key: None,
             keep_alive_interval: Duration::from_secs(90),
             circuit_max_duration: Duration::from_secs(3600),
+            tcp_enabled: false,
         }
     }
 }
@@ -204,11 +225,18 @@ pub(crate) fn start_engine(
 /// Tries system DNS first (`/etc/resolv.conf`). If that fails (e.g. on Android
 /// where `/etc/resolv.conf` does not exist), falls back to Google public DNS
 /// via `dns::ResolverConfig::google()`.
+///
+/// When `tcp_enabled = true`, adds TCP as a secondary transport. See
+/// [`build_swarm_with_tcp`] and the `with_tcp_enabled` builder method.
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: Option<mdns::Config>,
     keep_alive_interval: Duration,
+    tcp_enabled: bool,
 ) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    if tcp_enabled {
+        return build_swarm_with_tcp(keypair, mdns_config, keep_alive_interval);
+    }
     // QUIC-only (no TCP). Two reasons:
     //
     // 1. **Cold-start latency.** QUIC is 1 RTT for fresh handshake and 0-RTT
@@ -228,7 +256,8 @@ fn build_swarm(
     //
     // The cost: networks that block UDP entirely (corporate firewalls,
     // captive-portal Wi-Fi) can't sync. In practice this is rare for the
-    // mobile-sync target audience.
+    // mobile-sync target audience — but apps with users on UDP-hostile
+    // networks can opt in via `WaveSyncDbBuilder::with_tcp_enabled(true)`.
     let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_quic()
@@ -255,6 +284,70 @@ fn build_swarm(
             let ping_interval = keep_alive_interval;
             Ok(SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
+                .with_quic()
+                .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build())
+        }
+    }
+}
+
+/// Build the libp2p swarm with both TCP and QUIC transports.
+///
+/// Opt-in path for apps whose users may be on networks that block UDP
+/// entirely (some corporate firewalls, captive-portal Wi-Fi). Pays the
+/// cold-start RTT cost (TCP+TLS+yamux is 2–3 RTT vs QUIC's 1 RTT) and
+/// allows the connection-per-peer limit of 2 to be filled by both
+/// protocols, which the original docs at `build_swarm` flagged as
+/// having broken circuit-relay on cellular. Apps that opt in are
+/// accepting that trade-off.
+fn build_swarm_with_tcp(
+    keypair: identity::Keypair,
+    mdns_config: Option<mdns::Config>,
+    keep_alive_interval: Duration,
+) -> Result<libp2p::Swarm<WaveSyncBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
+    use libp2p::tcp;
+
+    let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_quic()
+        .with_dns();
+
+    match system_result {
+        Ok(builder) => {
+            let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
+            Ok(builder
+                .with_relay_client(noise::Config::new, yamux::Config::default)?
+                .with_behaviour(move |key, relay_client| {
+                    WaveSyncBehaviour::new(key, relay_client, mdns_cfg, ping_interval)
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
+                .build())
+        }
+        Err(e) => {
+            log::warn!(
+                "System DNS resolver failed (expected on Android): {e}. \
+                 Falling back to Google public DNS."
+            );
+            let mdns_cfg = mdns_config;
+            let ping_interval = keep_alive_interval;
+            Ok(SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
                 .with_quic()
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
@@ -295,7 +388,12 @@ async fn run_engine(
         None
     };
 
-    let swarm = build_swarm(keypair.clone(), mdns_config, config.keep_alive_interval)?;
+    let swarm = build_swarm(
+        keypair.clone(),
+        mdns_config,
+        config.keep_alive_interval,
+        config.tcp_enabled,
+    )?;
 
     let local_peer_id = keypair.public().to_peer_id();
     log::info!("Local libp2p PeerId (persistent): {local_peer_id}");
@@ -385,6 +483,7 @@ async fn run_engine(
         circuit_retry_count: 0,
         circuit_listen_pending: false,
         relay_dial_pending: false,
+        dcutr_retries: HashMap::new(),
         diagnostics,
     };
 
@@ -524,6 +623,14 @@ struct EngineRunner {
     /// 3 reservation requests). Cleared on the connection-established or
     /// dial-failed event for the relay peer.
     pub(crate) relay_dial_pending: bool,
+    /// Per-peer DCUtR retry state. Each entry is a peer whose most recent
+    /// direct-connection-upgrade attempt failed; the engine retries with
+    /// bounded exponential backoff so a single transient hole-punch
+    /// failure (very common on cellular, where RTT jitter trips the
+    /// synchronized punch) doesn't permanently strand the connection on
+    /// the relay path. See [`relay_manager::DcutrRetryState`] and
+    /// [`relay_manager::process_dcutr_retries`].
+    pub(crate) dcutr_retries: HashMap<libp2p::PeerId, crate::engine::relay_manager::DcutrRetryState>,
     /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
     /// All increments are `Relaxed` atomic ops on the hot path; readers
     /// (UI / debug panel / test assertions) snapshot via
@@ -849,6 +956,11 @@ impl EngineRunner {
             return;
         }
 
+        // No more connections — drop any pending DCUtR retry for this
+        // peer. Re-attempts only make sense while the relay-circuit
+        // connection is still alive (DCUtR coordinates through it).
+        self.dcutr_retries.remove(&peer_id);
+
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
             &self.relay_state
@@ -1064,6 +1176,11 @@ impl EngineRunner {
                 },
                 _ = relay_reconnect.tick(), if has_relay => {
                     self.maybe_reconnect_relay();
+                    // Same tick handles DCUtR retries. Both are
+                    // infrastructure-paths book-keeping; aligning them on
+                    // one 5s timer keeps the wakeup count low (saves a
+                    // bit of mobile battery vs. running two timers).
+                    self.process_dcutr_retries();
                 },
                 Some((channel, response)) = self.snapshot_resp_rx.recv() => {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {
@@ -1289,10 +1406,44 @@ impl EngineRunner {
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::AuthResult(event)) => {
                 self.handle_auth_result(event);
             }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Upnp(event)) => {
+                // libp2p auto-adds mapped addresses to the swarm's external
+                // addresses; we just log for observability. Useful signal that
+                // a residential router accepted our port-mapping request,
+                // which means peers on other networks can now dial us
+                // directly without DCUtR coordination.
+                use libp2p::upnp::Event as UpnpEvent;
+                match event {
+                    UpnpEvent::NewExternalAddr(addr) => {
+                        log::info!("UPnP: gateway mapped external address {addr}");
+                    }
+                    UpnpEvent::ExpiredExternalAddr(addr) => {
+                        log::info!("UPnP: gateway expired external address {addr}");
+                    }
+                    UpnpEvent::GatewayNotFound => {
+                        log::debug!(
+                            "UPnP: no IGD-capable gateway on this network \
+                             (expected on cellular/CGNAT/enterprise)"
+                        );
+                    }
+                    UpnpEvent::NonRoutableGateway => {
+                        log::debug!(
+                            "UPnP: gateway is itself behind NAT (CGNAT or \
+                             double-NAT); port mapping wouldn't help"
+                        );
+                    }
+                }
+            }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
                 log::info!("Connection established with {peer_id}");
+                // Clear any pending DCUtR retry for this peer: a direct
+                // connection just succeeded, so the hole-punch problem is
+                // resolved (even if this connection happens to be via
+                // circuit-relay; libp2p's DCUtR will upgrade later, and
+                // we don't want stale retry timers firing redundantly).
+                self.dcutr_retries.remove(&peer_id);
                 // Count successful peer dials. Infrastructure peers (relay /
                 // rendezvous) are excluded so the rate reflects sync-peer
                 // discovery health, not infra plumbing.
