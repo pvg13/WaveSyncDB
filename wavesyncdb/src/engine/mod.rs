@@ -1043,7 +1043,7 @@ impl EngineRunner {
         ));
         self.update_network_status();
 
-        let db = self.db.clone();
+        let db = self.default_group().db.clone();
         let peer_str = peer_id.to_string();
         tokio::spawn(async move {
             let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
@@ -1579,7 +1579,7 @@ impl EngineRunner {
                     // Cache this (peer_id, multiaddr) so the next cold start
                     // can dial it directly before discovery (#29). Skip the
                     // relay so the cache stays a sync-peer set.
-                    let db = self.db.clone();
+                    let db = self.default_group().db.clone();
                     let peer_str = peer_id.to_string();
                     let addr_str = endpoint.get_remote_address().to_string();
                     tokio::spawn(async move {
@@ -1664,7 +1664,7 @@ impl EngineRunner {
                     // Bump fail_count on cached addresses for this peer
                     // (#29). No-op if the peer isn't cached yet — cache rows
                     // are only seeded on a successful connection.
-                    let db = self.db.clone();
+                    let db = self.default_group().db.clone();
                     let peer_str = pid.to_string();
                     tokio::spawn(async move {
                         if let Err(e) =
