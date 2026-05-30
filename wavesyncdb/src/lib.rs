@@ -93,7 +93,7 @@ pub use web_store::{BrowserStore, ResolvedRow, ShadowRow, StoreError};
 
 pub use auth::GroupKey;
 #[cfg(not(target_arch = "wasm32"))]
-pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
+pub use connection::{SchemaBuilder, SyncConfig, WaveSyncDb, WaveSyncDbBuilder, WaveSyncNode};
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::EngineCommand;
 pub use messages::{
