@@ -732,21 +732,36 @@ impl EngineRunner {
     fn update_network_status(&self) {
         use crate::network_status as ns;
 
+        // Aggregate per-peer view across all groups (max known version; member
+        // of the node if verified in any group). For a single-group node this
+        // is identical to the pre-multi-group behaviour.
         let connected_peers = self
             .peers
             .iter()
             .filter(|(peer_id, _)| !self.infrastructure_peers.contains(peer_id))
-            .map(|(peer_id, addr)| ns::PeerInfo {
-                peer_id: ns::PeerId(peer_id.to_string()),
-                address: addr.to_string(),
-                db_version: self
-                    .peer_db_versions
-                    .get(peer_id)
-                    .copied()
-                    .or_else(|| self.peer_reported_versions.get(peer_id).copied()),
-                is_bootstrap: self.bootstrap_peers.contains(peer_id),
-                is_group_member: self.verified_peers.contains(peer_id),
-                app_id: self.peer_identities.get(peer_id).cloned(),
+            .map(|(peer_id, addr)| {
+                let db_version = self
+                    .groups
+                    .values()
+                    .filter_map(|g| {
+                        g.peer_db_versions
+                            .get(peer_id)
+                            .copied()
+                            .or_else(|| g.peer_reported_versions.get(peer_id).copied())
+                    })
+                    .max();
+                let is_group_member = self
+                    .groups
+                    .values()
+                    .any(|g| g.verified_peers.contains(peer_id));
+                ns::PeerInfo {
+                    peer_id: ns::PeerId(peer_id.to_string()),
+                    address: addr.to_string(),
+                    db_version,
+                    is_bootstrap: self.bootstrap_peers.contains(peer_id),
+                    is_group_member,
+                    app_id: self.peer_identities.get(peer_id).cloned(),
+                }
             })
             .collect();
 
