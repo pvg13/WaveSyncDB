@@ -108,7 +108,9 @@ impl EngineRunner {
                             "DCUtR: upgrade failed with {peer}: {error} \
                              (scheduling retry #{next_attempts}/{DCUTR_MAX_ATTEMPTS} \
                              in ~{:?})",
-                            state.next_attempt.duration_since(tokio::time::Instant::now())
+                            state
+                                .next_attempt
+                                .duration_since(tokio::time::Instant::now())
                         );
                         self.dcutr_retries.insert(peer, state);
                     }
@@ -336,8 +338,11 @@ impl EngineRunner {
 
     /// Register every group's namespace with the rendezvous server.
     pub(super) fn rendezvous_register(&mut self, server_peer_id: libp2p::PeerId) {
-        let namespaces: Vec<String> =
-            self.groups.values().map(|g| g.rendezvous_namespace.clone()).collect();
+        let namespaces: Vec<String> = self
+            .groups
+            .values()
+            .map(|g| g.rendezvous_namespace.clone())
+            .collect();
         for ns_str in namespaces {
             let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
                 Ok(ns) => ns,
@@ -388,8 +393,11 @@ impl EngineRunner {
         // Discover each group's namespace. Cookie is shared on the default group
         // (per-namespace cookies are a multi-group refinement).
         let cookie = self.default_group().rendezvous_cookie.clone();
-        let namespaces: Vec<String> =
-            self.groups.values().map(|g| g.rendezvous_namespace.clone()).collect();
+        let namespaces: Vec<String> = self
+            .groups
+            .values()
+            .map(|g| g.rendezvous_namespace.clone())
+            .collect();
         for ns_str in namespaces {
             let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
                 Ok(ns) => ns,

@@ -139,9 +139,7 @@ impl EngineRunner {
 
                             // Update the group's local db_version (Lamport).
                             let lamport_bump = my_db_version > group_local_db_version;
-                            if lamport_bump
-                                && let Some(g) = self.groups.get_mut(&effective)
-                            {
+                            if lamport_bump && let Some(g) = self.groups.get_mut(&effective) {
                                 g.local_db_version = my_db_version;
                             }
 
