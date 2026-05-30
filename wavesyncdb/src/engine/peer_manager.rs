@@ -6,9 +6,10 @@ impl EngineRunner {
     pub(super) async fn sync_all_known_peers(&mut self) {
         // Refresh local_db_version from DB before syncing, in case spawned tasks
         // (apply_remote_changeset) have incremented it since we last checked.
-        self.local_db_version = self
-            .db_version_cache
-            .load(std::sync::atomic::Ordering::Acquire);
+        // Refresh each group's local_db_version from its cache.
+        for g in self.groups.values_mut() {
+            g.local_db_version = g.db_version_cache.load(std::sync::atomic::Ordering::Acquire);
+        }
 
         let peer_ids: Vec<libp2p::PeerId> = self
             .peers
@@ -16,37 +17,53 @@ impl EngineRunner {
             .filter(|p| !self.infrastructure_peers.contains(p))
             .cloned()
             .collect();
-        for peer_id in peer_ids {
-            self.initiate_sync_for_peer(peer_id);
+        let topics: Vec<String> = self.groups.keys().cloned().collect();
+        for topic in &topics {
+            for peer_id in &peer_ids {
+                self.initiate_sync_for_peer(*peer_id, topic);
+            }
         }
     }
 
-    pub(super) fn initiate_sync_for_peer(&mut self, peer_id: libp2p::PeerId) {
-        if self.pending_sync_peers.contains(&peer_id) {
-            return;
-        }
-        if self.rejected_peers.contains(&peer_id) {
-            return;
-        }
+    /// Send a version-vector sync request to `peer_id` for the group identified
+    /// by `effective_topic`. No-op if the group is gone, the peer is infra, or
+    /// it's already pending/rejected for that group.
+    pub(super) fn initiate_sync_for_peer(&mut self, peer_id: libp2p::PeerId, effective_topic: &str) {
         if self.infrastructure_peers.contains(&peer_id) {
             return;
         }
 
-        let their_last_db_version = self.peer_db_versions.get(&peer_id).copied().unwrap_or(0);
+        // Pull the group's scalars into locals so the group borrow ends before
+        // we touch the swarm (borrow-split).
+        let (my_db_version, their_last_db_version, site_id, topic, group_key) = {
+            let Some(g) = self.groups.get(effective_topic) else {
+                return;
+            };
+            if g.pending_sync_peers.contains(&peer_id) || g.rejected_peers.contains(&peer_id) {
+                return;
+            }
+            (
+                g.local_db_version,
+                g.peer_db_versions.get(&peer_id).copied().unwrap_or(0),
+                g.site_id,
+                g.topic_name.clone(),
+                g.group_key.clone(),
+            )
+        };
 
         log::info!(
-            "Requesting version vector sync from peer {peer_id} (their last known version: {their_last_db_version})"
+            "Requesting version vector sync from peer {peer_id} for topic {topic} (their last known version: {their_last_db_version})"
         );
 
         let mut req = SyncRequest::VersionVector {
-            my_db_version: self.local_db_version,
+            my_db_version,
             your_last_db_version: their_last_db_version,
-            site_id: self.site_id,
-            topic: self.topic_name.clone(),
+            site_id,
+            topic,
             hmac: None,
         };
 
-        if let Some(ref gk) = self.group_key {
+        if let Some(ref gk) = group_key {
             // Serialize with hmac: None, compute MAC, then set hmac
             if let Ok(bytes) = serde_json::to_vec(&req) {
                 let tag = gk.mac(&bytes);
@@ -61,7 +78,9 @@ impl EngineRunner {
             .behaviour_mut()
             .snapshot
             .send_request(&peer_id, req);
-        self.pending_sync_peers.insert(peer_id);
+        if let Some(g) = self.groups.get_mut(effective_topic) {
+            g.pending_sync_peers.insert(peer_id);
+        }
     }
 
     pub(super) fn handle_mdns(&mut self, event: mdns::Event) {
@@ -77,16 +96,28 @@ impl EngineRunner {
                             .mdns_discoveries
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Never re-add peers rejected for topic mismatch
-                    if self.rejected_peers.contains(&peer_id) {
+                    // Never re-add peers rejected by EVERY local group (a peer
+                    // rejected by one group may still be valid for another).
+                    if !self.groups.is_empty()
+                        && self
+                            .groups
+                            .values()
+                            .all(|g| g.rejected_peers.contains(&peer_id))
+                    {
                         continue;
                     }
                     // Skip dial and address update if already tracked and connected —
                     // avoids duplicate dials from multi-address mDNS discovery
                     // (TCP+QUIC × multiple IPs), but still allow sync initiation below
                     if self.peers.contains_key(&peer_id) && self.swarm.is_connected(&peer_id) {
-                        if self.registry_is_ready {
-                            self.initiate_sync_for_peer(peer_id);
+                        let ready: Vec<String> = self
+                            .groups
+                            .iter()
+                            .filter(|(_, g)| g.registry_is_ready)
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        for t in ready {
+                            self.initiate_sync_for_peer(peer_id, &t);
                         }
                         continue;
                     }

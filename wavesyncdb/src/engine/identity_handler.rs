@@ -10,7 +10,9 @@ impl EngineRunner {
             hmac: None,
         };
 
-        if let Some(ref gk) = self.group_key
+        // Identity is node-level; sign with the default group's key for now.
+        // Per-group identity announce is a P3 refinement.
+        if let Some(ref gk) = self.default_group().group_key
             && let Ok(bytes) = serde_json::to_vec(&req)
         {
             let tag = gk.mac(&bytes);
@@ -27,7 +29,11 @@ impl EngineRunner {
 
     /// Announce identity to all currently verified peers.
     pub(super) fn announce_identity_to_verified_peers(&mut self, app_id: &str) {
-        let peers: Vec<libp2p::PeerId> = self.verified_peers.iter().copied().collect();
+        let peers: Vec<libp2p::PeerId> = self
+            .groups
+            .values()
+            .flat_map(|g| g.verified_peers.iter().copied())
+            .collect();
         for peer_id in peers {
             self.send_identity_announce(peer_id, app_id);
         }
