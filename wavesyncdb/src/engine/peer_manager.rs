@@ -143,7 +143,11 @@ impl EngineRunner {
                         crate::network_status::PeerInfo {
                             peer_id: crate::network_status::PeerId(peer_id.to_string()),
                             address: multiaddr.to_string(),
-                            db_version: self.peer_db_versions.get(&peer_id).copied(),
+                            db_version: self
+                                .default_group()
+                                .peer_db_versions
+                                .get(&peer_id)
+                                .copied(),
                             is_bootstrap: self.bootstrap_peers.contains(&peer_id),
                             is_group_member: false,
                             app_id: None,
@@ -151,15 +155,25 @@ impl EngineRunner {
                     ));
                     self.update_network_status();
 
-                    // Register peer and update last_seen
-                    let db = self.db.clone();
+                    // Register peer and update last_seen. The peer-address cache
+                    // is node-level today; tracked in the default group's DB
+                    // (making it truly node-level is a multi-group follow-up).
+                    let db = self.default_group().db.clone();
                     let peer_str = peer_id.to_string();
                     tokio::spawn(async move {
                         let _ = peer_tracker::update_last_seen(&db, &peer_str).await;
                     });
 
-                    if self.registry_is_ready && self.swarm.is_connected(&peer_id) {
-                        self.initiate_sync_for_peer(peer_id);
+                    if self.swarm.is_connected(&peer_id) {
+                        let ready: Vec<String> = self
+                            .groups
+                            .iter()
+                            .filter(|(_, g)| g.registry_is_ready)
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        for t in ready {
+                            self.initiate_sync_for_peer(peer_id, &t);
+                        }
                     }
                 }
             }
@@ -167,8 +181,10 @@ impl EngineRunner {
                 for (peer_id, multiaddr) in list {
                     log::debug!("Expired peer {peer_id} at {multiaddr}");
                     self.peers.remove(&peer_id);
-                    self.pending_sync_peers.remove(&peer_id);
-                    self.verified_peers.remove(&peer_id);
+                    for g in self.groups.values_mut() {
+                        g.pending_sync_peers.remove(&peer_id);
+                        g.verified_peers.remove(&peer_id);
+                    }
                     self.peer_identities.remove(&peer_id);
                     self.emit_network_event(crate::network_status::NetworkEvent::PeerDisconnected(
                         crate::network_status::PeerId(peer_id.to_string()),
