@@ -26,7 +26,11 @@ async fn single_group_peer(name: &str, topic: &str, psk: &str, seed: u8) -> Wave
         .build()
         .await
         .expect("build peer");
-    db.schema().register(task::Entity).sync().await.expect("sync schema");
+    db.schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("sync schema");
     db
 }
 
@@ -74,14 +78,24 @@ async fn test_multigroup_isolation() {
         .build()
         .await
         .expect("build node");
-    node_alpha.schema().register(task::Entity).sync().await.unwrap();
+    node_alpha
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
 
     let node = node_alpha.node();
     let node_beta = node
         .join_group(&topic_beta, "pass-beta")
         .await
         .expect("join beta");
-    node_beta.schema().register(task::Entity).sync().await.unwrap();
+    node_beta
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
 
     // The two groups must have distinct effective (PSK-derived) topics.
     assert_ne!(node_alpha.effective_topic(), node_beta.effective_topic());
@@ -107,8 +121,14 @@ async fn test_multigroup_isolation() {
     // Both positive propagations are done and the network has been live for a
     // while; now assert the isolation holds (no leakage either direction).
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!has_task(&peer_b, "a1").await, "beta peer must NOT see alpha data");
-    assert!(!has_task(&peer_a, "b1").await, "alpha peer must NOT see beta data");
+    assert!(
+        !has_task(&peer_b, "a1").await,
+        "beta peer must NOT see alpha data"
+    );
+    assert!(
+        !has_task(&peer_a, "b1").await,
+        "alpha peer must NOT see beta data"
+    );
 
     // The node's two group DBs are themselves separate.
     assert!(has_task(&node_alpha, "a1").await && !has_task(&node_alpha, "b1").await);
@@ -137,17 +157,30 @@ async fn test_multigroup_leave_and_rejoin() {
         .build()
         .await
         .expect("build node");
-    node_alpha.schema().register(task::Entity).sync().await.unwrap();
+    node_alpha
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
     let node = node_alpha.node();
     let node_beta = node.join_group(&topic_beta, "pass-beta").await.unwrap();
-    node_beta.schema().register(task::Entity).sync().await.unwrap();
+    node_beta
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
 
     let peer_a = single_group_peer("mg2_a", &topic_alpha, "pass-alpha", 244).await;
     let peer_b = single_group_peer("mg2_b", &topic_beta, "pass-beta", 245).await;
 
     // Establish baseline sync in both groups.
     insert_task(&node_beta, "b1", "beta one").await;
-    assert_eventually("peer_b has b1", timeout, || async { has_task(&peer_b, "b1").await }).await;
+    assert_eventually("peer_b has b1", timeout, || async {
+        has_task(&peer_b, "b1").await
+    })
+    .await;
 
     // Leave beta. Its DB file is preserved.
     node.leave_group(&node_beta).await;
@@ -165,8 +198,16 @@ async fn test_multigroup_leave_and_rejoin() {
 
     // Re-join beta: resumes from the preserved DB (still has b1) and catches b2.
     let node_beta2 = node.join_group(&topic_beta, "pass-beta").await.unwrap();
-    node_beta2.schema().register(task::Entity).sync().await.unwrap();
-    assert!(has_task(&node_beta2, "b1").await, "rejoined group resumes b1 from disk");
+    node_beta2
+        .schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .unwrap();
+    assert!(
+        has_task(&node_beta2, "b1").await,
+        "rejoined group resumes b1 from disk"
+    );
     assert_eventually("rejoined node catches up b2", timeout, || async {
         has_task(&node_beta2, "b2").await
     })
