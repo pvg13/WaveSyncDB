@@ -476,43 +476,51 @@ async fn run_engine(
     }
 
     let mdns_enabled = config.mdns_enabled;
-    let mut engine = EngineRunner {
-        swarm,
-        peers: HashMap::new(),
+    let default_effective_topic = effective_topic.clone();
+    let default_group = GroupState {
         db,
         change_tx,
         registry,
         notification_tx,
         notification_registry,
-        local_peer_id,
         site_id,
+        user_topic: topic_name,
         topic_name: effective_topic,
-        config,
-        mdns_enabled,
         local_db_version,
         db_version_cache,
         peer_db_versions,
         peer_reported_versions: HashMap::new(),
+        registry_ready,
+        registry_is_ready: false,
+        group_key,
+        rendezvous_namespace,
+        rendezvous_cookie: None,
+        rendezvous_registered: false,
+        rejected_peers: std::collections::HashSet::new(),
+        verified_peers: std::collections::HashSet::new(),
+        pending_sync_peers: std::collections::HashSet::new(),
+    };
+    let mut groups = HashMap::new();
+    groups.insert(default_effective_topic.clone(), default_group);
+    let mut engine = EngineRunner {
+        swarm,
+        peers: HashMap::new(),
+        groups,
+        default_effective_topic,
+        local_peer_id,
+        config,
+        mdns_enabled,
         snapshot_resp_tx,
         snapshot_resp_rx,
         remote_changeset_tx,
         remote_changeset_rx,
-        registry_ready,
-        registry_is_ready: false,
         cmd_rx,
-        group_key,
         relay_state: RelayState::Disabled,
         nat_status: NatStatus::Unknown,
-        rendezvous_namespace,
-        rendezvous_cookie: None,
-        rendezvous_registered: false,
         bootstrap_peers: std::collections::HashSet::new(),
-        rejected_peers: std::collections::HashSet::new(),
-        verified_peers: std::collections::HashSet::new(),
         local_app_id: None,
         peer_identities: HashMap::new(),
         infrastructure_peers,
-        pending_sync_peers: std::collections::HashSet::new(),
         dialing_peers: std::collections::HashSet::new(),
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
@@ -563,27 +571,56 @@ pub(crate) enum RelayState {
 
 use crate::network_status::NatStatus;
 
-struct EngineRunner {
-    pub(crate) swarm: libp2p::Swarm<WaveSyncBehaviour>,
-    pub(crate) peers: HashMap<libp2p::PeerId, libp2p::Multiaddr>,
+/// Per-group state: one per sync group the node has joined. Each group is backed
+/// by its own SQLite database (own shadow tables, db_version, peer_versions,
+/// registry, site_id). The shared libp2p swarm routes inbound messages to the
+/// right group by effective (PSK-derived) topic.
+pub(crate) struct GroupState {
     pub(crate) db: DatabaseConnection,
     pub(crate) change_tx: broadcast::Sender<ChangeNotification>,
     pub(crate) registry: Arc<TableRegistry>,
     pub(crate) notification_tx: broadcast::Sender<crate::notify::Notification>,
     pub(crate) notification_registry: Arc<crate::registry::NotificationRegistry>,
-    pub(crate) local_peer_id: libp2p::PeerId,
     pub(crate) site_id: NodeId,
+    /// User-supplied topic (pre-derivation), kept for diagnostics / config.
+    pub(crate) user_topic: String,
+    /// Effective (PSK-derived) topic — the on-the-wire routing key.
     pub(crate) topic_name: String,
-    pub(crate) config: EngineConfig,
-    /// Mirrors `config.mdns_enabled` but is mutable at runtime via
-    /// `EngineCommand::SetMdnsEnabled`. `trigger_rediscovery` and the
-    /// runtime toggle handler both read this field.
-    pub(crate) mdns_enabled: bool,
     pub(crate) local_db_version: u64,
     pub(crate) db_version_cache: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) peer_db_versions: HashMap<libp2p::PeerId, u64>,
     /// Display-only peer versions from incoming requests (NOT used for sync decisions).
     pub(crate) peer_reported_versions: HashMap<libp2p::PeerId, u64>,
+    pub(crate) registry_ready: Arc<Notify>,
+    pub(crate) registry_is_ready: bool,
+    pub(crate) group_key: Option<GroupKey>,
+    /// Rendezvous namespace for peer discovery (per group).
+    pub(crate) rendezvous_namespace: String,
+    pub(crate) rendezvous_cookie: Option<rendezvous::Cookie>,
+    pub(crate) rendezvous_registered: bool,
+    /// Peers rejected for THIS group (topic mismatch / failed HMAC). A peer
+    /// rejected here may still be a valid member of another group on this node.
+    pub(crate) rejected_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers verified via successful HMAC exchange for THIS group.
+    pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers with an in-flight sync request for THIS group.
+    pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+}
+
+struct EngineRunner {
+    pub(crate) swarm: libp2p::Swarm<WaveSyncBehaviour>,
+    pub(crate) peers: HashMap<libp2p::PeerId, libp2p::Multiaddr>,
+    /// Sync groups keyed by effective (PSK-derived) topic.
+    pub(crate) groups: HashMap<String, GroupState>,
+    /// Effective topic of the build-time / single-group default group. Lets
+    /// handlers without a per-message topic context reach the primary group.
+    pub(crate) default_effective_topic: String,
+    pub(crate) local_peer_id: libp2p::PeerId,
+    pub(crate) config: EngineConfig,
+    /// Mirrors `config.mdns_enabled` but is mutable at runtime via
+    /// `EngineCommand::SetMdnsEnabled`. `trigger_rediscovery` and the
+    /// runtime toggle handler both read this field.
+    pub(crate) mdns_enabled: bool,
     pub(crate) snapshot_resp_tx: mpsc::Sender<(
         request_response::ResponseChannel<crate::protocol::SyncResponse>,
         crate::protocol::SyncResponse,
@@ -595,34 +632,19 @@ struct EngineRunner {
     /// Channel for queuing remote changesets to be applied sequentially.
     pub(crate) remote_changeset_tx: mpsc::Sender<RemoteChangeset>,
     pub(crate) remote_changeset_rx: mpsc::Receiver<RemoteChangeset>,
-    pub(crate) registry_ready: Arc<Notify>,
-    pub(crate) registry_is_ready: bool,
     pub(crate) cmd_rx: mpsc::Receiver<EngineCommand>,
-    pub(crate) group_key: Option<GroupKey>,
     /// Relay connection state machine.
     pub(crate) relay_state: RelayState,
     /// Detected NAT status from AutoNAT probes.
     pub(crate) nat_status: NatStatus,
-    /// Rendezvous namespace for peer discovery.
-    pub(crate) rendezvous_namespace: String,
-    /// Rendezvous discovery pagination cookie.
-    pub(crate) rendezvous_cookie: Option<rendezvous::Cookie>,
-    /// Whether we have an active rendezvous registration.
-    pub(crate) rendezvous_registered: bool,
     /// Set of bootstrap peer IDs for tracking.
     pub(crate) bootstrap_peers: std::collections::HashSet<libp2p::PeerId>,
-    /// Peers rejected due to topic mismatch — never re-add via mDNS.
-    pub(crate) rejected_peers: std::collections::HashSet<libp2p::PeerId>,
-    /// Peers verified via successful HMAC exchange — only these are group members.
-    pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Application-level identity announced by the local peer (ephemeral, session-scoped).
     pub(crate) local_app_id: Option<String>,
     /// Application-level identities received from remote peers (ephemeral, session-scoped).
     pub(crate) peer_identities: HashMap<libp2p::PeerId, String>,
     /// Infrastructure peers (relay, rendezvous) — excluded from peer count and sync fan-out.
     pub(crate) infrastructure_peers: std::collections::HashSet<libp2p::PeerId>,
-    /// Peers with an in-flight sync request — prevents flooding request-response.
-    pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
     pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
@@ -686,6 +708,24 @@ struct EngineRunner {
 }
 
 impl EngineRunner {
+    /// The primary (build-time / single-group) group. Used by handlers that do
+    /// not yet have a per-message topic context. Safe for the engine lifetime —
+    /// the default group is always present.
+    #[allow(dead_code)]
+    pub(crate) fn default_group(&self) -> &GroupState {
+        self.groups
+            .get(&self.default_effective_topic)
+            .expect("default group always present")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn default_group_mut(&mut self) -> &mut GroupState {
+        let topic = self.default_effective_topic.clone();
+        self.groups
+            .get_mut(&topic)
+            .expect("default group always present")
+    }
+
     /// Rebuild the full network status snapshot from internal state.
     fn update_network_status(&self) {
         use crate::network_status as ns;

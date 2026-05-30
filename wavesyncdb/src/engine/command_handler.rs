@@ -21,10 +21,12 @@ impl EngineRunner {
             }
             EngineCommand::RequestFullSync => {
                 log::info!("Full sync requested by user");
-                // Reset peer versions to trigger full re-sync
-                self.peer_db_versions.clear();
-                self.peer_reported_versions.clear();
-                self.pending_sync_peers.clear();
+                // Reset peer versions to trigger full re-sync (every group)
+                for g in self.groups.values_mut() {
+                    g.peer_db_versions.clear();
+                    g.peer_reported_versions.clear();
+                    g.pending_sync_peers.clear();
+                }
                 self.dialing_peers.clear();
                 self.pending_rendezvous_dials.clear();
                 self.trigger_rediscovery();
@@ -75,9 +77,11 @@ impl EngineRunner {
         // Clear version maps so the next sync requests all changes since the
         // last *persisted* peer version, not stale in-memory values that may
         // have drifted during a network transition.
-        self.peer_db_versions.clear();
-        self.peer_reported_versions.clear();
-        self.pending_sync_peers.clear();
+        for g in self.groups.values_mut() {
+            g.peer_db_versions.clear();
+            g.peer_reported_versions.clear();
+            g.pending_sync_peers.clear();
+        }
         self.dialing_peers.clear();
         self.pending_rendezvous_dials.clear();
 
