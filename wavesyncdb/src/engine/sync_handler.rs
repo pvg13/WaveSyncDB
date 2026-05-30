@@ -263,8 +263,22 @@ impl EngineRunner {
         peer_topic: String,
         req_hmac: Option<[u8; 32]>,
     ) {
-        // Verify HMAC if group key is configured
-        if let Some(ref gk) = self.group_key {
+        // Route to the group this request targets (empty topic → default).
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            // Request for a topic none of our groups hold.
+            self.reject_peer_all_groups(peer);
+            return;
+        };
+        let group_key = g.group_key.clone();
+
+        // Verify HMAC with THIS group's key (topic selects the key; it never
+        // bypasses verification — Rule 2.7).
+        if let Some(ref gk) = group_key {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
@@ -286,9 +300,15 @@ impl EngineRunner {
                 log::debug!("Rejecting sync request with invalid HMAC from peer {peer}");
                 return;
             }
-            // HMAC verified — mark peer as group member
-            if !self.verified_peers.contains(&peer) {
-                self.verified_peers.insert(peer);
+            // HMAC verified — mark peer as a member of THIS group.
+            let newly_verified = match self.groups.get_mut(&effective) {
+                Some(g) if !g.verified_peers.contains(&peer) => {
+                    g.verified_peers.insert(peer);
+                    true
+                }
+                _ => false,
+            };
+            if newly_verified {
                 self.emit_network_event(crate::network_status::NetworkEvent::PeerVerified(
                     crate::network_status::PeerId(peer.to_string()),
                 ));
@@ -301,17 +321,6 @@ impl EngineRunner {
             }
         }
 
-        // Reject requests from peers on a different topic
-        if !peer_topic.is_empty() && peer_topic != self.topic_name {
-            log::debug!(
-                "Ignoring sync request from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
-                self.topic_name
-            );
-            // Permanently reject this peer so mDNS won't re-add it
-            self.reject_peer(peer);
-            return;
-        }
-
         // NOTE: Do NOT update peer_db_versions here. The peer's
         // reported db_version tells us what THEY have, but we haven't
         // received their data yet. peer_db_versions is only updated in
@@ -320,8 +329,10 @@ impl EngineRunner {
         // next sync request (your_last_db_version would be too high).
         //
         // However, track in peer_reported_versions for display purposes.
-        let reported = self.peer_reported_versions.entry(peer).or_insert(0);
-        *reported = (*reported).max(my_db_version);
+        if let Some(g) = self.groups.get_mut(&effective) {
+            let reported = g.peer_reported_versions.entry(peer).or_insert(0);
+            *reported = (*reported).max(my_db_version);
+        }
 
         self.emit_network_event(crate::network_status::NetworkEvent::PeerSynced {
             peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -329,15 +340,17 @@ impl EngineRunner {
         });
         self.update_network_status();
 
-        // Spawn async task to query changes and respond
-        let db = self.db.clone();
-        let registry = self.registry.clone();
+        // Snapshot this group's state for the spawned task.
+        let Some(g) = self.groups.get(&effective) else {
+            return;
+        };
+        let db = g.db.clone();
+        let registry = g.registry.clone();
         let resp_tx = self.snapshot_resp_tx.clone();
-        let local_db_version = self.local_db_version;
-        let local_site_id = self.site_id;
-        let change_tx = self.change_tx.clone();
-        let topic_name = self.topic_name.clone();
-        let group_key = self.group_key.clone();
+        let local_db_version = g.local_db_version;
+        let local_site_id = g.site_id;
+        let change_tx = g.change_tx.clone();
+        let topic_name = g.topic_name.clone();
 
         tokio::spawn(async move {
             // Get changes since the peer's last known version of us
@@ -400,8 +413,19 @@ impl EngineRunner {
         peer_topic: String,
         req_hmac: Option<[u8; 32]>,
     ) {
-        // Verify HMAC if group key is configured
-        if let Some(ref gk) = self.group_key {
+        // Route to the group this push targets (empty topic → default).
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            self.reject_peer_all_groups(peer);
+            return;
+        };
+
+        // Verify HMAC with THIS group's key.
+        if let Some(ref gk) = g.group_key {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
@@ -420,9 +444,15 @@ impl EngineRunner {
                 log::debug!("Rejecting push with invalid HMAC from peer {peer}");
                 return;
             }
-            // HMAC verified — mark peer as group member
-            if !self.verified_peers.contains(&peer) {
-                self.verified_peers.insert(peer);
+            // HMAC verified — mark peer as a member of THIS group.
+            let newly_verified = match self.groups.get_mut(&effective) {
+                Some(g) if !g.verified_peers.contains(&peer) => {
+                    g.verified_peers.insert(peer);
+                    true
+                }
+                _ => false,
+            };
+            if newly_verified {
                 self.emit_network_event(crate::network_status::NetworkEvent::PeerVerified(
                     crate::network_status::PeerId(peer.to_string()),
                 ));
@@ -435,21 +465,13 @@ impl EngineRunner {
             }
         }
 
-        // Reject pushes from peers on a different topic
-        if !peer_topic.is_empty() && peer_topic != self.topic_name {
-            log::debug!(
-                "Ignoring push from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
-                self.topic_name
-            );
-            self.reject_peer(peer);
-            return;
+        // Track peer's db_version in the group (max to avoid stale overwrite).
+        if let Some(g) = self.groups.get_mut(&effective) {
+            let entry = g.peer_db_versions.entry(peer).or_insert(0);
+            *entry = (*entry).max(changeset.db_version);
+            let reported = g.peer_reported_versions.entry(peer).or_insert(0);
+            *reported = (*reported).max(changeset.db_version);
         }
-
-        // Track peer's db_version (use max to avoid overwriting with stale values)
-        let entry = self.peer_db_versions.entry(peer).or_insert(0);
-        *entry = (*entry).max(changeset.db_version);
-        let reported = self.peer_reported_versions.entry(peer).or_insert(0);
-        *reported = (*reported).max(changeset.db_version);
 
         log::info!(
             "Received push from peer {peer} with {} changes at db_version {}",
@@ -475,6 +497,7 @@ impl EngineRunner {
             peer,
             peer_site: changeset.site_id,
             peer_db_version: None,
+            effective_topic: effective.clone(),
             changes: changeset.changes,
         }) {
             log::warn!("Remote changeset queue full, dropping push: {e}");
@@ -489,8 +512,9 @@ impl EngineRunner {
         app_id: String,
         req_hmac: Option<[u8; 32]>,
     ) {
-        // Verify HMAC if group key is configured
-        if let Some(ref gk) = self.group_key {
+        // Identity is node-level. Verify against the default group's key and
+        // accept from a peer verified in ANY group.
+        if let Some(ref gk) = self.default_group().group_key {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
@@ -510,8 +534,12 @@ impl EngineRunner {
             }
         }
 
-        // Only accept from verified peers
-        if !self.verified_peers.contains(&peer) {
+        // Only accept from peers verified in at least one group.
+        let verified_somewhere = self
+            .groups
+            .values()
+            .any(|g| g.verified_peers.contains(&peer));
+        if !verified_somewhere {
             log::debug!("Ignoring identity announce from unverified peer {peer}");
             return;
         }
@@ -532,15 +560,35 @@ impl EngineRunner {
         });
     }
 
-    /// Permanently reject a peer: remove from all tracking sets and emit PeerRejected.
-    fn reject_peer(&mut self, peer: libp2p::PeerId) {
-        self.rejected_peers.insert(peer);
-        self.verified_peers.remove(&peer);
+    /// Reject a peer for a single group (failed HMAC for that group). Removes it
+    /// from that group's tracking only — the peer may still belong to other
+    /// groups on this node.
+    #[allow(dead_code)]
+    fn reject_peer_for_group(&mut self, effective_topic: &str, peer: libp2p::PeerId) {
+        if let Some(g) = self.groups.get_mut(effective_topic) {
+            g.rejected_peers.insert(peer);
+            g.verified_peers.remove(&peer);
+            g.pending_sync_peers.remove(&peer);
+            g.peer_db_versions.remove(&peer);
+            g.peer_reported_versions.remove(&peer);
+        }
+        self.update_network_status();
+    }
+
+    /// Reject a peer for every current group — used when an inbound message's
+    /// topic matches none of our groups. The shared connection is dropped and
+    /// the peer is removed from node-level identity tracking. Joining that topic
+    /// later (a fresh group with an empty rejected set) makes it eligible again.
+    fn reject_peer_all_groups(&mut self, peer: libp2p::PeerId) {
+        for g in self.groups.values_mut() {
+            g.rejected_peers.insert(peer);
+            g.verified_peers.remove(&peer);
+            g.pending_sync_peers.remove(&peer);
+            g.peer_db_versions.remove(&peer);
+            g.peer_reported_versions.remove(&peer);
+        }
         self.peer_identities.remove(&peer);
-        self.pending_sync_peers.remove(&peer);
         self.peers.remove(&peer);
-        self.peer_db_versions.remove(&peer);
-        self.peer_reported_versions.remove(&peer);
         self.emit_network_event(crate::network_status::NetworkEvent::PeerRejected(
             crate::network_status::PeerId(peer.to_string()),
         ));
