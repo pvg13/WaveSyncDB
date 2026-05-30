@@ -68,6 +68,105 @@ impl EngineRunner {
                 log::info!("Engine shutdown requested");
                 true
             }
+            EngineCommand::JoinGroup(init) => {
+                self.handle_join_group(*init);
+                false
+            }
+            EngineCommand::LeaveGroup { effective_topic } => {
+                self.handle_leave_group(effective_topic);
+                false
+            }
+        }
+    }
+
+    /// Stand up a new group's [`GroupState`] from the application-supplied
+    /// [`GroupInit`], then wire it into discovery: register the rendezvous
+    /// namespace, re-announce presence to the relay, and sweep already-connected
+    /// peers with a version-vector request for the new topic. Idempotent — a
+    /// JoinGroup for an effective topic we already serve is a no-op.
+    fn handle_join_group(&mut self, init: GroupInit) {
+        let effective_topic = init.effective_topic.clone();
+        if self.groups.contains_key(&effective_topic) {
+            log::debug!("JoinGroup for already-joined topic {effective_topic}; ignoring");
+            return;
+        }
+
+        let GroupInit {
+            db,
+            user_topic,
+            effective_topic: topic_name,
+            group_key,
+            site_id,
+            local_db_version,
+            db_version_cache,
+            registry,
+            registry_ready,
+            change_tx,
+            notification_tx,
+            notification_registry,
+            peer_db_versions,
+        } = init;
+
+        let rendezvous_namespace = topic_name.clone();
+        let group = GroupState {
+            db,
+            change_tx,
+            registry,
+            notification_tx,
+            notification_registry,
+            site_id,
+            user_topic,
+            topic_name: topic_name.clone(),
+            local_db_version,
+            db_version_cache,
+            peer_db_versions,
+            peer_reported_versions: HashMap::new(),
+            registry_ready,
+            registry_is_ready: false,
+            group_key,
+            rendezvous_namespace,
+            rendezvous_cookie: None,
+            rendezvous_registered: false,
+            rejected_peers: std::collections::HashSet::new(),
+            verified_peers: std::collections::HashSet::new(),
+            pending_sync_peers: std::collections::HashSet::new(),
+        };
+        self.groups.insert(effective_topic.clone(), group);
+        log::info!("Joined sync group (effective topic {effective_topic})");
+
+        // Register the new namespace + re-announce presence if the
+        // rendezvous / relay infrastructure is already connected. Both helpers
+        // iterate every group, so the freshly-inserted one is picked up.
+        if let Some(ref rv_addr) = self.config.rendezvous_server
+            && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
+            && self.swarm.is_connected(&rv_peer_id)
+            && self.swarm.external_addresses().count() > 0
+        {
+            self.rendezvous_register(rv_peer_id);
+        }
+        if let RelayState::Connected { relay_peer_id, .. }
+        | RelayState::Listening { relay_peer_id } = self.relay_state
+        {
+            self.announce_presence_to_relay(relay_peer_id);
+        }
+
+        self.update_network_status();
+    }
+
+    /// Remove a group's [`GroupState`] so it stops syncing. The rendezvous
+    /// namespace registration simply TTL-expires on the server; we do not
+    /// touch the DB file (the connection side owns its handle). A LeaveGroup
+    /// for the default group, or for a topic we don't serve, is ignored.
+    fn handle_leave_group(&mut self, effective_topic: String) {
+        if effective_topic == self.default_effective_topic {
+            log::warn!("Refusing to leave the default group {effective_topic}");
+            return;
+        }
+        if self.groups.remove(&effective_topic).is_some() {
+            log::info!("Left sync group (effective topic {effective_topic})");
+            self.update_network_status();
+        } else {
+            log::debug!("LeaveGroup for unknown topic {effective_topic}; ignoring");
         }
     }
 

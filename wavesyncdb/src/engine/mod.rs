@@ -65,6 +65,49 @@ pub(crate) struct RemoteChangeset {
     pub changes: Vec<ColumnChange>,
 }
 
+/// A local write tagged with the group it originated from.
+///
+/// Every local write funnels through the connection layer's single
+/// `sync_tx.send(..)` site, which stamps the originating group's effective
+/// (PSK-derived) topic onto the changeset. The engine routes on this tag so a
+/// write to one group's DB only fans out on that group's topic / key. For a
+/// single-group node the tag is always the default group's topic, so behaviour
+/// is identical to the pre-multi-group path.
+pub(crate) struct TaggedChangeset {
+    pub effective_topic: String,
+    pub changeset: SyncChangeset,
+}
+
+/// Everything the engine needs to stand up a new [`GroupState`] at runtime in
+/// response to [`EngineCommand::JoinGroup`]. Built entirely on the connection
+/// side (its own DB connection, broadcast channels, registry, hydrated peer
+/// versions) so the engine handler just inserts the group and wires discovery.
+pub struct GroupInit {
+    pub db: DatabaseConnection,
+    pub user_topic: String,
+    pub effective_topic: String,
+    pub group_key: Option<GroupKey>,
+    pub site_id: NodeId,
+    pub local_db_version: u64,
+    pub db_version_cache: Arc<std::sync::atomic::AtomicU64>,
+    pub registry: Arc<TableRegistry>,
+    pub registry_ready: Arc<Notify>,
+    pub change_tx: broadcast::Sender<ChangeNotification>,
+    pub notification_tx: broadcast::Sender<crate::notify::Notification>,
+    pub notification_registry: Arc<crate::registry::NotificationRegistry>,
+    pub peer_db_versions: HashMap<libp2p::PeerId, u64>,
+}
+
+impl std::fmt::Debug for GroupInit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupInit")
+            .field("user_topic", &self.user_topic)
+            .field("effective_topic", &self.effective_topic)
+            .field("local_db_version", &self.local_db_version)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Commands sent from the application to the P2P engine.
 #[derive(Debug)]
 pub enum EngineCommand {
@@ -86,6 +129,15 @@ pub enum EngineCommand {
     SetMdnsEnabled(bool),
     /// Graceful shutdown — stop the engine loop.
     Shutdown,
+    /// Join a new sync group at runtime. The group's DB, channels, registry,
+    /// and hydrated peer versions are built on the connection side and handed
+    /// to the engine, which inserts the `GroupState` and wires up discovery
+    /// (rendezvous namespace + sweeping connected peers for the new topic).
+    JoinGroup(Box<GroupInit>),
+    /// Leave a sync group at runtime. The `GroupState` is removed so the group
+    /// stops syncing; the rendezvous namespace simply TTL-expires. The DB file
+    /// is preserved (the connection side closes its handle separately).
+    LeaveGroup { effective_topic: String },
 }
 
 /// Configuration for the sync engine.
@@ -183,7 +235,7 @@ impl EngineConfig {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_engine(
     db: DatabaseConnection,
-    sync_rx: mpsc::Receiver<SyncChangeset>,
+    sync_rx: mpsc::Receiver<TaggedChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
     site_id: NodeId,
@@ -387,7 +439,7 @@ fn build_swarm_with_tcp(
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(
     db: DatabaseConnection,
-    mut sync_rx: mpsc::Receiver<SyncChangeset>,
+    mut sync_rx: mpsc::Receiver<TaggedChangeset>,
     change_tx: broadcast::Sender<ChangeNotification>,
     registry: Arc<TableRegistry>,
     site_id: NodeId,
@@ -585,6 +637,7 @@ pub(crate) struct GroupState {
     pub(crate) notification_registry: Arc<crate::registry::NotificationRegistry>,
     pub(crate) site_id: NodeId,
     /// User-supplied topic (pre-derivation), kept for diagnostics / config.
+    #[allow(dead_code)]
     pub(crate) user_topic: String,
     /// Effective (PSK-derived) topic — the on-the-wire routing key.
     pub(crate) topic_name: String,
@@ -1141,7 +1194,7 @@ impl EngineRunner {
 
     async fn run(
         &mut self,
-        sync_rx: &mut mpsc::Receiver<SyncChangeset>,
+        sync_rx: &mut mpsc::Receiver<TaggedChangeset>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!(
             "DIAG run() entered: relay_server={:?} rendezvous_server={:?} ipv6={} os={}",
@@ -1276,8 +1329,8 @@ impl EngineRunner {
 
         loop {
             tokio::select! {
-                Some(changeset) = sync_rx.recv() => {
-                    self.handle_local_changeset(changeset).await;
+                Some(tc) = sync_rx.recv() => {
+                    self.handle_local_changeset(tc).await;
                 },
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await;
@@ -1413,26 +1466,41 @@ impl EngineRunner {
         }
     }
 
-    async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
-        // For this phase, local writes fan out on the default group. Clone the
+    async fn handle_local_changeset(&mut self, tc: TaggedChangeset) {
+        // Route the local write to the group it originated from. Clone the
         // topic/group_key into locals up front so the group borrow ends before
-        // we touch the swarm below (borrow-split).
-        let effective_topic = self.default_effective_topic.clone();
-        let topic_name = self.default_group().topic_name.clone();
-        let group_key = self.default_group().group_key.clone();
+        // we touch the swarm below (borrow-split). For a single-group node the
+        // tag is always the default group's effective topic.
+        let TaggedChangeset {
+            effective_topic,
+            changeset,
+        } = tc;
 
-        // Update local db_version
-        {
-            let g = self.default_group_mut();
+        let (topic_name, group_key) = match self.groups.get(&effective_topic) {
+            Some(g) => (g.topic_name.clone(), g.group_key.clone()),
+            None => {
+                log::debug!("local changeset for unknown group {effective_topic}; dropping");
+                return;
+            }
+        };
+
+        // Update local db_version for this group
+        if let Some(g) = self.groups.get_mut(&effective_topic) {
             g.local_db_version = g.local_db_version.max(changeset.db_version);
         }
         self.update_network_status();
 
-        // Fan-out: push changeset to all connected peers via request-response
+        // Fan-out: push changeset to all connected peers via request-response.
+        // Exclude peers rejected *for this group* and infrastructure peers.
+        let rejected = self
+            .groups
+            .get(&effective_topic)
+            .map(|g| g.rejected_peers.clone())
+            .unwrap_or_default();
         let peer_ids: Vec<libp2p::PeerId> = self
             .peers
             .keys()
-            .filter(|p| !self.default_group().rejected_peers.contains(p))
+            .filter(|p| !rejected.contains(p))
             .filter(|p| !self.infrastructure_peers.contains(p))
             .cloned()
             .collect();

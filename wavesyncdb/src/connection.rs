@@ -12,6 +12,8 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
+use crate::auth::GroupKey;
+use crate::engine::{EngineCommand, GroupInit, TaggedChangeset};
 use crate::messages::{
     ChangeNotification, ColumnChange, DeletePolicy, NodeId, SyncChangeset, WriteKind,
 };
@@ -300,11 +302,81 @@ fn sql_value_to_json(val: &str) -> serde_json::Value {
     }
 }
 
-/// Internal shared state for [`WaveSyncDb`].
+/// Node-level shared state: the single libp2p engine and everything that is
+/// shared across all of its sync groups.
+///
+/// One [`WaveSyncNode`] owns one engine task serving N groups, each backed by
+/// its own SQLite DB and surfaced as a [`WaveSyncDb`] handle. The engine task
+/// is aborted exactly once, when the last reference to this inner struct drops
+/// (see the `Drop` impl). Every [`WaveSyncDbInner`] holds an
+/// `Arc<WaveSyncNodeInner>`, so the engine outlives any individual group
+/// handle: a single-group app that only keeps the returned `WaveSyncDb` keeps
+/// the engine alive transitively, and dropping that last handle tears the
+/// engine down — preserving the original single-group lifecycle.
+pub(crate) struct WaveSyncNodeInner {
+    cmd_tx: mpsc::Sender<EngineCommand>,
+    /// Local-write channel into the engine. Each group's handle clones this and
+    /// stamps its own effective topic onto every changeset (see
+    /// [`TaggedChangeset`]).
+    tagged_sync_tx: mpsc::Sender<TaggedChangeset>,
+    engine_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
+    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+    diagnostics: Arc<crate::diagnostics::Counters>,
+    /// Active group handles keyed by *user* topic (pre-derivation). Lets
+    /// `join_group` be idempotent and `leave_group` resolve handles.
+    ///
+    /// Stored as `Weak` to avoid a reference cycle: every `WaveSyncDbInner`
+    /// holds `Arc<WaveSyncNodeInner>` (this struct), so a *strong* handle here
+    /// would keep the node — and thus the engine task and its DB connection
+    /// pool — alive forever. That zombie engine holds the group's SQLite file
+    /// open across a handle drop / reopen (rolling restart, partition → merge),
+    /// producing "database is locked" and cross-talking zombie swarms. With
+    /// `Weak`, dropping the last external `WaveSyncDb` lets `WaveSyncDbInner`'s
+    /// `Drop` run and tear the engine down, exactly as the single-group `Drop`
+    /// did before the node/engine split.
+    groups: std::sync::Mutex<HashMap<String, std::sync::Weak<WaveSyncDbInner>>>,
+    /// Base for deriving per-group SQLite URLs. The default group keeps the
+    /// original URL; joined groups derive a sibling file. See `join_group`.
+    base_database_url: String,
+}
+
+impl Drop for WaveSyncNodeInner {
+    fn drop(&mut self) {
+        // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk
+        // between tests). Use get_mut() instead of lock() — since we have
+        // &mut self, no other thread can hold a reference, so we can access the
+        // mutex data without locking. This avoids the
+        // "pthread_mutex_lock called on a destroyed mutex" crash on Android
+        // when the app process is killed.
+        if let Some(handle) = self.engine_handle.get_mut().ok().and_then(|h| h.take()) {
+            handle.abort();
+        }
+    }
+}
+
+/// A handle to the libp2p engine that serves one or more sync groups.
+///
+/// Cheap to clone (internally `Arc`-based). Holding a `WaveSyncNode` keeps the
+/// engine alive even if every per-group [`WaveSyncDb`] is dropped, and lets an
+/// app `join_group` / `leave_group` additional groups at runtime.
+#[derive(Clone)]
+pub struct WaveSyncNode {
+    inner: Arc<WaveSyncNodeInner>,
+}
+
+/// Internal shared state for [`WaveSyncDb`] — a single sync group's handle.
 struct WaveSyncDbInner {
     inner: DatabaseConnection,
+    #[allow(dead_code)]
     database_url: String,
-    sync_tx: mpsc::Sender<SyncChangeset>,
+    /// Clone of the node's local-write channel. Every local write funnels
+    /// through `dispatch_sync`'s single `send` site, which stamps
+    /// [`effective_topic`](Self::effective_topic) onto the changeset.
+    sync_tx: mpsc::Sender<TaggedChangeset>,
+    /// Effective (PSK-derived) topic of this group — the routing tag the engine
+    /// uses to find this group's [`GroupState`].
+    effective_topic: String,
     change_tx: broadcast::Sender<ChangeNotification>,
     /// User-facing notifications produced by `#[derive(SyncNotify)]` policies on
     /// incoming remote changes. Drained by `use_sync_notifications`. The
@@ -316,14 +388,12 @@ struct WaveSyncDbInner {
     node_id: NodeId,
     registry: Arc<TableRegistry>,
     registry_ready: Arc<Notify>,
-    cmd_tx: mpsc::Sender<crate::engine::EngineCommand>,
-    engine_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
-    network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
-    /// Engine-wide diagnostics counters. Shared with the engine task —
-    /// engine writes, [`WaveSyncDb::diagnostics`] reads via lock-free
-    /// atomic loads. See [`crate::diagnostics`] for rationale.
-    diagnostics: Arc<crate::diagnostics::Counters>,
+    /// The node that owns the engine. Keeping this `Arc` here makes the engine
+    /// outlive any *single* `WaveSyncDb` clone (so multi-group handles share one
+    /// engine), while `WaveSyncDbInner`'s `Drop` still aborts the engine
+    /// eagerly when this is the last group handle — preserving the back-compat
+    /// single-group teardown (drop the handle → engine stops, DB file released).
+    node: Arc<WaveSyncNodeInner>,
     table_cache: std::sync::RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
@@ -339,12 +409,25 @@ pub struct WaveSyncDb {
 
 impl Drop for WaveSyncDbInner {
     fn drop(&mut self) {
-        // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk between tests).
-        // Use get_mut() instead of lock() — since we have &mut self, no other thread
-        // can hold a reference, so we can access the mutex data without locking.
-        // This avoids the "pthread_mutex_lock called on a destroyed mutex" crash
-        // on Android when the app process is killed.
-        if let Some(handle) = self.engine_handle.get_mut().ok().and_then(|h| h.take()) {
+        // When this is the last live group handle for the node and no
+        // `WaveSyncNode` is being held, abort the engine task *eagerly* here
+        // rather than waiting for `WaveSyncNodeInner`'s own `Drop`. A running
+        // engine keeps this group's SQLite connection pool open and keeps mDNS
+        // announcing the topic; tests (and apps) that drop a peer and then
+        // immediately reopen the same DB file — rolling restart, partition →
+        // merge — depend on the file being released synchronously on drop, the
+        // way the pre-split single-group `WaveSyncDbInner::drop` did.
+        //
+        // `strong_count == 1` means the only remaining strong reference to the
+        // node is the one held by this `WaveSyncDbInner` (about to drop), i.e.
+        // no other group handle and no held `WaveSyncNode` exist. A genuine
+        // multi-group node with other live handles has count > 1, so the engine
+        // stays up and `WaveSyncNodeInner::drop` tears it down once the last
+        // reference goes away.
+        if Arc::strong_count(&self.node) == 1
+            && let Ok(mut guard) = self.node.engine_handle.lock()
+            && let Some(handle) = guard.take()
+        {
             handle.abort();
         }
     }
@@ -405,12 +488,12 @@ impl WaveSyncDb {
     ///
     /// This is a cheap read from shared memory — no network round-trip.
     pub fn network_status(&self) -> crate::network_status::NetworkStatus {
-        self.inner.network_status.read().unwrap().clone()
+        self.inner.node.network_status.read().unwrap().clone()
     }
 
     /// Subscribe to network events (peer connect/disconnect, relay changes, etc.).
     pub fn network_event_rx(&self) -> broadcast::Receiver<crate::network_status::NetworkEvent> {
-        self.inner.network_event_tx.subscribe()
+        self.inner.node.network_event_tx.subscribe()
     }
 
     /// Snapshot the engine's diagnostics counters.
@@ -419,12 +502,7 @@ impl WaveSyncDb {
     /// zero on engine restart — see [`crate::diagnostics`] for what each
     /// counter measures and why this exists.
     pub fn diagnostics(&self) -> crate::diagnostics::Snapshot {
-        self.inner.diagnostics.snapshot()
-    }
-
-    /// Get a reference to the sync changeset sender.
-    pub fn sync_tx(&self) -> &mpsc::Sender<SyncChangeset> {
-        &self.inner.sync_tx
+        self.inner.node.diagnostics.snapshot()
     }
 
     /// Get a reference to the table registry.
@@ -470,12 +548,14 @@ impl WaveSyncDb {
     pub async fn shutdown(&self) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .send(crate::engine::EngineCommand::Shutdown)
             .await;
 
         let handle = {
             self.inner
+                .node
                 .engine_handle
                 .lock()
                 .ok()
@@ -491,6 +571,7 @@ impl WaveSyncDb {
     /// Check if the engine background task is still running.
     pub fn is_engine_alive(&self) -> bool {
         self.inner
+            .node
             .engine_handle
             .lock()
             .unwrap()
@@ -502,6 +583,7 @@ impl WaveSyncDb {
     pub fn resume(&self) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::Resume);
     }
@@ -514,6 +596,7 @@ impl WaveSyncDb {
     pub fn network_transition(&self) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::NetworkTransition);
     }
@@ -522,6 +605,7 @@ impl WaveSyncDb {
     pub fn request_full_sync(&self) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::RequestFullSync);
     }
@@ -539,6 +623,7 @@ impl WaveSyncDb {
     pub fn set_mdns_enabled(&self, enabled: bool) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::SetMdnsEnabled(enabled));
     }
@@ -552,6 +637,7 @@ impl WaveSyncDb {
     pub fn register_push_token(&self, platform: &str, token: &str) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::RegisterPushToken {
                 platform: platform.to_string(),
@@ -577,6 +663,7 @@ impl WaveSyncDb {
     pub fn set_peer_identity(&self, app_id: &str) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::SetPeerIdentity(Some(
                 app_id.to_string(),
@@ -587,6 +674,7 @@ impl WaveSyncDb {
     pub fn clear_peer_identity(&self) {
         let _ = self
             .inner
+            .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::SetPeerIdentity(None));
     }
@@ -598,7 +686,7 @@ impl WaveSyncDb {
     pub fn peers_by_identity(
         &self,
     ) -> std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> {
-        let status = self.inner.network_status.read().unwrap();
+        let status = self.inner.node.network_status.read().unwrap();
         let mut map: std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> =
             std::collections::HashMap::new();
         for peer in &status.connected_peers {
@@ -958,8 +1046,17 @@ impl WaveSyncDb {
 
         // sync_tx is a bounded mpsc; if the engine is slow we wait. That's
         // intentional — backpressure into the user write loop is preferable
-        // to dropping changesets.
-        let _ = self.inner.sync_tx.send(changeset).await;
+        // to dropping changesets. The changeset is tagged with this handle's
+        // effective topic so the engine routes it to the correct group — the
+        // single point where a local write enters the engine.
+        let _ = self
+            .inner
+            .sync_tx
+            .send(TaggedChangeset {
+                effective_topic: self.inner.effective_topic.clone(),
+                changeset,
+            })
+            .await;
 
         Ok(())
     }
@@ -1782,7 +1879,7 @@ impl WaveSyncDbBuilder {
 
         let db_version = crate::shadow::get_db_version(&inner).await?;
 
-        let (sync_tx, sync_rx) = mpsc::channel::<SyncChangeset>(256);
+        let (sync_tx, sync_rx) = mpsc::channel::<TaggedChangeset>(256);
         let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
         // Smaller than change_tx: notifications are post-policy + post-coalesce,
         // so far fewer than raw change events.
@@ -1922,6 +2019,16 @@ impl WaveSyncDbBuilder {
 
         let db_version_cache = Arc::new(AtomicU64::new(db_version));
 
+        // Effective (PSK-derived) topic for the default group. Computed before
+        // `self.topic` / `self.group_key` are consumed by `start_engine`, and
+        // used both as the default group's routing tag (the changeset stamp in
+        // `dispatch_sync`) and to register the default group in the node map.
+        let default_user_topic = self.topic.clone();
+        let effective_topic = match &self.group_key {
+            Some(gk) => gk.derive_topic(&self.topic),
+            None => self.topic.clone(),
+        };
+
         // Start the P2P engine in a background task
         let engine_handle = crate::engine::start_engine(
             inner.clone(),
@@ -1942,11 +2049,27 @@ impl WaveSyncDbBuilder {
             notification_registry,
         );
 
+        // The node owns the engine and everything shared across groups. Its
+        // `Arc` is held by every group handle, so the engine is aborted only
+        // when the last handle (and any held `WaveSyncNode`) drops — preserving
+        // the original single-group teardown behaviour.
+        let node = Arc::new(WaveSyncNodeInner {
+            cmd_tx,
+            tagged_sync_tx: sync_tx,
+            engine_handle: std::sync::Mutex::new(Some(engine_handle)),
+            network_status,
+            network_event_tx,
+            diagnostics,
+            groups: std::sync::Mutex::new(HashMap::new()),
+            base_database_url: self.database_url.clone(),
+        });
+
         let db = WaveSyncDb {
             inner: Arc::new(WaveSyncDbInner {
                 inner,
                 database_url: self.database_url,
-                sync_tx,
+                sync_tx: node.tagged_sync_tx.clone(),
+                effective_topic,
                 change_tx,
                 notification_tx,
                 site_id,
@@ -1955,16 +2078,184 @@ impl WaveSyncDbBuilder {
                 node_id,
                 registry,
                 registry_ready,
-                cmd_tx,
-                engine_handle: std::sync::Mutex::new(Some(engine_handle)),
-                network_status,
-                network_event_tx,
-                diagnostics,
+                node: node.clone(),
                 table_cache: std::sync::RwLock::new(HashMap::new()),
             }),
         };
 
+        // Register the default group under its user topic so a later
+        // `join_group` for the same topic is idempotent.
+        node.groups
+            .lock()
+            .unwrap()
+            .insert(default_user_topic, Arc::downgrade(&db.inner));
+
         Ok(db)
+    }
+}
+
+impl WaveSyncNode {
+    /// Join an additional sync group at runtime, served by this node's existing
+    /// libp2p engine and peer identity.
+    ///
+    /// Idempotent: if `user_topic` is already joined, the existing handle is
+    /// returned. Each group is backed by its own SQLite file derived from the
+    /// node's base URL (the default group keeps the original URL). The returned
+    /// [`WaveSyncDb`] must have its schema registered
+    /// (`.schema().register(..).sync()` / `register_table`) before it syncs,
+    /// exactly like the handle returned by [`WaveSyncDbBuilder::build`].
+    pub async fn join_group(
+        &self,
+        user_topic: &str,
+        passphrase: &str,
+    ) -> Result<WaveSyncDb, DbErr> {
+        // Idempotency: return the existing handle if still alive. A dead `Weak`
+        // (handle already dropped) falls through to a fresh join.
+        if let Some(inner) = self
+            .inner
+            .groups
+            .lock()
+            .unwrap()
+            .get(user_topic)
+            .and_then(|w| w.upgrade())
+        {
+            return Ok(WaveSyncDb { inner });
+        }
+
+        let group_key = GroupKey::from_passphrase(passphrase);
+        let effective_topic = group_key.derive_topic(user_topic);
+
+        // Per-group DB file derived from the node's base URL. The effective
+        // topic is already `wavesync-<hex>`, so it is filesystem-safe.
+        let group_url = derive_group_database_url(&self.inner.base_database_url, &effective_topic);
+
+        let mut opts = ConnectOptions::new(&group_url);
+        opts.sqlx_logging_level(log::LevelFilter::Debug);
+        let db = Database::connect(opts).await?;
+
+        // Same per-DB setup that `build()` performs for the default group.
+        crate::shadow::create_meta_table(&db).await?;
+        let site_id = crate::shadow::get_site_id(&db).await?;
+        let db_version = crate::shadow::get_db_version(&db).await?;
+        let db_version_cache = Arc::new(AtomicU64::new(db_version));
+        crate::peer_tracker::create_peer_versions_table(&db).await?;
+        crate::peer_addrs::create_peer_addrs_table(&db).await?;
+
+        let registry = Arc::new(TableRegistry::new());
+        let registry_ready = Arc::new(Notify::new());
+        let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
+        let (notification_tx, _) = broadcast::channel::<crate::notify::Notification>(256);
+        let notification_registry = Arc::new(crate::registry::NotificationRegistry::new());
+        for info in inventory::iter::<crate::notify::NotifyEntityInfo> {
+            let (table_name, dispatch) = (info.make)();
+            notification_registry.register(table_name, dispatch);
+        }
+
+        let node_id = site_id;
+
+        // Hydrate this group's last-known peer versions from its own DB.
+        let peer_db_versions = match crate::peer_tracker::get_all_peer_versions(&db).await {
+            Ok(rows) => crate::peer_tracker::parse_peer_versions(rows),
+            Err(e) => {
+                log::warn!("Failed to hydrate peer versions for joined group: {e}");
+                HashMap::new()
+            }
+        };
+
+        let db_handle = WaveSyncDb {
+            inner: Arc::new(WaveSyncDbInner {
+                inner: db.clone(),
+                database_url: group_url,
+                sync_tx: self.inner.tagged_sync_tx.clone(),
+                effective_topic: effective_topic.clone(),
+                change_tx: change_tx.clone(),
+                notification_tx: notification_tx.clone(),
+                site_id,
+                db_version: Mutex::new(db_version),
+                db_version_cache: db_version_cache.clone(),
+                node_id,
+                registry: registry.clone(),
+                registry_ready: registry_ready.clone(),
+                node: self.inner.clone(),
+                table_cache: std::sync::RwLock::new(HashMap::new()),
+            }),
+        };
+
+        self.inner
+            .groups
+            .lock()
+            .unwrap()
+            .insert(user_topic.to_string(), Arc::downgrade(&db_handle.inner));
+
+        // Hand the group to the engine. The engine inserts the GroupState and
+        // wires discovery (rendezvous namespace + connected-peer sweep).
+        let init = GroupInit {
+            db,
+            user_topic: user_topic.to_string(),
+            effective_topic,
+            group_key: Some(group_key),
+            site_id,
+            local_db_version: db_version,
+            db_version_cache,
+            registry,
+            registry_ready,
+            change_tx,
+            notification_tx,
+            notification_registry,
+            peer_db_versions,
+        };
+        let _ = self
+            .inner
+            .cmd_tx
+            .send(EngineCommand::JoinGroup(Box::new(init)))
+            .await;
+
+        Ok(db_handle)
+    }
+
+    /// Leave a sync group: the engine stops syncing it and the rendezvous
+    /// namespace TTL-expires. The DB file is preserved. Leaving the node's
+    /// default group is a no-op.
+    pub async fn leave_group(&self, db: &WaveSyncDb) {
+        let effective_topic = db.inner.effective_topic.clone();
+        let _ = self
+            .inner
+            .cmd_tx
+            .send(EngineCommand::LeaveGroup {
+                effective_topic: effective_topic.clone(),
+            })
+            .await;
+        self.inner.groups.lock().unwrap().retain(|_, weak| {
+            weak.upgrade()
+                .map(|inner| inner.effective_topic != effective_topic)
+                .unwrap_or(false)
+        });
+    }
+}
+
+/// Derive a per-group SQLite URL from the node's base URL.
+///
+/// `sqlite:/path/app.db` → `sqlite:/path/app__<effective_topic>.db?mode=rwc`.
+/// Query strings on the base URL are preserved on the derived URL. Non-sqlite
+/// or unrecognized URLs fall back to suffixing the whole URL, which is enough
+/// for the file-backed sqlite URLs WaveSyncDB targets.
+fn derive_group_database_url(base: &str, effective_topic: &str) -> String {
+    // Split off any existing query string.
+    let (path_part, query_part) = match base.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (base, None),
+    };
+
+    let suffixed = if let Some(stripped) = path_part.strip_suffix(".db") {
+        format!("{stripped}__{effective_topic}.db")
+    } else {
+        format!("{path_part}__{effective_topic}.db")
+    };
+
+    match query_part {
+        Some(q) => format!("{suffixed}?{q}"),
+        // Ensure the file is created if it doesn't exist yet.
+        None => format!("{suffixed}?mode=rwc"),
     }
 }
 
