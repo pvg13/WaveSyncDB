@@ -8,7 +8,9 @@ impl EngineRunner {
         // (apply_remote_changeset) have incremented it since we last checked.
         // Refresh each group's local_db_version from its cache.
         for g in self.groups.values_mut() {
-            g.local_db_version = g.db_version_cache.load(std::sync::atomic::Ordering::Acquire);
+            g.local_db_version = g
+                .db_version_cache
+                .load(std::sync::atomic::Ordering::Acquire);
         }
 
         let peer_ids: Vec<libp2p::PeerId> = self
@@ -28,7 +30,11 @@ impl EngineRunner {
     /// Send a version-vector sync request to `peer_id` for the group identified
     /// by `effective_topic`. No-op if the group is gone, the peer is infra, or
     /// it's already pending/rejected for that group.
-    pub(super) fn initiate_sync_for_peer(&mut self, peer_id: libp2p::PeerId, effective_topic: &str) {
+    pub(super) fn initiate_sync_for_peer(
+        &mut self,
+        peer_id: libp2p::PeerId,
+        effective_topic: &str,
+    ) {
         if self.infrastructure_peers.contains(&peer_id) {
             return;
         }
@@ -219,20 +225,24 @@ impl EngineRunner {
         const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
         const MAX_FAIL_COUNT: u32 = 10;
 
+        // The peer-address cache is node-level today; tracked in the default
+        // group's DB (making it truly node-level is a multi-group follow-up).
+        // Clone the handle so the group borrow ends before we touch the swarm.
+        let db = self.default_group().db.clone();
+
         // Opportunistic GC. Cheap and only runs once per engine lifetime,
         // so we don't bother throttling it.
-        if let Err(e) = crate::peer_addrs::gc(&self.db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
+        if let Err(e) = crate::peer_addrs::gc(&db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
             log::debug!("peer_addrs::gc failed: {e}");
         }
 
-        let cached =
-            match crate::peer_addrs::load_recent(&self.db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
-                Ok(v) => v,
-                Err(e) => {
-                    log::debug!("peer_addrs::load_recent failed: {e}");
-                    return;
-                }
-            };
+        let cached = match crate::peer_addrs::load_recent(&db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("peer_addrs::load_recent failed: {e}");
+                return;
+            }
+        };
 
         if cached.is_empty() {
             log::debug!("peer_addrs cache empty — no cold-start pre-dials");

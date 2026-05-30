@@ -777,13 +777,13 @@ impl EngineRunner {
         let status = ns::NetworkStatus {
             local_peer_id: ns::PeerId(self.local_peer_id.to_string()),
             connected_peers,
-            topic: self.topic_name.clone(),
+            topic: self.default_group().topic_name.clone(),
             relay_status,
             nat_status,
-            rendezvous_registered: self.rendezvous_registered,
+            rendezvous_registered: self.default_group().rendezvous_registered,
             push_registered: self.push_registered,
-            local_db_version: self.local_db_version,
-            registry_ready: self.registry_is_ready,
+            local_db_version: self.default_group().local_db_version,
+            registry_ready: self.default_group().registry_is_ready,
         };
 
         *self.network_status.write().unwrap() = status;
@@ -916,18 +916,21 @@ impl EngineRunner {
             self.handle_bootstrap_peer_connected(peer_id, endpoint);
         }
 
-        if self.registry_is_ready
-            && !self.rejected_peers.contains(&peer_id)
+        if self.default_group().registry_is_ready
+            && !self.default_group().rejected_peers.contains(&peer_id)
             && !self.infrastructure_peers.contains(&peer_id)
         {
             // Ensure reconnecting peer is tracked for future periodic syncs
             self.peers
                 .entry(peer_id)
                 .or_insert_with(|| endpoint.get_remote_address().clone());
-            self.local_db_version = self
-                .db_version_cache
-                .load(std::sync::atomic::Ordering::Acquire);
-            self.initiate_sync_for_peer(peer_id);
+            let effective_topic = self.default_effective_topic.clone();
+            if let Some(g) = self.groups.get_mut(&effective_topic) {
+                g.local_db_version = g
+                    .db_version_cache
+                    .load(std::sync::atomic::Ordering::Acquire);
+            }
+            self.initiate_sync_for_peer(peer_id, &effective_topic);
         }
 
         self.dialing_peers.remove(&peer_id);
@@ -1052,8 +1055,10 @@ impl EngineRunner {
 
     /// Handle peer disconnection: clean up tracking, reconnect relay/rendezvous.
     fn handle_connection_closed(&mut self, peer_id: libp2p::PeerId, num_established: u32) {
-        self.pending_sync_peers.remove(&peer_id);
-        self.verified_peers.remove(&peer_id);
+        for g in self.groups.values_mut() {
+            g.pending_sync_peers.remove(&peer_id);
+            g.verified_peers.remove(&peer_id);
+        }
         self.peer_identities.remove(&peer_id);
 
         if num_established > 0 {
@@ -1078,10 +1083,10 @@ impl EngineRunner {
             && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
             && peer_id == rv_peer_id
             && !matches!(&self.relay_state, RelayState::Connecting { .. })
-            && self.rendezvous_registered
+            && self.default_group().rendezvous_registered
         {
             log::warn!("Lost connection to rendezvous server {peer_id}");
-            self.rendezvous_registered = false;
+            self.default_group_mut().rendezvous_registered = false;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
@@ -1090,7 +1095,10 @@ impl EngineRunner {
 
         // Trigger rendezvous discover for disconnected sync peers
         if !self.infrastructure_peers.contains(&peer_id)
-            && self.peer_db_versions.contains_key(&peer_id)
+            && self
+                .groups
+                .values()
+                .any(|g| g.peer_db_versions.contains_key(&peer_id))
         {
             log::info!(
                 "Peer {peer_id} disconnected with sync history, triggering rendezvous discover"
@@ -1118,7 +1126,7 @@ impl EngineRunner {
             && peer_id == rv_peer_id
         {
             log::warn!("Rendezvous server also disconnected (same as relay)");
-            self.rendezvous_registered = false;
+            self.default_group_mut().rendezvous_registered = false;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
             );
@@ -1261,6 +1269,11 @@ impl EngineRunner {
         );
         let has_relay = self.config.relay_server.is_some();
 
+        // The registry-ready notifier is awaited inside the select! arm, which
+        // cannot hold a borrow of `self` across the await. Clone the default
+        // group's `Arc<Notify>` out here so the arm only touches the local.
+        let registry_ready = self.default_group().registry_ready.clone();
+
         loop {
             tokio::select! {
                 Some(changeset) = sync_rx.recv() => {
@@ -1271,7 +1284,7 @@ impl EngineRunner {
                 },
                 _ = sync_interval.tick() => {
                     // Periodic version vector sync with all known peers
-                    if self.registry_is_ready {
+                    if self.default_group().registry_is_ready {
                         self.sync_all_known_peers().await;
                     }
                 },
@@ -1292,37 +1305,54 @@ impl EngineRunner {
                     }
                 },
                 Some(rc) = self.remote_changeset_rx.recv() => {
+                    // Route the changeset to the group it was received for.
+                    // Borrow-split: pull the group's handles into locals before
+                    // the await so the group borrow ends (the swarm is not held
+                    // here, but we must not keep a `groups` borrow across it).
+                    let Some(g) = self.groups.get(&rc.effective_topic) else {
+                        log::debug!("remote changeset for unknown group {}; dropping", rc.effective_topic);
+                        continue;
+                    };
+                    let db = g.db.clone();
+                    let change_tx = g.change_tx.clone();
+                    let registry = g.registry.clone();
+                    let cache = g.db_version_cache.clone();
+                    let notif_registry = g.notification_registry.clone();
+                    let notif_tx = g.notification_tx.clone();
+
                     let change_source =
                         crate::messages::ChangeSource::Remote { peer_site: rc.peer_site };
                     let notify_ctx = sync_handler::NotifyCtx {
-                        registry: &self.notification_registry,
-                        tx: &self.notification_tx,
+                        registry: &notif_registry,
+                        tx: &notif_tx,
                     };
-                    apply_remote_changeset(&self.db, &self.change_tx, &self.registry, &rc.changes, Some(&self.db_version_cache), change_source, Some(notify_ctx)).await;
+                    apply_remote_changeset(&db, &change_tx, &registry, &rc.changes, Some(&cache), change_source, Some(notify_ctx)).await;
                     // Record our knowledge of the sender's db_version only now,
                     // after the changes are durably committed — never at receive
                     // time. This guarantees the persisted peer version is always
                     // <= what we have actually applied, so a restart can hydrate
                     // it without risking a silently-skipped change range.
                     if let Some(version) = rc.peer_db_version {
-                        self.peer_db_versions.insert(rc.peer, version);
+                        if let Some(g) = self.groups.get_mut(&rc.effective_topic) {
+                            g.peer_db_versions.insert(rc.peer, version);
+                        }
                         let peer_str = rc.peer.to_string();
                         if let Err(e) =
-                            peer_tracker::upsert_peer_version(&self.db, &peer_str, &rc.peer_site, version).await
+                            peer_tracker::upsert_peer_version(&db, &peer_str, &rc.peer_site, version).await
                         {
                             log::warn!("Failed to persist peer version for {peer_str}: {e}");
                         }
                     }
                 },
-                _ = self.registry_ready.notified(), if !self.registry_is_ready => {
-                    self.registry_is_ready = true;
+                _ = registry_ready.notified(), if !self.default_group().registry_is_ready => {
+                    self.default_group_mut().registry_is_ready = true;
                     self.update_network_status();
                     log::info!("Registry ready, syncing all known peers");
                     self.sync_all_known_peers().await;
                 },
-                _ = &mut registry_deadline, if !self.registry_is_ready => {
+                _ = &mut registry_deadline, if !self.default_group().registry_is_ready => {
                     log::error!("Schema registry not ready after 30s — proceeding without sync tables");
-                    self.registry_is_ready = true;
+                    self.default_group_mut().registry_is_ready = true;
                     self.update_network_status();
                 },
                 _ = async {
@@ -1333,8 +1363,10 @@ impl EngineRunner {
                 }, if self.resume_sync_deadline.is_some() => {
                     log::info!("Post-resume sync retry");
                     self.resume_sync_deadline = None;
-                    self.pending_sync_peers.clear();
-                    if self.registry_is_ready {
+                    for g in self.groups.values_mut() {
+                        g.pending_sync_peers.clear();
+                    }
+                    if self.default_group().registry_is_ready {
                         self.sync_all_known_peers().await;
                     }
                 },
@@ -1382,15 +1414,25 @@ impl EngineRunner {
     }
 
     async fn handle_local_changeset(&mut self, changeset: SyncChangeset) {
+        // For this phase, local writes fan out on the default group. Clone the
+        // topic/group_key into locals up front so the group borrow ends before
+        // we touch the swarm below (borrow-split).
+        let effective_topic = self.default_effective_topic.clone();
+        let topic_name = self.default_group().topic_name.clone();
+        let group_key = self.default_group().group_key.clone();
+
         // Update local db_version
-        self.local_db_version = self.local_db_version.max(changeset.db_version);
+        {
+            let g = self.default_group_mut();
+            g.local_db_version = g.local_db_version.max(changeset.db_version);
+        }
         self.update_network_status();
 
         // Fan-out: push changeset to all connected peers via request-response
         let peer_ids: Vec<libp2p::PeerId> = self
             .peers
             .keys()
-            .filter(|p| !self.rejected_peers.contains(p))
+            .filter(|p| !self.default_group().rejected_peers.contains(p))
             .filter(|p| !self.infrastructure_peers.contains(p))
             .cloned()
             .collect();
@@ -1403,11 +1445,11 @@ impl EngineRunner {
             for peer_id in &peer_ids {
                 let mut req = SyncRequest::Push {
                     changeset: changeset.clone(),
-                    topic: self.topic_name.clone(),
+                    topic: topic_name.clone(),
                     hmac: None,
                 };
 
-                if let Some(ref gk) = self.group_key {
+                if let Some(ref gk) = group_key {
                     // Serialize with hmac: None, compute MAC, then set hmac
                     if let Ok(bytes) = serde_json::to_vec(&req) {
                         let tag = gk.mac(&bytes);
@@ -1435,7 +1477,7 @@ impl EngineRunner {
         // Must run even when peer_ids is empty — that's the case where both
         // peers are behind NAT with no direct connection, and push is the
         // only way to wake the other side.
-        self.notify_relay_topic();
+        self.notify_relay_topic(&effective_topic);
     }
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
@@ -1677,8 +1719,10 @@ impl EngineRunner {
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
                     if !self.swarm.is_connected(&pid) && self.peers.remove(&pid).is_some() {
-                        self.pending_sync_peers.remove(&pid);
-                        self.verified_peers.remove(&pid);
+                        for g in self.groups.values_mut() {
+                            g.pending_sync_peers.remove(&pid);
+                            g.verified_peers.remove(&pid);
+                        }
                         self.peer_identities.remove(&pid);
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::PeerDisconnected(
@@ -1784,7 +1828,7 @@ impl EngineRunner {
                             );
                             return;
                         }
-                        if *topic != self.topic_name {
+                        if *topic != self.default_group().topic_name {
                             log::debug!(
                                 "Ignoring PeerJoined for foreign topic (ours vs theirs hash mismatch)"
                             );
