@@ -213,7 +213,15 @@ impl EngineRunner {
                 log::info!(
                     "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
                 );
-                self.rendezvous_registered = true;
+                // Mark the matching group's namespace as registered.
+                let ns = namespace.to_string();
+                if let Some(g) = self
+                    .groups
+                    .values_mut()
+                    .find(|g| g.rendezvous_namespace == ns)
+                {
+                    g.rendezvous_registered = true;
+                }
                 self.emit_network_event(
                     crate::network_status::NetworkEvent::RendezvousStatusChanged {
                         registered: true,
@@ -229,7 +237,14 @@ impl EngineRunner {
                 log::warn!(
                     "Rendezvous registration failed at {rendezvous_node} namespace '{namespace}': {error:?}"
                 );
-                self.rendezvous_registered = false;
+                let ns = namespace.to_string();
+                if let Some(g) = self
+                    .groups
+                    .values_mut()
+                    .find(|g| g.rendezvous_namespace == ns)
+                {
+                    g.rendezvous_registered = false;
+                }
                 self.emit_network_event(
                     crate::network_status::NetworkEvent::RendezvousStatusChanged {
                         registered: false,
@@ -246,23 +261,37 @@ impl EngineRunner {
                     "Discovered {} peers via rendezvous at {rendezvous_node}",
                     registrations.len()
                 );
-                self.rendezvous_cookie = Some(cookie);
+                // The Discovered event doesn't carry which namespace it answered;
+                // store the pagination cookie on the default group (single-group
+                // path). Per-namespace cookies are a multi-group refinement.
+                self.default_group_mut().rendezvous_cookie = Some(cookie);
 
                 // Collect one address per peer, skip ineligible
                 let mut to_dial: Vec<(libp2p::PeerId, libp2p::Multiaddr)> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for registration in registrations {
                     let peer_id = registration.record.peer_id();
+                    let rejected_by_all = !self.groups.is_empty()
+                        && self
+                            .groups
+                            .values()
+                            .all(|g| g.rejected_peers.contains(&peer_id));
                     if peer_id == self.local_peer_id
                         || self.dialing_peers.contains(&peer_id)
-                        || self.rejected_peers.contains(&peer_id)
+                        || rejected_by_all
                         || !seen.insert(peer_id)
                     {
                         continue;
                     }
                     if self.swarm.is_connected(&peer_id) {
-                        if self.registry_is_ready {
-                            self.initiate_sync_for_peer(peer_id);
+                        let ready: Vec<String> = self
+                            .groups
+                            .iter()
+                            .filter(|(_, g)| g.registry_is_ready)
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        for t in ready {
+                            self.initiate_sync_for_peer(peer_id, &t);
                         }
                         continue;
                     }
@@ -305,26 +334,29 @@ impl EngineRunner {
         }
     }
 
-    /// Register with the rendezvous server.
+    /// Register every group's namespace with the rendezvous server.
     pub(super) fn rendezvous_register(&mut self, server_peer_id: libp2p::PeerId) {
-        let namespace = match rendezvous::Namespace::new(self.rendezvous_namespace.clone()) {
-            Ok(ns) => ns,
-            Err(e) => {
-                log::error!("Invalid rendezvous namespace: {e:?}");
-                return;
-            }
-        };
-
-        match self.swarm.behaviour_mut().rendezvous.register(
-            namespace,
-            server_peer_id,
-            None, // Let server assign default TTL (server MIN_TTL=7200s)
-        ) {
-            Ok(()) => {
-                log::info!("Sent rendezvous registration to {server_peer_id}");
-            }
-            Err(e) => {
-                log::warn!("Failed to send rendezvous registration: {e}");
+        let namespaces: Vec<String> =
+            self.groups.values().map(|g| g.rendezvous_namespace.clone()).collect();
+        for ns_str in namespaces {
+            let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    log::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
+                    continue;
+                }
+            };
+            match self.swarm.behaviour_mut().rendezvous.register(
+                namespace,
+                server_peer_id,
+                None, // Let server assign default TTL (server MIN_TTL=7200s)
+            ) {
+                Ok(()) => {
+                    log::info!("Sent rendezvous registration for '{ns_str}' to {server_peer_id}");
+                }
+                Err(e) => {
+                    log::warn!("Failed to send rendezvous registration for '{ns_str}': {e}");
+                }
             }
         }
     }
@@ -347,26 +379,32 @@ impl EngineRunner {
             return;
         }
 
-        let namespace = match rendezvous::Namespace::new(self.rendezvous_namespace.clone()) {
-            Ok(ns) => ns,
-            Err(e) => {
-                log::error!("Invalid rendezvous namespace: {e:?}");
-                return;
-            }
-        };
-
         // Re-register if we have external addresses (avoids NoExternalAddresses error).
         // Handles TTL expiry and stale state after silent disconnects.
         if self.swarm.external_addresses().count() > 0 {
             self.rendezvous_register(server_peer_id);
         }
 
-        self.swarm.behaviour_mut().rendezvous.discover(
-            Some(namespace),
-            self.rendezvous_cookie.clone(),
-            None,
-            server_peer_id,
-        );
+        // Discover each group's namespace. Cookie is shared on the default group
+        // (per-namespace cookies are a multi-group refinement).
+        let cookie = self.default_group().rendezvous_cookie.clone();
+        let namespaces: Vec<String> =
+            self.groups.values().map(|g| g.rendezvous_namespace.clone()).collect();
+        for ns_str in namespaces {
+            let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    log::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
+                    continue;
+                }
+            };
+            self.swarm.behaviour_mut().rendezvous.discover(
+                Some(namespace),
+                cookie.clone(),
+                None,
+                server_peer_id,
+            );
+        }
     }
 
     /// Attempt to reconnect to the relay server if disconnected.
@@ -503,16 +541,20 @@ impl EngineRunner {
             }
         };
 
-        let req = push_protocol::PushRequest::RegisterToken {
-            topic: self.topic_name.clone(),
-            platform: push_platform,
-            token,
-        };
-
-        self.swarm
-            .behaviour_mut()
-            .push
-            .send_request(&relay_peer_id, req);
+        // Register the device token under every group's topic so the relay
+        // wakes this device for any group it belongs to.
+        let topics: Vec<String> = self.groups.values().map(|g| g.topic_name.clone()).collect();
+        for topic in topics {
+            let req = push_protocol::PushRequest::RegisterToken {
+                topic,
+                platform: push_platform.clone(),
+                token: token.clone(),
+            };
+            self.swarm
+                .behaviour_mut()
+                .push
+                .send_request(&relay_peer_id, req);
+        }
         self.push_registered = true;
         self.update_network_status();
         log::info!("Sent push token registration to relay {relay_peer_id}");
@@ -524,14 +566,17 @@ impl EngineRunner {
     /// how two foreground peers behind NAT discover each other without
     /// running a separate rendezvous server.
     pub(super) fn announce_presence_to_relay(&mut self, relay_peer_id: libp2p::PeerId) {
-        let req = push_protocol::PushRequest::AnnouncePresence {
-            topic: self.topic_name.clone(),
-        };
-        self.swarm
-            .behaviour_mut()
-            .push
-            .send_request(&relay_peer_id, req);
-        log::info!("Announced presence to relay {relay_peer_id} for topic");
+        // Announce presence under every group's topic so the relay can introduce
+        // us to peers in each of our groups.
+        let topics: Vec<String> = self.groups.values().map(|g| g.topic_name.clone()).collect();
+        for topic in topics {
+            let req = push_protocol::PushRequest::AnnouncePresence { topic };
+            self.swarm
+                .behaviour_mut()
+                .push
+                .send_request(&relay_peer_id, req);
+        }
+        log::info!("Announced presence to relay {relay_peer_id} for all group topics");
     }
 
     /// Dial a peer introduced by the relay (via PeerList response or
@@ -576,9 +621,14 @@ impl EngineRunner {
             return;
         };
 
+        let rejected_by_all = !self.groups.is_empty()
+            && self
+                .groups
+                .values()
+                .all(|g| g.rejected_peers.contains(&peer_id));
         if peer_id == self.local_peer_id
             || self.infrastructure_peers.contains(&peer_id)
-            || self.rejected_peers.contains(&peer_id)
+            || rejected_by_all
             || self.swarm.is_connected(&peer_id)
             || self.dialing_peers.contains(&peer_id)
         {
@@ -612,8 +662,9 @@ impl EngineRunner {
         }
     }
 
-    /// Send a NotifyTopic request to the relay after pushing changesets to peers.
-    pub(super) fn notify_relay_topic(&mut self) {
+    /// Send a NotifyTopic request to the relay after pushing changesets to peers
+    /// for the group identified by `effective_topic`.
+    pub(super) fn notify_relay_topic(&mut self, effective_topic: &str) {
         let relay_peer_id = match &self.relay_state {
             RelayState::Connected { relay_peer_id, .. }
             | RelayState::Listening { relay_peer_id } => *relay_peer_id,
@@ -627,9 +678,12 @@ impl EngineRunner {
             }
         };
 
+        let Some(g) = self.groups.get(effective_topic) else {
+            return;
+        };
         let req = push_protocol::PushRequest::NotifyTopic {
-            topic: self.topic_name.clone(),
-            sender_site_id: self
+            topic: g.topic_name.clone(),
+            sender_site_id: g
                 .site_id
                 .0
                 .iter()
@@ -638,9 +692,8 @@ impl EngineRunner {
         };
 
         log::info!(
-            "Sending NotifyTopic to relay {relay_peer_id} for topic {} \
-             (this should produce a 'NotifyTopic received' log on the relay)",
-            self.topic_name
+            "Sending NotifyTopic to relay {relay_peer_id} for topic {effective_topic} \
+             (this should produce a 'NotifyTopic received' log on the relay)"
         );
         self.swarm
             .behaviour_mut()
