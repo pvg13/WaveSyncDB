@@ -60,6 +60,8 @@ pub(crate) struct RemoteChangeset {
     /// changes are applied. `None` for real-time `Push` frames, whose version
     /// is only tracked in-memory via `max()` and is not persisted from here.
     pub peer_db_version: Option<u64>,
+    /// Effective (PSK-derived) topic identifying which group's DB to apply to.
+    pub effective_topic: String,
     pub changes: Vec<ColumnChange>,
 }
 

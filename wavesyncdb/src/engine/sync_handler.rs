@@ -50,7 +50,11 @@ impl EngineRunner {
                     }
                 }
                 request_response::Message::Response { response, .. } => {
-                    self.pending_sync_peers.remove(&peer);
+                    // Response received — this peer no longer has an in-flight
+                    // request in any group.
+                    for g in self.groups.values_mut() {
+                        g.pending_sync_peers.remove(&peer);
+                    }
                     log::info!("Received sync response from peer {peer}");
 
                     match response {
@@ -62,8 +66,27 @@ impl EngineRunner {
                             topic: peer_topic,
                             hmac: resp_hmac,
                         } => {
-                            // Verify HMAC if group key is configured
-                            if let Some(ref gk) = self.group_key {
+                            // Route to the group this response belongs to. The
+                            // (PSK-derived) topic on the wire selects the group;
+                            // an empty topic maps to the default (single-group /
+                            // back-compat). HMAC is then verified with THAT
+                            // group's key — the topic selects the key, it does
+                            // not bypass verification (Rule 2.7).
+                            let effective = if peer_topic.is_empty() {
+                                self.default_effective_topic.clone()
+                            } else {
+                                peer_topic.clone()
+                            };
+                            let Some(g) = self.groups.get(&effective) else {
+                                // Response for a topic none of our groups use —
+                                // reject the peer in all current groups so we
+                                // stop re-dialing (joining its group later, which
+                                // won't have it rejected, makes it eligible again).
+                                self.reject_peer_all_groups(peer);
+                                return;
+                            };
+
+                            if let Some(ref gk) = g.group_key {
                                 let tag = match resp_hmac {
                                     Some(t) => t,
                                     None => {
@@ -92,24 +115,20 @@ impl EngineRunner {
                                 }
                             }
 
-                            // Ignore responses from peers on a different topic
-                            if !peer_topic.is_empty() && peer_topic != self.topic_name {
-                                log::debug!(
-                                    "Ignoring sync response from peer {peer}: topic mismatch (theirs={peer_topic}, ours={})",
-                                    self.topic_name
-                                );
-                                // Permanently reject this peer so mDNS won't re-add it
-                                self.reject_peer(peer);
-                                return;
-                            }
+                            // Arcs for the spawned persistence task.
+                            let db = g.db.clone();
+                            let cache = g.db_version_cache.clone();
+                            let group_local_db_version = g.local_db_version;
 
-                            // Track the display-only "reported" version now. The
+                            // Track the display-only "reported" version. The
                             // authoritative peer_db_versions entry is recorded
                             // after the changes commit (or immediately, in the
                             // no-changes branch below) so it never runs ahead of
                             // data we have actually applied.
-                            let reported = self.peer_reported_versions.entry(peer).or_insert(0);
-                            *reported = (*reported).max(my_db_version);
+                            if let Some(g) = self.groups.get_mut(&effective) {
+                                let reported = g.peer_reported_versions.entry(peer).or_insert(0);
+                                *reported = (*reported).max(my_db_version);
+                            }
                             self.emit_network_event(
                                 crate::network_status::NetworkEvent::PeerSynced {
                                     peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -118,13 +137,13 @@ impl EngineRunner {
                             );
                             self.update_network_status();
 
-                            // Update local db_version with Lamport semantics
-                            let lamport_bump = if my_db_version > self.local_db_version {
-                                self.local_db_version = my_db_version;
-                                true
-                            } else {
-                                false
-                            };
+                            // Update the group's local db_version (Lamport).
+                            let lamport_bump = my_db_version > group_local_db_version;
+                            if lamport_bump
+                                && let Some(g) = self.groups.get_mut(&effective)
+                            {
+                                g.local_db_version = my_db_version;
+                            }
 
                             if changes.is_empty() {
                                 log::info!(
@@ -132,9 +151,9 @@ impl EngineRunner {
                                 );
                                 // Nothing to apply, so it is safe to record the
                                 // peer's version (and any Lamport bump) right away.
-                                self.peer_db_versions.insert(peer, my_db_version);
-                                let db = self.db.clone();
-                                let cache = self.db_version_cache.clone();
+                                if let Some(g) = self.groups.get_mut(&effective) {
+                                    g.peer_db_versions.insert(peer, my_db_version);
+                                }
                                 let peer_str = peer.to_string();
                                 tokio::spawn(async move {
                                     if lamport_bump
@@ -161,17 +180,8 @@ impl EngineRunner {
                                 );
 
                                 // Emit PeerSynced so subscribers (notably
-                                // background_sync, which polls network_event_rx
-                                // to decide whether the FCM-triggered sync
-                                // actually accomplished anything) see a
-                                // success signal here. Previously this event
-                                // was only emitted on the request-handling
-                                // path, so a peer that *initiated* sync and
-                                // received changes never observed PeerSynced
-                                // for its own counterparty — and
-                                // background_sync would (mis)report
-                                // BackgroundSyncResult::NoPeers despite a
-                                // successful 40-change pull.
+                                // background_sync) see a success signal on the
+                                // initiating side too.
                                 self.emit_network_event(
                                     crate::network_status::NetworkEvent::PeerSynced {
                                         peer_id: crate::network_status::PeerId(peer.to_string()),
@@ -185,8 +195,8 @@ impl EngineRunner {
                                 // db_version is recorded only after these changes
                                 // commit; see the remote_changeset_rx handler.
                                 if lamport_bump {
-                                    let db = self.db.clone();
-                                    let cache = self.db_version_cache.clone();
+                                    let db = db.clone();
+                                    let cache = cache.clone();
                                     tokio::spawn(async move {
                                         if shadow::set_db_version(&db, my_db_version).await.is_ok()
                                         {
@@ -202,6 +212,7 @@ impl EngineRunner {
                                     peer,
                                     peer_site: peer_site_id,
                                     peer_db_version: Some(my_db_version),
+                                    effective_topic: effective.clone(),
                                     changes,
                                 }) {
                                     log::warn!(
@@ -220,7 +231,9 @@ impl EngineRunner {
                 }
             },
             request_response::Event::OutboundFailure { peer, error, .. } => {
-                self.pending_sync_peers.remove(&peer);
+                for g in self.groups.values_mut() {
+                    g.pending_sync_peers.remove(&peer);
+                }
                 log::warn!("Sync request to {peer} failed: {error}");
                 // Connection might be dead — re-dial if we know the peer's address
                 if let Some(addr) = self.peers.get(&peer).cloned()
