@@ -40,7 +40,16 @@ fn ensure_android_logger() {
 }
 
 /// Shared sync logic used by both C FFI and JNI entry points.
-fn run_background_sync(database_url: &str, timeout_secs: u32, peer_addrs: &[String]) -> i32 {
+///
+/// `target_topic`, when `Some`, is the effective (PSK-derived) topic from the
+/// push payload — only that group is brought up for this wake. `None` rejoins
+/// every configured group (the conservative wake).
+fn run_background_sync(
+    database_url: &str,
+    timeout_secs: u32,
+    peer_addrs: &[String],
+    target_topic: Option<&str>,
+) -> i32 {
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -52,7 +61,14 @@ fn run_background_sync(database_url: &str, timeout_secs: u32, peer_addrs: &[Stri
     let timeout = Duration::from_secs(timeout_secs.into());
 
     rt.block_on(async {
-        match background_sync::background_sync_with_peers(database_url, timeout, peer_addrs).await {
+        match background_sync::background_sync_with_peers_for_topic(
+            database_url,
+            timeout,
+            peer_addrs,
+            target_topic,
+        )
+        .await
+        {
             Ok(BackgroundSyncResult::Synced { .. }) => 0,
             Ok(BackgroundSyncResult::NoPeers) => 1,
             Ok(BackgroundSyncResult::TimedOut { .. }) => 2,
@@ -92,7 +108,7 @@ pub extern "C" fn wavesync_background_sync(database_url: *const c_char, timeout_
         Err(_) => return -5,
     };
 
-    run_background_sync(url, timeout_secs, &[])
+    run_background_sync(url, timeout_secs, &[], None)
 }
 
 /// C FFI entry point for background sync with peer addresses.
@@ -133,7 +149,7 @@ pub extern "C" fn wavesync_background_sync_with_peers(
         }
     };
 
-    run_background_sync(url, timeout_secs, &peer_addrs)
+    run_background_sync(url, timeout_secs, &peer_addrs, None)
 }
 
 /// JNI entry point for background sync. Called from Dioxus-generated
@@ -181,5 +197,62 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
         "background_sync starting: db={url}, {} bootstrap peer(s) from FCM payload",
         peer_addrs.len()
     );
-    run_background_sync(&url, timeout_secs as u32, &peer_addrs)
+    run_background_sync(&url, timeout_secs as u32, &peer_addrs, None)
+}
+
+/// JNI entry point for **targeted** background sync. Called from Dioxus-generated
+/// `WaveSyncService.backgroundSyncTargeted()` in `dev.dioxus.main`. Like
+/// `backgroundSync`, but `topic` is the effective (PSK-derived) topic from the
+/// FCM payload — only that group is synced for this wake. A null/empty `topic`
+/// falls back to syncing all groups.
+///
+/// Same return codes as `wavesync_background_sync`.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSyncTargeted(
+    mut env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    database_url: jni::objects::JString,
+    timeout_secs: jni::sys::jint,
+    peer_addrs_json: jni::objects::JString,
+    topic: jni::objects::JString,
+) -> jni::sys::jint {
+    ensure_android_logger();
+
+    let url: String = match env.get_string(&database_url) {
+        Ok(s) => s.into(),
+        Err(_) => return -5,
+    };
+
+    let peer_addrs: Vec<String> = if peer_addrs_json.is_null() {
+        Vec::new()
+    } else {
+        match env.get_string(&peer_addrs_json) {
+            Ok(s) => {
+                let json: String = s.into();
+                serde_json::from_str(&json).unwrap_or_default()
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let target: Option<String> = if topic.is_null() {
+        None
+    } else {
+        match env.get_string(&topic) {
+            Ok(s) => {
+                let t: String = s.into();
+                if t.is_empty() { None } else { Some(t) }
+            }
+            Err(_) => None,
+        }
+    };
+
+    log::info!(
+        "JNI backgroundSyncTargeted invoked (timeout={}s, peer_addrs present={}, topic present={})",
+        timeout_secs,
+        !peer_addrs_json.is_null(),
+        target.is_some()
+    );
+    run_background_sync(&url, timeout_secs as u32, &peer_addrs, target.as_deref())
 }
