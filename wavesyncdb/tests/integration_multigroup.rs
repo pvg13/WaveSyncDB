@@ -46,6 +46,16 @@ async fn insert_task(db: &WaveSyncDb, id: &str, title: &str) {
     .expect("insert task");
 }
 
+/// A db URL inside a unique temp *directory*, so the per-directory
+/// `.wavesync_config.json` is isolated from other tests (mem_db puts every DB in
+/// the shared temp dir, where they would share one config file).
+fn isolated_db_url(name: &str) -> String {
+    let dir =
+        std::env::temp_dir().join(format!("wavesync_mg_{}_{}", name, Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    format!("sqlite:{}/app.db?mode=rwc", dir.display())
+}
+
 async fn has_task(db: &WaveSyncDb, id: &str) -> bool {
     task::Entity::find_by_id(id.to_string())
         .one(db)
@@ -223,7 +233,7 @@ async fn test_multigroup_leave_and_rejoin() {
 async fn test_multigroup_config_persistence() {
     let _ = env_logger::try_init();
     let suffix = Uuid::new_v4().simple().to_string();
-    let url = mem_db("mg_cfg");
+    let url = isolated_db_url("mg_cfg");
     let topic_alpha = format!("alpha-{suffix}");
     let topic_beta = format!("beta-{suffix}");
 
@@ -277,7 +287,7 @@ async fn test_multigroup_config_persistence() {
 async fn test_multigroup_config_survives_rebuild() {
     let _ = env_logger::try_init();
     let suffix = Uuid::new_v4().simple().to_string();
-    let url = mem_db("mg_rebuild");
+    let url = isolated_db_url("mg_rebuild");
     let topic_alpha = format!("alpha-{suffix}");
     let topic_beta = format!("beta-{suffix}");
 
