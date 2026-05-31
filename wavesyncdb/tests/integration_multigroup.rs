@@ -97,7 +97,7 @@ async fn test_multigroup_isolation() {
 
     let node = node_alpha.node();
     let node_beta = node
-        .join_group(&topic_beta, "pass-beta")
+        .join_group(&topic_beta, "pass-beta", None)
         .await
         .expect("join beta");
     node_beta
@@ -174,7 +174,10 @@ async fn test_multigroup_leave_and_rejoin() {
         .await
         .unwrap();
     let node = node_alpha.node();
-    let node_beta = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+    let node_beta = node
+        .join_group(&topic_beta, "pass-beta", None)
+        .await
+        .unwrap();
     node_beta
         .schema()
         .register(task::Entity)
@@ -207,7 +210,10 @@ async fn test_multigroup_leave_and_rejoin() {
     .await;
 
     // Re-join beta: resumes from the preserved DB (still has b1) and catches b2.
-    let node_beta2 = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+    let node_beta2 = node
+        .join_group(&topic_beta, "pass-beta", None)
+        .await
+        .unwrap();
     node_beta2
         .schema()
         .register(task::Entity)
@@ -251,7 +257,7 @@ async fn test_multigroup_config_persistence() {
     // Joining a group records it in the config.
     let node = db.node();
     let beta = node
-        .join_group(&topic_beta, "pass-beta")
+        .join_group(&topic_beta, "pass-beta", None)
         .await
         .expect("join beta");
     let cfg = SyncConfig::load(&url).expect("config");
@@ -265,7 +271,10 @@ async fn test_multigroup_config_persistence() {
     );
 
     // Re-joining the same topic is idempotent in the config (no duplicate).
-    let _beta_again = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+    let _beta_again = node
+        .join_group(&topic_beta, "pass-beta", None)
+        .await
+        .unwrap();
     assert_eq!(SyncConfig::load(&url).unwrap().groups.len(), 1);
 
     // Leaving removes it.
@@ -299,7 +308,10 @@ async fn test_multigroup_config_survives_rebuild() {
             .await
             .unwrap();
         let node = db.node();
-        let beta = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+        let beta = node
+            .join_group(&topic_beta, "pass-beta", None)
+            .await
+            .unwrap();
         assert_eq!(SyncConfig::load(&url).unwrap().groups.len(), 1);
         // Clean teardown before reopening the same DB file.
         db.shutdown().await;

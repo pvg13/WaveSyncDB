@@ -760,8 +760,14 @@ impl WaveSyncDb {
             }
         };
 
+        // Only auto-register entities whose declared scope includes THIS group.
+        // Private → default group only; All → every group; Groups("kind") → a
+        // group joined with a matching kind label. Explicit `.register(E)` is an
+        // unconditional override and bypasses this gate.
+        let is_default = self.inner.is_default_group;
+        let group_kind = self.inner.group_kind.as_deref();
         for info in inventory::iter::<SyncEntityInfo> {
-            if info.module_path.starts_with(prefix) {
+            if info.module_path.starts_with(prefix) && info.scope.matches(is_default, group_kind) {
                 let (create_sql, meta) = (info.schema_fn)(backend);
                 builder.entries.push(EntityEntry {
                     create_sql,
@@ -2169,6 +2175,7 @@ impl WaveSyncNode {
         &self,
         user_topic: &str,
         passphrase: &str,
+        kind: Option<&str>,
     ) -> Result<WaveSyncDb, DbErr> {
         // Idempotency: return the existing handle if still alive. A dead `Weak`
         // (handle already dropped) falls through to a fresh join.
@@ -2229,6 +2236,8 @@ impl WaveSyncNode {
                 database_url: group_url.clone(),
                 sync_tx: self.inner.tagged_sync_tx.clone(),
                 effective_topic: effective_topic.clone(),
+                is_default_group: false,
+                group_kind: kind.map(|k| k.to_string()),
                 change_tx: change_tx.clone(),
                 notification_tx: notification_tx.clone(),
                 site_id,
@@ -2280,6 +2289,7 @@ impl WaveSyncNode {
                 user_topic: user_topic.to_string(),
                 passphrase: passphrase.to_string(),
                 database_url: group_url,
+                kind: kind.map(|k| k.to_string()),
             },
         ) {
             log::debug!("Could not persist joined group '{user_topic}' to config: {e}");

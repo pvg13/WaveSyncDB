@@ -235,7 +235,7 @@ pub async fn background_sync_with_peers_for_topic(
         let group = &extra_groups[idx];
         match db
             .node()
-            .join_group(&group.user_topic, &group.passphrase)
+            .join_group(&group.user_topic, &group.passphrase, group.kind.as_deref())
             .await
         {
             Ok(group_db) => {
