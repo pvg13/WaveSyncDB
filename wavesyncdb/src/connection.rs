@@ -448,6 +448,20 @@ impl std::fmt::Debug for WaveSyncDb {
 }
 
 impl WaveSyncDb {
+    /// The effective (PSK-derived) topic of this group handle. Uniquely
+    /// identifies the group on the wire; distinct passphrases/topics yield
+    /// distinct effective topics.
+    pub fn effective_topic(&self) -> &str {
+        &self.inner.effective_topic
+    }
+
+    /// The [`WaveSyncNode`] that owns this group's engine. Use it to
+    /// `join_group` / `leave_group` additional groups at runtime.
+    pub fn node(&self) -> WaveSyncNode {
+        WaveSyncNode {
+            inner: self.inner.node.clone(),
+        }
+    }
     /// Get a reference to the underlying SeaORM connection.
     pub fn inner(&self) -> &DatabaseConnection {
         &self.inner.inner
@@ -2212,7 +2226,7 @@ impl WaveSyncNode {
         let db_handle = WaveSyncDb {
             inner: Arc::new(WaveSyncDbInner {
                 inner: db.clone(),
-                database_url: group_url,
+                database_url: group_url.clone(),
                 sync_tx: self.inner.tagged_sync_tx.clone(),
                 effective_topic: effective_topic.clone(),
                 change_tx: change_tx.clone(),

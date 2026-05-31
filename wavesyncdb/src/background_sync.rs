@@ -196,12 +196,18 @@ pub async fn background_sync_with_peers(
     // A single group's failure must not abort the others or the default sync.
     // The handles are held in `_group_handles` for the rest of the function so
     // the groups stay joined while we wait for sync below.
+    let crate_name: Option<String> = config.crate_name.clone();
+    let extra_groups: Vec<crate::connection::GroupConfig> = config.groups.clone();
     let mut _group_handles: Vec<crate::WaveSyncDb> = Vec::new();
-    for group in &config.groups {
-        match db.node().join_group(&group.user_topic, &group.passphrase).await {
+    for group in &extra_groups {
+        match db
+            .node()
+            .join_group(&group.user_topic, &group.passphrase)
+            .await
+        {
             Ok(group_db) => {
-                if let Some(ref crate_name) = config.crate_name {
-                    if let Err(e) = group_db.get_schema_registry(crate_name).sync().await {
+                if let Some(ref cn) = crate_name {
+                    if let Err(e) = group_db.get_schema_registry(cn).sync().await {
                         log::warn!(
                             "bg_sync: schema sync failed for group '{}': {e}",
                             group.user_topic
@@ -213,7 +219,10 @@ pub async fn background_sync_with_peers(
                 _group_handles.push(group_db);
             }
             Err(e) => {
-                log::warn!("bg_sync: failed to rejoin group '{}': {e}", group.user_topic);
+                log::warn!(
+                    "bg_sync: failed to rejoin group '{}': {e}",
+                    group.user_topic
+                );
             }
         }
     }
