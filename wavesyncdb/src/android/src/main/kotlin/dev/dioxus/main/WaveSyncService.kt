@@ -155,6 +155,9 @@ class WaveSyncService : FirebaseMessagingService() {
             Log.i(TAG, "FCM includes peer addresses: ${peerAddrsJson.take(100)}...")
         }
 
+        // Effective (PSK-derived) topic of the group that changed; sync only it.
+        val topic = message.data["topic"]
+
         val dbUrl = findDatabaseUrl()
         if (dbUrl == null) {
             Log.e(TAG, "No WaveSyncDB database found — has the app been launched?")
@@ -169,7 +172,7 @@ class WaveSyncService : FirebaseMessagingService() {
         }
 
         try {
-            val result = backgroundSync(dbUrl, 25, peerAddrsJson)
+            val result = backgroundSyncTargeted(dbUrl, 25, peerAddrsJson, topic)
             when (result) {
                 0 -> Log.i(TAG, "Background sync completed successfully")
                 1 -> Log.w(TAG, "Background sync: no peers found")

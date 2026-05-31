@@ -216,12 +216,13 @@ pub(crate) fn read_apns_token_file(database_url: &str) -> Option<String> {
 #[inline(never)]
 fn anchor_ios_ffi_exports() {
     // Cast through a volatile write so even aggressive LTO cannot elide.
-    let slots: [*const (); 2] = [
+    let slots: [*const (); 3] = [
         crate::ffi::wavesync_background_sync as *const (),
         crate::ffi::wavesync_background_sync_with_peers as *const (),
+        crate::ffi::wavesync_background_sync_targeted as *const (),
     ];
     unsafe {
-        std::ptr::read_volatile(&slots as *const [*const (); 2]);
+        std::ptr::read_volatile(&slots as *const [*const (); 3]);
     }
 }
 
