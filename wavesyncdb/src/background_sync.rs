@@ -426,6 +426,7 @@ mod tests {
             user_topic: user_topic.to_string(),
             passphrase: passphrase.to_string(),
             database_url: format!("sqlite:/tmp/{user_topic}.db"),
+            kind: None,
         }
     }
 
