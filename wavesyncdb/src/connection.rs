@@ -377,6 +377,12 @@ struct WaveSyncDbInner {
     /// Effective (PSK-derived) topic of this group — the routing tag the engine
     /// uses to find this group's [`GroupState`].
     effective_topic: String,
+    /// Whether this is the node's default group (created by `build()`). Drives
+    /// `EntityScope::Private` registration — private entities live here only.
+    is_default_group: bool,
+    /// Stable kind label for this group (from `join_group(.., kind)`); `None`
+    /// for the default group. Matched against `EntityScope::Groups`.
+    group_kind: Option<String>,
     change_tx: broadcast::Sender<ChangeNotification>,
     /// User-facing notifications produced by `#[derive(SyncNotify)]` policies on
     /// incoming remote changes. Drained by `use_sync_notifications`. The
@@ -1498,6 +1504,10 @@ pub struct GroupConfig {
     pub user_topic: String,
     pub passphrase: String,
     pub database_url: String,
+    /// Stable kind label (from `join_group(.., kind)`), used to resolve
+    /// `EntityScope::Groups` when a background wake rejoins this group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// **Security note**: The passphrase is stored in plaintext. On Android/iOS the app's
