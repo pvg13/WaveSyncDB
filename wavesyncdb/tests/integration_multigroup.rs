@@ -333,3 +333,127 @@ async fn test_multigroup_config_survives_rebuild() {
     assert_eq!(cfg.groups[0].user_topic, topic_beta);
     db2.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Per-struct sync scope (#[wavesync(scope = ...)]). Scope is a registration-time
+// policy: an entity's table is only created+registered in a group whose
+// (is_default, kind) satisfies the entity's scope. We assert table presence per
+// group DB via sqlite_master — deterministic, no P2P. Seeds 248-259.
+// ---------------------------------------------------------------------------
+mod scope_entities {
+    pub mod priv_e {
+        use sea_orm::entity::prelude::*;
+        use wavesyncdb_derive::SyncEntity;
+        // No #[wavesync] attribute → defaults to EntityScope::Private.
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+        #[sea_orm(table_name = "scope_priv")]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: String,
+            pub val: String,
+        }
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    pub mod all_e {
+        use sea_orm::entity::prelude::*;
+        use wavesyncdb_derive::SyncEntity;
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+        #[sea_orm(table_name = "scope_all")]
+        #[wavesync(scope = all)]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: String,
+            pub val: String,
+        }
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    pub mod house_e {
+        use sea_orm::entity::prelude::*;
+        use wavesyncdb_derive::SyncEntity;
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+        #[sea_orm(table_name = "scope_house")]
+        #[wavesync(scope = groups("household"))]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: String,
+            pub val: String,
+        }
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+}
+
+async fn table_exists(db: &WaveSyncDb, table: &str) -> bool {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=$1",
+        [table.into()],
+    );
+    db.query_one(stmt).await.ok().flatten().is_some()
+}
+
+#[tokio::test]
+async fn test_scope_controls_table_registration() {
+    let _ = env_logger::try_init();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let url = isolated_db_url("scope");
+    let topic_house = format!("household-{suffix}");
+
+    // Default group (is_default=true, kind=None).
+    let default_db = WaveSyncDbBuilder::new(&url, &format!("personal-{suffix}"))
+        .with_node_id(make_node_id(248))
+        .with_passphrase("pass-personal")
+        .build()
+        .await
+        .expect("build default");
+
+    // Household group joined with kind="household".
+    let house_db = default_db
+        .node()
+        .join_group(&topic_house, "pass-house", Some("household"))
+        .await
+        .expect("join household");
+
+    // Auto-register the scoped entities into each group by scope.
+    let prefix = "integration_multigroup::scope_entities";
+    default_db.get_schema_registry(prefix).sync().await.unwrap();
+    house_db.get_schema_registry(prefix).sync().await.unwrap();
+
+    // Default group: Private + All present; Groups("household") absent.
+    assert!(
+        table_exists(&default_db, "scope_priv").await,
+        "private in default"
+    );
+    assert!(
+        table_exists(&default_db, "scope_all").await,
+        "all in default"
+    );
+    assert!(
+        !table_exists(&default_db, "scope_house").await,
+        "household-scoped must NOT be in the default group"
+    );
+
+    // Household group: All + Groups("household") present; Private absent.
+    assert!(
+        !table_exists(&house_db, "scope_priv").await,
+        "private must NOT be in a non-default group"
+    );
+    assert!(
+        table_exists(&house_db, "scope_all").await,
+        "all in household"
+    );
+    assert!(
+        table_exists(&house_db, "scope_house").await,
+        "household-scoped in household"
+    );
+
+    default_db.shutdown().await;
+}
