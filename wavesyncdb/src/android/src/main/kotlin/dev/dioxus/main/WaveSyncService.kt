@@ -118,6 +118,10 @@ class WaveSyncService : FirebaseMessagingService() {
 
         @JvmStatic
         private external fun backgroundSync(databaseUrl: String, timeoutSecs: Int, peerAddrsJson: String?): Int
+
+        /// Targeted variant: `topic` is the effective (PSK-derived) topic from the
+        /// FCM payload, so only that group is synced. Null/empty syncs all groups.
+        private external fun backgroundSyncTargeted(databaseUrl: String, timeoutSecs: Int, peerAddrsJson: String?, topic: String?): Int
     }
 
     override fun onCreate() {
