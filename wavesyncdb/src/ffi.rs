@@ -152,6 +152,56 @@ pub extern "C" fn wavesync_background_sync_with_peers(
     run_background_sync(url, timeout_secs, &peer_addrs, None)
 }
 
+/// C FFI entry point for **targeted** background sync. Called from iOS Swift via
+/// `@_silgen_name`. Like `wavesync_background_sync_with_peers`, but `topic` is the
+/// effective (PSK-derived) topic from the APNs payload — only that group is synced
+/// for this wake. A null/empty `topic` falls back to syncing all groups.
+///
+/// Same return codes as `wavesync_background_sync`.
+///
+/// # Safety
+///
+/// `database_url` must be a valid, null-terminated UTF-8 string pointer.
+/// `peer_addrs_json` and `topic`, if non-null, must be valid null-terminated
+/// UTF-8 string pointers.
+#[unsafe(no_mangle)]
+pub extern "C" fn wavesync_background_sync_targeted(
+    database_url: *const c_char,
+    timeout_secs: u32,
+    peer_addrs_json: *const c_char,
+    topic: *const c_char,
+) -> i32 {
+    if database_url.is_null() {
+        return -5;
+    }
+
+    let url = match unsafe { CStr::from_ptr(database_url) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -5,
+    };
+
+    let peer_addrs: Vec<String> = if peer_addrs_json.is_null() {
+        Vec::new()
+    } else {
+        match unsafe { CStr::from_ptr(peer_addrs_json) }.to_str() {
+            Ok(json) => serde_json::from_str(json).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    let target: Option<String> = if topic.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(topic) }
+            .to_str()
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+
+    run_background_sync(url, timeout_secs, &peer_addrs, target.as_deref())
+}
+
 /// JNI entry point for background sync. Called from Dioxus-generated
 /// `WaveSyncService.backgroundSync()` in `dev.dioxus.main`.
 ///

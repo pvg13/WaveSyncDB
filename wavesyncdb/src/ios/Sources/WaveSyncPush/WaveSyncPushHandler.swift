@@ -19,6 +19,26 @@ private func wavesync_background_sync_with_peers(
     _ peerAddrsJson: UnsafePointer<CChar>?
 ) -> Int32
 
+@_silgen_name("wavesync_background_sync_targeted")
+private func wavesync_background_sync_targeted(
+    _ databaseUrl: UnsafePointer<CChar>,
+    _ timeoutSecs: UInt32,
+    _ peerAddrsJson: UnsafePointer<CChar>?,
+    _ topic: UnsafePointer<CChar>?
+) -> Int32
+
+/// Run `body` with a C string for `s`, or `nil` when `s` is nil — lets us pass
+/// an optional Swift `String?` to a `*const c_char` FFI parameter.
+private func withOptionalCString<R>(
+    _ s: String?,
+    _ body: (UnsafePointer<CChar>?) -> R
+) -> R {
+    if let s = s {
+        return s.withCString { body($0) }
+    }
+    return body(nil)
+}
+
 /// Implements the APNs side of WaveSyncDB's iOS cold-sync integration.
 ///
 /// Called by `WaveSyncPushBridge` in response to the three APNs delegate
@@ -79,7 +99,7 @@ public enum WaveSyncPushHandler {
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
-        guard userInfo["topic"] is String else {
+        guard let topic = userInfo["topic"] as? String else {
             completionHandler(.noData)
             return
         }
@@ -94,13 +114,14 @@ public enum WaveSyncPushHandler {
         }
 
         DispatchQueue.global(qos: .utility).async {
+            // Sync only the group named by the push (`topic`); the Rust side
+            // falls back to all groups if it is nil.
             let rc: Int32 = dbUrl.withCString { urlPtr in
-                if let peers = peerAddrsJson {
-                    return peers.withCString { peersPtr in
-                        wavesync_background_sync_with_peers(urlPtr, 25, peersPtr)
+                withOptionalCString(peerAddrsJson) { peersPtr in
+                    withOptionalCString(topic) { topicPtr in
+                        wavesync_background_sync_targeted(urlPtr, 25, peersPtr, topicPtr)
                     }
                 }
-                return wavesync_background_sync_with_peers(urlPtr, 25, nil)
             }
 
             let result: UIBackgroundFetchResult
