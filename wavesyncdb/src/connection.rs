@@ -2147,6 +2147,8 @@ impl WaveSyncDbBuilder {
                 database_url: self.database_url,
                 sync_tx: node.tagged_sync_tx.clone(),
                 effective_topic,
+                is_default_group: true,
+                group_kind: None,
                 change_tx,
                 notification_tx,
                 site_id,
