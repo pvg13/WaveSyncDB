@@ -221,8 +221,18 @@ pub async fn background_sync_with_peers_for_topic(
     // the groups stay joined while we wait for sync below.
     let crate_name: Option<String> = config.crate_name.clone();
     let extra_groups: Vec<crate::connection::GroupConfig> = config.groups.clone();
+    let default_effective = derive_effective_topic(&config.topic, config.passphrase.as_deref());
+    let selected = groups_to_rejoin(target_effective_topic, &default_effective, &extra_groups);
+    if let Some(target) = target_effective_topic {
+        log::info!(
+            "bg_sync: targeted wake for topic {target} → rejoining {} of {} extra group(s)",
+            selected.len(),
+            extra_groups.len()
+        );
+    }
     let mut _group_handles: Vec<crate::WaveSyncDb> = Vec::new();
-    for group in &extra_groups {
+    for &idx in &selected {
+        let group = &extra_groups[idx];
         match db
             .node()
             .join_group(&group.user_topic, &group.passphrase)
@@ -249,7 +259,8 @@ pub async fn background_sync_with_peers_for_topic(
             }
         }
     }
-    if !config.groups.is_empty() {
+    let joined_any_extra = !_group_handles.is_empty();
+    if joined_any_extra {
         log_stage("groups_rejoined");
     }
 
