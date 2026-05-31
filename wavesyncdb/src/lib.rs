@@ -104,6 +104,8 @@ pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInf
 #[cfg(not(target_arch = "wasm32"))]
 pub use notify::{Notification, NotifyEntityInfo, SyncEvent, SyncNotify};
 #[cfg(not(target_arch = "wasm32"))]
+pub use registry::EntityScope;
+#[cfg(not(target_arch = "wasm32"))]
 pub use registry::SyncEntityInfo;
 pub use registry::{TableMeta, TableRegistry};
 pub use synced_model::SyncedModel;

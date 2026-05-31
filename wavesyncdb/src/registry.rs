@@ -42,6 +42,51 @@ pub struct SyncEntityInfo {
     pub module_path: &'static str,
     /// Function that generates the CREATE TABLE SQL and [`TableMeta`] for a given backend.
     pub schema_fn: fn(DatabaseBackend) -> (String, TableMeta),
+    /// Which sync groups this entity replicates in. Declared on the type via
+    /// `#[wavesync(scope = ...)]`; defaults to [`EntityScope::Private`].
+    pub scope: EntityScope,
+}
+
+/// The set of sync groups a `#[derive(SyncEntity)]` model replicates in.
+///
+/// Declared on the type via `#[wavesync(scope = ...)]`. Scope governs *which
+/// groups' databases the entity's table is created in and registered for sync* —
+/// it is a registration-time policy, not a per-message filter. Because each
+/// group is a separate SQLite database with its own [`TableRegistry`], a
+/// `Private` entity simply never gets a table in another group's DB, so it
+/// cannot sync there.
+///
+/// All variants are `const`-constructible so the derive macro can emit them in
+/// the static [`SyncEntityInfo`] inventory record.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityScope {
+    /// Default. Only the node's *default* group (the user's own-devices replica,
+    /// created by [`WaveSyncDbBuilder::build`](crate::WaveSyncDbBuilder::build)).
+    /// Personal data stays private unless explicitly opted into sharing.
+    Private,
+    /// Every joined group, including the default one.
+    All,
+    /// Only groups joined with a *kind* label in this list (see
+    /// [`WaveSyncNode::join_group`](crate::WaveSyncNode::join_group)'s `kind`).
+    /// The kind is a stable label decoupled from the (often dynamic) topic id.
+    Groups(&'static [&'static str]),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EntityScope {
+    /// Whether an entity with this scope should be created+registered for a group.
+    ///
+    /// * `is_default` — is this the node's default group?
+    /// * `kind` — the group's kind label (`None` for the default group or any
+    ///   group joined without one).
+    pub fn matches(&self, is_default: bool, kind: Option<&str>) -> bool {
+        match self {
+            EntityScope::Private => is_default,
+            EntityScope::All => true,
+            EntityScope::Groups(kinds) => kind.is_some_and(|k| kinds.contains(&k)),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -213,6 +258,32 @@ impl NotificationGate {
 mod tests {
     use super::*;
     use crate::messages::DeletePolicy;
+
+    #[test]
+    fn entity_scope_private_matches_only_default() {
+        assert!(EntityScope::Private.matches(true, None));
+        assert!(EntityScope::Private.matches(true, Some("household")));
+        assert!(!EntityScope::Private.matches(false, None));
+        assert!(!EntityScope::Private.matches(false, Some("household")));
+    }
+
+    #[test]
+    fn entity_scope_all_matches_everything() {
+        assert!(EntityScope::All.matches(true, None));
+        assert!(EntityScope::All.matches(false, None));
+        assert!(EntityScope::All.matches(false, Some("household")));
+    }
+
+    #[test]
+    fn entity_scope_groups_matches_by_kind() {
+        let s = EntityScope::Groups(&["household", "team"]);
+        assert!(s.matches(false, Some("household")));
+        assert!(s.matches(false, Some("team")));
+        // wrong kind, no kind, and default-without-kind all fail
+        assert!(!s.matches(false, Some("other")));
+        assert!(!s.matches(false, None));
+        assert!(!s.matches(true, None));
+    }
 
     fn make_meta(name: &str, pk: &str, cols: &[&str]) -> TableMeta {
         TableMeta {

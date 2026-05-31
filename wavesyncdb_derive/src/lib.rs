@@ -51,7 +51,7 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input, spanned::Spanned};
 ///     pub done: bool,
 /// }
 /// ```
-#[proc_macro_derive(SyncEntity, attributes(sea_orm))]
+#[proc_macro_derive(SyncEntity, attributes(sea_orm, wavesync))]
 pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -65,10 +65,16 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    let scope = match parse_wavesync_scope(&input) {
+        Ok(s) => s,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
     let inventory_block = quote! {
         wavesyncdb::register_sync_entity! {
             wavesyncdb::SyncEntityInfo {
                 module_path: module_path!(),
+                scope: #scope,
                 schema_fn: |backend| {
                     use sea_orm::{EntityTrait, Iterable, IdenStatic, PrimaryKeyToColumn, Schema};
                     use sea_orm::sea_query::SqliteQueryBuilder;
