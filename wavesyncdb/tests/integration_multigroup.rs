@@ -397,7 +397,12 @@ async fn table_exists(db: &WaveSyncDb, table: &str) -> bool {
         "SELECT name FROM sqlite_master WHERE type='table' AND name=$1",
         [table.into()],
     );
-    db.inner().query_one_raw(stmt).await.ok().flatten().is_some()
+    db.inner()
+        .query_one_raw(stmt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 #[tokio::test]
