@@ -93,6 +93,29 @@ pub async fn background_sync_with_peers(
     timeout: Duration,
     peer_addrs: &[String],
 ) -> Result<BackgroundSyncResult, BackgroundSyncError> {
+    background_sync_with_peers_for_topic(database_url, timeout, peer_addrs, None).await
+}
+
+/// Performs a one-shot background sync, optionally **targeting a single group**.
+///
+/// `target_effective_topic` is the effective (PSK-derived) topic carried in the
+/// FCM/APNs `data` payload by the relay's `NotifyTopic` push — it names the one
+/// group whose data changed. When `Some`:
+///
+/// * if it is the **default** group's effective topic → only the default group
+///   is synced (no extra groups are rejoined);
+/// * if it matches a **configured extra** group → the engine is built on the
+///   default group (the node identity) and only that one extra group is rejoined;
+/// * if it matches **nothing** we know → fall back to rejoining all groups.
+///
+/// When `None`, every configured group is rejoined (the conservative wake used by
+/// callers that can't tell which group changed).
+pub async fn background_sync_with_peers_for_topic(
+    database_url: &str,
+    timeout: Duration,
+    peer_addrs: &[String],
+    target_effective_topic: Option<&str>,
+) -> Result<BackgroundSyncResult, BackgroundSyncError> {
     // Per-stage timing. When a sync round is slow (sometimes hits the 25s
     // timeout while typical runs are 2–3s), the question is always "where
     // did the time go". These markers let logcat show the answer:
@@ -249,10 +272,10 @@ pub async fn background_sync_with_peers(
     // tear down. With extra groups joined, give their (fast, incremental)
     // version-vector round-trips room to land too — they share the connections
     // but emit their own PeerSynced events.
-    let completion_grace = if config.groups.is_empty() {
-        Duration::from_millis(500)
-    } else {
+    let completion_grace = if joined_any_extra {
         Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(500)
     };
     const FALLBACK_AFTER: Duration = Duration::from_secs(5);
 
@@ -336,4 +359,105 @@ pub async fn background_sync_with_peers(
         t_start.elapsed().as_millis()
     );
     Ok(result)
+}
+
+/// Derive the effective (PSK-derived) topic for a group, mirroring the engine:
+/// with a passphrase it is `BLAKE3(user_topic, group_key)`; without one the
+/// effective topic is the user topic verbatim. Keep in lockstep with
+/// `engine::run_engine`'s `effective_topic` computation.
+fn derive_effective_topic(user_topic: &str, passphrase: Option<&str>) -> String {
+    match passphrase {
+        Some(p) => crate::auth::GroupKey::from_passphrase(p).derive_topic(user_topic),
+        None => user_topic.to_string(),
+    }
+}
+
+/// Decide which configured extra groups to rejoin for a wake, returning indices
+/// into `groups`.
+///
+/// * `None` target → all groups (conservative wake).
+/// * target == the default group's effective topic → none (default covers it).
+/// * target matches one or more extra groups → just those.
+/// * target matches nothing known → all groups (safe fallback; the relay should
+///   only ever push a topic we registered for, so this is belt-and-suspenders).
+fn groups_to_rejoin(
+    target_effective_topic: Option<&str>,
+    default_effective: &str,
+    groups: &[crate::connection::GroupConfig],
+) -> Vec<usize> {
+    let Some(target) = target_effective_topic else {
+        return (0..groups.len()).collect();
+    };
+    if target == default_effective {
+        return Vec::new();
+    }
+    let matched: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| derive_effective_topic(&g.user_topic, Some(&g.passphrase)) == target)
+        .map(|(i, _)| i)
+        .collect();
+    if matched.is_empty() {
+        // Unknown target — don't silently sync nothing; bring up everything.
+        (0..groups.len()).collect()
+    } else {
+        matched
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::GroupConfig;
+
+    fn group(user_topic: &str, passphrase: &str) -> GroupConfig {
+        GroupConfig {
+            user_topic: user_topic.to_string(),
+            passphrase: passphrase.to_string(),
+            database_url: format!("sqlite:/tmp/{user_topic}.db"),
+        }
+    }
+
+    #[test]
+    fn no_target_rejoins_all_groups() {
+        let groups = vec![group("beta", "pb"), group("gamma", "pg")];
+        let sel = groups_to_rejoin(None, "wavesync-default", &groups);
+        assert_eq!(sel, vec![0, 1]);
+    }
+
+    #[test]
+    fn target_default_rejoins_nothing() {
+        let groups = vec![group("beta", "pb")];
+        let default_eff = derive_effective_topic("alpha", Some("pa"));
+        let sel = groups_to_rejoin(Some(&default_eff), &default_eff, &groups);
+        assert!(sel.is_empty(), "default-targeted wake skips extra groups");
+    }
+
+    #[test]
+    fn target_extra_rejoins_only_that_group() {
+        let groups = vec![group("beta", "pb"), group("gamma", "pg")];
+        let beta_eff = derive_effective_topic("beta", Some("pb"));
+        let sel = groups_to_rejoin(Some(&beta_eff), "wavesync-default", &groups);
+        assert_eq!(sel, vec![0], "only the targeted extra group is rejoined");
+    }
+
+    #[test]
+    fn unknown_target_falls_back_to_all() {
+        let groups = vec![group("beta", "pb"), group("gamma", "pg")];
+        let sel = groups_to_rejoin(Some("wavesync-stranger"), "wavesync-default", &groups);
+        assert_eq!(sel, vec![0, 1], "unknown target falls back to all groups");
+    }
+
+    #[test]
+    fn effective_topic_matches_engine_semantics() {
+        // No passphrase → effective == user topic (mirrors engine::run_engine).
+        assert_eq!(derive_effective_topic("plain", None), "plain");
+        // With passphrase → derived hash, stable and != the raw topic.
+        let eff = derive_effective_topic("plain", Some("secret"));
+        assert!(eff.starts_with("wavesync-"));
+        assert_ne!(eff, "plain");
+        // Same inputs → same output; different passphrase → different topic.
+        assert_eq!(eff, derive_effective_topic("plain", Some("secret")));
+        assert_ne!(eff, derive_effective_topic("plain", Some("other")));
+    }
 }
