@@ -2210,6 +2210,20 @@ impl WaveSyncNode {
             .send(EngineCommand::JoinGroup(Box::new(init)))
             .await;
 
+        // Persist the group so a background wake (which only has the default
+        // group's config on disk) can rejoin it. Best-effort: a missing config
+        // file (e.g. in-memory test DB) is not fatal to the live join.
+        if let Err(e) = SyncConfig::persist_group_joined(
+            &self.inner.base_database_url,
+            GroupConfig {
+                user_topic: user_topic.to_string(),
+                passphrase: passphrase.to_string(),
+                database_url: group_url,
+            },
+        ) {
+            log::debug!("Could not persist joined group '{user_topic}' to config: {e}");
+        }
+
         Ok(db_handle)
     }
 
@@ -2225,11 +2239,26 @@ impl WaveSyncNode {
                 effective_topic: effective_topic.clone(),
             })
             .await;
-        self.inner.groups.lock().unwrap().retain(|_, weak| {
-            weak.upgrade()
+        // Drop the group from the node map, capturing its user topic(s) so we
+        // can also remove it from the persisted config.
+        let mut left_user_topics: Vec<String> = Vec::new();
+        self.inner.groups.lock().unwrap().retain(|user_topic, weak| {
+            let keep = weak
+                .upgrade()
                 .map(|inner| inner.effective_topic != effective_topic)
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !keep {
+                left_user_topics.push(user_topic.clone());
+            }
+            keep
         });
+        for user_topic in left_user_topics {
+            if let Err(e) =
+                SyncConfig::persist_group_left(&self.inner.base_database_url, &user_topic)
+            {
+                log::debug!("Could not remove left group '{user_topic}' from config: {e}");
+            }
+        }
     }
 }
 

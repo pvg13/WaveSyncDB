@@ -190,6 +190,37 @@ pub async fn background_sync_with_peers(
     }
     log_stage("registry_ready");
 
+    // 4b. Rejoin every additional group recorded in the config so the wake
+    // syncs ALL of this device's groups, not just the default one. Each runs on
+    // the same engine/swarm; each needs its own schema registered to sync.
+    // A single group's failure must not abort the others or the default sync.
+    // The handles are held in `_group_handles` for the rest of the function so
+    // the groups stay joined while we wait for sync below.
+    let mut _group_handles: Vec<crate::WaveSyncDb> = Vec::new();
+    for group in &config.groups {
+        match db.node().join_group(&group.user_topic, &group.passphrase).await {
+            Ok(group_db) => {
+                if let Some(ref crate_name) = config.crate_name {
+                    if let Err(e) = group_db.get_schema_registry(crate_name).sync().await {
+                        log::warn!(
+                            "bg_sync: schema sync failed for group '{}': {e}",
+                            group.user_topic
+                        );
+                    }
+                } else {
+                    group_db.registry_ready();
+                }
+                _group_handles.push(group_db);
+            }
+            Err(e) => {
+                log::warn!("bg_sync: failed to rejoin group '{}': {e}", group.user_topic);
+            }
+        }
+    }
+    if !config.groups.is_empty() {
+        log_stage("groups_rejoined");
+    }
+
     // 5. Wait for peer discovery and let the engine sync on its own.
     //
     // We deliberately do NOT call request_full_sync() here. With peer versions
@@ -205,7 +236,15 @@ pub async fn background_sync_with_peers(
     //     completed by then (first-ever contact, or our persisted view of the
     //     peer was somehow ahead), ask for a full sync once. Preserves new-peer
     //     onboarding (db_version=0 semantics) without making it the default.
-    const COMPLETION_GRACE: Duration = Duration::from_millis(500);
+    // After the first peer syncs, linger for additional peers/groups before we
+    // tear down. With extra groups joined, give their (fast, incremental)
+    // version-vector round-trips room to land too — they share the connections
+    // but emit their own PeerSynced events.
+    let completion_grace = if config.groups.is_empty() {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(1500)
+    };
     const FALLBACK_AFTER: Duration = Duration::from_secs(5);
 
     let mut events = db.network_event_rx();
@@ -259,7 +298,7 @@ pub async fn background_sync_with_peers(
                         log_stage("first_peer_synced");
                         synced_peers.insert(peer_id);
                         // Give a brief window for additional peers to sync
-                        tokio::time::sleep(COMPLETION_GRACE).await;
+                        tokio::time::sleep(completion_grace).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

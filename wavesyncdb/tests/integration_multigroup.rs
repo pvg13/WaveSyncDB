@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use uuid::Uuid;
-use wavesyncdb::{WaveSyncDb, WaveSyncDbBuilder};
+use wavesyncdb::{SyncConfig, WaveSyncDb, WaveSyncDbBuilder};
 
 use common::task;
 use common::{assert_eventually, make_node_id, mem_db};
@@ -212,4 +212,102 @@ async fn test_multigroup_leave_and_rejoin() {
         has_task(&node_beta2, "b2").await
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Config persistence: join_group/leave_group must update the on-disk
+// `.wavesync_config.json` so a background wake can rebuild every group. This is
+// what makes multi-group background_sync possible (issue #62 follow-up).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_multigroup_config_persistence() {
+    let _ = env_logger::try_init();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let url = mem_db("mg_cfg");
+    let topic_alpha = format!("alpha-{suffix}");
+    let topic_beta = format!("beta-{suffix}");
+
+    let db = WaveSyncDbBuilder::new(&url, &topic_alpha)
+        .with_node_id(make_node_id(246))
+        .with_passphrase("pass-alpha")
+        .build()
+        .await
+        .expect("build default group");
+
+    // A fresh build writes a config with no extra groups.
+    let cfg = SyncConfig::load(&url).expect("build() writes config");
+    assert!(cfg.groups.is_empty(), "fresh build has no extra groups");
+
+    // Joining a group records it in the config.
+    let node = db.node();
+    let beta = node
+        .join_group(&topic_beta, "pass-beta")
+        .await
+        .expect("join beta");
+    let cfg = SyncConfig::load(&url).expect("config");
+    assert_eq!(cfg.groups.len(), 1, "join_group persists the group");
+    assert_eq!(cfg.groups[0].user_topic, topic_beta);
+    assert_eq!(cfg.groups[0].passphrase, "pass-beta");
+    assert!(
+        cfg.groups[0].database_url.contains("__wavesync-"),
+        "group gets its own derived DB file: {}",
+        cfg.groups[0].database_url
+    );
+
+    // Re-joining the same topic is idempotent in the config (no duplicate).
+    let _beta_again = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+    assert_eq!(SyncConfig::load(&url).unwrap().groups.len(), 1);
+
+    // Leaving removes it.
+    node.leave_group(&beta).await;
+    assert!(
+        SyncConfig::load(&url).unwrap().groups.is_empty(),
+        "leave_group removes the group from config"
+    );
+
+    db.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// build() runs on every app launch; it must PRESERVE groups joined in a
+// previous session rather than wipe them (the bug that would otherwise make
+// background_sync forget every runtime-joined group after a restart).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_multigroup_config_survives_rebuild() {
+    let _ = env_logger::try_init();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let url = mem_db("mg_rebuild");
+    let topic_alpha = format!("alpha-{suffix}");
+    let topic_beta = format!("beta-{suffix}");
+
+    {
+        let db = WaveSyncDbBuilder::new(&url, &topic_alpha)
+            .with_node_id(make_node_id(247))
+            .with_passphrase("pass-alpha")
+            .build()
+            .await
+            .unwrap();
+        let node = db.node();
+        let beta = node.join_group(&topic_beta, "pass-beta").await.unwrap();
+        assert_eq!(SyncConfig::load(&url).unwrap().groups.len(), 1);
+        // Clean teardown before reopening the same DB file.
+        db.shutdown().await;
+        drop(beta);
+        drop(node);
+        drop(db);
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // App restart: a fresh build() at the same URL must keep the joined group.
+    let db2 = WaveSyncDbBuilder::new(&url, &topic_alpha)
+        .with_node_id(make_node_id(247))
+        .with_passphrase("pass-alpha")
+        .build()
+        .await
+        .unwrap();
+    let cfg = SyncConfig::load(&url).unwrap();
+    assert_eq!(cfg.groups.len(), 1, "build() must preserve joined groups");
+    assert_eq!(cfg.groups[0].user_topic, topic_beta);
+    db2.shutdown().await;
 }
