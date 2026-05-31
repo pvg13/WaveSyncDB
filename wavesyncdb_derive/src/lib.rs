@@ -203,6 +203,81 @@ pub fn derive_sync_notify(input: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Parse the optional `#[wavesync(scope = ...)]` attribute into the tokens that
+/// construct a `wavesyncdb::EntityScope`. Absent attribute defaults to
+/// `Private`. Accepted forms:
+///   - `#[wavesync(scope = private)]`
+///   - `#[wavesync(scope = all)]`
+///   - `#[wavesync(scope = groups("household", "team"))]`
+fn parse_wavesync_scope(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let mut scope: Option<proc_macro2::TokenStream> = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("wavesync") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("scope") {
+                return Err(meta.error("unknown wavesync key (expected `scope`)"));
+            }
+            let value = meta.value()?;
+            let expr: syn::Expr = value.parse()?;
+            let tokens = match &expr {
+                // `private` / `all`
+                syn::Expr::Path(p) if p.path.is_ident("private") => {
+                    quote! { ::wavesyncdb::EntityScope::Private }
+                }
+                syn::Expr::Path(p) if p.path.is_ident("all") => {
+                    quote! { ::wavesyncdb::EntityScope::All }
+                }
+                // `groups("a", "b", ...)`
+                syn::Expr::Call(call) => {
+                    let is_groups = matches!(
+                        &*call.func,
+                        syn::Expr::Path(p) if p.path.is_ident("groups")
+                    );
+                    if !is_groups {
+                        return Err(syn::Error::new_spanned(
+                            &call.func,
+                            "expected `groups(\"kind\", ...)`",
+                        ));
+                    }
+                    if call.args.is_empty() {
+                        return Err(syn::Error::new_spanned(
+                            &expr,
+                            "`groups(...)` needs at least one kind label",
+                        ));
+                    }
+                    let mut kinds: Vec<syn::LitStr> = Vec::new();
+                    for arg in &call.args {
+                        match arg {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }) => kinds.push(s.clone()),
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    other,
+                                    "group kinds must be string literals",
+                                ));
+                            }
+                        }
+                    }
+                    quote! { ::wavesyncdb::EntityScope::Groups(&[ #( #kinds ),* ]) }
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "scope must be `private`, `all`, or `groups(\"kind\", ...)`",
+                    ));
+                }
+            };
+            scope = Some(tokens);
+            Ok(())
+        })?;
+    }
+    Ok(scope.unwrap_or_else(|| quote! { ::wavesyncdb::EntityScope::Private }))
+}
+
 /// Parse the table name from the struct-level `#[sea_orm(table_name = "...")]`
 /// attribute. Required on both native and wasm32 targets — on wasm there's
 /// no `DeriveEntityModel` to consume it, but `SyncEntity` claims it via
