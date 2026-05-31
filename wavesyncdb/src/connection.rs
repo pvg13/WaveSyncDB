@@ -1467,6 +1467,19 @@ async fn lookup_first_addr(host: &str) -> std::io::Result<std::net::IpAddr> {
 /// Read by [`background_sync()`](crate::background_sync::background_sync) to reconstruct
 /// the builder without the app developer passing any configuration.
 ///
+/// A single additional sync group joined at runtime via
+/// [`WaveSyncNode::join_group`], persisted so a background wake can rejoin it.
+///
+/// The node's *default* group is described by the top-level [`SyncConfig`]
+/// fields; these entries are the extra groups. `database_url` is the group's
+/// own sibling SQLite file (derived from the node's base URL at join time).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfig {
+    pub user_topic: String,
+    pub passphrase: String,
+    pub database_url: String,
+}
+
 /// **Security note**: The passphrase is stored in plaintext. On Android/iOS the app's
 /// data directory is sandboxed (same protection as the SQLite database itself).
 #[derive(Serialize, Deserialize)]
@@ -1494,6 +1507,11 @@ pub struct SyncConfig {
     /// Firebase API key for background service cold-start init.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fcm_api_key: Option<String>,
+    /// Additional groups joined at runtime via [`WaveSyncNode::join_group`].
+    /// A background wake rebuilds the default group from the top-level fields,
+    /// then rejoins each of these. Empty for single-group / back-compat configs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<GroupConfig>,
 }
 
 impl SyncConfig {
@@ -1531,6 +1549,29 @@ impl SyncConfig {
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
         std::fs::write(&path, json)
             .map_err(|e| format!("Failed to write config to {}: {e}", path.display()))
+    }
+
+    /// Record a runtime-joined group in the persisted config (load → upsert by
+    /// `user_topic` → save). Keyed off `base_database_url` (the default group's),
+    /// which is where the config file lives. Best-effort: errors (e.g. no config
+    /// written yet, as with in-memory test DBs) leave the live join unaffected.
+    fn persist_group_joined(base_database_url: &str, group: GroupConfig) -> Result<(), String> {
+        let mut config = Self::load(base_database_url)?;
+        config.groups.retain(|g| g.user_topic != group.user_topic);
+        config.groups.push(group);
+        config.save()
+    }
+
+    /// Remove a runtime-joined group from the persisted config (load → drop by
+    /// `user_topic` → save). Best-effort, same as [`Self::persist_group_joined`].
+    fn persist_group_left(base_database_url: &str, user_topic: &str) -> Result<(), String> {
+        let mut config = Self::load(base_database_url)?;
+        let before = config.groups.len();
+        config.groups.retain(|g| g.user_topic != user_topic);
+        if config.groups.len() == before {
+            return Ok(());
+        }
+        config.save()
     }
 }
 
@@ -1973,6 +2014,11 @@ impl WaveSyncDbBuilder {
         #[cfg(not(feature = "push-sync"))]
         let (fcm_project_id, fcm_app_id, fcm_api_key) = (None, None, None);
 
+        // Preserve any runtime-joined groups recorded by a previous launch —
+        // build() runs every startup and would otherwise wipe them.
+        let preserved_groups = SyncConfig::load(&self.database_url)
+            .map(|c| c.groups)
+            .unwrap_or_default();
         let sync_config = SyncConfig {
             database_url: self.database_url.clone(),
             topic: self.topic.clone(),
@@ -1987,6 +2033,7 @@ impl WaveSyncDbBuilder {
             fcm_project_id,
             fcm_app_id,
             fcm_api_key,
+            groups: preserved_groups,
         };
         if let Err(e) = sync_config.save() {
             log::warn!("Failed to save sync config for background services: {e}");
@@ -2242,16 +2289,20 @@ impl WaveSyncNode {
         // Drop the group from the node map, capturing its user topic(s) so we
         // can also remove it from the persisted config.
         let mut left_user_topics: Vec<String> = Vec::new();
-        self.inner.groups.lock().unwrap().retain(|user_topic, weak| {
-            let keep = weak
-                .upgrade()
-                .map(|inner| inner.effective_topic != effective_topic)
-                .unwrap_or(false);
-            if !keep {
-                left_user_topics.push(user_topic.clone());
-            }
-            keep
-        });
+        self.inner
+            .groups
+            .lock()
+            .unwrap()
+            .retain(|user_topic, weak| {
+                let keep = weak
+                    .upgrade()
+                    .map(|inner| inner.effective_topic != effective_topic)
+                    .unwrap_or(false);
+                if !keep {
+                    left_user_topics.push(user_topic.clone());
+                }
+                keep
+            });
         for user_topic in left_user_topics {
             if let Err(e) =
                 SyncConfig::persist_group_left(&self.inner.base_database_url, &user_topic)
