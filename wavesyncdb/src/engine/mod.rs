@@ -579,6 +579,7 @@ async fn run_engine(
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
         push_registered_topics: std::collections::HashSet::new(),
+        push_pending_registrations: std::collections::HashMap::new(),
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
@@ -713,6 +714,15 @@ struct EngineRunner {
     /// Cleared on relay disconnect and on token rotation so every topic is
     /// re-registered against the new connection / token.
     pub(crate) push_registered_topics: std::collections::HashSet<String>,
+    /// In-flight `RegisterToken` requests, keyed by their outbound request id,
+    /// mapped to the topic they register. A topic moves into
+    /// `push_registered_topics` only when the relay *acks* the request
+    /// (`PushResponse::Ok`); an `OutboundFailure` / `Error` drops it from here
+    /// without marking it registered, so the periodic reconcile retries. This
+    /// is what makes registration survive a relay substream that isn't ready
+    /// the instant a late-joined group fires its `RegisterToken`.
+    pub(crate) push_pending_registrations:
+        std::collections::HashMap<request_response::OutboundRequestId, String>,
     /// Shared network status snapshot, read by consumers.
     pub(crate) network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     /// Broadcast sender for network events.
@@ -1171,6 +1181,10 @@ impl EngineRunner {
         self.relay_state = RelayState::Connecting { retry_count: 0 };
         self.circuit_accepted_at = None;
         self.push_registered_topics.clear();
+        // In-flight registrations die with the connection; drop them so the
+        // post-reconnect sweep re-sends rather than waiting on acks that will
+        // never arrive on the old substream.
+        self.push_pending_registrations.clear();
         // The reservation died with the connection; clear both idempotency
         // flags so the immediate reconnect path below can re-arm.
         self.circuit_listen_pending = false;
@@ -1830,14 +1844,37 @@ impl EngineRunner {
         match event {
             request_response::Event::Message {
                 peer,
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        response,
+                        request_id,
+                    },
                 ..
             } => match response {
                 push_protocol::PushResponse::Ok => {
-                    log::debug!("Push request acknowledged by {peer}");
+                    // If this acks an in-flight RegisterToken, the relay now
+                    // holds our token for that topic — mark it registered so
+                    // the reconcile stops resending. Only confirmed-on-ack
+                    // registration is trusted (issue #65).
+                    if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
+                        self.push_registered_topics.insert(topic.clone());
+                        self.update_network_status();
+                        log::info!("Push token registration confirmed for topic {topic} by {peer}");
+                    } else {
+                        log::debug!("Push request acknowledged by {peer}");
+                    }
                 }
                 push_protocol::PushResponse::Error { message } => {
-                    log::warn!("Push request error from {peer}: {message}");
+                    // A rejected RegisterToken must not count as registered —
+                    // drop it from the in-flight set so the reconcile retries.
+                    if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
+                        log::warn!(
+                            "Push token registration for topic {topic} rejected by {peer}: \
+                             {message} — will retry"
+                        );
+                    } else {
+                        log::warn!("Push request error from {peer}: {message}");
+                    }
                 }
                 push_protocol::PushResponse::PeerList { peers } => {
                     // PeerList is a flat list of addresses for every existing
@@ -1952,8 +1989,24 @@ impl EngineRunner {
                     }
                 }
             }
-            request_response::Event::OutboundFailure { error, peer, .. } => {
-                log::warn!("Push request to {peer} failed: {error}");
+            request_response::Event::OutboundFailure {
+                error,
+                peer,
+                request_id,
+                ..
+            } => {
+                // A RegisterToken that never reached the relay (e.g. the
+                // relayed substream wasn't ready at join time) must not stay
+                // marked in-flight, or the reconcile would skip it forever.
+                // Dropping it here lets the 5s reconcile resend (issue #65).
+                if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
+                    log::warn!(
+                        "Push token registration for topic {topic} to {peer} failed: \
+                         {error} — will retry"
+                    );
+                } else {
+                    log::warn!("Push request to {peer} failed: {error}");
+                }
             }
             _ => {}
         }

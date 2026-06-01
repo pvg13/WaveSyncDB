@@ -167,6 +167,13 @@ class WaveSyncService : FirebaseMessagingService() {
 
         /// Targeted variant: `topic` is the effective (PSK-derived) topic from the
         /// FCM payload, so only that group is synced. Null/empty syncs all groups.
+        ///
+        /// `@JvmStatic` is mandatory: it hoists the method onto the outer class so
+        /// the JNI symbol is `Java_..._WaveSyncService_backgroundSyncTargeted`,
+        /// matching the Rust export. Without it the JVM looks for the
+        /// `..._00024Companion_...` symbol and crashes with UnsatisfiedLinkError on
+        /// every delivered push.
+        @JvmStatic
         private external fun backgroundSyncTargeted(databaseUrl: String, timeoutSecs: Int, peerAddrsJson: String?, topic: String?): Int
     }
 

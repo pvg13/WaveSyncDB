@@ -45,8 +45,10 @@ impl EngineRunner {
                 log::info!("Registering push token (platform: {platform})");
                 self.push_token = Some((platform, token));
                 // Token rotated — every topic must be re-registered with the
-                // new token, so clear the per-topic registration set.
+                // new token, so clear the per-topic registration set and any
+                // in-flight registrations carrying the old token.
                 self.push_registered_topics.clear();
+                self.push_pending_registrations.clear();
                 // If relay is already connected, register immediately
                 if let RelayState::Connected { relay_peer_id, .. }
                 | RelayState::Listening { relay_peer_id } = self.relay_state

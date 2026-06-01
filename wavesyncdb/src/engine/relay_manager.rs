@@ -544,9 +544,15 @@ impl EngineRunner {
     }
 
     /// Send a `RegisterToken` for a single group topic if we hold a push token
-    /// and haven't already registered that topic on the current relay
-    /// connection. Records the topic in `push_registered_topics` so repeated
-    /// calls (relay-connect sweep, join-time registration) stay idempotent.
+    /// and the topic isn't already registered or mid-registration on the
+    /// current relay connection. The topic is recorded in
+    /// `push_registered_topics` only once the relay *acks* the request (see the
+    /// push response handler); here we only track the in-flight request id in
+    /// `push_pending_registrations`. This keeps repeated calls (relay-connect
+    /// sweep, join-time registration, 5s reconcile) idempotent without
+    /// optimistically marking a topic registered before delivery is confirmed —
+    /// a `RegisterToken` that loses the race against a not-yet-ready relayed
+    /// substream fails, the topic stays unregistered, and the reconcile retries.
     pub(super) fn register_push_token_for_topic(
         &mut self,
         relay_peer_id: libp2p::PeerId,
@@ -556,7 +562,11 @@ impl EngineRunner {
             Some(pt) => pt.clone(),
             None => return,
         };
-        if self.push_registered_topics.contains(topic) {
+        // Skip if confirmed-registered or a request for this topic is already
+        // in flight (don't pile on duplicates every reconcile tick).
+        if self.push_registered_topics.contains(topic)
+            || self.push_pending_registrations.values().any(|t| t == topic)
+        {
             return;
         }
         let push_platform = match platform.as_str() {
@@ -573,12 +583,13 @@ impl EngineRunner {
             platform: push_platform,
             token,
         };
-        self.swarm
+        let request_id = self
+            .swarm
             .behaviour_mut()
             .push
             .send_request(&relay_peer_id, req);
-        self.push_registered_topics.insert(topic.to_string());
-        self.update_network_status();
+        self.push_pending_registrations
+            .insert(request_id, topic.to_string());
         log::info!("Sent push token registration for topic {topic} to relay {relay_peer_id}");
     }
 
@@ -602,6 +613,9 @@ impl EngineRunner {
             .push
             .send_request(&relay_peer_id, req);
         self.push_registered_topics.remove(topic);
+        // Drop any in-flight RegisterToken for this topic so a late ack can't
+        // resurrect it into the registered set after we've left the group.
+        self.push_pending_registrations.retain(|_, t| t != topic);
         self.update_network_status();
         log::info!("Sent push token unregistration for topic {topic} to relay {relay_peer_id}");
     }
