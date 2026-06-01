@@ -157,12 +157,34 @@ impl PushStore {
         Ok(())
     }
 
-    /// Get all tokens registered for a given topic.
-    pub async fn get_tokens_for_topic(&self, topic: &str) -> Result<Vec<PushToken>, sqlx::Error> {
-        let rows = sqlx::query("SELECT platform, token FROM push_tokens WHERE topic = ?1")
-            .bind(topic)
-            .fetch_all(&self.pool)
-            .await?;
+    /// Get tokens registered for a given topic.
+    ///
+    /// When `exclude_peer_id` is `Some`, tokens registered by that libp2p peer
+    /// are skipped. A device uses the same peer id for its `RegisterToken` and
+    /// its `NotifyTopic`, so passing the notifying peer here stops a local write
+    /// from waking the device that made it (self-wake).
+    pub async fn get_tokens_for_topic(
+        &self,
+        topic: &str,
+        exclude_peer_id: Option<&str>,
+    ) -> Result<Vec<PushToken>, sqlx::Error> {
+        let rows = match exclude_peer_id {
+            Some(peer) => {
+                sqlx::query(
+                    "SELECT platform, token FROM push_tokens WHERE topic = ?1 AND peer_id <> ?2",
+                )
+                .bind(topic)
+                .bind(peer)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query("SELECT platform, token FROM push_tokens WHERE topic = ?1")
+                    .bind(topic)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
 
         Ok(rows
             .iter()
@@ -389,12 +411,41 @@ mod tests {
             .await
             .unwrap();
 
-        let tokens = store.get_tokens_for_topic("topic1").await.unwrap();
+        let tokens = store.get_tokens_for_topic("topic1", None).await.unwrap();
         assert_eq!(tokens.len(), 2);
 
-        let tokens = store.get_tokens_for_topic("topic2").await.unwrap();
+        let tokens = store.get_tokens_for_topic("topic2", None).await.unwrap();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].token, "token-c");
+    }
+
+    #[tokio::test]
+    async fn test_get_tokens_excluding_peer() {
+        let store = mem_store().await;
+        // Two devices on the same topic, plus the same writer also on another topic.
+        store
+            .register_token("topic1", "Fcm", "token-writer", "peer-writer")
+            .await
+            .unwrap();
+        store
+            .register_token("topic1", "Fcm", "token-other", "peer-other")
+            .await
+            .unwrap();
+
+        // Excluding the writer's peer id drops only the writer's token.
+        let tokens = store
+            .get_tokens_for_topic("topic1", Some("peer-writer"))
+            .await
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token, "token-other");
+
+        // Excluding an unrelated peer keeps both.
+        let tokens = store
+            .get_tokens_for_topic("topic1", Some("peer-nobody"))
+            .await
+            .unwrap();
+        assert_eq!(tokens.len(), 2);
     }
 
     #[tokio::test]
@@ -405,7 +456,7 @@ mod tests {
             .await
             .unwrap();
         store.unregister_token("topic1", "token-a").await.unwrap();
-        let tokens = store.get_tokens_for_topic("topic1").await.unwrap();
+        let tokens = store.get_tokens_for_topic("topic1", None).await.unwrap();
         assert!(tokens.is_empty());
     }
 
@@ -421,7 +472,7 @@ mod tests {
             .register_token("topic1", "Fcm", "token-a", "peer-2")
             .await
             .unwrap();
-        let tokens = store.get_tokens_for_topic("topic1").await.unwrap();
+        let tokens = store.get_tokens_for_topic("topic1", None).await.unwrap();
         assert_eq!(tokens.len(), 1);
     }
 

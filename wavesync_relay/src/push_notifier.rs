@@ -31,6 +31,10 @@ use crate::push_store::{PushStore, RetryRow};
 /// A notification request for a topic.
 pub struct TopicNotification {
     pub topic: String,
+    /// libp2p peer id of the device that triggered the notification. Used to
+    /// skip that device's own token in the fan-out so a local write never
+    /// wakes the writer itself.
+    pub notifying_peer: String,
     /// Addresses of the peer that triggered the notification.
     pub peer_addrs: Vec<String>,
 }
@@ -97,8 +101,14 @@ impl PushNotifier {
     }
 
     /// Queue a topic for notification (non-blocking, drops if channel full).
-    pub fn notify(&self, topic: String, peer_addrs: Vec<String>) {
-        let _ = self.tx.try_send(TopicNotification { topic, peer_addrs });
+    /// `notifying_peer` is the libp2p peer id of the device that sent the
+    /// `NotifyTopic`; its own registered token is excluded from the fan-out.
+    pub fn notify(&self, topic: String, notifying_peer: String, peer_addrs: Vec<String>) {
+        let _ = self.tx.try_send(TopicNotification {
+            topic,
+            notifying_peer,
+            peer_addrs,
+        });
     }
 }
 
@@ -106,9 +116,10 @@ impl PushNotifier {
 struct CooldownState {
     /// When the cooldown expires (next fire allowed).
     expires_at: Instant,
-    /// If a notification arrived during cooldown, store its addresses here.
-    /// When cooldown expires, this fires as a trailing-edge notification.
-    pending: Option<Vec<String>>,
+    /// If a notification arrived during cooldown, store the notifying peer id
+    /// and its addresses here. When cooldown expires, this fires as a
+    /// trailing-edge notification (excluding that peer's own token).
+    pending: Option<(String, Vec<String>)>,
 }
 
 async fn notifier_loop(
@@ -138,16 +149,16 @@ async fn notifier_loop(
                         if let Some(state) = cooldowns.get_mut(&topic) {
                             if now >= state.expires_at {
                                 // Cooldown expired — fire immediately (leading edge)
-                                fire_notifications(&store, &sender, &topic, &notification.peer_addrs, &nudge_tx).await;
+                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx).await;
                                 state.expires_at = now + cooldown_duration;
                                 state.pending = None;
                             } else {
                                 // During cooldown — suppress, but save for trailing edge
-                                state.pending = Some(notification.peer_addrs);
+                                state.pending = Some((notification.notifying_peer, notification.peer_addrs));
                             }
                         } else {
                             // First notification for this topic — fire immediately
-                            fire_notifications(&store, &sender, &topic, &notification.peer_addrs, &nudge_tx).await;
+                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx).await;
                             cooldowns.insert(topic, CooldownState {
                                 expires_at: now + cooldown_duration,
                                 pending: None,
@@ -165,14 +176,14 @@ async fn notifier_loop(
             } => {
                 // Check for expired cooldowns with pending notifications
                 let now = Instant::now();
-                let expired: Vec<(String, Vec<String>)> = cooldowns
+                let expired: Vec<(String, (String, Vec<String>))> = cooldowns
                     .iter()
                     .filter(|(_, state)| state.pending.is_some() && state.expires_at <= now)
                     .map(|(topic, state)| (topic.clone(), state.pending.clone().unwrap()))
                     .collect();
 
-                for (topic, peer_addrs) in expired {
-                    fire_notifications(&store, &sender, &topic, &peer_addrs, &nudge_tx).await;
+                for (topic, (notifying_peer, peer_addrs)) in expired {
+                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx).await;
                     if let Some(state) = cooldowns.get_mut(&topic) {
                         state.expires_at = now + cooldown_duration;
                         state.pending = None;
@@ -203,10 +214,17 @@ async fn fire_notifications(
     store: &PushStore,
     sender: &PushSender,
     topic: &str,
+    notifying_peer: &str,
     peer_addrs: &[String],
     nudge_tx: &mpsc::Sender<RetryNudge>,
 ) {
-    let tokens = match store.get_tokens_for_topic(topic).await {
+    // Exclude the writer's own token: a device uses the same libp2p peer id for
+    // its RegisterToken and its NotifyTopic, so a local write must not wake the
+    // device that made it.
+    let tokens = match store
+        .get_tokens_for_topic(topic, Some(notifying_peer))
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             log::error!("Failed to get push tokens for topic {topic}: {e}");

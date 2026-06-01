@@ -880,7 +880,9 @@ async fn handle_push_request(
             log::info!(
                 "NotifyTopic received from {peer_id} (sender site={sender_site_id}) for {topic}"
             );
-            notifier.notify(topic.clone(), sender_addrs);
+            // Pass the sender's peer id so the fan-out skips the writer's own
+            // registered token (no self-wake on a local write).
+            notifier.notify(topic.clone(), peer_id.to_string(), sender_addrs);
             PushResponse::Ok
         }
         // Handled inline in the main loop — needs swarm access to fan out
