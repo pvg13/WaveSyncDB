@@ -578,7 +578,7 @@ async fn run_engine(
         dialing_peers: std::collections::HashSet::new(),
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
-        push_registered: false,
+        push_registered_topics: std::collections::HashSet::new(),
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
@@ -706,8 +706,13 @@ struct EngineRunner {
     pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
     pub(crate) push_token: Option<(String, String)>,
-    /// Whether push token has been registered with the relay.
-    pub(crate) push_registered: bool,
+    /// Group topics whose push token has already been registered with the
+    /// current relay connection. Tracked per-topic (not a single bool) so a
+    /// group joined *after* the relay connect still gets a `RegisterToken`,
+    /// and re-registration of an already-covered topic stays idempotent.
+    /// Cleared on relay disconnect and on token rotation so every topic is
+    /// re-registered against the new connection / token.
+    pub(crate) push_registered_topics: std::collections::HashSet<String>,
     /// Shared network status snapshot, read by consumers.
     pub(crate) network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     /// Broadcast sender for network events.
@@ -834,7 +839,7 @@ impl EngineRunner {
             relay_status,
             nat_status,
             rendezvous_registered: self.default_group().rendezvous_registered,
-            push_registered: self.push_registered,
+            push_registered: !self.push_registered_topics.is_empty(),
             local_db_version: self.default_group().local_db_version,
             registry_ready: self.default_group().registry_is_ready,
         };
@@ -1165,7 +1170,7 @@ impl EngineRunner {
         log::warn!("Lost connection to relay server {peer_id}");
         self.relay_state = RelayState::Connecting { retry_count: 0 };
         self.circuit_accepted_at = None;
-        self.push_registered = false;
+        self.push_registered_topics.clear();
         // The reservation died with the connection; clear both idempotency
         // flags so the immediate reconnect path below can re-arm.
         self.circuit_listen_pending = false;

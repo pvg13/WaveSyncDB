@@ -44,7 +44,9 @@ impl EngineRunner {
             EngineCommand::RegisterPushToken { platform, token } => {
                 log::info!("Registering push token (platform: {platform})");
                 self.push_token = Some((platform, token));
-                self.push_registered = false;
+                // Token rotated — every topic must be re-registered with the
+                // new token, so clear the per-topic registration set.
+                self.push_registered_topics.clear();
                 // If relay is already connected, register immediately
                 if let RelayState::Connected { relay_peer_id, .. }
                 | RelayState::Listening { relay_peer_id } = self.relay_state
@@ -148,6 +150,12 @@ impl EngineRunner {
         | RelayState::Listening { relay_peer_id } = self.relay_state
         {
             self.announce_presence_to_relay(relay_peer_id);
+            // Register the device push token for the new group's topic so the
+            // relay can wake this device for writes to it. The one-shot
+            // relay-connect registration only covered groups present at that
+            // moment; a group joined later (e.g. a household joined after
+            // login) would otherwise never be registered.
+            self.register_push_token_for_topic(relay_peer_id, &topic_name);
         }
 
         self.update_network_status();
@@ -162,8 +170,19 @@ impl EngineRunner {
             log::warn!("Refusing to leave the default group {effective_topic}");
             return;
         }
-        if self.groups.remove(&effective_topic).is_some() {
+        if let Some(group) = self.groups.remove(&effective_topic) {
             log::info!("Left sync group (effective topic {effective_topic})");
+            // Stop the relay from waking this device for the left group's
+            // topic. Skip if another remaining group shares the same topic name.
+            if let RelayState::Connected { relay_peer_id, .. }
+            | RelayState::Listening { relay_peer_id } = self.relay_state
+                && !self
+                    .groups
+                    .values()
+                    .any(|g| g.topic_name == group.topic_name)
+            {
+                self.unregister_push_token_for_topic(relay_peer_id, &group.topic_name);
+            }
             self.update_network_status();
         } else {
             log::debug!("LeaveGroup for unknown topic {effective_topic}; ignoring");

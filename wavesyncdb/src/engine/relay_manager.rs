@@ -522,24 +522,43 @@ impl EngineRunner {
         }
     }
 
-    /// Register push token with the relay server if we have one and are connected.
+    /// Register the push token with the relay for every group topic that
+    /// hasn't been registered yet on the current relay connection. Idempotent:
+    /// topics already in `push_registered_topics` are skipped, so this is safe
+    /// to call both on relay-connect and whenever a new group is joined.
     pub(super) fn maybe_register_push_token(&mut self, relay_peer_id: libp2p::PeerId) {
-        if self.push_registered {
+        if self.push_token.is_none() {
+            log::info!(
+                "maybe_register_push_token skipped: no push_token set — \
+                 either the platform isn't mobile, push-sync feature is off, \
+                 or the FCM/APNs token file wasn't written by the OS service \
+                 in time. Push notifications won't be delivered."
+            );
             return;
         }
+        // Register every topic not yet covered on this connection.
+        let topics: Vec<String> = self.groups.values().map(|g| g.topic_name.clone()).collect();
+        for topic in topics {
+            self.register_push_token_for_topic(relay_peer_id, &topic);
+        }
+    }
+
+    /// Send a `RegisterToken` for a single group topic if we hold a push token
+    /// and haven't already registered that topic on the current relay
+    /// connection. Records the topic in `push_registered_topics` so repeated
+    /// calls (relay-connect sweep, join-time registration) stay idempotent.
+    pub(super) fn register_push_token_for_topic(
+        &mut self,
+        relay_peer_id: libp2p::PeerId,
+        topic: &str,
+    ) {
         let (platform, token) = match &self.push_token {
             Some(pt) => pt.clone(),
-            None => {
-                log::info!(
-                    "maybe_register_push_token skipped: no push_token set — \
-                     either the platform isn't mobile, push-sync feature is off, \
-                     or the FCM/APNs token file wasn't written by the OS service \
-                     in time. Push notifications won't be delivered."
-                );
-                return;
-            }
+            None => return,
         };
-
+        if self.push_registered_topics.contains(topic) {
+            return;
+        }
         let push_platform = match platform.as_str() {
             "Fcm" => push_protocol::PushPlatform::Fcm,
             "Apns" => push_protocol::PushPlatform::Apns,
@@ -549,23 +568,42 @@ impl EngineRunner {
             }
         };
 
-        // Register the device token under every group's topic so the relay
-        // wakes this device for any group it belongs to.
-        let topics: Vec<String> = self.groups.values().map(|g| g.topic_name.clone()).collect();
-        for topic in topics {
-            let req = push_protocol::PushRequest::RegisterToken {
-                topic,
-                platform: push_platform.clone(),
-                token: token.clone(),
-            };
-            self.swarm
-                .behaviour_mut()
-                .push
-                .send_request(&relay_peer_id, req);
-        }
-        self.push_registered = true;
+        let req = push_protocol::PushRequest::RegisterToken {
+            topic: topic.to_string(),
+            platform: push_platform,
+            token,
+        };
+        self.swarm
+            .behaviour_mut()
+            .push
+            .send_request(&relay_peer_id, req);
+        self.push_registered_topics.insert(topic.to_string());
         self.update_network_status();
-        log::info!("Sent push token registration to relay {relay_peer_id}");
+        log::info!("Sent push token registration for topic {topic} to relay {relay_peer_id}");
+    }
+
+    /// Tell the relay to stop waking this device for a topic we've left, and
+    /// drop the topic from the registered set so a later re-join re-registers.
+    pub(super) fn unregister_push_token_for_topic(
+        &mut self,
+        relay_peer_id: libp2p::PeerId,
+        topic: &str,
+    ) {
+        let token = match &self.push_token {
+            Some((_, token)) => token.clone(),
+            None => return,
+        };
+        let req = push_protocol::PushRequest::UnregisterToken {
+            topic: topic.to_string(),
+            token,
+        };
+        self.swarm
+            .behaviour_mut()
+            .push
+            .send_request(&relay_peer_id, req);
+        self.push_registered_topics.remove(topic);
+        self.update_network_status();
+        log::info!("Sent push token unregistration for topic {topic} to relay {relay_peer_id}");
     }
 
     /// Announce this peer's presence to the relay so it can introduce us
