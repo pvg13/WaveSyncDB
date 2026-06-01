@@ -657,10 +657,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
-                log::info!("Relay: {event:?}");
+                use libp2p::relay::Event as RelayEvent;
+                match event {
+                    RelayEvent::ReservationReqAccepted {
+                        src_peer_id,
+                        renewed,
+                    } => {
+                        // Renewals are frequent (every reservation refresh); only
+                        // the first acceptance is interesting at info level.
+                        if renewed {
+                            log::debug!("Relay: reservation renewed for {src_peer_id}");
+                        } else {
+                            log::info!("Relay: reservation accepted for {src_peer_id}");
+                        }
+                    }
+                    RelayEvent::ReservationReqDenied { src_peer_id, status } => {
+                        log::warn!("Relay: reservation denied for {src_peer_id} (status {status:?})");
+                    }
+                    RelayEvent::ReservationClosed { src_peer_id } => {
+                        log::debug!("Relay: reservation closed for {src_peer_id}");
+                    }
+                    RelayEvent::ReservationTimedOut { src_peer_id } => {
+                        log::debug!("Relay: reservation timed out for {src_peer_id}");
+                    }
+                    RelayEvent::CircuitReqAccepted {
+                        src_peer_id,
+                        dst_peer_id,
+                    } => {
+                        log::info!("Relay: circuit {src_peer_id} → {dst_peer_id}");
+                    }
+                    RelayEvent::CircuitReqDenied {
+                        src_peer_id,
+                        dst_peer_id,
+                        status,
+                    } => {
+                        log::warn!(
+                            "Relay: circuit denied {src_peer_id} → {dst_peer_id} (status {status:?})"
+                        );
+                    }
+                    RelayEvent::CircuitClosed {
+                        src_peer_id,
+                        dst_peer_id,
+                        error,
+                    } => match error {
+                        Some(e) => log::debug!(
+                            "Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}"
+                        ),
+                        None => log::debug!(
+                            "Relay: circuit closed {src_peer_id} → {dst_peer_id}"
+                        ),
+                    },
+                    // Deprecated *Failed variants and any future additions:
+                    // keep them off the steady-state log but available at debug.
+                    other => log::debug!("Relay: {other:?}"),
+                }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Rendezvous(event)) => {
-                log::info!("Rendezvous: {event:?}");
+                use libp2p::rendezvous::server::Event as RzEvent;
+                match event {
+                    // Routine, high-frequency churn (peers re-register every
+                    // ~TTL/2 and discover on every cycle). At debug so the
+                    // steady-state log stays readable; the previous `{event:?}`
+                    // dumped the full SignedEnvelope (hundreds of bytes/line).
+                    RzEvent::PeerRegistered { peer, registration } => {
+                        log::debug!(
+                            "Rendezvous: {peer} registered ns={} ttl={}s",
+                            short_topic(&registration.namespace.to_string()),
+                            registration.ttl,
+                        );
+                    }
+                    RzEvent::DiscoverServed {
+                        enquirer,
+                        registrations,
+                    } => {
+                        log::debug!(
+                            "Rendezvous: served discover to {enquirer} ({} registration(s))",
+                            registrations.len(),
+                        );
+                    }
+                    RzEvent::DiscoverNotServed { enquirer, error } => {
+                        // Mostly the benign first-page / expired-cookie case the
+                        // client immediately re-issues; not actionable.
+                        log::debug!("Rendezvous: discover for {enquirer} not served ({error:?})");
+                    }
+                    RzEvent::RegistrationExpired(registration) => {
+                        log::debug!(
+                            "Rendezvous: registration expired for {} ns={}",
+                            registration.record.peer_id(),
+                            short_topic(&registration.namespace.to_string()),
+                        );
+                    }
+                    // Notable, low-frequency: surface at info/warn.
+                    RzEvent::PeerUnregistered { peer, namespace } => {
+                        log::info!(
+                            "Rendezvous: {peer} unregistered ns={}",
+                            short_topic(&namespace.to_string()),
+                        );
+                    }
+                    RzEvent::PeerNotRegistered {
+                        peer,
+                        namespace,
+                        error,
+                    } => {
+                        log::warn!(
+                            "Rendezvous: declined registration from {peer} ns={} ({error:?})",
+                            short_topic(&namespace.to_string()),
+                        );
+                    }
+                }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(
                 identify::Event::Received { info, peer_id, .. },
@@ -822,6 +926,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Shorten a derived topic / rendezvous namespace for logs. The full form is
+/// `wavesync-<64 hex>`; keeping the prefix plus the first 10 hex chars stays
+/// scannable while still distinguishing groups. Anything else passes through.
+pub(crate) fn short_topic(s: &str) -> String {
+    match s.strip_prefix("wavesync-") {
+        Some(hex) if hex.len() > 10 => format!("wavesync-{}…", &hex[..10]),
+        _ => s.to_string(),
+    }
+}
+
 async fn handle_push_request(
     push_state: &Option<(Arc<PushStore>, push_notifier::PushNotifier)>,
     request: &PushRequest,
@@ -878,7 +992,8 @@ async fn handle_push_request(
             sender_site_id,
         } => {
             log::info!(
-                "NotifyTopic received from {peer_id} (sender site={sender_site_id}) for {topic}"
+                "NotifyTopic from {peer_id} (site {sender_site_id}) for {}",
+                short_topic(topic),
             );
             // Pass the sender's peer id so the fan-out skips the writer's own
             // registered token (no self-wake on a local write).

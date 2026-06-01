@@ -232,19 +232,24 @@ async fn fire_notifications(
         }
     };
 
+    let topic_short = crate::short_topic(topic);
+
     if tokens.is_empty() {
-        log::info!(
-            "fire_notifications: no registered tokens for topic {topic} — \
-             nothing to push (this is the silent path that masks 'phone never \
-             registered' in production)"
+        // With the writer's own token excluded, an empty set is the normal
+        // single-device / self-only case — not necessarily a registration
+        // failure. Kept at debug so it doesn't read as an alarm on every write;
+        // a genuinely-unregistered peer shows up as a missing RegisterToken on
+        // the relay's INFO log, not here.
+        log::debug!(
+            "No other registered devices to wake for {topic_short} (writer {notifying_peer} excluded)"
         );
         return;
     }
 
     log::info!(
-        "Sending push notifications for topic {topic} to {} devices (peer_addrs: {})",
+        "Waking {} device(s) for {topic_short} (writer {notifying_peer} excluded; {} peer addr(s))",
         tokens.len(),
-        peer_addrs.len()
+        peer_addrs.len(),
     );
 
     let peer_addrs_json = serde_json::to_string(peer_addrs).unwrap_or_else(|_| "[]".to_string());
