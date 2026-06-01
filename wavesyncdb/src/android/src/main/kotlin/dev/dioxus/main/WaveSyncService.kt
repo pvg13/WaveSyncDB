@@ -39,6 +39,11 @@ class WaveSyncService : FirebaseMessagingService() {
         private const val FG_NOTIFICATION_ID = 0xC0DEC0DE.toInt()
         private const val MULTICAST_LOCK_TAG = "wavesync.mdns"
 
+        /// How deep below `filesDir` to search for `.wavesync_config.json`.
+        /// Consumer apps nest per-user data dirs (e.g. `<app>/u/<userhash>/`);
+        /// a generous bound covers that without an unbounded walk.
+        private const val MAX_CONFIG_SEARCH_DEPTH = 6
+
         private var nativeLoaded = false
 
         private fun ensureNativeLoaded() {
@@ -81,17 +86,57 @@ class WaveSyncService : FirebaseMessagingService() {
             }
         }
 
+        /**
+         * Locate the active `.wavesync_config.json`.
+         *
+         * The config is written by Rust alongside the database file
+         * (`SyncConfig::save`), which an app may nest arbitrarily deep below
+         * `filesDir` (e.g. `filesDir/<app>/u/<userhash>/`). A shallow scan
+         * misses it and may instead pick up a stale config left at a shallower
+         * level. We therefore search the whole `filesDir` subtree and prefer
+         * the config that actually carries the `fcm_*` credentials — that is
+         * the one `with_google_services()` persisted into the active group.
+         */
         private fun findConfigFile(context: Context): File? {
-            val direct = File(context.filesDir, ".wavesync_config.json")
-            if (direct.exists()) return direct
-
-            context.filesDir.listFiles()?.forEach { dir ->
-                if (dir.isDirectory) {
-                    val config = File(dir, ".wavesync_config.json")
-                    if (config.exists()) return config
-                }
+            val candidates = mutableListOf<File>()
+            collectConfigFiles(context.filesDir, candidates, MAX_CONFIG_SEARCH_DEPTH)
+            // The SQLite databases dir (getDatabasePath) is outside filesDir; check it too.
+            context.getDatabasePath("dummy").parentFile?.let { dbDir ->
+                File(dbDir, ".wavesync_config.json").takeIf { it.exists() }?.let { candidates.add(it) }
             }
-            return null
+            if (candidates.isEmpty()) return null
+            return candidates.firstOrNull { configHasFcmCredentials(it) } ?: candidates.first()
+        }
+
+        private fun collectConfigFiles(dir: File, out: MutableList<File>, depthRemaining: Int) {
+            if (depthRemaining < 0) return
+            File(dir, ".wavesync_config.json").takeIf { it.exists() }?.let { out.add(it) }
+            dir.listFiles()?.forEach { child ->
+                if (child.isDirectory) collectConfigFiles(child, out, depthRemaining - 1)
+            }
+        }
+
+        private fun configHasFcmCredentials(config: File): Boolean {
+            return try {
+                config.readText().contains("fcm_project_id")
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        /**
+         * The directory the FCM token must be written to so Rust can find it.
+         *
+         * Rust (`push.rs::read_token_from_file`) reads the token from the
+         * database's parent directory, which is exactly where the active config
+         * lives. Keeping the write next to the discovered config guarantees the
+         * write location (here) and the read location (Rust) agree even when the
+         * data dir is nested below `filesDir`. Falls back to `filesDir` only when
+         * no config exists yet (very first launch, before Rust writes one).
+         */
+        private fun tokenFile(context: Context): File {
+            val configDir = findConfigFile(context)?.parentFile ?: context.filesDir
+            return File(configDir, TOKEN_FILENAME)
         }
 
         /**
@@ -108,8 +153,9 @@ class WaveSyncService : FirebaseMessagingService() {
                     FirebaseMessaging.getInstance().token
                 )
                 if (token != null) {
-                    File(context.filesDir, TOKEN_FILENAME).writeText(token)
-                    Log.i(TAG, "FCM token written: ${token.take(10)}...")
+                    val dest = tokenFile(context)
+                    dest.writeText(token)
+                    Log.i(TAG, "FCM token written to ${dest.absolutePath}: ${token.take(10)}...")
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Could not get FCM token yet: ${e.message}")
@@ -297,31 +343,23 @@ class WaveSyncService : FirebaseMessagingService() {
             .putString("fcm_token", token)
             .apply()
 
-        // Write to file so Rust can read it without JNI
+        // Write to file so Rust can read it without JNI. Must land in the DB
+        // directory (next to the active config), where Rust looks for it.
         try {
-            File(applicationContext.filesDir, TOKEN_FILENAME).writeText(token)
+            tokenFile(applicationContext).writeText(token)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write token file: ${e.message}")
         }
     }
 
     private fun findDatabaseUrl(): String? {
-        val configInFiles = File(applicationContext.filesDir, ".wavesync_config.json")
-        if (configInFiles.exists()) return extractDatabaseUrl(configInFiles)
-
-        val dbDir = applicationContext.getDatabasePath("dummy").parentFile
-        if (dbDir != null) {
-            val configInDb = File(dbDir, ".wavesync_config.json")
-            if (configInDb.exists()) return extractDatabaseUrl(configInDb)
+        // Resolve from the same config the token/Firebase paths use, so a nested
+        // data dir is handled identically across all three code paths.
+        findConfigFile(applicationContext)?.let { config ->
+            extractDatabaseUrl(config)?.let { return it }
         }
 
-        applicationContext.filesDir.listFiles()?.forEach { dir ->
-            if (dir.isDirectory) {
-                val config = File(dir, ".wavesync_config.json")
-                if (config.exists()) return extractDatabaseUrl(config)
-            }
-        }
-
+        // Last resort: any *.db sitting directly in filesDir.
         val dbFile = applicationContext.filesDir.listFiles()
             ?.firstOrNull { it.extension == "db" }
         return dbFile?.let { "sqlite:${it.absolutePath}?mode=rwc" }
