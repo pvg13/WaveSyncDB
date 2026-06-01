@@ -78,11 +78,15 @@ impl EngineRunner {
                                 peer_topic.clone()
                             };
                             let Some(g) = self.groups.get(&effective) else {
-                                // Response for a topic none of our groups use —
-                                // reject the peer in all current groups so we
-                                // stop re-dialing (joining its group later, which
-                                // won't have it rejected, makes it eligible again).
-                                self.reject_peer_all_groups(peer);
+                                // Response for a topic none of our groups hold —
+                                // silently ignore. One connection is shared across
+                                // every group on the node, and a peer that serves a
+                                // group we don't have may still share another group
+                                // with us; rejecting it here would poison those
+                                // shared groups too (Rule 2.8, multi-group).
+                                log::debug!(
+                                    "Ignoring sync response from {peer} for unknown topic {effective}"
+                                );
                                 return;
                             };
 
@@ -268,8 +272,14 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            // Request for a topic none of our groups hold.
-            self.reject_peer_all_groups(peer);
+            // Version-vector request for a topic none of our groups hold —
+            // silently ignore. The peer reaches us over a connection shared by
+            // all groups and may still share another group with us (e.g. a
+            // household), so rejecting it would also kill that shared group's
+            // sync. Reject only on per-group HMAC failure (Rule 2.8, multi-group).
+            log::debug!(
+                "Ignoring version-vector request from {peer} for unknown topic {effective}"
+            );
             return;
         };
         let group_key = g.group_key.clone();
@@ -442,7 +452,10 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            self.reject_peer_all_groups(peer);
+            // Push for a topic none of our groups hold — silently ignore (a
+            // group we don't have doesn't mean we share no group with this
+            // peer over the shared connection). Rule 2.8, multi-group.
+            log::debug!("Ignoring push from {peer} for unknown topic {effective}");
             return;
         };
 
@@ -597,25 +610,6 @@ impl EngineRunner {
         self.update_network_status();
     }
 
-    /// Reject a peer for every current group — used when an inbound message's
-    /// topic matches none of our groups. The shared connection is dropped and
-    /// the peer is removed from node-level identity tracking. Joining that topic
-    /// later (a fresh group with an empty rejected set) makes it eligible again.
-    fn reject_peer_all_groups(&mut self, peer: libp2p::PeerId) {
-        for g in self.groups.values_mut() {
-            g.rejected_peers.insert(peer);
-            g.verified_peers.remove(&peer);
-            g.pending_sync_peers.remove(&peer);
-            g.peer_db_versions.remove(&peer);
-            g.peer_reported_versions.remove(&peer);
-        }
-        self.peer_identities.remove(&peer);
-        self.peers.remove(&peer);
-        self.emit_network_event(crate::network_status::NetworkEvent::PeerRejected(
-            crate::network_status::PeerId(peer.to_string()),
-        ));
-        self.update_network_status();
-    }
 }
 
 const CHANGESET_CHUNK_SIZE: usize = 50;
