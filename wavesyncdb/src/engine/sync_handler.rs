@@ -332,6 +332,30 @@ impl EngineRunner {
             *reported = (*reported).max(my_db_version);
         }
 
+        // Reverse-trigger. A VersionVector reconciles only one direction: we are
+        // about to send the requester OUR changes, but their request also tells
+        // us they hold ops we have not pulled (their `my_db_version` exceeds the
+        // version we have actually applied from them). Real-time push covers the
+        // connected-and-reachable case, but when it doesn't land (relay/NAT, a
+        // dropped substream, a peer that wrote while we were briefly away) those
+        // ops would otherwise reach us only on our own next sync tick — up to
+        // `sync_interval` (30s) later, and asymmetrically. Initiating our own
+        // sync now reconciles the other direction promptly (~one round trip).
+        // Idempotent and bounded: `initiate_sync_for_peer` skips peers with an
+        // in-flight or rejected sync, and once both sides are level the
+        // condition is false so it cannot ping-pong.
+        let should_pull = self.groups.get(&effective).is_some_and(|g| {
+            g.registry_is_ready
+                && my_db_version > g.peer_db_versions.get(&peer).copied().unwrap_or(0)
+        });
+        if should_pull {
+            log::debug!(
+                "Reverse-trigger: peer {peer} is ahead (their v{my_db_version} > our record) \
+                 for {effective} — initiating sync to pull their changes"
+            );
+            self.initiate_sync_for_peer(peer, &effective);
+        }
+
         self.emit_network_event(crate::network_status::NetworkEvent::PeerSynced {
             peer_id: crate::network_status::PeerId(peer.to_string()),
             db_version: my_db_version,
