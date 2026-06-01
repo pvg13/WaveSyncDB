@@ -220,6 +220,9 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
     peer_addrs_json: jni::objects::JString,
 ) -> jni::sys::jint {
     ensure_android_logger();
+    // Capture the JavaVM so the background-sync notification pump can call back
+    // into Kotlin (this process has no ndk_context).
+    crate::notify_display::store_java_vm(&env);
     log::info!(
         "JNI backgroundSync invoked (timeout={}s, peer_addrs payload present={})",
         timeout_secs,
@@ -268,6 +271,9 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSyncTarget
     topic: jni::objects::JString,
 ) -> jni::sys::jint {
     ensure_android_logger();
+    // Capture the JavaVM for the background-sync notification pump (no
+    // ndk_context in the FCM service process).
+    crate::notify_display::store_java_vm(&env);
 
     let url: String = match env.get_string(&database_url) {
         Ok(s) => s.into(),

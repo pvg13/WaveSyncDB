@@ -281,6 +281,33 @@ pub async fn background_sync_with_peers_for_topic(
         log_stage("groups_rejoined");
     }
 
+    // 4c. Pump user-facing notifications. The foreground `use_sync_notifications`
+    // Dioxus hook isn't running in this (FCM service) process, so the
+    // SyncNotify policies the engine evaluates while we sync would fire but
+    // never reach the OS. Subscribe to every group's notification channel
+    // *before* the wait loop (broadcast only delivers to current subscribers)
+    // and post each one natively. Aborted after shutdown below.
+    #[cfg(feature = "push-sync")]
+    let notif_pumps: Vec<tokio::task::JoinHandle<()>> = {
+        let mut rxs = vec![db.notification_rx()];
+        for g in &_group_handles {
+            rxs.push(g.notification_rx());
+        }
+        rxs.into_iter()
+            .map(|mut rx| {
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(n) => crate::notify_display::show_background(&n),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                })
+            })
+            .collect()
+    };
+
     // 5. Wait for peer discovery and let the engine sync on its own.
     //
     // We deliberately do NOT call request_full_sync() here. With peer versions
@@ -371,6 +398,13 @@ pub async fn background_sync_with_peers_for_topic(
 
     // 7. Graceful shutdown
     log_stage("shutdown_started");
+    // Stop the notification pumps before tearing down the engine — any
+    // notification for a change applied during the sync window has already
+    // been posted by now.
+    #[cfg(feature = "push-sync")]
+    for h in notif_pumps {
+        h.abort();
+    }
     db.shutdown().await;
 
     // 8. Return result

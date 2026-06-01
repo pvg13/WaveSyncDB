@@ -768,6 +768,15 @@ async fn apply_changeset_chunk<'a>(
         if let Some(ctx) = notify
             && let Some(user_notif) = ctx.registry.dispatch(&n)
         {
+            // Visibility: confirms the SyncNotify policy fired and passed the
+            // anti-spam gate. If you see this but no OS notification, the gap is
+            // downstream (no `use_sync_notifications` subscriber in this process
+            // — e.g. a background wake — or the native display call failed).
+            log::info!(
+                "notification: generated for table {} ({} receiver(s) subscribed)",
+                user_notif.table,
+                ctx.tx.receiver_count(),
+            );
             let _ = ctx.tx.send(user_notif);
         }
         let _ = change_tx.send(n);

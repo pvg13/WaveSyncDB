@@ -64,6 +64,10 @@ pub mod engine;
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod notify;
+// Native notification display for the headless background-sync path (the
+// foreground Dioxus hook can't run in the FCM service process).
+#[cfg(all(not(target_arch = "wasm32"), feature = "push-sync"))]
+pub(crate) mod notify_display;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod peer_addrs;
 #[cfg(not(target_arch = "wasm32"))]

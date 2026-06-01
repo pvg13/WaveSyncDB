@@ -22,6 +22,12 @@ class WaveSyncInitProvider : ContentProvider() {
         val ctx = context ?: return false
         Log.i("WaveSyncInitProvider", "Initializing Firebase and writing FCM token")
 
+        // Stash the application context so the Rust background-sync notification
+        // pump (which runs in this FCM service process, with no Activity) can
+        // post notifications via NotificationHelper.showFromNative. Runs in every
+        // process because ContentProviders initialize per-process at startup.
+        NotificationHelper.appContext = ctx.applicationContext
+
         // Run token fetch on a background thread to avoid blocking app startup,
         // but it will still complete before most Rust code runs.
         Thread {

@@ -155,6 +155,7 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
             return;
         }
     };
+    log::info!("notification: posting Android notification via NotificationHelper.show (group={group})");
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
     let (Ok(title_j), Ok(body_j), Ok(group_j)) = (
         env.new_string(title),
@@ -164,7 +165,7 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
         log::warn!("notification: failed to build JNI strings");
         return;
     };
-    if let Err(e) = env.call_static_method(
+    match env.call_static_method(
         "dev/dioxus/main/NotificationHelper",
         "show",
         "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
@@ -175,9 +176,12 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
             JValue::Object(&group_j),
         ],
     ) {
-        log::warn!("notification: NotificationHelper.show failed: {e}");
-        // Clear any pending Java exception so it can't leak into later JNI calls.
-        let _ = env.exception_clear();
+        Ok(_) => log::debug!("notification: NotificationHelper.show returned ok"),
+        Err(e) => {
+            log::warn!("notification: NotificationHelper.show failed: {e}");
+            // Clear any pending Java exception so it can't leak into later JNI calls.
+            let _ = env.exception_clear();
+        }
     }
 }
 

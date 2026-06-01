@@ -23,6 +23,31 @@ object NotificationHelper {
     private const val CHANNEL_ID = "wavesync_messages"
 
     /**
+     * Application context stashed by [WaveSyncInitProvider] (which runs once per
+     * process, including the FCM service process). Lets the Rust background-sync
+     * path post notifications via [showFromNative] without a Context of its own.
+     * Holding the *application* context is leak-safe — it lives for the process.
+     */
+    @Volatile
+    @JvmStatic
+    var appContext: Context? = null
+
+    /**
+     * Context-less entry point for the Rust background-sync notification pump,
+     * which has no Activity/Context. Uses the stashed [appContext]; no-ops with
+     * a log if it hasn't been set yet.
+     */
+    @JvmStatic
+    fun showFromNative(title: String, body: String, group: String) {
+        val ctx = appContext
+        if (ctx == null) {
+            Log.w(TAG, "showFromNative: no application context stored; notification dropped")
+            return
+        }
+        show(ctx, title, body, group)
+    }
+
+    /**
      * Show a notification. [group] is the coalescing key: notifications sharing
      * a group replace each other (a stable notification id), so a burst for the
      * same conversation collapses to one entry instead of stacking.
