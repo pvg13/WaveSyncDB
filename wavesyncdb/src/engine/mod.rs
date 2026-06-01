@@ -1356,6 +1356,18 @@ impl EngineRunner {
                     // one 5s timer keeps the wakeup count low (saves a
                     // bit of mobile battery vs. running two timers).
                     self.process_dcutr_retries();
+                    // Reconcile push-token registration against the current
+                    // group set. Registration is otherwise only attempted at
+                    // discrete moments (relay-connect, token set, join-while-
+                    // connected); if any of those raced the relay state or the
+                    // token wasn't available yet, a group stays unregistered
+                    // and its silent wake-pushes never fire. This is a no-op
+                    // for topics already registered on the current connection.
+                    if let RelayState::Connected { relay_peer_id, .. }
+                    | RelayState::Listening { relay_peer_id } = self.relay_state
+                    {
+                        self.maybe_register_push_token(relay_peer_id);
+                    }
                 },
                 Some((channel, response)) = self.snapshot_resp_rx.recv() => {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {

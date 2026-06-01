@@ -188,6 +188,23 @@ pub async fn background_sync_with_peers_for_topic(
         builder = builder.with_ipv6(true);
     }
 
+    // Restore FCM credentials persisted by the foreground `build()`. Without
+    // this the Android token-file read in `build()` (gated on
+    // `fcm_credentials.is_some()`) is skipped, so the wake runs with no push
+    // token and registers no topics — including any extra group rejoined
+    // below. That silently breaks push wake-ups for a device whose token
+    // rotated while it lived in the background, and for any group whose
+    // registration window was missed. (iOS reads its APNs token
+    // unconditionally, so this only affects FCM/Android.)
+    #[cfg(feature = "push-sync")]
+    if let (Some(project_id), Some(app_id), Some(api_key)) = (
+        config.fcm_project_id.as_deref(),
+        config.fcm_app_id.as_deref(),
+        config.fcm_api_key.as_deref(),
+    ) {
+        builder = builder.with_fcm(project_id, app_id, api_key);
+    }
+
     // Add dynamic peer addresses from FCM payload (direct dial, skips discovery)
     for addr in peer_addrs {
         builder = builder.with_bootstrap_peer(addr);
