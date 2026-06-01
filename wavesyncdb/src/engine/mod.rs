@@ -138,6 +138,14 @@ pub enum EngineCommand {
     /// stops syncing; the rendezvous namespace simply TTL-expires. The DB file
     /// is preserved (the connection side closes its handle separately).
     LeaveGroup { effective_topic: String },
+    /// A runtime-joined (non-default) group has finished registering its schema.
+    /// The default group signals readiness via its `registry_ready` Notify (which
+    /// the engine awaits directly); joined groups have no such await, so their
+    /// readiness arrives as this command. Flipping `registry_is_ready` lets the
+    /// group participate in connect/discovery-time sync initiation (which only
+    /// fires for ready groups) — without it a joined group only ever syncs via
+    /// the periodic tick, making it slow and one-directional/asymmetric.
+    GroupRegistryReady { effective_topic: String },
 }
 
 /// Configuration for the sync engine.

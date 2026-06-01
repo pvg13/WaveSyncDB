@@ -80,6 +80,26 @@ impl EngineRunner {
                 self.handle_leave_group(effective_topic);
                 false
             }
+            EngineCommand::GroupRegistryReady { effective_topic } => {
+                if let Some(g) = self.groups.get_mut(&effective_topic)
+                    && !g.registry_is_ready
+                {
+                    g.registry_is_ready = true;
+                    log::info!(
+                        "Group {effective_topic} schema registered — now eligible for \
+                         connect-time sync initiation"
+                    );
+                    self.update_network_status();
+                    // No eager peer sweep here on purpose: the periodic tick
+                    // already syncs every group with known peers, and adding a
+                    // burst of version-vector requests across all connected peers
+                    // the instant a group goes ready amplifies traffic (and, with
+                    // a busy mDNS segment, can starve the request-response
+                    // substreams). Connect/discovery events drive the (bounded)
+                    // per-peer initiation from here on.
+                }
+                false
+            }
         }
     }
 

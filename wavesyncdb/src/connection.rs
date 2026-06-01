@@ -729,6 +729,18 @@ impl WaveSyncDb {
     /// without using the schema builder.
     pub fn registry_ready(&self) {
         self.inner.registry_ready.notify_one();
+        // The engine awaits only the *default* group's `registry_ready` Notify.
+        // A runtime-joined group has no such await, so signal it explicitly —
+        // otherwise it's excluded from connect/discovery-time sync initiation
+        // (which only fires for `registry_is_ready` groups) and syncs only via
+        // the slow periodic tick, leaving it one-directional/asymmetric.
+        if !self.inner.is_default_group {
+            let _ = self.inner.node.cmd_tx.try_send(
+                crate::engine::EngineCommand::GroupRegistryReady {
+                    effective_topic: self.inner.effective_topic.clone(),
+                },
+            );
+        }
     }
 
     /// Start building the sync schema.
@@ -1354,8 +1366,10 @@ impl<'a> SchemaBuilder<'a> {
                 let _ = std::fs::write(&config_path, updated);
             }
         }
-        // Signal the engine that tables are registered and sync can begin
-        self.db.inner.registry_ready.notify_one();
+        // Signal the engine that tables are registered and sync can begin. Via
+        // `registry_ready()` so runtime-joined groups also notify the engine
+        // (GroupRegistryReady), not just the default group's Notify.
+        self.db.registry_ready();
         Ok(())
     }
 
