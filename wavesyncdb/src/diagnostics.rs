@@ -127,6 +127,11 @@ pub(crate) struct Counters {
     /// Reconcile-digest exchanges that found a mismatch — the peers differ and
     /// the version-vector catch-up is relied on to transfer the diff.
     pub reconcile_diverged: AtomicU64,
+    /// Fan-out pushes re-sent from the pending-push retry set (#81) — a local
+    /// changeset that wasn't confirmed delivered by its initial real-time push
+    /// and got redelivered on the short retry cadence. Steady state is 0; a
+    /// rising count means real-time pushes are being dropped (slow/lossy peers).
+    pub pending_pushes_redelivered: AtomicU64,
 }
 
 impl Counters {
@@ -156,6 +161,7 @@ impl Counters {
                 .load(Ordering::Relaxed),
             reconcile_converged: self.reconcile_converged.load(Ordering::Relaxed),
             reconcile_diverged: self.reconcile_diverged.load(Ordering::Relaxed),
+            pending_pushes_redelivered: self.pending_pushes_redelivered.load(Ordering::Relaxed),
         }
     }
 }
@@ -182,6 +188,7 @@ pub struct Snapshot {
     pub direct_connections_established: u64,
     pub reconcile_converged: u64,
     pub reconcile_diverged: u64,
+    pub pending_pushes_redelivered: u64,
 }
 
 #[cfg(test)]

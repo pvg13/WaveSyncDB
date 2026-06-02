@@ -153,6 +153,7 @@ impl EngineRunner {
             rejected_peers: std::collections::HashMap::new(),
             verified_peers: std::collections::HashSet::new(),
             pending_sync_peers: std::collections::HashSet::new(),
+            pending_pushes: std::collections::BTreeMap::new(),
         };
         self.groups.insert(effective_topic.clone(), group);
         log::info!("Joined sync group (effective topic {effective_topic})");

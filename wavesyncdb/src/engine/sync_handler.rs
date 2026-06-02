@@ -73,7 +73,11 @@ impl EngineRunner {
                         }
                     }
                 }
-                request_response::Message::Response { response, .. } => {
+                request_response::Message::Response {
+                    response,
+                    request_id,
+                    ..
+                } => {
                     // Response received — this peer no longer has an in-flight
                     // request in any group.
                     for g in self.groups.values_mut() {
@@ -249,6 +253,9 @@ impl EngineRunner {
                         }
                         crate::protocol::SyncResponse::PushAck => {
                             log::debug!("Received PushAck from peer {peer}");
+                            // Confirmed delivery — drop this changeset from the
+                            // group's pending-push retry set for this peer (#81).
+                            self.note_push_ack(request_id, peer);
                         }
                         crate::protocol::SyncResponse::IdentityAck => {
                             log::debug!("Received IdentityAck from peer {peer}");
@@ -280,10 +287,19 @@ impl EngineRunner {
                     }
                 }
             },
-            request_response::Event::OutboundFailure { peer, error, .. } => {
+            request_response::Event::OutboundFailure {
+                peer,
+                error,
+                request_id,
+                ..
+            } => {
                 for g in self.groups.values_mut() {
                     g.pending_sync_peers.remove(&peer);
                 }
+                // Drop any pending-push correlation for this request: the
+                // changeset stays in `pending_pushes` (still un-acked by this
+                // peer) and the next redelivery tick retries it (#81).
+                self.pending_push_reqs.remove(&request_id);
                 if matches!(
                     error,
                     request_response::OutboundFailure::UnsupportedProtocols
@@ -905,6 +921,9 @@ impl EngineRunner {
                 .reconcile_converged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!("Reconcile: proven converged with peer {peer} for group {effective}");
+            // The peer holds all our data for this group — clear it from the
+            // pending-push retry set so we stop re-pushing to it (#81).
+            self.note_peer_converged_pushes(&effective, peer);
             self.emit_network_event(crate::network_status::NetworkEvent::PeerConverged {
                 peer_id: crate::network_status::PeerId(peer.to_string()),
                 topic: effective,

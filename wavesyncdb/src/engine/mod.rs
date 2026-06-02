@@ -621,6 +621,7 @@ async fn run_engine(
         rejected_peers: std::collections::HashMap::new(),
         verified_peers: std::collections::HashSet::new(),
         pending_sync_peers: std::collections::HashSet::new(),
+        pending_pushes: std::collections::BTreeMap::new(),
     };
     let mut groups = HashMap::new();
     groups.insert(default_effective_topic.clone(), default_group);
@@ -650,6 +651,7 @@ async fn run_engine(
         push_token,
         push_registered_topics: std::collections::HashSet::new(),
         push_pending_registrations: std::collections::HashMap::new(),
+        pending_push_reqs: std::collections::HashMap::new(),
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
@@ -739,7 +741,34 @@ pub(crate) struct GroupState {
     pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers with an in-flight sync request for THIS group.
     pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Recently fanned-out local changesets not yet confirmed delivered to every
+    /// connected peer, keyed by their `db_version` (#81 Option A). A real-time
+    /// push is fire-and-forget; if it's dropped to a still-connected peer the
+    /// data otherwise waits up to a full `sync_interval` for the reconcile
+    /// catch-up to redeliver it. Re-pushing these on a short cadence closes that
+    /// latency gap. In-memory only — durability and *eventual* delivery are
+    /// already guaranteed by the shadow tables + RBSR (#82); this just makes the
+    /// common case fast. Bounded by [`MAX_PENDING_PUSHES`]; an entry is dropped
+    /// once every connected peer has acked it (or proven converged), and the
+    /// oldest is evicted to the reconcile backstop on overflow.
+    pub(crate) pending_pushes: std::collections::BTreeMap<u64, PendingPush>,
 }
+
+/// A locally-originated changeset awaiting confirmed delivery. See
+/// [`GroupState::pending_pushes`].
+#[derive(Debug, Clone)]
+pub(crate) struct PendingPush {
+    /// The changeset to (re)push. Idempotent to re-apply (CRDT), so re-delivery
+    /// is always safe.
+    pub(crate) changeset: SyncChangeset,
+    /// Peers that have acked this changeset (or are proven converged past it).
+    pub(crate) acked_by: std::collections::HashSet<libp2p::PeerId>,
+}
+
+/// Cap on per-group un-acked pending pushes. Past this the oldest is evicted —
+/// it is never lost (it's committed in the shadow tables and the reconcile
+/// catch-up still carries it), it just stops getting the fast-path retry.
+pub(crate) const MAX_PENDING_PUSHES: usize = 256;
 
 /// Per-(group, peer) rejection backoff state. See [`GroupState::rejected_peers`].
 #[derive(Debug, Clone)]
@@ -839,6 +868,14 @@ struct EngineRunner {
     /// the instant a late-joined group fires its `RegisterToken`.
     pub(crate) push_pending_registrations:
         std::collections::HashMap<request_response::OutboundRequestId, String>,
+    /// In-flight fan-out push requests, keyed by outbound request id, mapped to
+    /// the `(effective_topic, db_version)` they carried (#81 Option A). A
+    /// `PushAck` resolves the id to its group + changeset so that peer can be
+    /// marked as having received it (`GroupState::pending_pushes`); an
+    /// `OutboundFailure` just drops the id (the pending entry stays for the next
+    /// redelivery tick). Correlation is local — nothing new goes on the wire.
+    pub(crate) pending_push_reqs:
+        std::collections::HashMap<request_response::OutboundRequestId, (String, u64)>,
     /// Shared network status snapshot, read by consumers.
     pub(crate) network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     /// Broadcast sender for network events.
@@ -1568,6 +1605,12 @@ impl EngineRunner {
         let watch_interfaces = cfg!(target_os = "ios");
         let mut interface_watch = tokio::time::interval(Duration::from_secs(3));
 
+        // Fast-path redelivery of un-acked local pushes (#81 Option A). Short
+        // cadence (well under `sync_interval`) so a dropped real-time push to a
+        // still-connected peer is retried in seconds; a no-op whenever there is
+        // nothing un-acked (the steady state).
+        let mut redeliver_interval = tokio::time::interval(Duration::from_secs(3));
+
         // The registry-ready notifier is awaited inside the select! arm, which
         // cannot hold a borrow of `self` across the await. Clone the default
         // group's `Arc<Notify>` out here so the arm only touches the local.
@@ -1593,6 +1636,9 @@ impl EngineRunner {
                         // catch-up still does the work.
                         self.send_reconcile_digests();
                     }
+                },
+                _ = redeliver_interval.tick() => {
+                    self.redeliver_pending_pushes();
                 },
                 _ = rendezvous_interval.tick(), if has_rendezvous => {
                     self.rendezvous_discover();
@@ -1759,9 +1805,29 @@ impl EngineRunner {
             }
         };
 
-        // Update local db_version for this group
+        // Update local db_version for this group, and record this changeset as
+        // pending confirmed delivery so a dropped push is redelivered promptly
+        // (#81 Option A). Tracked even with zero peers connected — a peer that
+        // joins later gets it on the next redelivery tick without waiting for a
+        // full reconcile pass.
         if let Some(g) = self.groups.get_mut(&effective_topic) {
             g.local_db_version = g.local_db_version.max(changeset.db_version);
+            g.pending_pushes.insert(
+                changeset.db_version,
+                PendingPush {
+                    changeset: changeset.clone(),
+                    acked_by: std::collections::HashSet::new(),
+                },
+            );
+            while g.pending_pushes.len() > MAX_PENDING_PUSHES {
+                if let Some(oldest) = g.pending_pushes.keys().next().copied() {
+                    g.pending_pushes.remove(&oldest);
+                    log::debug!(
+                        "pending_pushes overflow for group {effective_topic}; \
+                         evicting db_version={oldest} to the reconcile backstop"
+                    );
+                }
+            }
         }
         self.update_network_status();
 
@@ -1811,10 +1877,14 @@ impl EngineRunner {
                     }
                 }
 
-                self.swarm
+                let request_id = self
+                    .swarm
                     .behaviour_mut()
                     .snapshot
                     .send_request(peer_id, req);
+                // Correlate the ack back to this group + changeset (local only).
+                self.pending_push_reqs
+                    .insert(request_id, (effective_topic.clone(), changeset.db_version));
             }
 
             log::info!(
@@ -1829,6 +1899,156 @@ impl EngineRunner {
         // peers are behind NAT with no direct connection, and push is the
         // only way to wake the other side.
         self.notify_relay_topic(&effective_topic);
+    }
+
+    /// Connected peers eligible for a fan-out push of `effective_topic`: every
+    /// peer that isn't infrastructure and isn't in an active rejection backoff
+    /// for this group. Mirrors the filter in `handle_local_changeset`.
+    fn eligible_push_peers(
+        &self,
+        effective_topic: &str,
+    ) -> std::collections::HashSet<libp2p::PeerId> {
+        let now = tokio::time::Instant::now();
+        let rejected: std::collections::HashSet<libp2p::PeerId> = self
+            .groups
+            .get(effective_topic)
+            .map(|g| {
+                g.rejected_peers
+                    .iter()
+                    .filter(|(_, r)| r.until > now)
+                    .map(|(p, _)| *p)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.peers
+            .keys()
+            .filter(|p| !rejected.contains(p))
+            .filter(|p| !self.infrastructure_peers.contains(p))
+            .copied()
+            .collect()
+    }
+
+    /// Record a `PushAck`: resolve the request id to its group + changeset and
+    /// mark `peer` as having received it. Once every currently-connected
+    /// eligible peer has acked a changeset it is dropped from `pending_pushes`
+    /// (#81 Option A).
+    fn note_push_ack(
+        &mut self,
+        request_id: request_response::OutboundRequestId,
+        peer: libp2p::PeerId,
+    ) {
+        let Some((effective_topic, db_version)) = self.pending_push_reqs.remove(&request_id) else {
+            return;
+        };
+        let eligible = self.eligible_push_peers(&effective_topic);
+        if let Some(g) = self.groups.get_mut(&effective_topic)
+            && let Some(p) = g.pending_pushes.get_mut(&db_version)
+        {
+            p.acked_by.insert(peer);
+            if eligible.iter().all(|pid| p.acked_by.contains(pid)) {
+                g.pending_pushes.remove(&db_version);
+            }
+        }
+    }
+
+    /// A reconcile digest proved `peer` holds all of `effective_topic`'s data
+    /// (#82). That subsumes every pending push for the group as far as this peer
+    /// is concerned — mark them acked by it and drop any now fully-delivered.
+    fn note_peer_converged_pushes(&mut self, effective_topic: &str, peer: libp2p::PeerId) {
+        let eligible = self.eligible_push_peers(effective_topic);
+        if let Some(g) = self.groups.get_mut(effective_topic) {
+            g.pending_pushes.retain(|_, p| {
+                p.acked_by.insert(peer);
+                !eligible.iter().all(|pid| p.acked_by.contains(pid))
+            });
+        }
+    }
+
+    /// Re-push every pending changeset to the connected peers that haven't acked
+    /// it yet (#81 Option A). Runs on a short cadence so a dropped real-time
+    /// push reaches a still-connected peer in seconds rather than waiting for
+    /// the next reconcile pass. Re-application is idempotent (CRDT), so a
+    /// redundant resend (e.g. an ack still in flight) is harmless.
+    fn redeliver_pending_pushes(&mut self) {
+        struct Redeliver {
+            effective_topic: String,
+            topic_name: String,
+            group_key: Option<GroupKey>,
+            db_version: u64,
+            changeset: SyncChangeset,
+            peers: Vec<libp2p::PeerId>,
+        }
+
+        // Collect the work first so no `groups` borrow is held across the swarm
+        // sends below.
+        let mut work: Vec<Redeliver> = Vec::new();
+        let topics: Vec<String> = self.groups.keys().cloned().collect();
+        for topic in topics {
+            let eligible = self.eligible_push_peers(&topic);
+            if eligible.is_empty() {
+                continue;
+            }
+            let Some(g) = self.groups.get(&topic) else {
+                continue;
+            };
+            if !g.registry_is_ready || g.pending_pushes.is_empty() {
+                continue;
+            }
+            let topic_name = g.topic_name.clone();
+            let group_key = g.group_key.clone();
+            for (db_version, p) in &g.pending_pushes {
+                let peers: Vec<libp2p::PeerId> = eligible
+                    .iter()
+                    .filter(|pid| !p.acked_by.contains(*pid))
+                    .copied()
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                work.push(Redeliver {
+                    effective_topic: topic.clone(),
+                    topic_name: topic_name.clone(),
+                    group_key: group_key.clone(),
+                    db_version: *db_version,
+                    changeset: p.changeset.clone(),
+                    peers,
+                });
+            }
+        }
+
+        let mut total = 0usize;
+        for w in work {
+            for peer_id in &w.peers {
+                let mut req = SyncRequest::Push {
+                    changeset: w.changeset.clone(),
+                    topic: w.topic_name.clone(),
+                    hmac: None,
+                };
+                if let Some(ref gk) = w.group_key
+                    && let Ok(bytes) = serde_json::to_vec(&req)
+                {
+                    let tag = gk.mac(&bytes);
+                    let SyncRequest::Push { ref mut hmac, .. } = req else {
+                        unreachable!()
+                    };
+                    *hmac = Some(tag);
+                }
+                let request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .snapshot
+                    .send_request(peer_id, req);
+                self.pending_push_reqs
+                    .insert(request_id, (w.effective_topic.clone(), w.db_version));
+                total += 1;
+            }
+        }
+        if total > 0 {
+            self.diagnostics
+                .pending_pushes_redelivered
+                .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+            log::debug!("Redelivered {total} pending push(es) to un-acked peers");
+        }
     }
 
     /// Graceful-shutdown flush for queued local writes.

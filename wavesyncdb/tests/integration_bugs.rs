@@ -1270,3 +1270,82 @@ async fn test_82_rbsr_repairs_divergence_without_version_vector() {
     assert_eq!(a_rows, N, "A holds all injected rows");
     assert_eq!(b_rows, N, "B converged to A's state via RBSR");
 }
+
+// ---------------------------------------------------------------------------
+// #81 Option A: a local write made while no peer is connected lands in the
+// in-memory pending-push set; when a peer joins, the changeset is redelivered
+// on the short retry cadence (~3s) instead of waiting for the periodic
+// reconcile pass. We pin `sync_interval` very high so the periodic VV/digest
+// catch-up cannot run in-window — then both the delivery AND the redelivery
+// counter advancing prove the fast-retry path did the work. (The on-connect
+// VV may also pull the row, but it never clears a pending push — only a
+// PushAck or proven convergence does, and convergence needs a digest the high
+// interval suppresses — so the redelivery deterministically fires at least
+// once to clear the entry.)
+//
+// Seeds 233, 234. See CLAUDE.md §6.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_81_pending_push_redelivers_to_late_peer() {
+    async fn slow_peer(url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+        let peer = WaveSyncDbBuilder::new(url, topic)
+            .with_node_id(common::make_node_id(seed))
+            .with_mdns_query_interval(Duration::from_millis(100))
+            .with_mdns_ttl(Duration::from_secs(5))
+            // Far longer than the test: the periodic catch-up must not run, so
+            // any delivery within the window comes from the fast-retry path.
+            .with_sync_interval(Duration::from_secs(600))
+            .build()
+            .await
+            .expect("build slow peer");
+        peer.schema()
+            .register(task::Entity)
+            .sync()
+            .await
+            .expect("schema sync");
+        peer
+    }
+
+    let _ = env_logger::try_init();
+    let topic = format!("test-redeliver-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(20);
+
+    let a = slow_peer(&mem_db("redeliver_a"), &topic, 233).await;
+
+    // Write on A while B does not exist yet: no eligible peer, so no real-time
+    // push is sent — the changeset only enters the pending-push retry set.
+    task::ActiveModel {
+        id: Set("p1".to_string()),
+        title: Set("late-joiner".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    // Bring B up. It connects via mDNS; A redelivers the pending push within the
+    // short retry cadence.
+    let b = slow_peer(&mem_db("redeliver_b"), &topic, 234).await;
+
+    assert_eventually(
+        "B receives the write made before it connected",
+        timeout,
+        || async {
+            task::Entity::find_by_id("p1".to_string())
+                .one(&b)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
+    .await;
+
+    // The redelivery counter must advance — proving the fast-retry path ran (the
+    // 600s periodic tick cannot have fired in this window).
+    assert_eventually("A redelivered the pending push", timeout, || async {
+        a.diagnostics().pending_pushes_redelivered >= 1
+    })
+    .await;
+}
