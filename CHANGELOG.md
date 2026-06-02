@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.0 — 03/06/2026
+
+Crate versions: `wavesyncdb` 0.7.0, `wavesyncdb_derive` 0.3.0,
+`wavesync_relay` 0.2.1.
+
 ### iOS cold-sync + unified `push-sync` feature
 
 iOS APNs integration now matches Android's zero-setup experience. A Swift
@@ -100,6 +105,38 @@ version-vector sync.
 #### Added
 - Targeted, multi-group background wake: the push payload's topic selects which
   group(s) to rejoin and catch up; incremental version-vector sync on wake.
+
+### Sync reliability hardening
+
+#### Added
+- **Convergence verification + RBSR (#82).** Recursive range-based set
+  reconciliation over the shadow tables: peers exchange a value-inclusive
+  digest that *proves* whether they hold identical data (the version-vector
+  catch-up only compares height, not equality), then reconcile the symmetric
+  difference by recursively splitting mismatching key ranges and transferring
+  only the differing cells. Additive on the wire — older / web peers that
+  can't decode it fall back to the version-vector catch-up. The periodic
+  version-vector resend is skipped for peers proven converged.
+- **Fast-path push redelivery (#81).** Un-acked real-time pushes are retried
+  on a short cadence so a dropped push reaches a still-connected peer in
+  seconds instead of waiting for the next reconcile pass. In-memory and
+  idempotent; durability is already guaranteed by the shadow tables + RBSR.
+  New `pending_pushes_redelivered` diagnostics counter.
+- **Relay-cost telemetry (#84).** Connections are classified direct vs
+  relayed (`PeerInfo.via_relay`, `relayed_connections_established` /
+  `direct_connections_established` counters) toward demoting paid relay paths.
+
+#### Fixed
+- **#80** — writes queued at `shutdown()` are now drained and flushed to peers
+  before the engine stops, instead of waiting for a peer's next catch-up.
+- **#83** — shadow-table write failures fail closed (roll back rather than
+  advance `db_version` on a half-written change), and `ChangeNotification`
+  fires only after the shadow transaction commits.
+- **#85** — incompatible-protocol peers are surfaced
+  (`NetworkEvent::PeerProtocolMismatch`) instead of silently never syncing.
+- **#86** — per-(group, peer) topic/HMAC rejection is time-boxed with
+  exponential backoff (30s→1h) and cleared on a later successful verify,
+  instead of being permanent (which needed an engine restart to recover).
 
 ### Fixed
 - **#72** — iOS QUIC listener bound to loopback made all WAN dials fail with

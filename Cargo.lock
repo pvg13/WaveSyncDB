@@ -8116,7 +8116,7 @@ dependencies = [
 
 [[package]]
 name = "wavesync_relay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8137,7 +8137,7 @@ dependencies = [
 
 [[package]]
 name = "wavesyncdb"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "android_logger",
  "async-trait",
@@ -8214,7 +8214,7 @@ dependencies = [
 
 [[package]]
 name = "wavesyncdb_derive"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
