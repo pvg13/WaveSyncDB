@@ -713,6 +713,9 @@ async fn apply_changeset_chunk<'a>(
         let mut any_applied = false;
         let mut changed_pairs: Vec<(String, serde_json::Value)> = Vec::new();
         let mut is_delete = false;
+        // Whether the row already existed before this changeset was applied —
+        // drives the Insert vs Update classification of the notification below.
+        let mut existed = false;
 
         let delete_change = row_changes.iter().find(|c| c.cid.0 == "__deleted");
         if let Some(change) = delete_change {
@@ -721,18 +724,24 @@ async fn apply_changeset_chunk<'a>(
                 is_delete = true;
             }
         } else {
-            let (applied, pairs) =
+            let (applied, row_existed, pairs) =
                 apply_remote_column_changes(&txn, table, pk, row_changes, &meta, local_db_version)
                     .await;
             if applied {
                 any_applied = true;
+                existed = row_existed;
                 changed_pairs = pairs;
             }
         }
 
         if any_applied {
+            // A remote edit to a pre-existing row is an Update; first-time
+            // creation is an Insert. This lets an `on_sync` policy that only
+            // notifies on `Insert` stay quiet when a peer merely edits a row.
             let kind = if is_delete {
                 WriteKind::Delete
+            } else if existed {
+                WriteKind::Update
             } else {
                 WriteKind::Insert
             };
@@ -841,10 +850,12 @@ async fn apply_remote_delete(
 }
 
 /// Apply non-delete column changes: resolve conflicts per-column, write winning values,
-/// update shadow tables. Returns `(applied, changed_column_pairs)` where each pair
-/// is `(column_name, post_write_json_value)` for the columns that actually got
-/// applied. Reactive hooks consume the JSON values to update signal state in place
-/// without re-querying SeaORM.
+/// update shadow tables. Returns `(applied, existed, changed_column_pairs)` where
+/// `existed` is whether the row already existed *before* this changeset was applied
+/// (so the caller can classify the write as `Update` vs `Insert`), and each pair in
+/// `changed_column_pairs` is `(column_name, post_write_json_value)` for the columns
+/// that actually got applied. Reactive hooks consume the JSON values to update signal
+/// state in place without re-querying SeaORM.
 async fn apply_remote_column_changes(
     db: &impl ConnectionTrait,
     table: &str,
@@ -852,7 +863,7 @@ async fn apply_remote_column_changes(
     row_changes: &[&ColumnChange],
     meta: &crate::registry::TableMeta,
     local_db_version: u64,
-) -> (bool, Vec<(String, serde_json::Value)>) {
+) -> (bool, bool, Vec<(String, serde_json::Value)>) {
     let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
     let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
     let mut pending_shadow_updates: Vec<(String, u64, crate::messages::NodeId, u32)> = Vec::new();
@@ -928,7 +939,7 @@ async fn apply_remote_column_changes(
     }
 
     if winning_columns.is_empty() {
-        return (false, changed_columns);
+        return (false, exists, changed_columns);
     }
 
     if exists {
@@ -950,7 +961,7 @@ async fn apply_remote_column_changes(
             }
         }
         flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await;
-        return (true, changed_columns);
+        return (true, exists, changed_columns);
     }
 
     // INSERT OR IGNORE — silently skips if row was created by a concurrent task
@@ -1004,7 +1015,7 @@ async fn apply_remote_column_changes(
     // Verify INSERT actually created the row before writing shadow
     if row_exists(db, table, &meta.primary_key_column, pk).await {
         flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await;
-        (true, changed_columns)
+        (true, exists, changed_columns)
     } else {
         log::debug!(
             "Row {}/{} not created (likely missing NOT NULL columns from \
@@ -1012,7 +1023,7 @@ async fn apply_remote_column_changes(
             table,
             pk
         );
-        (false, changed_columns)
+        (false, exists, changed_columns)
     }
 }
 
