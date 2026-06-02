@@ -36,20 +36,43 @@ mod imp {
     /// attach a tokio worker thread to call back into Kotlin.
     static JAVA_VM: OnceLock<jni::JavaVM> = OnceLock::new();
 
-    pub(super) fn store_java_vm(env: &jni::JNIEnv) {
-        if JAVA_VM.get().is_some() {
-            return;
-        }
-        match env.get_java_vm() {
-            Ok(vm) => {
-                let _ = JAVA_VM.set(vm);
+    /// Global ref to `dev.dioxus.main.NotificationHelper`, resolved on the JNI
+    /// entry thread. `show()` runs on a runtime-spawned worker thread, where
+    /// `FindClass` resolves against the system classloader — which cannot see
+    /// app classes, so a name lookup there fails with ClassNotFoundException
+    /// ("Java exception was thrown") and the notification is silently dropped.
+    /// The JNI entry thread is JVM-created and carries the app classloader, so
+    /// we resolve the class there and hold a global ref for the worker to use.
+    static HELPER_CLASS: OnceLock<jni::objects::GlobalRef> = OnceLock::new();
+
+    pub(super) fn store_java_vm(env: &mut jni::JNIEnv) {
+        if JAVA_VM.get().is_none() {
+            match env.get_java_vm() {
+                Ok(vm) => {
+                    let _ = JAVA_VM.set(vm);
+                }
+                Err(e) => log::warn!("notify_display: could not capture JavaVM: {e}"),
             }
-            Err(e) => log::warn!("notify_display: could not capture JavaVM: {e}"),
+        }
+        // Cache the class from this (JVM-created, app-classloader) thread.
+        if HELPER_CLASS.get().is_none() {
+            match env
+                .find_class("dev/dioxus/main/NotificationHelper")
+                .and_then(|c| env.new_global_ref(c))
+            {
+                Ok(g) => {
+                    let _ = HELPER_CLASS.set(g);
+                }
+                Err(e) => {
+                    log::warn!("notify_display: could not cache NotificationHelper class: {e}");
+                    let _ = env.exception_clear();
+                }
+            }
         }
     }
 
     pub(super) fn show(title: &str, body: &str, group: &str) {
-        use jni::objects::JValue;
+        use jni::objects::{JClass, JValue};
 
         let Some(vm) = JAVA_VM.get() else {
             log::warn!(
@@ -73,12 +96,28 @@ mod imp {
             log::warn!("notify_display: failed to build JNI strings");
             return;
         };
-        match env.call_static_method(
-            "dev/dioxus/main/NotificationHelper",
-            "showFromNative",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-            &[JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)],
-        ) {
+        let args = [JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)];
+        const SIG: &str = "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V";
+
+        // Use the class cached on the JNI entry thread (correct classloader).
+        // Fall back to a name lookup only if caching failed — that path works
+        // solely on JVM-created threads, but it's better than nothing.
+        let result = match HELPER_CLASS.get() {
+            Some(global) => {
+                // SAFETY: `global` is a live global ref to the class for the
+                // process lifetime; we only borrow its handle for this call and
+                // never free it here.
+                let class = unsafe { JClass::from_raw(global.as_raw()) };
+                env.call_static_method(&class, "showFromNative", SIG, &args)
+            }
+            None => env.call_static_method(
+                "dev/dioxus/main/NotificationHelper",
+                "showFromNative",
+                SIG,
+                &args,
+            ),
+        };
+        match result {
             Ok(_) => log::debug!("notify_display: NotificationHelper.showFromNative ok"),
             Err(e) => {
                 log::warn!("notify_display: showFromNative failed: {e}");
@@ -137,6 +176,6 @@ pub(crate) fn show_background(n: &Notification) {
 /// can call back into Kotlin without `ndk_context`. Android-only; called from
 /// `crate::ffi`'s background-sync entry points.
 #[cfg(target_os = "android")]
-pub(crate) fn store_java_vm(env: &jni::JNIEnv) {
+pub(crate) fn store_java_vm(env: &mut jni::JNIEnv) {
     imp::store_java_vm(env);
 }
