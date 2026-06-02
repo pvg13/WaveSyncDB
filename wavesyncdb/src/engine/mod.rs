@@ -610,7 +610,7 @@ async fn run_engine(
         group_key,
         rendezvous_namespace,
         rendezvous_registered: false,
-        rejected_peers: std::collections::HashSet::new(),
+        rejected_peers: std::collections::HashMap::new(),
         verified_peers: std::collections::HashSet::new(),
         pending_sync_peers: std::collections::HashSet::new(),
     };
@@ -717,13 +717,51 @@ pub(crate) struct GroupState {
     /// Rendezvous namespace for peer discovery (per group).
     pub(crate) rendezvous_namespace: String,
     pub(crate) rendezvous_registered: bool,
-    /// Peers rejected for THIS group (topic mismatch / failed HMAC). A peer
-    /// rejected here may still be a valid member of another group on this node.
-    pub(crate) rejected_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers rejected for THIS group: a per-group HMAC failure for a topic we
+    /// hold (a spoofed / incorrect-key request — an honest peer that derived
+    /// the right topic necessarily has the right key). Time-boxed with
+    /// exponential backoff rather than permanent (Rule 2.8 anti-storm intent),
+    /// and removed when the peer later passes verification (recovery, N6). A
+    /// peer rejected here may still be a valid member of another group.
+    pub(crate) rejected_peers: std::collections::HashMap<libp2p::PeerId, RejectionState>,
     /// Peers verified via successful HMAC exchange for THIS group.
     pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers with an in-flight sync request for THIS group.
     pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+}
+
+/// Per-(group, peer) rejection backoff state. See [`GroupState::rejected_peers`].
+#[derive(Debug, Clone)]
+pub(crate) struct RejectionState {
+    /// Consecutive rejections for this peer (1-based).
+    pub(crate) attempts: u32,
+    /// The peer is skipped (dialing / sync) until this instant. After it, the
+    /// peer is eligible for one re-evaluation: a continued mismatch extends the
+    /// backoff, a successful verify removes the entry.
+    pub(crate) until: tokio::time::Instant,
+}
+
+/// Exponential rejection backoff: 30s, 60s, 120s, … capped at 1 hour. Bounds
+/// how often a persistently-mismatching (e.g. spoofed-topic) peer is
+/// re-evaluated — the Rule 2.8 anti-storm guarantee — while still letting a
+/// transiently-misconfigured peer recover on a later attempt.
+fn rejection_backoff(attempts: u32) -> Duration {
+    const BASE_SECS: u64 = 30;
+    const MAX_SECS: u64 = 3600;
+    let shift = attempts.saturating_sub(1).min(20);
+    let secs = BASE_SECS.saturating_mul(1u64 << shift).min(MAX_SECS);
+    Duration::from_secs(secs)
+}
+
+impl GroupState {
+    /// Whether `peer` is currently within an active rejection backoff window
+    /// for this group (so it should be skipped for dialing / sync). An expired
+    /// entry returns `false` so the peer gets one re-evaluation.
+    pub(crate) fn is_rejected(&self, peer: &libp2p::PeerId) -> bool {
+        self.rejected_peers
+            .get(peer)
+            .is_some_and(|r| r.until > tokio::time::Instant::now())
+    }
 }
 
 struct EngineRunner {
@@ -1111,7 +1149,7 @@ impl EngineRunner {
         }
 
         if self.default_group().registry_is_ready
-            && !self.default_group().rejected_peers.contains(&peer_id)
+            && !self.default_group().is_rejected(&peer_id)
             && !self.infrastructure_peers.contains(&peer_id)
         {
             // Ensure reconnecting peer is tracked for future periodic syncs
@@ -1695,11 +1733,19 @@ impl EngineRunner {
         self.update_network_status();
 
         // Fan-out: push changeset to all connected peers via request-response.
-        // Exclude peers rejected *for this group* and infrastructure peers.
-        let rejected = self
+        // Exclude peers in an active rejection backoff *for this group* and
+        // infrastructure peers.
+        let now = tokio::time::Instant::now();
+        let rejected: std::collections::HashSet<libp2p::PeerId> = self
             .groups
             .get(&effective_topic)
-            .map(|g| g.rejected_peers.clone())
+            .map(|g| {
+                g.rejected_peers
+                    .iter()
+                    .filter(|(_, r)| r.until > now)
+                    .map(|(p, _)| *p)
+                    .collect()
+            })
             .unwrap_or_default();
         let peer_ids: Vec<libp2p::PeerId> = self
             .peers
@@ -2365,6 +2411,28 @@ fn group_bootstrap_addrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_backoff_grows_exponentially_and_caps() {
+        // 1-based attempts double from 30s and cap at 1 hour (Rule 2.8
+        // anti-storm: a persistently-mismatching peer is re-evaluated ever less
+        // often, never faster than the base and never more than hourly).
+        assert_eq!(rejection_backoff(1), Duration::from_secs(30));
+        assert_eq!(rejection_backoff(2), Duration::from_secs(60));
+        assert_eq!(rejection_backoff(3), Duration::from_secs(120));
+        assert_eq!(rejection_backoff(4), Duration::from_secs(240));
+        assert_eq!(rejection_backoff(7), Duration::from_secs(1920));
+        // Caps at 1 hour and never overflows for large attempt counts.
+        assert_eq!(rejection_backoff(8), Duration::from_secs(3600));
+        assert_eq!(rejection_backoff(1000), Duration::from_secs(3600));
+        // Non-decreasing.
+        let mut prev = Duration::ZERO;
+        for a in 1..=12 {
+            let d = rejection_backoff(a);
+            assert!(d >= prev, "backoff must be non-decreasing");
+            prev = d;
+        }
+    }
 
     #[test]
     fn group_bootstrap_addrs_collapses_addrs_for_same_peer() {

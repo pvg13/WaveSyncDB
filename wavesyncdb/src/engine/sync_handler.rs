@@ -347,13 +347,17 @@ impl EngineRunner {
             if let Ok(bytes) = serde_json::to_vec(&verify_req)
                 && !gk.verify(&bytes, &tag)
             {
-                log::debug!("Rejecting sync request with invalid HMAC from peer {peer}");
+                // Per-group HMAC failure for a topic we hold → time-boxed
+                // rejection with backoff (Rule 2.8 / N6).
+                self.reject_peer_for_group(&effective, peer);
                 return;
             }
-            // HMAC verified — mark peer as a member of THIS group.
+            // HMAC verified — mark peer as a member of THIS group, and clear any
+            // prior rejection backoff (it just proved the right key — recovery).
             let newly_verified = match self.groups.get_mut(&effective) {
                 Some(g) if !g.verified_peers.contains(&peer) => {
                     g.verified_peers.insert(peer);
+                    g.rejected_peers.remove(&peer);
                     true
                 }
                 _ => false,
@@ -504,13 +508,17 @@ impl EngineRunner {
             if let Ok(bytes) = serde_json::to_vec(&verify_req)
                 && !gk.verify(&bytes, &tag)
             {
-                log::debug!("Rejecting push with invalid HMAC from peer {peer}");
+                // Per-group HMAC failure for a topic we hold → time-boxed
+                // rejection with backoff (Rule 2.8 / N6).
+                self.reject_peer_for_group(&effective, peer);
                 return;
             }
-            // HMAC verified — mark peer as a member of THIS group.
+            // HMAC verified — mark peer as a member of THIS group, and clear any
+            // prior rejection backoff (it just proved the right key — recovery).
             let newly_verified = match self.groups.get_mut(&effective) {
                 Some(g) if !g.verified_peers.contains(&peer) => {
                     g.verified_peers.insert(peer);
+                    g.rejected_peers.remove(&peer);
                     true
                 }
                 _ => false,
@@ -623,17 +631,45 @@ impl EngineRunner {
         });
     }
 
-    /// Reject a peer for a single group (failed HMAC for that group). Removes it
-    /// from that group's tracking only — the peer may still belong to other
-    /// groups on this node.
-    #[allow(dead_code)]
+    /// Reject a peer for a single group on a per-group HMAC failure (a
+    /// spoofed / incorrect-key request for a topic we hold). The rejection is
+    /// time-boxed with exponential backoff (Rule 2.8 anti-storm) rather than
+    /// permanent: the peer is skipped while the window is open, the window grows
+    /// on repeated failures, and a later successful verify removes the entry
+    /// (recovery, N6 — see `handle_version_vector_request`). Scoped to this
+    /// group only; the peer may still be a valid member of other groups.
     fn reject_peer_for_group(&mut self, effective_topic: &str, peer: libp2p::PeerId) {
-        if let Some(g) = self.groups.get_mut(effective_topic) {
-            g.rejected_peers.insert(peer);
+        let backoff = if let Some(g) = self.groups.get_mut(effective_topic) {
+            let attempts = g
+                .rejected_peers
+                .get(&peer)
+                .map(|r| r.attempts)
+                .unwrap_or(0)
+                + 1;
+            let dur = super::rejection_backoff(attempts);
+            g.rejected_peers.insert(
+                peer,
+                super::RejectionState {
+                    attempts,
+                    until: tokio::time::Instant::now() + dur,
+                },
+            );
             g.verified_peers.remove(&peer);
             g.pending_sync_peers.remove(&peer);
             g.peer_db_versions.remove(&peer);
             g.peer_reported_versions.remove(&peer);
+            Some((attempts, dur))
+        } else {
+            None
+        };
+        if let Some((attempts, dur)) = backoff {
+            log::warn!(
+                "Rejecting peer {peer} for group {effective_topic} (HMAC failure, attempt \
+                 {attempts}); backing off for {dur:?}"
+            );
+            self.emit_network_event(crate::network_status::NetworkEvent::PeerRejected(
+                crate::network_status::PeerId(peer.to_string()),
+            ));
         }
         self.update_network_status();
     }

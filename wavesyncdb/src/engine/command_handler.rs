@@ -150,7 +150,7 @@ impl EngineRunner {
             group_key,
             rendezvous_namespace,
             rendezvous_registered: false,
-            rejected_peers: std::collections::HashSet::new(),
+            rejected_peers: std::collections::HashMap::new(),
             verified_peers: std::collections::HashSet::new(),
             pending_sync_peers: std::collections::HashSet::new(),
         };

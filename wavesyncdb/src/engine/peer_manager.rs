@@ -45,7 +45,7 @@ impl EngineRunner {
             let Some(g) = self.groups.get(effective_topic) else {
                 return;
             };
-            if g.pending_sync_peers.contains(&peer_id) || g.rejected_peers.contains(&peer_id) {
+            if g.pending_sync_peers.contains(&peer_id) || g.is_rejected(&peer_id) {
                 return;
             }
             (
@@ -105,10 +105,7 @@ impl EngineRunner {
                     // Never re-add peers rejected by EVERY local group (a peer
                     // rejected by one group may still be valid for another).
                     if !self.groups.is_empty()
-                        && self
-                            .groups
-                            .values()
-                            .all(|g| g.rejected_peers.contains(&peer_id))
+                        && self.groups.values().all(|g| g.is_rejected(&peer_id))
                     {
                         continue;
                     }

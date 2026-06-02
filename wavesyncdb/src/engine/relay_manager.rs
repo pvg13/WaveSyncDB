@@ -274,10 +274,7 @@ impl EngineRunner {
                 for registration in registrations {
                     let peer_id = registration.record.peer_id();
                     let rejected_by_all = !self.groups.is_empty()
-                        && self
-                            .groups
-                            .values()
-                            .all(|g| g.rejected_peers.contains(&peer_id));
+                        && self.groups.values().all(|g| g.is_rejected(&peer_id));
                     if peer_id == self.local_peer_id
                         || self.dialing_peers.contains(&peer_id)
                         || rejected_by_all
@@ -688,11 +685,8 @@ impl EngineRunner {
             return;
         };
 
-        let rejected_by_all = !self.groups.is_empty()
-            && self
-                .groups
-                .values()
-                .all(|g| g.rejected_peers.contains(&peer_id));
+        let rejected_by_all =
+            !self.groups.is_empty() && self.groups.values().all(|g| g.is_rejected(&peer_id));
         if peer_id == self.local_peer_id
             || self.infrastructure_peers.contains(&peer_id)
             || rejected_by_all
