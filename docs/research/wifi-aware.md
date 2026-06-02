@@ -36,9 +36,10 @@ Apple shipped Wi-Fi Aware as a first-class framework at **WWDC 2025**
 (iOS 26+). API: `WiFiAware` framework with `WAPairingHandler`,
 `WAPairingSession`, etc. Requires:
 
-- A new `com.apple.developer.networking.wifi-aware` entitlement
+- A new `com.apple.developer.wifi-aware` entitlement
   (provisioning profile must include it; gated per-app via the
   Developer Portal)
+- A `WiFiAwareServices` key in Info.plist declaring the published/subscribed services
 - `NSWiFiAwareUsageDescription` in Info.plist
 - User permission prompt on first use
 - iOS 26.0 deployment floor for the new APIs
