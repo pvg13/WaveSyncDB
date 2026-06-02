@@ -157,6 +157,25 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
     };
     log::info!("notification: posting Android notification via NotificationHelper.show (group={group})");
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    // Resolve NotificationHelper through the *application* classloader.
+    //
+    // This display runs on a runtime-spawned worker thread, not one the JVM
+    // created. `FindClass` (which `call_static_method` performs for a class
+    // *name*) resolves against the system classloader on such threads, and that
+    // loader cannot see app classes — the lookup fails with
+    // ClassNotFoundException ("Java exception was thrown") and the notification
+    // is silently dropped. The Context's classloader is the app one, so load the
+    // class through it explicitly and invoke the method on the resolved class.
+    let helper = match resolve_app_class(&mut env, &context, "dev.dioxus.main.NotificationHelper") {
+        Some(c) => c,
+        None => {
+            log::warn!("notification: could not resolve NotificationHelper via app classloader");
+            describe_and_clear(&mut env);
+            return;
+        }
+    };
+
     let (Ok(title_j), Ok(body_j), Ok(group_j)) = (
         env.new_string(title),
         env.new_string(body),
@@ -166,7 +185,7 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
         return;
     };
     match env.call_static_method(
-        "dev/dioxus/main/NotificationHelper",
+        &helper,
         "show",
         "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         &[
@@ -179,9 +198,50 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
         Ok(_) => log::debug!("notification: NotificationHelper.show returned ok"),
         Err(e) => {
             log::warn!("notification: NotificationHelper.show failed: {e}");
-            // Clear any pending Java exception so it can't leak into later JNI calls.
-            let _ = env.exception_clear();
+            // Surface the underlying Java stack trace, then clear so the pending
+            // exception can't leak into later JNI calls on this thread.
+            describe_and_clear(&mut env);
         }
+    }
+}
+
+/// Load an application class by its binary name via the Context's classloader,
+/// rather than `FindClass` (which uses the system loader on non-JVM threads and
+/// cannot see app classes). Returns `None` on failure, leaving any pending
+/// exception for the caller to describe/clear.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+fn resolve_app_class<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    context: &jni::objects::JObject,
+    binary_name: &str,
+) -> Option<jni::objects::JClass<'a>> {
+    use jni::objects::{JClass, JValue};
+
+    let loader = env
+        .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let name = env.new_string(binary_name).ok()?;
+    let class = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&name)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    Some(JClass::from(class))
+}
+
+/// Print a pending Java exception's stack trace to logcat, then clear it.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+fn describe_and_clear(env: &mut jni::JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
     }
 }
 
