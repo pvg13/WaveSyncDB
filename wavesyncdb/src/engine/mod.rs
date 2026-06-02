@@ -312,6 +312,50 @@ pub(crate) fn start_engine(
 ///
 /// When `tcp_enabled = true`, adds TCP as a secondary transport. See
 /// [`build_swarm_with_tcp`] and the `with_tcp_enabled` builder method.
+/// iOS: enumerate the device's routable interface addresses for QUIC binding.
+///
+/// Returns every non-loopback, non-link-local address on an up interface
+/// (Wi-Fi `en0`, cellular `pdp_ip0`, etc.), filtered to IPv4 unless `ipv6` is
+/// enabled. These are the addresses a concrete-interface QUIC listener binds
+/// to so that libp2p-quic sources outbound dials from a WAN-routable socket
+/// instead of loopback (#72). An empty result means the device currently has
+/// no usable interface (offline / between handoffs); the interface-watch tick
+/// will bind once one appears.
+#[cfg(target_os = "ios")]
+fn routable_listen_ips(ipv6: bool) -> Vec<std::net::IpAddr> {
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("getifaddrs failed; cannot enumerate interfaces for QUIC bind: {e}");
+            return Vec::new();
+        }
+    };
+    // `Interface::is_link_local` is platform-aware (IPv4 169.254.0.0/16 and
+    // IPv6 fe80::/10). Link-local addresses are not WAN-routable and need a
+    // scope id a bare multiaddr can't carry, so they're excluded.
+    ifaces
+        .into_iter()
+        .filter(|iface| !iface.is_loopback() && !iface.is_link_local())
+        .map(|iface| iface.ip())
+        .filter(|ip| ipv6 || ip.is_ipv4())
+        .collect()
+}
+
+/// iOS: build a `/ip{4,6}/<addr>/udp/0/quic-v1` listen multiaddr for `ip`
+/// (port 0 = let the OS pick an ephemeral UDP port).
+#[cfg(target_os = "ios")]
+fn quic_listen_multiaddr(ip: std::net::IpAddr) -> libp2p::Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let mut addr = libp2p::Multiaddr::empty();
+    match ip {
+        std::net::IpAddr::V4(v4) => addr.push(Protocol::Ip4(v4)),
+        std::net::IpAddr::V6(v6) => addr.push(Protocol::Ip6(v6)),
+    }
+    addr.push(Protocol::Udp(0));
+    addr.push(Protocol::QuicV1);
+    addr
+}
+
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: Option<mdns::Config>,
@@ -599,6 +643,8 @@ async fn run_engine(
         relay_dial_pending: false,
         dcutr_retries: HashMap::new(),
         diagnostics,
+        #[cfg(target_os = "ios")]
+        quic_listeners: std::collections::HashMap::new(),
     };
 
     // Set initial network status with local_peer_id and topic.
@@ -781,6 +827,16 @@ struct EngineRunner {
     /// (UI / debug panel / test assertions) snapshot via
     /// [`WaveSyncDb::diagnostics`]. See [`crate::diagnostics`].
     pub(crate) diagnostics: Arc<crate::diagnostics::Counters>,
+    /// iOS only: QUIC listeners keyed by the concrete interface IP they are
+    /// bound to. iOS binds QUIC to concrete routable addresses (not loopback,
+    /// not unspecified — see the listen logic in `run`), and a mobile device's
+    /// active interface changes (Wi-Fi↔cellular handoff, DHCP renew, NAT
+    /// remap). The interface-watch tick diffs the current routable set against
+    /// these keys to add listeners for new interfaces and `remove_listener`
+    /// departed ones, keeping the node dialable across network changes.
+    #[cfg(target_os = "ios")]
+    pub(crate) quic_listeners:
+        std::collections::HashMap<std::net::IpAddr, libp2p::core::transport::ListenerId>,
 }
 
 impl EngineRunner {
@@ -801,6 +857,45 @@ impl EngineRunner {
             .get_mut(&topic)
             .expect("default group always present")
     }
+
+    /// iOS: reconcile QUIC listeners against the current set of routable
+    /// interface addresses. Adds a listener for each newly-appeared interface
+    /// and removes the listener for each departed one. Called from the
+    /// interface-watch tick so a concrete-interface bind survives a network
+    /// change (Wi-Fi↔cellular handoff, DHCP renew, NAT remap). Adding a
+    /// listener fires `NewListenAddr`, which the existing handler uses to
+    /// redial the relay if it had dropped to `Connecting`.
+    #[cfg(target_os = "ios")]
+    fn reconcile_quic_listeners(&mut self) {
+        use std::collections::HashSet;
+        let current: HashSet<std::net::IpAddr> =
+            routable_listen_ips(self.config.ipv6).into_iter().collect();
+        let known: HashSet<std::net::IpAddr> = self.quic_listeners.keys().copied().collect();
+
+        // Drop listeners for interfaces that have gone away.
+        for ip in known.difference(&current).copied().collect::<Vec<_>>() {
+            if let Some(id) = self.quic_listeners.remove(&ip) {
+                log::info!("Network interface {ip} departed; removing QUIC listener {id:?}");
+                self.swarm.remove_listener(id);
+            }
+        }
+        // Bind listeners for interfaces that have just appeared.
+        for ip in current.difference(&known).copied().collect::<Vec<_>>() {
+            let addr = quic_listen_multiaddr(ip);
+            log::info!("Network interface {ip} appeared; binding QUIC listener {addr}");
+            match self.swarm.listen_on(addr.clone()) {
+                Ok(id) => {
+                    self.quic_listeners.insert(ip, id);
+                }
+                Err(e) => log::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
+            }
+        }
+    }
+
+    /// No-op on non-iOS targets: they bind QUIC to unspecified addresses and
+    /// let libp2p enumerate and track interfaces itself.
+    #[cfg(not(target_os = "ios"))]
+    fn reconcile_quic_listeners(&mut self) {}
 
     /// Rebuild the full network status snapshot from internal state.
     fn update_network_status(&self) {
@@ -1231,25 +1326,54 @@ impl EngineRunner {
 
         // QUIC-only listeners. See `build_swarm` for the rationale.
         //
-        // iOS (including simulator): libp2p-tcp's `do_listen` instantiates an
-        // `if_watch::tokio::IfWatcher` *only* when the bound IP is unspecified
-        // (`0.0.0.0` / `::`). On iOS that watcher blocks indefinitely inside
-        // `IfWatcher::new`. Binding to loopback skips the watcher path. The
-        // same caution applies to QUIC's UDP socket setup.
+        // iOS: bind to the device's *concrete* active-interface address(es),
+        // not loopback and not unspecified. libp2p-quic 0.13 dials with
+        // `PortUse::Reuse` by sourcing outbound dials from an eligible listener
+        // socket; its listener selection does not exclude a loopback listener
+        // for a public destination, so a loopback-bound listener makes every
+        // relay/rendezvous/direct dial leave from 127.0.0.1 and fail with
+        // EADDRNOTAVAIL (errno 49) — total WAN-sync failure (#72). A concrete
+        // routable bind sources dials from the real interface. Concrete (non-
+        // unspecified) binds also sidestep the unspecified-bind code path that
+        // the previous loopback workaround was guarding against. The
+        // interface-watch tick (below) re-binds when the active interface
+        // changes (Wi-Fi↔cellular handoff, DHCP renew).
         #[cfg(target_os = "ios")]
-        let (v4_quic, v6_quic) = ("/ip4/127.0.0.1/udp/0/quic-v1", "/ip6/::1/udp/0/quic-v1");
-        #[cfg(not(target_os = "ios"))]
-        let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
-
-        log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
-        let t1 = std::time::Instant::now();
-        self.swarm.listen_on(v4_quic.parse().unwrap())?;
-        log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
-
-        if self.config.ipv6
-            && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
         {
-            log::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
+            let ips = routable_listen_ips(self.config.ipv6);
+            if ips.is_empty() {
+                log::warn!(
+                    "No routable network interface at startup; QUIC listen deferred \
+                     to the interface watch (will bind once an interface appears)"
+                );
+            }
+            for ip in ips {
+                let addr = quic_listen_multiaddr(ip);
+                log::info!("DIAG calling listen_on(QUIC)={addr}");
+                let t1 = std::time::Instant::now();
+                match self.swarm.listen_on(addr.clone()) {
+                    Ok(id) => {
+                        self.quic_listeners.insert(ip, id);
+                        log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+                    }
+                    Err(e) => log::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
+                }
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
+
+            log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
+            let t1 = std::time::Instant::now();
+            self.swarm.listen_on(v4_quic.parse().unwrap())?;
+            log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+
+            if self.config.ipv6
+                && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
+            {
+                log::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
+            }
         }
 
         // If a relay server is configured, dial it. Set state to Connecting
@@ -1347,6 +1471,17 @@ impl EngineRunner {
         );
         let has_relay = self.config.relay_server.is_some();
 
+        // iOS: poll the active network interfaces and re-bind QUIC listeners
+        // when they change. A concrete-interface bind (see the listen logic
+        // above) goes stale silently on a Wi-Fi↔cellular handoff or NAT remap,
+        // so without this the node stops being dialable mid-session. Polling
+        // (vs an NWPathMonitor callback) keeps the swarm mutation on the event
+        // loop and adds no platform FFI; 3s is well inside human-perceptible
+        // handoff recovery. Disabled on every other platform (those bind to
+        // unspecified and let libp2p track interfaces itself).
+        let watch_interfaces = cfg!(target_os = "ios");
+        let mut interface_watch = tokio::time::interval(Duration::from_secs(3));
+
         // The registry-ready notifier is awaited inside the select! arm, which
         // cannot hold a borrow of `self` across the await. Clone the default
         // group's `Arc<Notify>` out here so the arm only touches the local.
@@ -1368,6 +1503,9 @@ impl EngineRunner {
                 },
                 _ = rendezvous_interval.tick(), if has_rendezvous => {
                     self.rendezvous_discover();
+                },
+                _ = interface_watch.tick(), if watch_interfaces => {
+                    self.reconcile_quic_listeners();
                 },
                 _ = relay_reconnect.tick(), if has_relay => {
                     self.maybe_reconnect_relay();

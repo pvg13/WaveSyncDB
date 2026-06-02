@@ -90,6 +90,12 @@ objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
 objc2-ui-kit = { version = "0.3", optional = true, features = ["UIApplication"] }
 block2 = { version = "0.6", optional = true }
+# Enumerate the device's active network interfaces (getifaddrs) so the QUIC
+# listener binds to a concrete routable address instead of loopback. A
+# loopback-bound listener makes libp2p-quic source every PortUse::Reuse dial
+# from 127.0.0.1, so all WAN dials fail with EADDRNOTAVAIL (issue #72).
+# Pure-Rust, no if-watch dependency.
+if-addrs = "0.13"
 
 [dev-dependencies]
 env_logger = "0.11"
