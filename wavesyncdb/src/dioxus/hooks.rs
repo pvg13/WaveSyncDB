@@ -19,6 +19,62 @@ use crate::{NetworkStatus, SyncedModel, WaveSyncDb, WaveSyncDbBuilder, WriteKind
 const BATCH_WINDOW: Duration = Duration::from_millis(16);
 const LAGGED_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// Process-global guard so the auto-resume lifecycle listener starts at most once.
+#[cfg(not(target_arch = "wasm32"))]
+static AUTO_RESUME_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Start a single process-wide lifecycle listener that drives
+/// [`WaveSyncDb::resume`] on every return to foreground, so synced hooks pick up
+/// writes made by a push-triggered background sync (which runs in a *separate
+/// process* and emits no in-process notification) — even when the app never
+/// explicitly calls [`use_auto_lifecycle`]. Idempotent: only the first caller
+/// starts the listener.
+///
+/// Runs on plain OS threads (not Dioxus tasks) so it survives component
+/// unmounts, and holds only a [`WaveSyncDb::resume_trigger`] closure (channel
+/// senders, no node `Arc`) so it never keeps the engine alive past teardown. On
+/// desktop the platform listener is a no-op — its sender drops immediately, the
+/// driver's `changed()` errors, and the driver thread exits at once, so nothing
+/// lingers in tests.
+#[cfg(not(target_arch = "wasm32"))]
+fn ensure_auto_resume(db: &WaveSyncDb) {
+    if AUTO_RESUME_STARTED.set(()).is_err() {
+        return;
+    }
+    let trigger = db.resume_trigger();
+    let (tx, mut rx) = tokio::sync::watch::channel(true);
+    std::thread::Builder::new()
+        .name("wavesync-lifecycle".into())
+        .spawn(move || super::lifecycle::start_lifecycle_listener(tx))
+        .ok();
+    std::thread::Builder::new()
+        .name("wavesync-auto-resume".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("auto-resume: failed to build runtime: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let mut was_foreground = true;
+                loop {
+                    if rx.changed().await.is_err() {
+                        break; // listener gone (e.g. desktop no-op) — stop.
+                    }
+                    let is_foreground = *rx.borrow_and_update();
+                    if is_foreground && !was_foreground {
+                        log::info!("wavesync: app returned to foreground — resync + UI refresh");
+                        trigger();
+                    }
+                    was_foreground = is_foreground;
+                }
+            });
+        })
+        .ok();
+}
+
 // ---------------------------------------------------------------------------
 // Context providers
 // ---------------------------------------------------------------------------
@@ -310,6 +366,11 @@ where
     let target_table = E::default().table_name().to_string();
     let pk_column = pk_column_name::<E>();
 
+    // Drive resume() on app foreground so a background-sync process's writes
+    // surface in the UI even without an explicit `use_auto_lifecycle` call.
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_auto_resume(&db);
+
     use_effect(move || {
         let mut rx = db.change_rx();
         let target_table = target_table.clone();
@@ -530,6 +591,11 @@ where
     let pk_string = format!("{}", pk);
     let target_table = E::default().table_name().to_string();
     let pk_column = pk_column_name::<E>();
+
+    // See `use_synced_table_db`: auto-drive resume() so background-sync writes
+    // surface on foreground without an explicit `use_auto_lifecycle` call.
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_auto_resume(&db);
 
     use_effect(move || {
         let mut rx = db.change_rx();

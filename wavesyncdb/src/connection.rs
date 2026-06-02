@@ -634,6 +634,21 @@ impl WaveSyncDb {
         self.inner.node.refresh_tx.subscribe()
     }
 
+    /// A cheap, `Send + Clone` callable that performs [`resume`](Self::resume)
+    /// when invoked. Captures only the engine command + refresh channel senders
+    /// — **not** the node `Arc` — so a long-lived lifecycle listener holding it
+    /// does not keep the engine alive past the last `WaveSyncDb` drop (which
+    /// would resurrect the zombie-swarm / "database is locked" problems the
+    /// `Weak` group map avoids). Used to auto-drive resume on app foreground.
+    pub(crate) fn resume_trigger(&self) -> impl Fn() + Clone + Send + 'static {
+        let cmd_tx = self.inner.node.cmd_tx.clone();
+        let refresh_tx = self.inner.node.refresh_tx.clone();
+        move || {
+            let _ = cmd_tx.try_send(crate::engine::EngineCommand::Resume);
+            let _ = refresh_tx.send(());
+        }
+    }
+
     /// Notify the engine that the network interface changed (e.g., WiFi to cellular).
     ///
     /// This force-disconnects all connections (including the relay) and
