@@ -407,6 +407,14 @@ pub struct WaveSyncE2eHarness {
     /// Default NAT profile applied to every peer. Per-peer overrides
     /// set via [`Self::add_peer_with_nat`] beat this default.
     default_nat: NatProfile,
+    /// When `false`, peers are started with mDNS disabled so the only
+    /// discovery path is the relay/rendezvous server. Used to reproduce
+    /// WAN-only bugs that LAN mDNS would otherwise mask.
+    mdns_enabled: bool,
+    /// Optional secondary (non-default) group every peer joins at runtime
+    /// in addition to the default group: `(topic, passphrase)`. Drives the
+    /// peer's `/g2/...` routes. `None` ⇒ single-group (today's behaviour).
+    secondary_group: Option<(String, String)>,
 }
 
 /// Configuration for a single peer in the harness.
@@ -430,6 +438,8 @@ impl WaveSyncE2eHarness {
             passphrase: None,
             default_netem: None,
             default_nat: NatProfile::Open,
+            mdns_enabled: true,
+            secondary_group: None,
         }
     }
 
@@ -499,6 +509,29 @@ impl WaveSyncE2eHarness {
     /// container — see [`NatProfile`] docs.
     pub fn with_nat(mut self, nat: NatProfile) -> Self {
         self.default_nat = nat;
+        self
+    }
+
+    /// Disable mDNS on every peer so the relay/rendezvous server is the
+    /// only discovery path. Use to reproduce WAN-only behaviour on the
+    /// Docker bridge (where mDNS multicast would otherwise let peers find
+    /// each other directly and mask relay-path bugs).
+    pub fn without_mdns(mut self) -> Self {
+        self.mdns_enabled = false;
+        self
+    }
+
+    /// Have every peer join a secondary (non-default) group in addition
+    /// to the default one. The group is reachable through the peer's
+    /// `/g2/...` routes (`insert_task_g2`, `wait_for_task_g2`, …). Models
+    /// a consumer app that joins a shared group (e.g. a household) at
+    /// runtime on top of each member's personal/default group.
+    pub fn with_secondary_group(
+        mut self,
+        topic: impl Into<String>,
+        passphrase: impl Into<String>,
+    ) -> Self {
+        self.secondary_group = Some((topic.into(), passphrase.into()));
         self
     }
 
@@ -601,6 +634,16 @@ impl WaveSyncE2eHarness {
 
             if let Some(ref p) = spec.passphrase {
                 img = img.with_env_var("PASSPHRASE", p.clone());
+            }
+
+            if !self.mdns_enabled {
+                img = img.with_env_var("MDNS_ENABLED", "false");
+            }
+
+            if let Some((ref topic, ref pass)) = self.secondary_group {
+                img = img
+                    .with_env_var("SECONDARY_TOPIC", topic.clone())
+                    .with_env_var("SECONDARY_PASSPHRASE", pass.clone());
             }
 
             // `tc qdisc add ... netem` and `iptables -A INPUT ...` both
@@ -851,8 +894,36 @@ impl RunningPeer {
     /// Fetch a single task by primary key, returning `None` if the row
     /// hasn't reached this peer yet.
     pub async fn get_task(&self, id: &str) -> Result<Option<Task>> {
+        self.get_task_at("tasks", id).await
+    }
+
+    /// `insert_task`, but against the secondary group's `/g2/tasks` route.
+    pub async fn insert_task_g2(&self, id: &str, title: &str, completed: bool) -> Result<()> {
         let resp = reqwest::Client::new()
-            .get(format!("{}/tasks/{}", self.base_url, id))
+            .post(format!("{}/g2/tasks", self.base_url))
+            .json(&Task {
+                id: id.into(),
+                title: title.into(),
+                completed,
+            })
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            bail!("insert_task_g2 on {} failed: {}", self.name, resp.status());
+        }
+        Ok(())
+    }
+
+    /// `get_task`, but against the secondary group's `/g2/tasks` route.
+    pub async fn get_task_g2(&self, id: &str) -> Result<Option<Task>> {
+        self.get_task_at("g2/tasks", id).await
+    }
+
+    /// Shared GET-by-id used by both `get_task` and `get_task_g2`. `route`
+    /// is the collection path segment (`tasks` or `g2/tasks`).
+    async fn get_task_at(&self, route: &str, id: &str) -> Result<Option<Task>> {
+        let resp = reqwest::Client::new()
+            .get(format!("{}/{}/{}", self.base_url, route, id))
             .send()
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -909,6 +980,25 @@ impl RunningPeer {
     /// port forward briefly disappears between `stop` and `start`.
     /// Only a timeout is fatal.
     pub async fn wait_for_task(&self, id: &str, title: &str, timeout: Duration) -> Result<()> {
+        self.wait_for_task_at("tasks", id, title, timeout).await
+    }
+
+    /// `wait_for_task`, but polling the secondary group's `/g2/tasks`
+    /// route. This is the assertion that reproduces the multi-group
+    /// rendezvous-discovery bug: with mDNS disabled, a secondary-group
+    /// write only reaches the other peer if relay-path discovery returns
+    /// the secondary namespace's registrations.
+    pub async fn wait_for_task_g2(&self, id: &str, title: &str, timeout: Duration) -> Result<()> {
+        self.wait_for_task_at("g2/tasks", id, title, timeout).await
+    }
+
+    async fn wait_for_task_at(
+        &self,
+        route: &str,
+        id: &str,
+        title: &str,
+        timeout: Duration,
+    ) -> Result<()> {
         let start = Instant::now();
         let mut interval = Duration::from_millis(50);
         loop {
@@ -916,16 +1006,17 @@ impl RunningPeer {
             // — that's how container-restart scenarios were silently
             // masking convergence as failure. Treat any error as
             // "not yet" and retry until the actual timeout.
-            match self.get_task(id).await {
+            match self.get_task_at(route, id).await {
                 Ok(Some(t)) if t.title == title => return Ok(()),
                 _ => {}
             }
             if start.elapsed() >= timeout {
                 bail!(
-                    "peer {} did not see task {{id={}, title={}}} within {:?}",
+                    "peer {} did not see task {{id={}, title={}}} on /{} within {:?}",
                     self.name,
                     id,
                     title,
+                    route,
                     timeout
                 );
             }

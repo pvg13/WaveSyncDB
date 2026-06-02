@@ -257,16 +257,16 @@ impl EngineRunner {
             rendezvous::client::Event::Discovered {
                 rendezvous_node,
                 registrations,
-                cookie,
+                // Pagination cookie intentionally ignored: each `discover` is
+                // issued with a fresh (None) cookie since the event doesn't
+                // report which namespace it answered, so a stored cookie can't
+                // be attributed to the right group (see `rendezvous_discover`).
+                ..
             } => {
                 log::info!(
                     "Discovered {} peers via rendezvous at {rendezvous_node}",
                     registrations.len()
                 );
-                // The Discovered event doesn't carry which namespace it answered;
-                // store the pagination cookie on the default group (single-group
-                // path). Per-namespace cookies are a multi-group refinement.
-                self.default_group_mut().rendezvous_cookie = Some(cookie);
 
                 // Collect one address per peer, skip ineligible
                 let mut to_dial: Vec<(libp2p::PeerId, libp2p::Multiaddr)> = Vec::new();
@@ -390,9 +390,16 @@ impl EngineRunner {
             self.rendezvous_register(server_peer_id);
         }
 
-        // Discover each group's namespace. Cookie is shared on the default group
-        // (per-namespace cookies are a multi-group refinement).
-        let cookie = self.default_group().rendezvous_cookie.clone();
+        // Discover each group's namespace with a fresh (None) cookie. libp2p
+        // rendezvous cookies are namespace-scoped pagination markers, but the
+        // `Discovered` event doesn't report which namespace it answered, so a
+        // single shared cookie cannot be attributed back to the right group.
+        // Reusing one namespace's cookie for another makes the server treat the
+        // second request as already-paginated and return nothing — which
+        // silently broke discovery for every secondary group. At our scale
+        // (a handful of peers per namespace) re-fetching the full registration
+        // list each tick is negligible, and it always returns the namespace's
+        // current registrations.
         let namespaces: Vec<String> = self
             .groups
             .values()
@@ -408,7 +415,7 @@ impl EngineRunner {
             };
             self.swarm.behaviour_mut().rendezvous.discover(
                 Some(namespace),
-                cookie.clone(),
+                None,
                 None,
                 server_peer_id,
             );

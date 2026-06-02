@@ -556,7 +556,6 @@ async fn run_engine(
         registry_is_ready: false,
         group_key,
         rendezvous_namespace,
-        rendezvous_cookie: None,
         rendezvous_registered: false,
         rejected_peers: std::collections::HashSet::new(),
         verified_peers: std::collections::HashSet::new(),
@@ -660,7 +659,6 @@ pub(crate) struct GroupState {
     pub(crate) group_key: Option<GroupKey>,
     /// Rendezvous namespace for peer discovery (per group).
     pub(crate) rendezvous_namespace: String,
-    pub(crate) rendezvous_cookie: Option<rendezvous::Cookie>,
     pub(crate) rendezvous_registered: bool,
     /// Peers rejected for THIS group (topic mismatch / failed HMAC). A peer
     /// rejected here may still be a valid member of another group on this node.

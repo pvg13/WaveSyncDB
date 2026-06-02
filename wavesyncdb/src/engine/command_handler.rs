@@ -149,7 +149,6 @@ impl EngineRunner {
             registry_is_ready: false,
             group_key,
             rendezvous_namespace,
-            rendezvous_cookie: None,
             rendezvous_registered: false,
             rejected_peers: std::collections::HashSet::new(),
             verified_peers: std::collections::HashSet::new(),
