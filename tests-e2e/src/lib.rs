@@ -1056,4 +1056,10 @@ pub struct DiagnosticsSnapshot {
     pub cached_addr_dials: u64,
     pub dcutr_upgrades_attempted: u64,
     pub dcutr_upgrades_succeeded: u64,
+    #[serde(default)]
+    pub relayed_connections_established: u64,
+    #[serde(default)]
+    pub direct_connections_established: u64,
+    #[serde(default)]
+    pub relay_connections_demoted: u64,
 }

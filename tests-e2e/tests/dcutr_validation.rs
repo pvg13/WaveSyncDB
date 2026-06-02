@@ -85,6 +85,35 @@ async fn dcutr_validation_cellular_fair() {
         bob.dcutr_upgrades_attempted, bob.dcutr_upgrades_succeeded
     );
 
+    // Relay-cost / DERP demotion readout (#84): once a direct path supersedes a
+    // relay-carried one (via DCUtR or a naturally-formed direct connection), the
+    // engine closes the relay connection so steady-state data leaves the relay.
+    eprintln!(
+        "Alice relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        alice.relayed_connections_established,
+        alice.direct_connections_established,
+        alice.relay_connections_demoted
+    );
+    eprintln!(
+        "Bob   relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        bob.relayed_connections_established,
+        bob.direct_connections_established,
+        bob.relay_connections_demoted
+    );
+    // Demotions can never exceed the relay connections we ever established.
+    assert!(
+        alice.relay_connections_demoted <= alice.relayed_connections_established,
+        "alice demoted {} > relayed-established {}",
+        alice.relay_connections_demoted,
+        alice.relayed_connections_established
+    );
+    assert!(
+        bob.relay_connections_demoted <= bob.relayed_connections_established,
+        "bob demoted {} > relayed-established {}",
+        bob.relay_connections_demoted,
+        bob.relayed_connections_established
+    );
+
     let total_attempted = alice.dcutr_upgrades_attempted + bob.dcutr_upgrades_attempted;
     let total_succeeded = alice.dcutr_upgrades_succeeded + bob.dcutr_upgrades_succeeded;
     if total_attempted > 0 {

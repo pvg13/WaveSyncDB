@@ -122,9 +122,14 @@ version-vector sync.
   seconds instead of waiting for the next reconcile pass. In-memory and
   idempotent; durability is already guaranteed by the shadow tables + RBSR.
   New `pending_pushes_redelivered` diagnostics counter.
-- **Relay-cost telemetry (#84).** Connections are classified direct vs
-  relayed (`PeerInfo.via_relay`, `relayed_connections_established` /
-  `direct_connections_established` counters) toward demoting paid relay paths.
+- **Relay-cost telemetry + DERP demotion (#84).** Connections are classified
+  direct vs relayed (`PeerInfo.via_relay`, `relayed_connections_established` /
+  `direct_connections_established` counters). Once a direct path to a peer
+  comes up (DCUtR hole-punch, or a naturally-formed direct connection), the
+  relay-carried connection to that peer is closed so steady-state data leaves
+  the paid relay — it reverts to wake/fallback only. New
+  `relay_connections_demoted` counter; in-flight requests on a closed relay
+  connection self-heal via push redelivery (#81) + reconcile.
 
 #### Fixed
 - **#80** — writes queued at `shutdown()` are now drained and flushed to peers

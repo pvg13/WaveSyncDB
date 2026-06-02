@@ -132,6 +132,12 @@ pub(crate) struct Counters {
     /// and got redelivered on the short retry cadence. Steady state is 0; a
     /// rising count means real-time pushes are being dropped (slow/lossy peers).
     pub pending_pushes_redelivered: AtomicU64,
+    /// Relay-carried (circuit) connections we proactively closed once a direct
+    /// path to the same peer came up (#84 DERP demotion). Each increment is a
+    /// peer whose steady-state data moved off the paid relay onto a direct
+    /// connection. Read alongside `relayed_connections_established` to see how
+    /// much relay traffic the demotion is shedding.
+    pub relay_connections_demoted: AtomicU64,
 }
 
 impl Counters {
@@ -162,6 +168,7 @@ impl Counters {
             reconcile_converged: self.reconcile_converged.load(Ordering::Relaxed),
             reconcile_diverged: self.reconcile_diverged.load(Ordering::Relaxed),
             pending_pushes_redelivered: self.pending_pushes_redelivered.load(Ordering::Relaxed),
+            relay_connections_demoted: self.relay_connections_demoted.load(Ordering::Relaxed),
         }
     }
 }
@@ -189,6 +196,7 @@ pub struct Snapshot {
     pub reconcile_converged: u64,
     pub reconcile_diverged: u64,
     pub pending_pushes_redelivered: u64,
+    pub relay_connections_demoted: u64,
 }
 
 #[cfg(test)]

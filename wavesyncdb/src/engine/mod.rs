@@ -652,6 +652,7 @@ async fn run_engine(
         push_registered_topics: std::collections::HashSet::new(),
         push_pending_registrations: std::collections::HashMap::new(),
         pending_push_reqs: std::collections::HashMap::new(),
+        relayed_conn_ids: std::collections::HashMap::new(),
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
@@ -941,6 +942,15 @@ struct EngineRunner {
     /// arrives as a fresh direct connection that flips this to `false`; cleared
     /// on full disconnect. Surfaced as `PeerInfo.via_relay`.
     pub(crate) peer_via_relay: std::collections::HashMap<libp2p::PeerId, bool>,
+    /// Relay-carried (circuit) connection ids per peer (#84 DERP demotion). When
+    /// a direct connection to the same peer comes up (typically a DCUtR
+    /// hole-punch), these are closed so steady-state data leaves the paid relay
+    /// — the relay reverts to wake/fallback only. Entries are pruned as their
+    /// connections close.
+    pub(crate) relayed_conn_ids: std::collections::HashMap<
+        libp2p::PeerId,
+        std::collections::HashSet<libp2p::swarm::ConnectionId>,
+    >,
     /// Peers that have answered a reconcile message (#82) — i.e. they speak the
     /// digest/bucket protocol. For these, the periodic version-vector catch-up
     /// is skipped (the digest exchange handles convergence + the bucket exchange
@@ -2224,7 +2234,10 @@ impl EngineRunner {
                 }
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
                 log::info!("Connection established with {peer_id}");
                 // Clear any pending DCUtR retry for this peer: a direct
@@ -2249,13 +2262,52 @@ impl EngineRunner {
                         self.diagnostics
                             .relayed_connections_established
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Don't override an already-known direct path.
-                        self.peer_via_relay.entry(peer_id).or_insert(true);
+                        if self.peer_via_relay.get(&peer_id) == Some(&false) {
+                            // A direct path to this peer already exists — don't
+                            // keep a redundant relay connection (#84 demotion).
+                            if self.swarm.close_connection(connection_id) {
+                                self.diagnostics
+                                    .relay_connections_demoted
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            log::info!(
+                                "Relay demotion: dropped redundant relay connection to {peer_id} (direct already up)"
+                            );
+                        } else {
+                            self.peer_via_relay.entry(peer_id).or_insert(true);
+                            self.relayed_conn_ids
+                                .entry(peer_id)
+                                .or_default()
+                                .insert(connection_id);
+                        }
                     } else {
                         self.diagnostics
                             .direct_connections_established
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.peer_via_relay.insert(peer_id, false);
+                        // DERP demotion (#84): a direct path to this peer just
+                        // came up (typically a DCUtR hole-punch). Close any
+                        // relay-carried connections so steady-state data leaves
+                        // the paid relay — it reverts to wake/fallback only.
+                        // In-flight requests on the closed connection fail and
+                        // self-heal via the push-redelivery (#81) + reconcile
+                        // paths, so this is safe to do immediately.
+                        if let Some(ids) = self.relayed_conn_ids.remove(&peer_id) {
+                            let mut closed = 0u64;
+                            for cid in ids {
+                                if self.swarm.close_connection(cid) {
+                                    closed += 1;
+                                }
+                            }
+                            if closed > 0 {
+                                self.diagnostics
+                                    .relay_connections_demoted
+                                    .fetch_add(closed, std::sync::atomic::Ordering::Relaxed);
+                                log::info!(
+                                    "Relay demotion: closed {closed} relay connection(s) to {peer_id} now that a direct path exists"
+                                );
+                            }
+                        }
                     }
 
                     // Cache this (peer_id, multiaddr) so the next cold start
@@ -2276,10 +2328,18 @@ impl EngineRunner {
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
+                connection_id,
                 num_established,
                 ..
             } => {
                 log::debug!("Connection closed with {peer_id} ({num_established} remaining)");
+                // Prune this connection from the relay-demotion tracking (#84).
+                if let Some(ids) = self.relayed_conn_ids.get_mut(&peer_id) {
+                    ids.remove(&connection_id);
+                    if ids.is_empty() {
+                        self.relayed_conn_ids.remove(&peer_id);
+                    }
+                }
                 self.handle_connection_closed(peer_id, num_established);
             }
             SwarmEvent::ListenerClosed { reason, .. } => {
@@ -2366,6 +2426,7 @@ impl EngineRunner {
                         self.peer_identities.remove(&pid);
                         self.protocol_mismatch_peers.remove(&pid);
                         self.peer_via_relay.remove(&pid);
+                        self.relayed_conn_ids.remove(&pid);
                         self.reconcile_capable.remove(&pid);
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::PeerDisconnected(
