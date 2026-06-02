@@ -14,7 +14,15 @@ Both are required. Topic isolation alone is brittle (an attacker who guesses the
 ## How the topic is derived
 
 ```rust
-let derived_topic = blake3(format!("{user_topic}\0{passphrase}").as_bytes());
+// The passphrase is first turned into a 32-byte group key via BLAKE3 key derivation
+// (domain-separated — NOT a plain hash of the passphrase):
+let group_key = blake3::derive_key("wavesyncdb-group-key-v1", passphrase.as_bytes());
+
+// The topic is then derived from the user topic + the group key, again via keyed derivation:
+let mut hasher = blake3::Hasher::new_derive_key("wavesyncdb-topic-v1");
+hasher.update(user_topic.as_bytes());
+hasher.update(&group_key);
+let derived_topic = format!("wavesync-{}", hasher.finalize().to_hex());
 ```
 
 The derived topic — not the raw `user_topic` you pass to `WaveSyncDbBuilder::new()` — is what's:
@@ -33,7 +41,7 @@ Two consequences:
 Every `SyncRequest`, `SyncResponse`, and `SyncChangeset` carries an `HmacTag` field. The signing process:
 
 1. Serialise the message with the `hmac` field set to a deterministic placeholder (32 zero bytes).
-2. Compute `tag = blake3_keyed(key = blake3(passphrase), data = serialized_bytes)`.
+2. Compute `tag = blake3::keyed_hash(key = group_key, data = serialized_bytes)`, where `group_key = blake3::derive_key("wavesyncdb-group-key-v1", passphrase)` (the same derived key used for the topic — never the raw passphrase).
 3. Replace the placeholder with the tag and send.
 
 Verification on the receiver mirrors this exactly. If the tag doesn't match, the message is **silently dropped** — no error response is returned, because returning one would let an attacker probe for valid topics.

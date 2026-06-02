@@ -12,24 +12,30 @@ dioxus = "0.7"
 
 ## Provide the database to the app
 
+There are two ways to get a `WaveSyncDb` into the component tree.
+
+**Eager** — build the DB at startup, then inject it (simplest):
+
 ```rust
 use dioxus::prelude::*;
-use wavesyncdb::dioxus::{use_wavesync_init, use_wavesync_provider, use_synced_table};
+use wavesyncdb::WaveSyncDbBuilder;
+use wavesyncdb::dioxus::{SyncHandle, use_wavesync, use_wavesync_provider, use_synced_table};
 
-fn main() {
-    dioxus::launch(App);
-}
+// `DB` is built once at startup and stashed (e.g. in a `OnceLock`):
+//   let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic").build().await?;
+//   db.get_schema_registry(module_path!().split("::").next().unwrap()).sync().await?;
+// then `dioxus::launch(App)`.
 
 fn App() -> Element {
-    use_wavesync_init("sqlite:./app.db?mode=rwc", "my-topic", |db| async move {
-        db.get_schema_registry(module_path!().split("::").next().unwrap())
-            .sync()
-            .await?;
-        Ok(())
-    });
+    // Inject the pre-built DB into context (cheap — WaveSyncDb is Arc-based).
+    use_wavesync_provider(DB.get().unwrap().clone());
+    rsx! { TaskList {} }
+}
 
-    let db = use_wavesync_provider();
-    let tasks = use_synced_table::<task::Entity>(&db);
+#[component]
+fn TaskList() -> Element {
+    let db = use_wavesync();
+    let tasks = use_synced_table::<task::Model>(SyncHandle::new(db));
 
     rsx! {
         for task in tasks.read().iter() {
@@ -39,14 +45,42 @@ fn App() -> Element {
 }
 ```
 
+**Lazy** — when the DB is created at runtime (e.g. after the user picks a file). Provide the
+lazy context in the root, then build via the `InitDb` handle:
+
+```rust
+use wavesyncdb::dioxus::{
+    use_wavesync_provider_lazy, use_wavesync_generation, use_wavesync_init, use_wavesync_opt,
+};
+
+fn App() -> Element {
+    use_wavesync_provider_lazy();
+    use_wavesync_generation();
+    let db = use_wavesync_opt(); // Signal<Option<WaveSyncDb>>, None until init
+    // ... render a picker when None, the app when Some ...
+    rsx! {}
+}
+
+// inside the picker component, once you know the url/topic:
+async fn open(init: wavesyncdb::dioxus::InitDb, url: String) -> Result<(), wavesyncdb::DbErr> {
+    init.call(&url, "my-topic", |db| async move {
+        db.get_schema_registry(module_path!().split("::").next().unwrap()).sync().await?;
+        Ok(())
+    }).await
+}
+```
+
 ## The hooks
 
 | Hook | What it does |
 |------|---|
-| `use_wavesync_init(url, topic, setup)` | Builds the `WaveSyncDb`, runs your setup closure, and provides the DB through Dioxus context. Returns `Resource<WaveSyncDb>`. |
-| `use_wavesync_provider()` | Retrieves the DB from context. Use it inside any descendant component. |
-| `use_synced_table::<E>(db)` | Reactive `Signal<Vec<E::Model>>`. Auto-refreshes on every local and remote write to that table. |
-| `use_synced_row::<E>(db, pk)` | Reactive `Signal<Option<E::Model>>`. Useful for detail pages keyed by primary key. |
+| `use_wavesync_provider(db)` | Injects a pre-built `WaveSyncDb` into Dioxus context (eager mode). |
+| `use_wavesync_provider_lazy()` + `use_wavesync_generation()` | Provide an empty (lazy) DB context in the root; fill it later via `use_wavesync_init`. |
+| `use_wavesync_init() -> InitDb` | Returns a handle; call `init.call(url, topic, setup).await` (or `call_with` for a custom builder) to build and inject the DB. |
+| `use_wavesync() -> WaveSyncDb` | Retrieves the DB from context (panics in lazy mode before init — use `use_wavesync_opt`). |
+| `use_wavesync_opt() -> Signal<Option<WaveSyncDb>>` | Retrieves the DB reactively; `None` until init completes. |
+| `use_synced_table::<E::Model>(SyncHandle::new(db))` | Reactive `Signal<Vec<E::Model>>`. Auto-refreshes on every local and remote write to that table. |
+| `use_synced_row::<E::Model>(SyncHandle::new(db), pk)` | Reactive `Signal<Option<E::Model>>`. Useful for detail pages keyed by primary key. |
 
 ## What "reactive" means here
 
@@ -65,7 +99,7 @@ That means a remote peer toggling `completed = true` will refresh the UI on ever
 The hooks return whole rows as a signal. If you need a filtered or projected view, derive it with a normal Dioxus memo:
 
 ```rust
-let tasks = use_synced_table::<task::Entity>(&db);
+let tasks = use_synced_table::<task::Model>(SyncHandle::new(db));
 let pending = use_memo(move || {
     tasks.read().iter().filter(|t| !t.completed).cloned().collect::<Vec<_>>()
 });

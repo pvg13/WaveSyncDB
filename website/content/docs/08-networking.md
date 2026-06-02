@@ -108,7 +108,7 @@ The engine dials each bootstrap peer at startup and adds them to its address boo
 
 ## Transport choice
 
-WaveSyncDB uses **QUIC over UDP** as its sole transport. Earlier versions also offered TCP, but maintaining two transports caused real issues:
+WaveSyncDB uses **QUIC over UDP** as its default transport. TCP is available as an opt-in via `WaveSyncDbBuilder::with_tcp_enabled(true)` for networks that block UDP entirely (some corporate firewalls, captive-portal Wi-Fi), but running both at once caused real issues, so QUIC-only is the default and recommended setup:
 
 - **Two connections per peer** — every dial succeeded twice (once per transport), confusing the relay-client behaviour and breaking circuit-relay dials with `oneshot canceled` on cellular.
 - **Cold-start latency** — TCP added a ~37 ms three-way handshake before TLS could begin; QUIC fuses transport + TLS into one round trip.

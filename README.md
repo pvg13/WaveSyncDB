@@ -128,21 +128,23 @@ The `wavesyncdb` crate provides Dioxus reactive hooks behind the `dioxus` featur
 
 ```rust
 use dioxus::prelude::*;
-use wavesyncdb::dioxus::{use_wavesync_init, use_synced_table, use_wavesync_provider};
+use wavesyncdb::dioxus::{SyncHandle, use_wavesync, use_wavesync_provider, use_synced_table};
 
-fn main() {
-    dioxus::launch(App);
-}
+// `db` is a `WaveSyncDb` built once at startup and stashed (e.g. in a `OnceLock`):
+//   let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic").build().await?;
+//   db.get_schema_registry(module_path!().split("::").next().unwrap()).sync().await?;
+// then `dioxus::launch(App)`.
 
 fn App() -> Element {
-    use_wavesync_init("sqlite:./app.db?mode=rwc", "my-topic", |db| async move {
-        db.get_schema_registry(module_path!().split("::").next().unwrap())
-            .sync()
-            .await?;
-        Ok(())
-    });
-    let db = use_wavesync_provider();
-    let tasks = use_synced_table::<task::Entity>(&db);
+    // Inject the pre-built DB into Dioxus context (cheap — WaveSyncDb is Arc-based).
+    use_wavesync_provider(DB.get().unwrap().clone());
+    rsx! { TaskList {} }
+}
+
+#[component]
+fn TaskList() -> Element {
+    let db = use_wavesync();
+    let tasks = use_synced_table::<task::Model>(SyncHandle::new(db));
 
     rsx! {
         for task in tasks.read().iter() {
@@ -152,10 +154,15 @@ fn App() -> Element {
 }
 ```
 
-- `use_wavesync_init()` — creates the `WaveSyncDb`, runs setup, provides DB via Dioxus context
-- `use_wavesync_provider()` — retrieves the `WaveSyncDb` from context
-- `use_synced_table::<E>(db)` — reactive signal of all rows, auto-refreshes on local and remote changes
-- `use_synced_row::<E>(db, pk)` — reactive signal for a single row by primary key
+- `use_wavesync_provider(db)` — injects a pre-built `WaveSyncDb` into Dioxus context
+- `use_wavesync()` — retrieves the `WaveSyncDb` from context (use `use_wavesync_opt()` in lazy mode)
+- `use_synced_table::<E::Model>(SyncHandle::new(db))` — reactive signal of all rows, auto-refreshes on local and remote changes
+- `use_synced_row::<E::Model>(SyncHandle::new(db), pk)` — reactive signal for a single row by primary key
+
+For runtime DB initialization (e.g. after the user picks a database file), use the lazy
+pattern instead: `use_wavesync_provider_lazy()` + `use_wavesync_generation()` in the root, then
+`use_wavesync_init()` returns an `InitDb` whose `init.call(url, topic, setup).await` builds and
+injects the DB. See `examples/dioxus_dynamic`.
 
 ## Key Types
 

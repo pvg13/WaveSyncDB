@@ -55,6 +55,60 @@ and re-dispatching into the same handler path as foreground pushes.
 - Accidentally-committed `.wavesync_config.json` at repo root; added to
   `.gitignore`.
 
+### Sync architecture rework (column-level CRDTs)
+
+Replaced the row-level LWW + HLC + `_wavesync_log` + Merkle-tree + snapshot
+architecture (see v0.3.0) with per-column CRDTs, shadow tables, and
+version-vector sync.
+
+#### Added
+- Per-column Lamport clocks (`col_version`) with deterministic conflict
+  resolution (`col_version → value_bytes → site_id`; no wall-clock).
+- Shadow tables (`_wavesync_{table}_clock`, `(pk, cid)` PK, `INSERT OR REPLACE`).
+- `db_version` monotonic counter + per-peer `_wavesync_peer_versions`; one-round
+  version-vector catch-up (`/wavesync/snapshot/3.0.0`) plus real-time push
+  fan-out (`/wavesync/push/1.0.0`).
+- Cached working peer addresses (`_wavesync_peer_addrs`) pre-dialed at startup.
+
+#### Removed
+- HLC (`uhlc`), `_wavesync_log`, Merkle tree, snapshot protocol, and compaction.
+
+### Multi-group sync + entity scope
+
+#### Added
+- `WaveSyncNode::join_group(user_topic, passphrase, kind)` / `leave_group` —
+  one node serves N groups over one swarm, each backed by its own database.
+- `#[wavesync(scope = private | all | groups(...))]` to control which groups an
+  entity replicates to.
+- Per-(group, peer) topic/HMAC rejection (`rejected_peers` on `GroupState`).
+
+### Sync notifications
+
+#### Added
+- `#[derive(SyncNotify)]` + per-table `on_sync` policy and the
+  `use_sync_notifications` Dioxus hook; `ChangeSource` distinguishes local vs
+  remote writes (notifications fire only for incoming remote changes).
+
+### Browser / WASM target
+
+#### Added
+- `web` feature: a wasm32 sync engine (WebSocket transport) with IndexedDB
+  persistence, interoperable with native peers over the shared snapshot protocol.
+
+### Background sync (FCM / APNs)
+
+#### Added
+- Targeted, multi-group background wake: the push payload's topic selects which
+  group(s) to rejoin and catch up; incremental version-vector sync on wake.
+
+### Fixed
+- **#72** — iOS QUIC listener bound to loopback made all WAN dials fail with
+  `EADDRNOTAVAIL`; now binds to concrete routable interface addresses (via
+  `if-addrs`) and re-listens on network change.
+- **#71** — multi-group rendezvous discovery reused the default group's
+  pagination cookie for every namespace, so secondary-group peers were never
+  discovered over WAN; each namespace is now discovered with a fresh cookie.
+
 ## v0.3.0 — 25/02/2026
 
 ### Architecture rewrite: SeaORM connection wrapper

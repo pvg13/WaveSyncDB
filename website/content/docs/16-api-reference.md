@@ -67,10 +67,14 @@ while let Ok(event) = events.recv().await {
 
 | Hook | Returns |
 |---|---|
-| `use_wavesync_init(url, topic, setup)` | `Resource<WaveSyncDb>` |
-| `use_wavesync_provider()` | `WaveSyncDb` from Dioxus context |
-| `use_synced_table::<E>(db)` | `Signal<Vec<E::Model>>` |
-| `use_synced_row::<E>(db, pk)` | `Signal<Option<E::Model>>` |
+| `use_wavesync_provider(db)` | `()` — injects a pre-built `WaveSyncDb` into context (eager mode) |
+| `use_wavesync_provider_lazy()` | `()` — provides an empty (lazy) DB context to fill later |
+| `use_wavesync_generation()` | `()` — provides the generation counter context that `use_wavesync_init` needs |
+| `use_wavesync_init()` | `InitDb` — call `init.call(url, topic, setup).await` (or `call_with`) to build + inject the DB |
+| `use_wavesync()` | `WaveSyncDb` from context (panics before init in lazy mode) |
+| `use_wavesync_opt()` | `Signal<Option<WaveSyncDb>>` — `None` until init completes |
+| `use_synced_table::<E::Model>(SyncHandle::new(db))` | `Signal<Vec<E::Model>>` |
+| `use_synced_row::<E::Model>(SyncHandle::new(db), pk)` | `Signal<Option<E::Model>>` |
 
 ## Background sync (feature `push-sync`)
 

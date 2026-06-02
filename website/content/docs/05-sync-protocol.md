@@ -70,8 +70,9 @@ All messages are JSON for ease of debugging — performance critical work happen
 
 | Protocol | Prefix | Why |
 |---|---|---|
-| `/wavesync/snapshot/2.0` (catch-up + push) | 4-byte **big-endian** | matches libp2p convention |
-| `/wavesync/auth/2.0` (challenge handshake) | 4-byte **little-endian** | legacy, predates the snapshot protocol |
+| `/wavesync/snapshot/3.0.0` (version-vector catch-up) | 4-byte **big-endian** | matches libp2p convention |
+| `/wavesync/push/1.0.0` (real-time push) | 4-byte **big-endian** | matches libp2p convention |
+| `/wavesync/auth/challenge/1.0.0` and `/wavesync/auth/result/1.0.0` (challenge handshake) | 4-byte **little-endian** | the auth codec predates the snapshot protocol; the endianness difference is intentional and must be preserved |
 
 These prefix encodings **must match** between peers — a peer that sees the wrong endianness will reject the message. The protocol identifier strings are how peers discover whether they speak compatible versions: a mismatch means the request-response handler refuses the substream and the connection survives but doesn't sync.
 

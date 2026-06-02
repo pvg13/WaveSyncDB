@@ -1382,9 +1382,9 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
 /// **Why this exists:** without this trigger, a fresh `WebSyncClient`
 /// joining a relay-mediated mesh receives only *future* writes — any
 /// historical state on the peer never lands in IndexedDB, because the
-/// gossipsub mesh only forwards real-time `Push` envelopes. The
-/// `peer_versions` table in `BrowserStore` was always being written on
-/// successful Push receipt but never read for catch-up. See issue #57.
+/// real-time `Push` request-response path only forwards new writes, not
+/// history. The `peer_versions` table in `BrowserStore` was always being
+/// written on successful Push receipt but never read for catch-up. See issue #57.
 ///
 /// HMAC: when a passphrase is configured, the `VersionVector` request
 /// MUST carry an HMAC tag — Rule 2.7 in `CLAUDE.md` (HMAC verification
