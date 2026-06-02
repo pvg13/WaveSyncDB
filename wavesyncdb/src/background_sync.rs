@@ -188,14 +188,12 @@ pub async fn background_sync_with_peers_for_topic(
         builder = builder.with_ipv6(true);
     }
 
-    // Restore FCM credentials persisted by the foreground `build()`. Without
-    // this the Android token-file read in `build()` (gated on
-    // `fcm_credentials.is_some()`) is skipped, so the wake runs with no push
-    // token and registers no topics — including any extra group rejoined
-    // below. That silently breaks push wake-ups for a device whose token
-    // rotated while it lived in the background, and for any group whose
-    // registration window was missed. (iOS reads its APNs token
-    // unconditionally, so this only affects FCM/Android.)
+    // Restore FCM credentials persisted by the foreground `build()` so a
+    // background build round-trips them back into the saved config rather than
+    // overwriting them with `None`. The token-file read in `build()` no longer
+    // depends on these (the relay sends with its own service account, so a
+    // device only needs its token registered), but keeping the persisted creds
+    // intact avoids churning `.wavesync_config.json` across wakes.
     #[cfg(feature = "push-sync")]
     if let (Some(project_id), Some(app_id), Some(api_key)) = (
         config.fcm_project_id.as_deref(),

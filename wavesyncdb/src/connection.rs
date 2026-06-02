@@ -1905,8 +1905,17 @@ impl WaveSyncDbBuilder {
         // The ContentProvider writes the token on a background thread at app startup,
         // so we retry a few times with a short delay to handle the race.
         // Only runs on Android — desktop has no FCM service to write the token file.
+        //
+        // This is intentionally NOT gated on `fcm_credentials.is_some()`. The
+        // device's FCM credentials (project/app/api key) are never transmitted:
+        // `RegisterToken` carries only `(topic, platform, token)`, and the relay
+        // sends the push with its *own* service account. So a device only needs
+        // its token to be woken — requiring the app to also embed sender
+        // credentials just to register left Android silently unable to wake
+        // whenever the consumer didn't ship google-services.json, while iOS
+        // (which reads its APNs token unconditionally, below) worked fine.
         #[cfg(all(feature = "push-sync", target_os = "android"))]
-        if self.fcm_credentials.is_some() && self.push_token.is_none() {
+        if self.push_token.is_none() {
             for attempt in 0..5 {
                 if let Some(token) = crate::push::read_token_file(&self.database_url) {
                     self.push_token = Some(("Fcm".to_string(), token));
