@@ -59,13 +59,20 @@ pub enum SyncRequest {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
-    /// Range reconciliation (#82): the sender's per-bucket digests. The
-    /// responder replies with its cells in the buckets whose digest differs, so
-    /// only ~the diff transfers instead of the whole range. Sent after a
-    /// `ReconcileDigest` shows global divergence.
-    ReconcileBuckets {
-        /// One digest per bucket (length is the agreed `BUCKET_COUNT`).
-        bucket_digests: Vec<[u8; 32]>,
+    /// One round of recursive range-based set reconciliation (#82). Carries a
+    /// list of range entries covering the keyspace; the responder compares,
+    /// then drops converged ranges, splits large mismatching ones, and
+    /// itemizes / transfers small ones (see [`crate::engine::reconcile`]). Sent
+    /// after a `ReconcileDigest` shows global divergence; the exchange recurses
+    /// over `ReconcileRangeResult` until empty. Additive: an older/web peer
+    /// that can't decode it fails cleanly and the sender falls back to the
+    /// version-vector catch-up.
+    ReconcileRange {
+        /// Range entries covering the keyspace (sorted by upper bound).
+        entries: Vec<RangeEntry>,
+        /// The sender's site_id (used as `peer_site` when the responder applies
+        /// changes carried in `IdList`/`Transfer` entries).
+        site_id: NodeId,
         /// The sync topic — selects the group + key (Rule 2.8).
         #[serde(default)]
         topic: String,
@@ -73,6 +80,56 @@ pub enum SyncRequest {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
+}
+
+/// One entry in a reconciliation message: covers the half-open key range
+/// `[lower, upper)`. Bounds are carried explicitly (not threaded positionally)
+/// so each entry maps independently — converged ranges can be dropped from a
+/// reply without breaking the bounds of the ranges that remain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeEntry {
+    /// Inclusive lower bound of this range as a sort key; `None` = −∞.
+    #[serde(default)]
+    pub lower: Option<Vec<u8>>,
+    /// Exclusive upper bound of this range as a sort key; `None` = +∞.
+    pub upper: Option<Vec<u8>>,
+    /// What the sender knows about this range.
+    pub payload: RangePayload,
+}
+
+/// The sender's knowledge of a reconciliation range. The recursion exchanges
+/// these to converge while transferring only the symmetric difference:
+/// `Fingerprint` (compare) → `IdList` (identities of a small range) →
+/// `Resolve` (cells you lack + keys I want) → `Transfer` (the requested cells).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RangePayload {
+    /// XOR of the sender's cell fingerprints in the range. The receiver
+    /// compares to its own: equal ⇒ converged; unequal ⇒ split or itemize.
+    Fingerprint([u8; 32]),
+    /// Identities (key + fingerprint, no values) of every cell the sender has
+    /// in this (small) range, so the receiver can compute the exact diff.
+    IdList(Vec<RangeItem>),
+    /// Reply to an `IdList`: the cells the `IdList` sender was missing
+    /// (`transfer`, applied directly) plus the keys the replier is missing
+    /// (`request`, which the `IdList` sender returns as a `Transfer`).
+    Resolve {
+        transfer: Vec<ColumnChange>,
+        request: Vec<Vec<u8>>,
+    },
+    /// Terminal: the cells the peer requested (reply to `Resolve`'s `request`).
+    /// Applied directly; no further reply.
+    Transfer(Vec<ColumnChange>),
+}
+
+/// A single cell identity in an [`RangePayload::IdList`]: sort key + content
+/// fingerprint (no value — values move only in `Resolve`/`Transfer`, and only
+/// for cells the peer actually lacks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeItem {
+    /// Sort key (`table\0pk\0cid`).
+    pub key: Vec<u8>,
+    /// Content fingerprint (includes the value).
+    pub fp: [u8; 32],
 }
 
 /// The response to a [`SyncRequest`].
@@ -114,18 +171,15 @@ pub enum SyncResponse {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
-    /// Response to [`SyncRequest::ReconcileBuckets`] (#82): the responder's
-    /// `ColumnChange`s in the buckets whose digest differed from the
-    /// requester's, plus the responder's current `db_version` so the requester
-    /// can advance its peer-version cursor (and the version-vector backstop
-    /// won't redundantly re-pull the same range).
-    ReconcileBucketsResult {
-        /// Column changes in the mismatching buckets (applied via the normal
-        /// conflict-resolving path, so only newer values win).
-        changes: Vec<ColumnChange>,
-        /// The responder's current db_version.
-        my_db_version: u64,
-        /// The responder's site_id (used as `peer_site` when applying).
+    /// Response to [`SyncRequest::ReconcileRange`] (#82): the responder's reply
+    /// range entries (converged ranges dropped, large ones split, small ones
+    /// itemized/transferred). The requester processes these, applies any
+    /// transferred changes, and — if the reply is non-empty — sends another
+    /// `ReconcileRange` round until the exchange is empty.
+    ReconcileRangeResult {
+        /// Reply range entries (empty ⇒ fully converged, exchange done).
+        entries: Vec<RangeEntry>,
+        /// The responder's site_id (used as `peer_site` when applying transfers).
         site_id: NodeId,
         /// The sync topic — selects the group + key (Rule 2.8).
         #[serde(default)]
