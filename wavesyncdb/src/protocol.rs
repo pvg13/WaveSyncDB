@@ -59,6 +59,20 @@ pub enum SyncRequest {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
+    /// Range reconciliation (#82): the sender's per-bucket digests. The
+    /// responder replies with its cells in the buckets whose digest differs, so
+    /// only ~the diff transfers instead of the whole range. Sent after a
+    /// `ReconcileDigest` shows global divergence.
+    ReconcileBuckets {
+        /// One digest per bucket (length is the agreed `BUCKET_COUNT`).
+        bucket_digests: Vec<[u8; 32]>,
+        /// The sync topic — selects the group + key (Rule 2.8).
+        #[serde(default)]
+        topic: String,
+        /// HMAC tag for group authentication (Rule 2.7).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
 }
 
 /// The response to a [`SyncRequest`].
@@ -93,6 +107,26 @@ pub enum SyncResponse {
         converged: bool,
         /// The responder's value-inclusive group digest.
         digest: [u8; 32],
+        /// The sync topic — selects the group + key (Rule 2.8).
+        #[serde(default)]
+        topic: String,
+        /// HMAC tag for group authentication (Rule 2.7).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
+    /// Response to [`SyncRequest::ReconcileBuckets`] (#82): the responder's
+    /// `ColumnChange`s in the buckets whose digest differed from the
+    /// requester's, plus the responder's current `db_version` so the requester
+    /// can advance its peer-version cursor (and the version-vector backstop
+    /// won't redundantly re-pull the same range).
+    ReconcileBucketsResult {
+        /// Column changes in the mismatching buckets (applied via the normal
+        /// conflict-resolving path, so only newer values win).
+        changes: Vec<ColumnChange>,
+        /// The responder's current db_version.
+        my_db_version: u64,
+        /// The responder's site_id (used as `peer_site` when applying).
+        site_id: NodeId,
         /// The sync topic — selects the group + key (Rule 2.8).
         #[serde(default)]
         topic: String,

@@ -17,6 +17,12 @@ impl EngineRunner {
             .peers
             .keys()
             .filter(|p| !self.infrastructure_peers.contains(p))
+            // Reconcile-capable peers (#82) are kept in sync by the digest +
+            // bucket exchange instead, so skip the periodic version-vector for
+            // them — otherwise the relay would carry a redundant whole-range
+            // resend every tick. Peers not (yet) known reconcile-capable still
+            // get the version-vector as the fallback / initial path.
+            .filter(|p| !self.reconcile_capable.contains(p))
             .cloned()
             .collect();
         let topics: Vec<String> = self.groups.keys().cloned().collect();

@@ -1660,8 +1660,8 @@ async fn handle_loopback_request(
             // engine; loopback has no concept of presence beyond the
             // online flag, so we ignore.
         }
-        SyncRequest::ReconcileDigest { .. } => {
-            // Convergence-digest reconciliation (#82) is a native-engine
+        SyncRequest::ReconcileDigest { .. } | SyncRequest::ReconcileBuckets { .. } => {
+            // Convergence-digest / range reconciliation (#82) is a native-engine
             // feature; the loopback path has no peer to reconcile with.
         }
     }
@@ -2500,6 +2500,28 @@ async fn handle_snapshot_event(
                 }
                 let _ = swarm.behaviour_mut().snapshot.send_response(channel, resp);
             }
+            SyncRequest::ReconcileBuckets { .. } => {
+                // The browser engine doesn't compute bucket diffs (#82). Reply
+                // with an empty result so the native peer doesn't time out and
+                // does NOT mark us reconcile-capable (an empty pull never gates
+                // its version-vector), keeping web↔native sync on the catch-up.
+                let mut resp = SyncResponse::ReconcileBucketsResult {
+                    changes: Vec::new(),
+                    my_db_version: 0,
+                    site_id: state.site_id,
+                    topic: state.topic.clone(),
+                    hmac: None,
+                };
+                if let Some(gk) = &state.group_key
+                    && let Ok(bytes) = serde_json::to_vec(&resp)
+                {
+                    let tag = gk.mac(&bytes);
+                    if let SyncResponse::ReconcileBucketsResult { ref mut hmac, .. } = resp {
+                        *hmac = Some(tag);
+                    }
+                }
+                let _ = swarm.behaviour_mut().snapshot.send_response(channel, resp);
+            }
         },
         // Real-network counterpart of the loopback ChangesetResponse
         // path. Without this, the catch-up data ships from the peer
@@ -2591,10 +2613,11 @@ async fn handle_snapshot_event(
             }
             SyncResponse::PushAck
             | SyncResponse::IdentityAck
-            | SyncResponse::ReconcileResult { .. } => {
+            | SyncResponse::ReconcileResult { .. }
+            | SyncResponse::ReconcileBucketsResult { .. } => {
                 // Acknowledgements / reconcile results — nothing to apply here.
-                // (Web never initiates a ReconcileDigest, so a ReconcileResult
-                // is not expected, but it's harmless to ignore.)
+                // (Web never initiates reconcile, so these are not expected, but
+                // it's harmless to ignore them.)
             }
         },
         Event::OutboundFailure { peer, error, .. } => {

@@ -664,6 +664,7 @@ async fn run_engine(
         diagnostics,
         protocol_mismatch_peers: std::collections::HashSet::new(),
         peer_via_relay: std::collections::HashMap::new(),
+        reconcile_capable: std::collections::HashSet::new(),
         #[cfg(target_os = "ios")]
         quic_listeners: std::collections::HashMap::new(),
     };
@@ -903,6 +904,13 @@ struct EngineRunner {
     /// arrives as a fresh direct connection that flips this to `false`; cleared
     /// on full disconnect. Surfaced as `PeerInfo.via_relay`.
     pub(crate) peer_via_relay: std::collections::HashMap<libp2p::PeerId, bool>,
+    /// Peers that have answered a reconcile message (#82) — i.e. they speak the
+    /// digest/bucket protocol. For these, the periodic version-vector catch-up
+    /// is skipped (the digest exchange handles convergence + the bucket exchange
+    /// handles the diff), so the relay carries no redundant whole-range resend.
+    /// Peers NOT in this set (older builds, web) keep getting the version-vector
+    /// catch-up as the fallback. Cleared on disconnect.
+    pub(crate) reconcile_capable: std::collections::HashSet<libp2p::PeerId>,
     /// iOS only: QUIC listeners keyed by the concrete interface IP they are
     /// bound to. iOS binds QUIC to concrete routable addresses (not loopback,
     /// not unspecified — see the listen logic in `run`), and a mobile device's
@@ -2138,6 +2146,7 @@ impl EngineRunner {
                         self.peer_identities.remove(&pid);
                         self.protocol_mismatch_peers.remove(&pid);
                         self.peer_via_relay.remove(&pid);
+                        self.reconcile_capable.remove(&pid);
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::PeerDisconnected(
                                 crate::network_status::PeerId(pid.to_string()),

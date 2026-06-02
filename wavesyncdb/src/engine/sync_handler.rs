@@ -56,6 +56,19 @@ impl EngineRunner {
                                 peer, channel, digest, peer_topic, req_hmac,
                             );
                         }
+                        SyncRequest::ReconcileBuckets {
+                            bucket_digests,
+                            topic: peer_topic,
+                            hmac: req_hmac,
+                        } => {
+                            self.handle_reconcile_buckets_request(
+                                peer,
+                                channel,
+                                bucket_digests,
+                                peer_topic,
+                                req_hmac,
+                            );
+                        }
                     }
                 }
                 request_response::Message::Response { response, .. } => {
@@ -246,6 +259,22 @@ impl EngineRunner {
                         } => {
                             self.handle_reconcile_result(
                                 peer, converged, digest, peer_topic, resp_hmac,
+                            );
+                        }
+                        crate::protocol::SyncResponse::ReconcileBucketsResult {
+                            changes,
+                            my_db_version,
+                            site_id: peer_site_id,
+                            topic: peer_topic,
+                            hmac: resp_hmac,
+                        } => {
+                            self.handle_reconcile_buckets_result(
+                                peer,
+                                changes,
+                                my_db_version,
+                                peer_site_id,
+                                peer_topic,
+                                resp_hmac,
                             );
                         }
                     }
@@ -659,12 +688,7 @@ impl EngineRunner {
     /// group only; the peer may still be a valid member of other groups.
     fn reject_peer_for_group(&mut self, effective_topic: &str, peer: libp2p::PeerId) {
         let backoff = if let Some(g) = self.groups.get_mut(effective_topic) {
-            let attempts = g
-                .rejected_peers
-                .get(&peer)
-                .map(|r| r.attempts)
-                .unwrap_or(0)
-                + 1;
+            let attempts = g.rejected_peers.get(&peer).map(|r| r.attempts).unwrap_or(0) + 1;
             let dur = super::rejection_backoff(attempts);
             g.rejected_peers.insert(
                 peer,
@@ -870,6 +894,13 @@ impl EngineRunner {
         }
 
         if converged {
+            // Proven converged → this peer fully speaks the reconcile protocol,
+            // so the periodic version-vector catch-up is skipped for it from now
+            // on (the digest exchange keeps proving convergence cheaply). We do
+            // NOT mark capable on mere divergence: a peer that answers the
+            // digest but can't do the bucket transfer (e.g. the browser engine)
+            // must keep getting the version-vector so its data still flows.
+            self.reconcile_capable.insert(peer);
             self.diagnostics
                 .reconcile_converged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -884,10 +915,220 @@ impl EngineRunner {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!(
                 "Reconcile: diverged with peer {peer} for group {effective}; \
-                 nudging version-vector catch-up"
+                 exchanging buckets to transfer the diff"
             );
-            // Repair promptly rather than waiting for the next periodic tick.
-            self.initiate_sync_for_peer(peer, &effective);
+            // Range reconciliation: send our per-bucket digests so the peer
+            // replies with just the cells in mismatching buckets.
+            self.send_reconcile_buckets(peer, &effective);
+        }
+    }
+
+    /// Send our per-bucket digests to `peer` for range reconciliation (#82).
+    /// Computed off-loop (DB scan) and handed back via `reconcile_req_tx`.
+    pub(super) fn send_reconcile_buckets(&mut self, peer: libp2p::PeerId, effective_topic: &str) {
+        let Some(g) = self.groups.get(effective_topic) else {
+            return;
+        };
+        if g.is_rejected(&peer) {
+            return;
+        }
+        let db = g.db.clone();
+        let registry = g.registry.clone();
+        let topic_name = g.topic_name.clone();
+        let group_key = g.group_key.clone();
+        let req_tx = self.reconcile_req_tx.clone();
+
+        tokio::spawn(async move {
+            let bucket_digests =
+                reconcile::compute_group_buckets(&db, &registry, reconcile::BUCKET_COUNT).await;
+            let mut req = SyncRequest::ReconcileBuckets {
+                bucket_digests,
+                topic: topic_name,
+                hmac: None,
+            };
+            if let Some(ref gk) = group_key
+                && let Ok(bytes) = serde_json::to_vec(&req)
+            {
+                let tag = gk.mac(&bytes);
+                if let SyncRequest::ReconcileBuckets { ref mut hmac, .. } = req {
+                    *hmac = Some(tag);
+                }
+            }
+            let _ = req_tx.send((peer, req)).await;
+        });
+    }
+
+    /// Handle an inbound `ReconcileBuckets` (#82): verify HMAC, compute our own
+    /// per-bucket digests, and reply with our cells in the buckets whose digest
+    /// differs from the requester's — only ~the diff, not the whole range.
+    fn handle_reconcile_buckets_request(
+        &mut self,
+        peer: libp2p::PeerId,
+        channel: request_response::ResponseChannel<crate::protocol::SyncResponse>,
+        remote_buckets: Vec<[u8; 32]>,
+        peer_topic: String,
+        req_hmac: Option<[u8; 32]>,
+    ) {
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            log::debug!("Ignoring reconcile buckets from {peer} for unknown topic {effective}");
+            return;
+        };
+        let group_key = g.group_key.clone();
+
+        if let Some(ref gk) = group_key {
+            let tag = match req_hmac {
+                Some(t) => t,
+                None => {
+                    log::debug!("Rejecting unauthenticated reconcile buckets from peer {peer}");
+                    return;
+                }
+            };
+            let verify_req = SyncRequest::ReconcileBuckets {
+                bucket_digests: remote_buckets.clone(),
+                topic: peer_topic.clone(),
+                hmac: None,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&verify_req)
+                && !gk.verify(&bytes, &tag)
+            {
+                self.reject_peer_for_group(&effective, peer);
+                return;
+            }
+        }
+
+        let Some(g) = self.groups.get(&effective) else {
+            return;
+        };
+        let db = g.db.clone();
+        let registry = g.registry.clone();
+        let topic_name = g.topic_name.clone();
+        let local_site_id = g.site_id;
+        let local_db_version = g.local_db_version;
+        let resp_tx = self.snapshot_resp_tx.clone();
+
+        tokio::spawn(async move {
+            let n = reconcile::BUCKET_COUNT;
+            let local_buckets = reconcile::compute_group_buckets(&db, &registry, n).await;
+            let mut mismatch = std::collections::HashSet::new();
+            if remote_buckets.len() == local_buckets.len() {
+                for (i, (l, r)) in local_buckets.iter().zip(remote_buckets.iter()).enumerate() {
+                    if l != r {
+                        mismatch.insert(i);
+                    }
+                }
+            } else {
+                // Unexpected bucket count (corrupt / different BUCKET_COUNT) —
+                // fall back to sending everything; the receiver conflict-resolves.
+                for i in 0..local_buckets.len() {
+                    mismatch.insert(i);
+                }
+            }
+            let changes = reconcile::changes_in_buckets(&db, &registry, n, &mismatch).await;
+            let mut resp = crate::protocol::SyncResponse::ReconcileBucketsResult {
+                changes,
+                my_db_version: local_db_version,
+                site_id: local_site_id,
+                topic: topic_name,
+                hmac: None,
+            };
+            if let Some(ref gk) = group_key
+                && let Ok(bytes) = serde_json::to_vec(&resp)
+            {
+                let tag = gk.mac(&bytes);
+                if let crate::protocol::SyncResponse::ReconcileBucketsResult {
+                    ref mut hmac, ..
+                } = resp
+                {
+                    *hmac = Some(tag);
+                }
+            }
+            if let Err(e) = resp_tx.send((channel, resp)).await {
+                log::error!("Failed to queue reconcile buckets result: {e}");
+            }
+        });
+    }
+
+    /// Handle a `ReconcileBucketsResult` (#82): verify HMAC, then apply the
+    /// pulled diff cells via the normal sequential conflict-resolving queue
+    /// (which records the peer's db_version), so the requester catches up to the
+    /// responder for the mismatching buckets.
+    fn handle_reconcile_buckets_result(
+        &mut self,
+        peer: libp2p::PeerId,
+        changes: Vec<crate::messages::ColumnChange>,
+        my_db_version: u64,
+        peer_site_id: NodeId,
+        peer_topic: String,
+        resp_hmac: Option<[u8; 32]>,
+    ) {
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            log::debug!(
+                "Ignoring reconcile buckets result from {peer} for unknown topic {effective}"
+            );
+            return;
+        };
+        if let Some(ref gk) = g.group_key {
+            let tag = match resp_hmac {
+                Some(t) => t,
+                None => {
+                    log::debug!("Rejecting unauthenticated reconcile buckets result from {peer}");
+                    return;
+                }
+            };
+            let verify_resp = crate::protocol::SyncResponse::ReconcileBucketsResult {
+                changes: changes.clone(),
+                my_db_version,
+                site_id: peer_site_id,
+                topic: peer_topic.clone(),
+                hmac: None,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&verify_resp)
+                && !gk.verify(&bytes, &tag)
+            {
+                log::debug!("Rejecting reconcile buckets result with invalid HMAC from {peer}");
+                return;
+            }
+        }
+
+        if changes.is_empty() {
+            // The responder had no cells in our mismatching buckets (e.g. only
+            // *we* have extra data the responder lacks). Don't mark the peer
+            // reconcile-capable from an empty pull — that could be the browser
+            // engine, which always replies empty; keep the version-vector for
+            // it. The peer's own reconcile round (or our VV) moves our extra
+            // data to it.
+            self.update_network_status();
+            return;
+        }
+
+        // A non-empty diff pull proves the peer fully speaks the protocol, so
+        // gate its periodic version-vector from here on.
+        self.reconcile_capable.insert(peer);
+
+        log::info!(
+            "Reconcile: pulling {} diff cell(s) from peer {peer} for group {effective}",
+            changes.len()
+        );
+        // Apply via the same sequential conflict-resolving queue the
+        // version-vector response uses; it records peer_db_versions after commit.
+        if let Err(e) = self.remote_changeset_tx.try_send(RemoteChangeset {
+            peer,
+            peer_site: peer_site_id,
+            peer_db_version: Some(my_db_version),
+            effective_topic: effective,
+            changes,
+        }) {
+            log::warn!("Remote changeset queue full, dropping reconcile diff: {e}");
         }
     }
 }
