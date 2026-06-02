@@ -939,37 +939,6 @@ impl WaveSyncDb {
             return Ok(());
         }
 
-        // Send one change notification per row IMMEDIATELY — user-table data
-        // is already committed by the time the interceptor sees the SQL, so
-        // subscribers re-querying are guaranteed to see the new state. We
-        // emit per-row so reactive hooks (`use_synced_table`) wake exactly
-        // once per affected primary key, matching the single-row insert
-        // semantics consumers already build against.
-        for parsed in &parsed_rows {
-            let column_values = if matches!(kind, WriteKind::Delete) {
-                None
-            } else {
-                Some(
-                    parsed
-                        .columns
-                        .iter()
-                        .map(|(col, val)| (crate::ColumnName(col.clone()), val.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            };
-            let changed_columns = column_values
-                .as_ref()
-                .map(|cv| cv.iter().map(|(c, _)| c.0.clone()).collect());
-            let _ = self.inner.change_tx.send(ChangeNotification {
-                table: table.to_string().into(),
-                kind: kind.clone(),
-                source: crate::messages::ChangeSource::Local,
-                primary_key: parsed.primary_key.clone().into(),
-                changed_columns,
-                column_values,
-            });
-        }
-
         let site_id = self.inner.site_id;
         let inner = &self.inner.inner;
         let table_owned = table;
@@ -1013,13 +982,25 @@ impl WaveSyncDb {
             match kind {
                 WriteKind::Delete => {
                     // Find max col_version for this row and create tombstone.
-                    let entries = crate::shadow::get_clock_entries_for_row(
+                    let entries = match crate::shadow::get_clock_entries_for_row(
                         &txn,
                         table_owned,
                         &parsed.primary_key,
                     )
                     .await
-                    .unwrap_or_default();
+                    {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            // Fail-closed: a read failure here would yield a
+                            // wrong tombstone col_version. Roll back rather than
+                            // publish a delete the local shadow can't back (N2).
+                            log::error!("Failed to read clock entries for delete: {e}");
+                            *ver -= 1;
+                            self.inner.db_version_cache.store(*ver, Ordering::Release);
+                            let _ = txn.rollback().await;
+                            return Err(e);
+                        }
+                    };
 
                     let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
                     let tombstone_cv = max_cv + 1;
@@ -1034,7 +1015,13 @@ impl WaveSyncDb {
                     )
                     .await
                     {
+                        // Fail-closed: don't advance db_version or push a delete
+                        // the local shadow table doesn't record (N2).
                         log::error!("Failed to insert tombstone: {e}");
+                        *ver -= 1;
+                        self.inner.db_version_cache.store(*ver, Ordering::Release);
+                        let _ = txn.rollback().await;
+                        return Err(e);
                     }
 
                     changes.push(ColumnChange {
@@ -1053,8 +1040,18 @@ impl WaveSyncDb {
                     // Clear any tombstone for this row (it's alive again),
                     // but preserve per-column clock entries so col_versions
                     // continue from their previous values.
-                    let _ = crate::shadow::clear_tombstone(&txn, table_owned, &parsed.primary_key)
-                        .await;
+                    if let Err(e) =
+                        crate::shadow::clear_tombstone(&txn, table_owned, &parsed.primary_key).await
+                    {
+                        // Fail-closed: a stale tombstone left behind could let a
+                        // delete win over this resurrection on a peer. Roll back
+                        // instead of committing inconsistent shadow state (N2).
+                        log::error!("Failed to clear tombstone: {e}");
+                        *ver -= 1;
+                        self.inner.db_version_cache.store(*ver, Ordering::Release);
+                        let _ = txn.rollback().await;
+                        return Err(e);
+                    }
 
                     // Single batched upsert across every changed column.
                     // SQLite's ON CONFLICT DO UPDATE … RETURNING gives us
@@ -1116,6 +1113,38 @@ impl WaveSyncDb {
         // shadow tables, so further writes can proceed concurrently with
         // the engine consuming this changeset.
         drop(ver);
+
+        // Emit change notifications only now that the shadow-table transaction
+        // has committed (Rule 2.12). The user-table data was already committed
+        // by the interceptor before dispatch_sync ran, but a subscriber that
+        // re-reads version/shadow state on notification must not observe a
+        // pre-commit — or since-rolled-back — shadow snapshot. One notification
+        // per row so reactive hooks (`use_synced_table`) wake exactly once per
+        // affected primary key.
+        for parsed in &parsed_rows {
+            let column_values = if matches!(kind, WriteKind::Delete) {
+                None
+            } else {
+                Some(
+                    parsed
+                        .columns
+                        .iter()
+                        .map(|(col, val)| (crate::ColumnName(col.clone()), val.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let changed_columns = column_values
+                .as_ref()
+                .map(|cv| cv.iter().map(|(c, _)| c.0.clone()).collect());
+            let _ = self.inner.change_tx.send(ChangeNotification {
+                table: table.to_string().into(),
+                kind: kind.clone(),
+                source: crate::messages::ChangeSource::Local,
+                primary_key: parsed.primary_key.clone().into(),
+                changed_columns,
+                column_values,
+            });
+        }
 
         let changeset = SyncChangeset {
             site_id,

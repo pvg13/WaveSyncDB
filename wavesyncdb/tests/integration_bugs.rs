@@ -998,3 +998,54 @@ async fn test_h6_graceful_shutdown_flushes_pending_writes() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// N2 / issue #83 regression: a shadow-table write failure during dispatch must
+// fail the whole operation closed, not be logged-and-swallowed.
+//
+// Pre-fix, the DELETE path read clock entries with `.unwrap_or_default()` and
+// only logged an `insert_tombstone` failure, so a DELETE whose tombstone could
+// not be recorded in the shadow table still returned Ok, advanced db_version,
+// and pushed a tombstone changeset the local shadow didn't back — silent
+// divergence between this node and its peers. The DELETE must now return Err.
+//
+// We simulate the shadow failure by dropping the row's `_wavesync_<table>_clock`
+// table after the row exists. (Single local DB; no peers, so no seed needed.)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_n2_shadow_failure_fails_closed_on_delete() {
+    use sea_orm::EntityTrait;
+
+    let db = WaveSyncDbBuilder::new(&mem_db("n2"), "test-n2")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    // Insert so the clock shadow table exists and holds this row's entries.
+    task::ActiveModel {
+        id: Set("t1".to_string()),
+        title: Set("first".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Simulate a shadow-table failure: drop the clock table so the DELETE can
+    // no longer read prior clocks or record its tombstone.
+    db.inner()
+        .execute_unprepared("DROP TABLE \"_wavesync_tasks_clock\"")
+        .await
+        .unwrap();
+
+    // Pre-fix this returned Ok (swallowed the error, diverged silently). It
+    // must now fail closed so the caller knows the change was not synced.
+    let result = task::Entity::delete_by_id("t1".to_string()).exec(&db).await;
+    assert!(
+        result.is_err(),
+        "N2: DELETE must fail closed when the shadow clock table is unavailable"
+    );
+}
