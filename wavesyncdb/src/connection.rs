@@ -323,6 +323,13 @@ pub(crate) struct WaveSyncNodeInner {
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    /// Node-level user-notification channel, shared by **every** group on this
+    /// node. Each group's engine-side `GroupState.notification_tx` is a clone of
+    /// this one sender, so `WaveSyncDb::notification_rx()` on any handle yields
+    /// notifications for *all* groups — a single `use_sync_notifications` covers
+    /// the whole node (default + every joined group), instead of silently
+    /// missing groups whose per-group channel had no subscriber.
+    notification_tx: broadcast::Sender<crate::notify::Notification>,
     /// Active group handles keyed by *user* topic (pre-derivation). Lets
     /// `join_group` be idempotent and `leave_group` resolve handles.
     ///
@@ -2151,6 +2158,9 @@ impl WaveSyncDbBuilder {
             network_status,
             network_event_tx,
             diagnostics,
+            // The default group's channel is the node-level channel; joined
+            // groups clone this same sender so all notifications merge here.
+            notification_tx: notification_tx.clone(),
             groups: std::sync::Mutex::new(HashMap::new()),
             base_database_url: self.database_url.clone(),
         });
@@ -2238,7 +2248,10 @@ impl WaveSyncNode {
         let registry = Arc::new(TableRegistry::new());
         let registry_ready = Arc::new(Notify::new());
         let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
-        let (notification_tx, _) = broadcast::channel::<crate::notify::Notification>(256);
+        // Reuse the node-level notification channel (not a fresh per-group one)
+        // so this group's notifications reach the same `notification_rx()` every
+        // other group does — one `use_sync_notifications` covers the whole node.
+        let notification_tx = self.inner.notification_tx.clone();
         let notification_registry = Arc::new(crate::registry::NotificationRegistry::new());
         for info in inventory::iter::<crate::notify::NotifyEntityInfo> {
             let (table_name, dispatch) = (info.make)();
