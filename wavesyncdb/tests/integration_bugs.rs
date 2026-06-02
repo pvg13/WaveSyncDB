@@ -1049,3 +1049,62 @@ async fn test_n2_shadow_failure_fails_closed_on_delete() {
         "N2: DELETE must fail closed when the shadow clock table is unavailable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #84 relay-cost telemetry: a direct (LAN/mDNS) connection must be classified
+// as direct, not relayed. Two peers connect with no relay configured, so the
+// direct-connection counter advances, the relayed counter stays zero, and
+// every connected peer reports via_relay == false. (The relayed path needs a
+// real relay server and is covered by the e2e suite, not this in-process test.)
+//
+// Seeds 222–223 (see CLAUDE.md §6).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_84_relay_cost_telemetry_classifies_direct() {
+    use sea_orm::EntityTrait;
+
+    let _ = env_logger::try_init();
+    let topic = format!("test-relaycost-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_peer(&mem_db("relaycost_a"), &topic, 222).await;
+    let b = make_peer(&mem_db("relaycost_b"), &topic, 223).await;
+
+    // Drive a write so the peers actually connect and sync.
+    task::ActiveModel {
+        id: Set("rc-1".to_string()),
+        title: Set("hi".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+    assert_eventually("b receives a's write (peers connected)", timeout, || async {
+        task::Entity::find_by_id("rc-1".to_string())
+            .one(&b)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
+
+    let diag = a.diagnostics();
+    assert!(
+        diag.direct_connections_established >= 1,
+        "expected >=1 direct connection, got {}",
+        diag.direct_connections_established
+    );
+    assert_eq!(
+        diag.relayed_connections_established, 0,
+        "no relay configured in tests, so no connection should be relayed"
+    );
+
+    let status = a.network_status();
+    assert_eq!(status.relayed_peer_count(), 0, "no peer should be via relay");
+    assert!(
+        status.connected_peers.iter().all(|p| !p.via_relay),
+        "all LAN peers must report via_relay == false"
+    );
+}

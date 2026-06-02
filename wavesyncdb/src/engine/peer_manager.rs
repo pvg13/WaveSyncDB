@@ -157,6 +157,7 @@ impl EngineRunner {
                             is_bootstrap: self.bootstrap_peers.contains(&peer_id),
                             is_group_member: false,
                             app_id: None,
+                            via_relay: self.peer_via_relay.get(&peer_id).copied().unwrap_or(false),
                         },
                     ));
                     self.update_network_status();

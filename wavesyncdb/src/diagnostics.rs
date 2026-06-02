@@ -105,6 +105,19 @@ pub(crate) struct Counters {
     /// is actually facing — typically ~70% on mixed home / office NATs,
     /// ~10–30% on cellular (carrier-grade NAT defeats hole punching).
     pub dcutr_upgrades_succeeded: AtomicU64,
+
+    /// `ConnectionEstablished` for a non-infrastructure peer whose remote
+    /// address is a circuit-relay address (`/.../p2p-circuit/...`) — i.e. the
+    /// connection (and any data over it) is being carried by the relay server,
+    /// which costs relay bandwidth/infrastructure. A DCUtR upgrade later
+    /// establishes a separate *direct* connection (counted in
+    /// [`Self::direct_connections_established`]); comparing the two against
+    /// [`Self::dcutr_upgrades_succeeded`] shows how much traffic the relay is
+    /// actually carrying vs. how often peers move off it.
+    pub relayed_connections_established: AtomicU64,
+    /// `ConnectionEstablished` for a non-infrastructure peer over a direct
+    /// (non-circuit) address — the relay is not on the data path for it.
+    pub direct_connections_established: AtomicU64,
 }
 
 impl Counters {
@@ -126,6 +139,12 @@ impl Counters {
             cached_addr_dials: self.cached_addr_dials.load(Ordering::Relaxed),
             dcutr_upgrades_attempted: self.dcutr_upgrades_attempted.load(Ordering::Relaxed),
             dcutr_upgrades_succeeded: self.dcutr_upgrades_succeeded.load(Ordering::Relaxed),
+            relayed_connections_established: self
+                .relayed_connections_established
+                .load(Ordering::Relaxed),
+            direct_connections_established: self
+                .direct_connections_established
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -148,6 +167,8 @@ pub struct Snapshot {
     pub cached_addr_dials: u64,
     pub dcutr_upgrades_attempted: u64,
     pub dcutr_upgrades_succeeded: u64,
+    pub relayed_connections_established: u64,
+    pub direct_connections_established: u64,
 }
 
 #[cfg(test)]

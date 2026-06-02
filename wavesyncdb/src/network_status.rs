@@ -33,6 +33,12 @@ pub struct PeerInfo {
     pub is_group_member: bool,
     /// Application-defined identity announced by this peer (ephemeral, session-scoped).
     pub app_id: Option<String>,
+    /// Whether the current connection to this peer is carried by the relay
+    /// server (a circuit-relay path) rather than a direct one. `true` means the
+    /// relay is on the data path for this peer (it costs relay bandwidth);
+    /// `false` means a direct path is in use. Flips to `false` once a DCUtR
+    /// hole-punch upgrades the connection to direct.
+    pub via_relay: bool,
 }
 
 /// Relay connection status.
@@ -105,6 +111,14 @@ impl NetworkStatus {
     /// Total number of connected peers (including non-group).
     pub fn connected_peer_count(&self) -> usize {
         self.connected_peers.len()
+    }
+
+    /// Number of currently-connected peers whose path is carried by the relay
+    /// (no direct connection). A non-zero value means the relay is on the data
+    /// path — the "closer-peer-first" goal wants this to trend to zero as DCUtR
+    /// upgrades connections to direct.
+    pub fn relayed_peer_count(&self) -> usize {
+        self.connected_peers.iter().filter(|p| p.via_relay).count()
     }
 }
 
@@ -206,6 +220,7 @@ mod tests {
                     is_bootstrap: false,
                     is_group_member: true,
                     app_id: None,
+                    via_relay: false,
                 },
                 PeerInfo {
                     peer_id: PeerId("b".into()),
@@ -214,6 +229,7 @@ mod tests {
                     is_bootstrap: false,
                     is_group_member: false,
                     app_id: None,
+                    via_relay: false,
                 },
                 PeerInfo {
                     peer_id: PeerId("c".into()),
@@ -222,6 +238,7 @@ mod tests {
                     is_bootstrap: true,
                     is_group_member: true,
                     app_id: None,
+                    via_relay: false,
                 },
             ],
             ..Default::default()
@@ -253,6 +270,7 @@ mod tests {
                 is_bootstrap: false,
                 is_group_member: true,
                 app_id: None,
+                via_relay: false,
             }],
             topic: "my-topic".into(),
             relay_status: RelayStatus::Connected,

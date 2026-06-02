@@ -356,6 +356,15 @@ fn quic_listen_multiaddr(ip: std::net::IpAddr) -> libp2p::Multiaddr {
     addr
 }
 
+/// Whether a multiaddr is a circuit-relay path (`/.../p2p-circuit/...`), i.e.
+/// a connection over it is carried by the relay server rather than direct.
+/// Used for relay-cost telemetry (which peers / connections cost relay
+/// bandwidth) — see [`crate::diagnostics`] and `PeerInfo::via_relay`.
+fn addr_is_relayed(addr: &libp2p::Multiaddr) -> bool {
+    addr.iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: Option<mdns::Config>,
@@ -644,6 +653,7 @@ async fn run_engine(
         dcutr_retries: HashMap::new(),
         diagnostics,
         protocol_mismatch_peers: std::collections::HashSet::new(),
+        peer_via_relay: std::collections::HashMap::new(),
         #[cfg(target_os = "ios")]
         quic_listeners: std::collections::HashMap::new(),
     };
@@ -835,6 +845,12 @@ struct EngineRunner {
     /// periodic sync retry; cleared when the peer fully disconnects so a later
     /// reconnect can re-surface it.
     pub(crate) protocol_mismatch_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Per-peer current path classification for relay-cost telemetry: `true` if
+    /// the best-known connection to the peer is carried by the relay (circuit),
+    /// `false` if direct. Updated on `ConnectionEstablished` — a DCUtR upgrade
+    /// arrives as a fresh direct connection that flips this to `false`; cleared
+    /// on full disconnect. Surfaced as `PeerInfo.via_relay`.
+    pub(crate) peer_via_relay: std::collections::HashMap<libp2p::PeerId, bool>,
     /// iOS only: QUIC listeners keyed by the concrete interface IP they are
     /// bound to. iOS binds QUIC to concrete routable addresses (not loopback,
     /// not unspecified — see the listen logic in `run`), and a mobile device's
@@ -938,6 +954,7 @@ impl EngineRunner {
                     is_bootstrap: self.bootstrap_peers.contains(peer_id),
                     is_group_member,
                     app_id: self.peer_identities.get(peer_id).cloned(),
+                    via_relay: self.peer_via_relay.get(peer_id).copied().unwrap_or(false),
                 }
             })
             .collect();
@@ -1219,6 +1236,7 @@ impl EngineRunner {
                 is_bootstrap: true,
                 is_group_member: false,
                 app_id: None,
+                via_relay: self.peer_via_relay.get(&peer_id).copied().unwrap_or(false),
             },
         ));
         self.update_network_status();
@@ -1924,6 +1942,23 @@ impl EngineRunner {
                         .peer_dial_successes
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+                    // Relay-cost telemetry: classify this connection as relayed
+                    // (carried by the relay server) or direct. A DCUtR upgrade
+                    // later arrives as a separate direct ConnectionEstablished,
+                    // which flips the peer to direct below.
+                    if addr_is_relayed(endpoint.get_remote_address()) {
+                        self.diagnostics
+                            .relayed_connections_established
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Don't override an already-known direct path.
+                        self.peer_via_relay.entry(peer_id).or_insert(true);
+                    } else {
+                        self.diagnostics
+                            .direct_connections_established
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.peer_via_relay.insert(peer_id, false);
+                    }
+
                     // Cache this (peer_id, multiaddr) so the next cold start
                     // can dial it directly before discovery (#29). Skip the
                     // relay so the cache stays a sync-peer set.
@@ -2031,6 +2066,7 @@ impl EngineRunner {
                         }
                         self.peer_identities.remove(&pid);
                         self.protocol_mismatch_peers.remove(&pid);
+                        self.peer_via_relay.remove(&pid);
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::PeerDisconnected(
                                 crate::network_status::PeerId(pid.to_string()),
