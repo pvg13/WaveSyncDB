@@ -1168,3 +1168,105 @@ async fn test_82_reconcile_proves_convergence() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// #82 RBSR (full recursive range reconciliation): once two peers are proven
+// converged they mark each other `reconcile_capable`, which GATES OFF the
+// periodic version-vector catch-up between them. From that point the digest +
+// recursive range exchange is the ONLY catch-up path. This test injects a gap
+// that a real-time push would normally cover (simulating a push the peer
+// missed while the two stayed connected) and asserts the gap is repaired —
+// proving the on-wire RBSR path (ReconcileRange / ReconcileRangeResult codec,
+// HMAC, recursion, apply) works end-to-end, not just the in-memory algorithm.
+//
+// The gap is created out of band: a throwaway handle opened on A's database
+// file under an unrelated topic writes rows that commit to A's shadow tables
+// but are never fan-out pushed to B (the writing handle has no peers, and A's
+// own engine didn't originate the write). Because VV is gated, only RBSR can
+// carry those rows to B.
+//
+// Seeds 224 (out-of-band writer), 228 (A), 229 (B). See CLAUDE.md §6.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_82_rbsr_repairs_divergence_without_version_vector() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-rbsr-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(30);
+
+    let a_url = mem_db("rbsr_a");
+    let a = make_peer(&a_url, &topic, 228).await;
+    let b = make_peer(&mem_db("rbsr_b"), &topic, 229).await;
+
+    // 1. Converge on the empty state so BOTH peers mark each other
+    //    `reconcile_capable`. The periodic version-vector catch-up is now
+    //    skipped between them — RBSR is the only remaining catch-up mechanism.
+    assert_eventually("A proves convergence with B (empty)", timeout, || async {
+        a.diagnostics().reconcile_converged >= 1
+    })
+    .await;
+    assert_eventually("B proves convergence with A (empty)", timeout, || async {
+        b.diagnostics().reconcile_converged >= 1
+    })
+    .await;
+
+    let diverged_before = a.diagnostics().reconcile_diverged + b.diagnostics().reconcile_diverged;
+
+    // 2. Inject rows into A out of band — a push B will never receive.
+    const N: usize = 25;
+    {
+        let writer = make_peer(&a_url, &format!("isolated-{}", Uuid::new_v4()), 224).await;
+        for i in 0..N {
+            task::ActiveModel {
+                id: Set(format!("g{i:03}")),
+                title: Set(format!("ghost-{i}")),
+                completed: Set(i % 2 == 0),
+                ..Default::default()
+            }
+            .insert(&writer)
+            .await
+            .expect("out-of-band insert");
+        }
+        // Drop `writer` so only A's engine touches A's file from here on.
+    }
+
+    // 3. The next digest tick must see A and B disagree (VV is gated, so this is
+    //    the digest path detecting the gap).
+    assert_eventually(
+        "digest detects the injected divergence",
+        timeout,
+        || async {
+            a.diagnostics().reconcile_diverged + b.diagnostics().reconcile_diverged
+                > diverged_before
+        },
+    )
+    .await;
+
+    // 4. All injected rows reach B — carried purely by recursive range
+    //    reconciliation, since the version-vector path is gated off.
+    assert_eventually(
+        "B receives all out-of-band rows via RBSR",
+        timeout,
+        || async {
+            task::Entity::find()
+                .all(&b)
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
+                == N
+        },
+    )
+    .await;
+
+    // 5. The peers prove convergence again after the repair.
+    let conv_a = a.diagnostics().reconcile_converged;
+    assert_eventually("A re-proves convergence after repair", timeout, || async {
+        a.diagnostics().reconcile_converged > conv_a
+    })
+    .await;
+
+    // Final state is identical on both sides.
+    let a_rows = task::Entity::find().all(&a).await.unwrap().len();
+    let b_rows = task::Entity::find().all(&b).await.unwrap().len();
+    assert_eq!(a_rows, N, "A holds all injected rows");
+    assert_eq!(b_rows, N, "B converged to A's state via RBSR");
+}
