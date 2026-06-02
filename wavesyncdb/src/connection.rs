@@ -330,6 +330,14 @@ pub(crate) struct WaveSyncNodeInner {
     /// the whole node (default + every joined group), instead of silently
     /// missing groups whose per-group channel had no subscriber.
     notification_tx: broadcast::Sender<crate::notify::Notification>,
+    /// Fires on [`WaveSyncDb::resume`] to tell foreground table/row hooks to
+    /// re-query the DB from scratch. A push-triggered background sync runs in a
+    /// **separate process** (the FCM service) and writes the shared SQLite file
+    /// directly, so it emits no in-process `ChangeNotification` — the foreground
+    /// hooks' in-memory signals would otherwise stay stale until the next write
+    /// they happen to observe. Carries no payload: it just means "the DB may
+    /// have changed underneath you; reload."
+    refresh_tx: broadcast::Sender<()>,
     /// Active group handles keyed by *user* topic (pre-derivation). Lets
     /// `join_group` be idempotent and `leave_group` resolve handles.
     ///
@@ -613,6 +621,17 @@ impl WaveSyncDb {
             .node
             .cmd_tx
             .try_send(crate::engine::EngineCommand::Resume);
+        // Tell foreground table/row hooks to re-query: a background-sync wake
+        // (a separate process) may have written the shared DB while we were
+        // backgrounded, with no in-process ChangeNotification to observe.
+        let _ = self.inner.node.refresh_tx.send(());
+    }
+
+    /// Subscribe to resume/refresh ticks (fired by [`resume`](Self::resume)).
+    /// Foreground hooks reload the DB on each tick to pick up writes made by a
+    /// background-sync process. Node-level: shared across every group handle.
+    pub fn refresh_rx(&self) -> broadcast::Receiver<()> {
+        self.inner.node.refresh_tx.subscribe()
     }
 
     /// Notify the engine that the network interface changed (e.g., WiFi to cellular).
@@ -1985,6 +2004,8 @@ impl WaveSyncDbBuilder {
         // Smaller than change_tx: notifications are post-policy + post-coalesce,
         // so far fewer than raw change events.
         let (notification_tx, _) = broadcast::channel::<crate::notify::Notification>(256);
+        // Resume/refresh signal for foreground hooks (see `refresh_tx` doc).
+        let (refresh_tx, _) = broadcast::channel::<()>(16);
 
         let registry = Arc::new(TableRegistry::new());
         // Populate per-table notification policies from every #[derive(SyncNotify)]
@@ -2170,6 +2191,7 @@ impl WaveSyncDbBuilder {
             // The default group's channel is the node-level channel; joined
             // groups clone this same sender so all notifications merge here.
             notification_tx: notification_tx.clone(),
+            refresh_tx,
             groups: std::sync::Mutex::new(HashMap::new()),
             base_database_url: self.database_url.clone(),
         });

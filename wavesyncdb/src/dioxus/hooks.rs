@@ -338,9 +338,33 @@ where
             signal.set(rows.clone());
 
             let mut last_full_reload = Instant::now();
+            let mut refresh_rx = db.refresh_rx();
 
             loop {
-                let first = match rx.recv().await {
+                // Wait for either a change notification or a resume/refresh tick.
+                // A tick means the DB may have been written by a background-sync
+                // process (a separate process — no in-process notification), so
+                // reload the whole table to surface those writes.
+                let first = tokio::select! {
+                    biased;
+                    r = refresh_rx.recv() => {
+                        match r {
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if let Ok(r) = E::find().all(&db).await {
+                                    rows = r;
+                                    rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                                    db.set_table_cache(rows.clone());
+                                    signal.set(rows.clone());
+                                    last_full_reload = Instant::now();
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                        continue;
+                    }
+                    n = rx.recv() => n,
+                };
+                let first = match first {
                     Ok(n) => n,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("Missed {} change notifications for {}", n, target_table);
@@ -539,9 +563,30 @@ where
             signal.set(current.clone());
 
             let mut last_full_reload = Instant::now();
+            let mut refresh_rx = db.refresh_rx();
 
             loop {
-                let first = match rx.recv().await {
+                // Either a change notification or a resume/refresh tick. A tick
+                // means a background-sync process may have written the DB with no
+                // in-process notification, so re-query this row.
+                let first = tokio::select! {
+                    biased;
+                    r = refresh_rx.recv() => {
+                        match r {
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                                    current = row;
+                                    signal.set(current.clone());
+                                    last_full_reload = Instant::now();
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                        continue;
+                    }
+                    n = rx.recv() => n,
+                };
+                let first = match first {
                     Ok(n) => n,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("Missed {} change notifications for {}", n, target_table);
