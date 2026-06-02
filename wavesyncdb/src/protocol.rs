@@ -44,6 +44,21 @@ pub enum SyncRequest {
         #[serde(default)]
         hmac: Option<[u8; 32]>,
     },
+    /// Convergence-verification digest (#82). Carries a value-inclusive digest
+    /// of the sender's group state so the responder can *prove* whether the two
+    /// peers hold identical data. Additive: an older peer that can't decode this
+    /// variant fails the request cleanly and the sender falls back to the
+    /// version-vector catch-up.
+    ReconcileDigest {
+        /// The sender's value-inclusive group digest (see `engine::reconcile`).
+        digest: [u8; 32],
+        /// The sync topic — selects the group + key (Rule 2.8).
+        #[serde(default)]
+        topic: String,
+        /// HMAC tag for group authentication (Rule 2.7).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
 }
 
 /// The response to a [`SyncRequest`].
@@ -70,6 +85,21 @@ pub enum SyncResponse {
     PushAck,
     /// Acknowledgement for a [`SyncRequest::IdentityAnnounce`].
     IdentityAck,
+    /// Response to [`SyncRequest::ReconcileDigest`] (#82): whether the
+    /// responder's digest matched the requester's (peers are proven converged),
+    /// plus the responder's own digest for logging.
+    ReconcileResult {
+        /// True iff the responder's group digest equals the requester's.
+        converged: bool,
+        /// The responder's value-inclusive group digest.
+        digest: [u8; 32],
+        /// The sync topic — selects the group + key (Rule 2.8).
+        #[serde(default)]
+        topic: String,
+        /// HMAC tag for group authentication (Rule 2.7).
+        #[serde(default)]
+        hmac: Option<[u8; 32]>,
+    },
 }
 
 #[cfg(test)]

@@ -1080,14 +1080,18 @@ async fn test_84_relay_cost_telemetry_classifies_direct() {
     .insert(&a)
     .await
     .unwrap();
-    assert_eventually("b receives a's write (peers connected)", timeout, || async {
-        task::Entity::find_by_id("rc-1".to_string())
-            .one(&b)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-    })
+    assert_eventually(
+        "b receives a's write (peers connected)",
+        timeout,
+        || async {
+            task::Entity::find_by_id("rc-1".to_string())
+                .one(&b)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        },
+    )
     .await;
 
     let diag = a.diagnostics();
@@ -1102,9 +1106,65 @@ async fn test_84_relay_cost_telemetry_classifies_direct() {
     );
 
     let status = a.network_status();
-    assert_eq!(status.relayed_peer_count(), 0, "no peer should be via relay");
+    assert_eq!(
+        status.relayed_peer_count(),
+        0,
+        "no peer should be via relay"
+    );
     assert!(
         status.connected_peers.iter().all(|p| !p.via_relay),
         "all LAN peers must report via_relay == false"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #82 RBSR (digest verification cut): once two peers hold identical data, the
+// periodic reconcile-digest exchange must PROVE convergence — a capability the
+// version-vector catch-up lacks (matching db_version is height, not equality).
+// We assert the `reconcile_converged` diagnostic advances on both peers after a
+// write propagates and they settle.
+//
+// Seeds 226-227 (see CLAUDE.md §6).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_82_reconcile_proves_convergence() {
+    use sea_orm::EntityTrait;
+
+    let _ = env_logger::try_init();
+    let topic = format!("test-reconcile-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(25);
+
+    let a = make_peer(&mem_db("reconcile_a"), &topic, 226).await;
+    let b = make_peer(&mem_db("reconcile_b"), &topic, 227).await;
+
+    // Write on A; wait until B has it (peers connected + data synced).
+    task::ActiveModel {
+        id: Set("r1".to_string()),
+        title: Set("hello".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+    assert_eventually("B receives A's write", timeout, || async {
+        task::Entity::find_by_id("r1".to_string())
+            .one(&b)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
+
+    // Now that the data is identical, the periodic digest exchange must prove
+    // convergence on both sides (value-inclusive digests match).
+    assert_eventually("A proves convergence with B", timeout, || async {
+        a.diagnostics().reconcile_converged >= 1
+    })
+    .await;
+    assert_eventually("B proves convergence with A", timeout, || async {
+        b.diagnostics().reconcile_converged >= 1
+    })
+    .await;
 }

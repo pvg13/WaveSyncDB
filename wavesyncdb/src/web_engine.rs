@@ -1660,6 +1660,10 @@ async fn handle_loopback_request(
             // engine; loopback has no concept of presence beyond the
             // online flag, so we ignore.
         }
+        SyncRequest::ReconcileDigest { .. } => {
+            // Convergence-digest reconciliation (#82) is a native-engine
+            // feature; the loopback path has no peer to reconcile with.
+        }
     }
 }
 
@@ -2474,6 +2478,28 @@ async fn handle_snapshot_event(
                     .snapshot
                     .send_response(channel, SyncResponse::IdentityAck);
             }
+            SyncRequest::ReconcileDigest { .. } => {
+                // The browser engine doesn't compute reconciliation digests
+                // (#82). Reply "diverged" with a zero digest so the native peer
+                // falls back to the version-vector catch-up (which web supports).
+                // Signed when a passphrase is configured (Rule 2.7) so native
+                // accepts the response.
+                let mut resp = SyncResponse::ReconcileResult {
+                    converged: false,
+                    digest: [0u8; 32],
+                    topic: state.topic.clone(),
+                    hmac: None,
+                };
+                if let Some(gk) = &state.group_key
+                    && let Ok(bytes) = serde_json::to_vec(&resp)
+                {
+                    let tag = gk.mac(&bytes);
+                    if let SyncResponse::ReconcileResult { ref mut hmac, .. } = resp {
+                        *hmac = Some(tag);
+                    }
+                }
+                let _ = swarm.behaviour_mut().snapshot.send_response(channel, resp);
+            }
         },
         // Real-network counterpart of the loopback ChangesetResponse
         // path. Without this, the catch-up data ships from the peer
@@ -2563,8 +2589,12 @@ async fn handle_snapshot_event(
                 let _ = state.inbound_tx.send(changeset.clone());
                 apply_remote_changeset(state, &peer, &changeset).await;
             }
-            SyncResponse::PushAck | SyncResponse::IdentityAck => {
-                // Acknowledgements only — nothing to apply.
+            SyncResponse::PushAck
+            | SyncResponse::IdentityAck
+            | SyncResponse::ReconcileResult { .. } => {
+                // Acknowledgements / reconcile results — nothing to apply here.
+                // (Web never initiates a ReconcileDigest, so a ReconcileResult
+                // is not expected, but it's harmless to ignore.)
             }
         },
         Event::OutboundFailure { peer, error, .. } => {

@@ -161,6 +161,11 @@ pub enum NetworkEvent {
     RendezvousStatusChanged { registered: bool },
     /// Version vector sync completed with a peer.
     PeerSynced { peer_id: PeerId, db_version: u64 },
+    /// A reconcile-digest exchange (#82) *proved* this peer holds data identical
+    /// to ours for the given group — full convergence, not just matching
+    /// `db_version` height. The signal an app/operator can trust to say "this
+    /// peer is fully in sync".
+    PeerConverged { peer_id: PeerId, topic: String },
     /// A connected peer does not speak our sync protocol version — its
     /// request-response substream negotiation reported the protocol
     /// unsupported. The peer is reachable at the transport level but runs an

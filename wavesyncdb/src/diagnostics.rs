@@ -118,6 +118,15 @@ pub(crate) struct Counters {
     /// `ConnectionEstablished` for a non-infrastructure peer over a direct
     /// (non-circuit) address — the relay is not on the data path for it.
     pub direct_connections_established: AtomicU64,
+
+    /// Reconcile-digest exchanges (#82) that *proved* convergence — the peer
+    /// returned a digest equal to ours, so the two databases are byte-identical
+    /// for that group. This is the convergence signal the version-vector
+    /// catch-up cannot provide (matching `db_version` is height, not equality).
+    pub reconcile_converged: AtomicU64,
+    /// Reconcile-digest exchanges that found a mismatch — the peers differ and
+    /// the version-vector catch-up is relied on to transfer the diff.
+    pub reconcile_diverged: AtomicU64,
 }
 
 impl Counters {
@@ -145,6 +154,8 @@ impl Counters {
             direct_connections_established: self
                 .direct_connections_established
                 .load(Ordering::Relaxed),
+            reconcile_converged: self.reconcile_converged.load(Ordering::Relaxed),
+            reconcile_diverged: self.reconcile_diverged.load(Ordering::Relaxed),
         }
     }
 }
@@ -169,6 +180,8 @@ pub struct Snapshot {
     pub dcutr_upgrades_succeeded: u64,
     pub relayed_connections_established: u64,
     pub direct_connections_established: u64,
+    pub reconcile_converged: u64,
+    pub reconcile_diverged: u64,
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ pub(crate) mod command_handler;
 pub(crate) mod identity_handler;
 pub(crate) mod peer_manager;
 pub(crate) mod push_protocol;
+pub(crate) mod reconcile;
 pub(crate) mod relay_manager;
 pub(crate) mod snapshot_protocol;
 pub(crate) mod sync_handler;
@@ -565,6 +566,13 @@ async fn run_engine(
 
     let (remote_changeset_tx, remote_changeset_rx) = mpsc::channel::<RemoteChangeset>(32);
 
+    // Reconcile-digest requests are built by a spawned task (the digest is an
+    // async DB scan) and handed back here so the event loop — the only owner of
+    // the non-Sync swarm — actually sends them (Rule 2.10). Mirrors
+    // `snapshot_resp_tx` for the response direction.
+    let (reconcile_req_tx, reconcile_req_rx) =
+        mpsc::channel::<(libp2p::PeerId, crate::protocol::SyncRequest)>(16);
+
     let effective_topic = match &group_key {
         Some(gk) => gk.derive_topic(&topic_name),
         None => topic_name.clone(),
@@ -628,6 +636,8 @@ async fn run_engine(
         snapshot_resp_rx,
         remote_changeset_tx,
         remote_changeset_rx,
+        reconcile_req_tx,
+        reconcile_req_rx,
         cmd_rx,
         relay_state: RelayState::Disabled,
         nat_status: NatStatus::Unknown,
@@ -789,6 +799,10 @@ struct EngineRunner {
     /// Channel for queuing remote changesets to be applied sequentially.
     pub(crate) remote_changeset_tx: mpsc::Sender<RemoteChangeset>,
     pub(crate) remote_changeset_rx: mpsc::Receiver<RemoteChangeset>,
+    /// Reconcile-digest requests built off-loop (digest is an async DB scan),
+    /// drained by the event loop to send on the swarm. See `send_reconcile_digest`.
+    pub(crate) reconcile_req_tx: mpsc::Sender<(libp2p::PeerId, crate::protocol::SyncRequest)>,
+    pub(crate) reconcile_req_rx: mpsc::Receiver<(libp2p::PeerId, crate::protocol::SyncRequest)>,
     pub(crate) cmd_rx: mpsc::Receiver<EngineCommand>,
     /// Relay connection state machine.
     pub(crate) relay_state: RelayState,
@@ -1563,6 +1577,13 @@ impl EngineRunner {
                     // Periodic version vector sync with all known peers
                     if self.default_group().registry_is_ready {
                         self.sync_all_known_peers().await;
+                        // Convergence verification (#82): alongside the
+                        // version-vector catch-up above (the data path /
+                        // backstop), exchange a value-inclusive digest with each
+                        // peer to *prove* convergence. Additive — a peer that
+                        // can't decode the digest fails it cleanly and the
+                        // catch-up still does the work.
+                        self.send_reconcile_digests();
                     }
                 },
                 _ = rendezvous_interval.tick(), if has_rendezvous => {
@@ -1595,6 +1616,10 @@ impl EngineRunner {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {
                         log::error!("Failed to send sync response: {:?}", resp);
                     }
+                },
+                Some((peer, req)) = self.reconcile_req_rx.recv() => {
+                    // Off-loop-built reconcile digest (#82) — send it on the swarm.
+                    self.swarm.behaviour_mut().snapshot.send_request(&peer, req);
                 },
                 Some(rc) = self.remote_changeset_rx.recv() => {
                     // Route the changeset to the group it was received for.

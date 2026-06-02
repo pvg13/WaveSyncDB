@@ -47,6 +47,15 @@ impl EngineRunner {
                         } => {
                             self.handle_identity_announce_request(peer, channel, app_id, req_hmac);
                         }
+                        SyncRequest::ReconcileDigest {
+                            digest,
+                            topic: peer_topic,
+                            hmac: req_hmac,
+                        } => {
+                            self.handle_reconcile_digest_request(
+                                peer, channel, digest, peer_topic, req_hmac,
+                            );
+                        }
                     }
                 }
                 request_response::Message::Response { response, .. } => {
@@ -228,6 +237,16 @@ impl EngineRunner {
                         }
                         crate::protocol::SyncResponse::IdentityAck => {
                             log::debug!("Received IdentityAck from peer {peer}");
+                        }
+                        crate::protocol::SyncResponse::ReconcileResult {
+                            converged,
+                            digest,
+                            topic: peer_topic,
+                            hmac: resp_hmac,
+                        } => {
+                            self.handle_reconcile_result(
+                                peer, converged, digest, peer_topic, resp_hmac,
+                            );
                         }
                     }
                 }
@@ -674,6 +693,203 @@ impl EngineRunner {
         self.update_network_status();
     }
 
+    /// Send a convergence-verification reconcile digest (#82) to every
+    /// non-infrastructure, non-rejected peer for each registry-ready group.
+    /// Called from the periodic tick alongside the version-vector catch-up.
+    pub(super) fn send_reconcile_digests(&mut self) {
+        let peers: Vec<libp2p::PeerId> = self
+            .peers
+            .keys()
+            .filter(|p| !self.infrastructure_peers.contains(p))
+            .copied()
+            .collect();
+        let topics: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|(_, g)| g.registry_is_ready)
+            .map(|(t, _)| t.clone())
+            .collect();
+        for topic in &topics {
+            for peer in &peers {
+                self.send_reconcile_digest(*peer, topic);
+            }
+        }
+    }
+
+    /// Compute (off-loop) and send a single reconcile digest to `peer` for
+    /// `effective_topic`. The digest is an async DB scan, so it's built in a
+    /// spawned task and handed back via `reconcile_req_tx` for the event loop to
+    /// send on the swarm (Rule 2.10). No-op for a gone group or a peer in
+    /// rejection backoff.
+    pub(super) fn send_reconcile_digest(&mut self, peer: libp2p::PeerId, effective_topic: &str) {
+        let Some(g) = self.groups.get(effective_topic) else {
+            return;
+        };
+        if g.is_rejected(&peer) {
+            return;
+        }
+        let db = g.db.clone();
+        let registry = g.registry.clone();
+        let topic_name = g.topic_name.clone();
+        let group_key = g.group_key.clone();
+        let req_tx = self.reconcile_req_tx.clone();
+
+        tokio::spawn(async move {
+            let digest = reconcile::compute_group_digest(&db, &registry).await;
+            let mut req = SyncRequest::ReconcileDigest {
+                digest,
+                topic: topic_name,
+                hmac: None,
+            };
+            if let Some(ref gk) = group_key
+                && let Ok(bytes) = serde_json::to_vec(&req)
+            {
+                let tag = gk.mac(&bytes);
+                if let SyncRequest::ReconcileDigest { ref mut hmac, .. } = req {
+                    *hmac = Some(tag);
+                }
+            }
+            let _ = req_tx.send((peer, req)).await;
+        });
+    }
+
+    /// Handle an inbound reconcile digest (#82): verify HMAC, compute our own
+    /// group digest off-loop, and reply whether the two match (proven
+    /// converged). A per-group HMAC failure rejects the peer (Rule 2.8 / N6).
+    fn handle_reconcile_digest_request(
+        &mut self,
+        peer: libp2p::PeerId,
+        channel: request_response::ResponseChannel<crate::protocol::SyncResponse>,
+        remote_digest: [u8; 32],
+        peer_topic: String,
+        req_hmac: Option<[u8; 32]>,
+    ) {
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            log::debug!("Ignoring reconcile digest from {peer} for unknown topic {effective}");
+            return;
+        };
+        let group_key = g.group_key.clone();
+
+        if let Some(ref gk) = group_key {
+            let tag = match req_hmac {
+                Some(t) => t,
+                None => {
+                    log::debug!("Rejecting unauthenticated reconcile digest from peer {peer}");
+                    return;
+                }
+            };
+            let verify_req = SyncRequest::ReconcileDigest {
+                digest: remote_digest,
+                topic: peer_topic.clone(),
+                hmac: None,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&verify_req)
+                && !gk.verify(&bytes, &tag)
+            {
+                self.reject_peer_for_group(&effective, peer);
+                return;
+            }
+        }
+
+        let Some(g) = self.groups.get(&effective) else {
+            return;
+        };
+        let db = g.db.clone();
+        let registry = g.registry.clone();
+        let topic_name = g.topic_name.clone();
+        let resp_tx = self.snapshot_resp_tx.clone();
+
+        tokio::spawn(async move {
+            let local_digest = reconcile::compute_group_digest(&db, &registry).await;
+            let converged = local_digest == remote_digest;
+            let mut resp = crate::protocol::SyncResponse::ReconcileResult {
+                converged,
+                digest: local_digest,
+                topic: topic_name,
+                hmac: None,
+            };
+            if let Some(ref gk) = group_key
+                && let Ok(bytes) = serde_json::to_vec(&resp)
+            {
+                let tag = gk.mac(&bytes);
+                if let crate::protocol::SyncResponse::ReconcileResult { ref mut hmac, .. } = resp {
+                    *hmac = Some(tag);
+                }
+            }
+            if let Err(e) = resp_tx.send((channel, resp)).await {
+                log::error!("Failed to queue reconcile result: {e}");
+            }
+        });
+    }
+
+    /// Handle a reconcile result (#82): verify HMAC, then either record proven
+    /// convergence (emit `PeerConverged` + diagnostic) or, on divergence, nudge
+    /// a version-vector catch-up to repair the diff promptly.
+    fn handle_reconcile_result(
+        &mut self,
+        peer: libp2p::PeerId,
+        converged: bool,
+        remote_digest: [u8; 32],
+        peer_topic: String,
+        resp_hmac: Option<[u8; 32]>,
+    ) {
+        let effective = if peer_topic.is_empty() {
+            self.default_effective_topic.clone()
+        } else {
+            peer_topic.clone()
+        };
+        let Some(g) = self.groups.get(&effective) else {
+            log::debug!("Ignoring reconcile result from {peer} for unknown topic {effective}");
+            return;
+        };
+        if let Some(ref gk) = g.group_key {
+            let tag = match resp_hmac {
+                Some(t) => t,
+                None => {
+                    log::debug!("Rejecting unauthenticated reconcile result from peer {peer}");
+                    return;
+                }
+            };
+            let verify_resp = crate::protocol::SyncResponse::ReconcileResult {
+                converged,
+                digest: remote_digest,
+                topic: peer_topic.clone(),
+                hmac: None,
+            };
+            if let Ok(bytes) = serde_json::to_vec(&verify_resp)
+                && !gk.verify(&bytes, &tag)
+            {
+                log::debug!("Rejecting reconcile result with invalid HMAC from peer {peer}");
+                return;
+            }
+        }
+
+        if converged {
+            self.diagnostics
+                .reconcile_converged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::debug!("Reconcile: proven converged with peer {peer} for group {effective}");
+            self.emit_network_event(crate::network_status::NetworkEvent::PeerConverged {
+                peer_id: crate::network_status::PeerId(peer.to_string()),
+                topic: effective,
+            });
+        } else {
+            self.diagnostics
+                .reconcile_diverged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::debug!(
+                "Reconcile: diverged with peer {peer} for group {effective}; \
+                 nudging version-vector catch-up"
+            );
+            // Repair promptly rather than waiting for the next periodic tick.
+            self.initiate_sync_for_peer(peer, &effective);
+        }
+    }
 }
 
 const CHANGESET_CHUNK_SIZE: usize = 50;
