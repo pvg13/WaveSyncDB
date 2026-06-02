@@ -904,3 +904,97 @@ async fn test_peer_version_hydration_no_missed_changes_across_restart() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// H6 / issue #80 regression: a graceful `shutdown()` must flush writes still
+// queued for fan-out, so the last edits reach connected peers instead of being
+// stranded until the writer's next catch-up.
+//
+// The writer establishes a live sync link (a warm-up row the reader receives),
+// then bursts a batch of inserts and *immediately* calls `shutdown()`. Because
+// the writer is gone afterward, the reader can only hold those rows if they
+// were pushed before/while the writer shut down — there is no peer left to
+// catch up *from*. Pre-fix, changesets still sitting in the bounded sync
+// channel when `EngineCommand::Shutdown` broke the loop were dropped, so the
+// tail of the burst never reached the reader.
+//
+// Seeds 220–221 (see CLAUDE.md §6).
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_h6_graceful_shutdown_flushes_pending_writes() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-h6-shutdown-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let url_a = mem_db("h6_writer");
+    let url_b = mem_db("h6_reader");
+
+    let writer = make_peer(&url_a, &topic, 220).await;
+    let reader = make_peer(&url_b, &topic, 221).await;
+
+    // Warm-up: prove the two peers are connected and syncing before we rely on
+    // real-time delivery. Once the reader has this row, the link is live.
+    task::ActiveModel {
+        id: Set("h6-warmup".to_string()),
+        title: Set("warmup".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&writer)
+    .await
+    .unwrap();
+    assert_eventually("reader receives warm-up row", timeout, || async {
+        task::Entity::find_by_id("h6-warmup".to_string())
+            .one(&reader)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    })
+    .await;
+
+    // Burst of writes, then shut down immediately so some changesets are likely
+    // still queued for fan-out when shutdown fires.
+    const N: usize = 12;
+    let ids: Vec<String> = (0..N).map(|i| format!("h6-{i}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        task::ActiveModel {
+            id: Set(id.clone()),
+            title: Set(format!("task {i}")),
+            completed: Set(false),
+            ..Default::default()
+        }
+        .insert(&writer)
+        .await
+        .unwrap();
+    }
+
+    // Graceful shutdown: drains the sync channel and flushes outbound before
+    // the engine stops. After this returns, the writer is gone for good — the
+    // reader cannot catch up from it.
+    writer.shutdown().await;
+    drop(writer);
+
+    // The reader must end up with every row from the burst, delivered only by
+    // the writer's pre-/during-shutdown push fan-out.
+    assert_eventually(
+        "reader has all burst writes after writer shutdown",
+        timeout,
+        || async {
+            let mut have = 0usize;
+            for id in &ids {
+                if task::Entity::find_by_id(id.clone())
+                    .one(&reader)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    have += 1;
+                }
+            }
+            have == N
+        },
+    )
+    .await;
+}

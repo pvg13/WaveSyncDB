@@ -1634,6 +1634,9 @@ impl EngineRunner {
                 },
                 Some(cmd) = self.cmd_rx.recv() => {
                     if self.handle_command(cmd).await {
+                        // Graceful shutdown: flush any writes still queued so
+                        // the last edits reach peers before we stop polling.
+                        self.drain_pending_changesets_on_shutdown(sync_rx).await;
                         break Ok(());
                     }
                 },
@@ -1721,6 +1724,58 @@ impl EngineRunner {
         // peers are behind NAT with no direct connection, and push is the
         // only way to wake the other side.
         self.notify_relay_topic(&effective_topic);
+    }
+
+    /// Graceful-shutdown flush for queued local writes.
+    ///
+    /// A write made just before `shutdown()` has already been committed to
+    /// SQLite — its shadow-table clocks and `db_version` are persisted in
+    /// `dispatch_sync` *before* the changeset is enqueued — so no data is lost
+    /// on shutdown. What can still be pending is that changeset's real-time
+    /// Push fan-out to connected peers and the relay wake for sleeping peers,
+    /// sitting in the bounded sync channel that the event loop would normally
+    /// service. Drain the queue, dispatch each changeset, then give the swarm a
+    /// brief, bounded grace period to actually flush the resulting outbound
+    /// request-response traffic before the loop exits and the swarm is dropped.
+    /// Without this, the last writes are delivered only on a peer's next
+    /// version-vector catch-up (and if the shutting-down node is the only one
+    /// holding them and never returns, not until it does). See PROBLEMS.md H6.
+    ///
+    /// Only runs on the explicit `shutdown()` path (which awaits the engine
+    /// task); dropping a node without `shutdown()` aborts the task and skips it.
+    async fn drain_pending_changesets_on_shutdown(
+        &mut self,
+        sync_rx: &mut mpsc::Receiver<TaggedChangeset>,
+    ) {
+        // Hard cap on how long shutdown waits to flush outbound traffic.
+        const FLUSH_GRACE: Duration = Duration::from_secs(2);
+        // If no swarm event arrives for this long, assume outbound has flushed
+        // and stop early — keeps a clean shutdown snappy (and tests fast).
+        const IDLE_GAP: Duration = Duration::from_millis(200);
+
+        let mut drained = 0usize;
+        while let Ok(tc) = sync_rx.try_recv() {
+            self.handle_local_changeset(tc).await;
+            drained += 1;
+        }
+        if drained == 0 {
+            return;
+        }
+        log::info!(
+            "Shutdown: drained {drained} pending changeset(s); flushing outbound (\u{2264}{FLUSH_GRACE:?})"
+        );
+
+        let deadline = tokio::time::Instant::now() + FLUSH_GRACE;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                // Re-armed each iteration: a quiet gap means outbound drained.
+                _ = tokio::time::sleep(IDLE_GAP) => break,
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event).await;
+                },
+            }
+        }
     }
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
