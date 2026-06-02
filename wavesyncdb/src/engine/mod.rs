@@ -643,6 +643,7 @@ async fn run_engine(
         relay_dial_pending: false,
         dcutr_retries: HashMap::new(),
         diagnostics,
+        protocol_mismatch_peers: std::collections::HashSet::new(),
         #[cfg(target_os = "ios")]
         quic_listeners: std::collections::HashMap::new(),
     };
@@ -827,6 +828,13 @@ struct EngineRunner {
     /// (UI / debug panel / test assertions) snapshot via
     /// [`WaveSyncDb::diagnostics`]. See [`crate::diagnostics`].
     pub(crate) diagnostics: Arc<crate::diagnostics::Counters>,
+    /// Peers that rejected our sync request-response protocol id
+    /// (`OutboundFailure::UnsupportedProtocols`) — i.e. they are connected at
+    /// the transport level but run an incompatible WaveSyncDB version. Tracked
+    /// so the mismatch is logged/emitted once per peer instead of on every
+    /// periodic sync retry; cleared when the peer fully disconnects so a later
+    /// reconnect can re-surface it.
+    pub(crate) protocol_mismatch_peers: std::collections::HashSet<libp2p::PeerId>,
     /// iOS only: QUIC listeners keyed by the concrete interface IP they are
     /// bound to. iOS binds QUIC to concrete routable addresses (not loopback,
     /// not unspecified — see the listen logic in `run`), and a mobile device's
@@ -2022,6 +2030,7 @@ impl EngineRunner {
                             g.verified_peers.remove(&pid);
                         }
                         self.peer_identities.remove(&pid);
+                        self.protocol_mismatch_peers.remove(&pid);
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::PeerDisconnected(
                                 crate::network_status::PeerId(pid.to_string()),

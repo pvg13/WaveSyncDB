@@ -147,6 +147,17 @@ pub enum NetworkEvent {
     RendezvousStatusChanged { registered: bool },
     /// Version vector sync completed with a peer.
     PeerSynced { peer_id: PeerId, db_version: u64 },
+    /// A connected peer does not speak our sync protocol version — its
+    /// request-response substream negotiation reported the protocol
+    /// unsupported. The peer is reachable at the transport level but runs an
+    /// incompatible WaveSyncDB build, so no data will sync with it until the
+    /// versions match. Surfaced (rather than failing silently) so a stalled
+    /// rolling upgrade is diagnosable. `our_protocol` is the local snapshot
+    /// protocol id the peer rejected.
+    PeerProtocolMismatch {
+        peer_id: PeerId,
+        our_protocol: String,
+    },
     /// Local persistent state is loaded — the database is queryable
     /// independently of any peer connectivity. Fired **before**
     /// [`Self::EngineStarted`] so subscribers that only care about

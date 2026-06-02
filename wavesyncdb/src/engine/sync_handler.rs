@@ -236,20 +236,62 @@ impl EngineRunner {
                 for g in self.groups.values_mut() {
                     g.pending_sync_peers.remove(&peer);
                 }
-                log::warn!("Sync request to {peer} failed: {error}");
-                // Connection might be dead — re-dial if we know the peer's address
-                if let Some(addr) = self.peers.get(&peer).cloned()
-                    && !self.swarm.is_connected(&peer)
-                {
-                    log::info!("Re-dialing {peer} after outbound failure");
-                    let _ = self.swarm.dial(addr);
+                if matches!(
+                    error,
+                    request_response::OutboundFailure::UnsupportedProtocols
+                ) {
+                    // The peer is connected but its substream negotiation rejected
+                    // our snapshot protocol id — it runs an incompatible WaveSyncDB
+                    // version. Surface it (once per peer) instead of silently never
+                    // syncing, and do NOT re-dial: a redial won't change versions,
+                    // and the periodic sync would otherwise re-trigger this forever.
+                    self.note_protocol_mismatch(peer);
+                } else {
+                    log::warn!("Sync request to {peer} failed: {error}");
+                    // Connection might be dead — re-dial if we know the peer's address
+                    if let Some(addr) = self.peers.get(&peer).cloned()
+                        && !self.swarm.is_connected(&peer)
+                    {
+                        log::info!("Re-dialing {peer} after outbound failure");
+                        let _ = self.swarm.dial(addr);
+                    }
                 }
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
-                log::warn!("Sync inbound from {peer} failed: {error}");
+                if matches!(
+                    error,
+                    request_response::InboundFailure::UnsupportedProtocols
+                ) {
+                    self.note_protocol_mismatch(peer);
+                } else {
+                    log::warn!("Sync inbound from {peer} failed: {error}");
+                }
             }
             _ => {}
         }
+    }
+
+    /// Log + emit a `PeerProtocolMismatch` exactly once per peer (deduped via
+    /// `protocol_mismatch_peers`). Called when a sync request/response substream
+    /// reports `UnsupportedProtocols` — the peer is connected at the transport
+    /// level but runs an incompatible WaveSyncDB protocol version, so no data
+    /// will sync with it. Surfacing this (instead of silently never syncing) is
+    /// the diagnosable signal a stalled rolling upgrade needs. See PROBLEMS.md N5.
+    fn note_protocol_mismatch(&mut self, peer: libp2p::PeerId) {
+        if !self.protocol_mismatch_peers.insert(peer) {
+            return; // already surfaced for this peer this connection
+        }
+        let our_protocol = super::snapshot_protocol::SNAPSHOT_PROTOCOL
+            .as_ref()
+            .to_string();
+        log::warn!(
+            "Peer {peer} does not speak our sync protocol {our_protocol} — it is running an \
+             incompatible WaveSyncDB version; no data will sync with it until the versions match"
+        );
+        self.emit_network_event(crate::network_status::NetworkEvent::PeerProtocolMismatch {
+            peer_id: crate::network_status::PeerId(peer.to_string()),
+            our_protocol,
+        });
     }
 
     /// Verify HMAC + topic, reject mismatched peers, then spawn a task to query
