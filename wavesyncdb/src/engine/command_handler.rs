@@ -235,6 +235,20 @@ impl EngineRunner {
         }
         self.dialing_peers.clear();
         self.pending_rendezvous_dials.clear();
+        // Resume is an explicit "sync now" signal, so drop any per-peer dial
+        // backoff accumulated before we were backgrounded: a peer that was
+        // unreachable on the old network (or while suspended) must be re-dialable
+        // immediately now, not throttled by stale failure history. The backoff
+        // re-arms from scratch if dials keep failing on the current network.
+        self.peer_dial_backoff.clear();
+
+        // On an actual network transition the previous LAN is gone — drop the
+        // LAN-preference markers so peers are re-classified from fresh mDNS on
+        // the new network (a peer that was same-LAN before may now be remote, and
+        // vice-versa). On a plain resume (same network) the markers stay valid.
+        if force_relay_reset {
+            self.lan_peers.clear();
+        }
 
         // Only tear down live connections on an actual network transition. On a
         // plain app resume (same network) the relay reservation and peer
