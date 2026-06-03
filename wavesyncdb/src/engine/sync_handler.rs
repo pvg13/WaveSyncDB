@@ -1320,15 +1320,47 @@ async fn apply_changeset_chunk<'a>(
             } else {
                 WriteKind::Insert
             };
-            let (changed_columns, column_values) = if is_delete || changed_pairs.is_empty() {
-                (None, None)
+            // `changed_columns` always reflects only what THIS changeset altered.
+            let changed_columns: Option<Vec<String>> = if is_delete || changed_pairs.is_empty() {
+                None
             } else {
-                let cols: Vec<String> = changed_pairs.iter().map(|(c, _)| c.clone()).collect();
-                let vals: Vec<(crate::ColumnName, serde_json::Value)> = changed_pairs
-                    .iter()
-                    .map(|(c, v)| (crate::ColumnName(c.clone()), v.clone()))
-                    .collect();
-                (Some(cols), Some(vals))
+                Some(changed_pairs.iter().map(|(c, _)| c.clone()).collect())
+            };
+            // `column_values` feeds both the reactive-hook fast path and the
+            // SyncNotify row reconstruction. A catch-up path (RBSR, #82) can
+            // deliver a row's columns across several changesets, so the columns
+            // in this batch may be only a subset of the row. When the table has a
+            // notification policy, read the committed full row so `on_sync`
+            // always sees a complete model regardless of how the cells were
+            // batched; otherwise keep just the applied columns (the hook only
+            // needs the delta).
+            let column_values: Option<Vec<(crate::ColumnName, serde_json::Value)>> = if is_delete {
+                None
+            } else {
+                let full_row = if notify.is_some_and(|ctx| ctx.registry.has(table)) {
+                    // Read from the open transaction so we see the just-applied
+                    // (not-yet-committed) row state.
+                    read_row_values(&txn, table, &meta, pk).await
+                } else {
+                    Vec::new()
+                };
+                if !full_row.is_empty() {
+                    Some(
+                        full_row
+                            .into_iter()
+                            .map(|(c, v)| (crate::ColumnName(c), v))
+                            .collect(),
+                    )
+                } else if changed_pairs.is_empty() {
+                    None
+                } else {
+                    Some(
+                        changed_pairs
+                            .iter()
+                            .map(|(c, v)| (crate::ColumnName(c.clone()), v.clone()))
+                            .collect(),
+                    )
+                }
             };
             pending_notifications.push(ChangeNotification {
                 table: (*table).into(),
@@ -1692,6 +1724,58 @@ pub(super) async fn get_local_value_bytes(
     }
 }
 
+/// Read the current value of every column of a row as JSON `(column, value)`
+/// pairs. Returns an empty vec if the row is absent.
+///
+/// Used to reconstruct the *full* row for a `#[derive(SyncNotify)]` policy. A
+/// catch-up path (notably RBSR, #82) can deliver a row's columns across several
+/// separate changesets, so the columns present in any one apply call may be only
+/// a subset of the row. The notification dispatch needs every required column at
+/// once to rebuild the typed model, so we read the committed row here rather than
+/// relying on whatever subset this particular changeset happened to carry.
+pub(super) async fn read_row_values(
+    db: &impl ConnectionTrait,
+    table: &str,
+    meta: &crate::registry::TableMeta,
+    pk: &str,
+) -> Vec<(String, serde_json::Value)> {
+    if meta.columns.is_empty() {
+        return Vec::new();
+    }
+    // Build `json_object('col', "col", …)` so SQLite handles the per-type
+    // value→JSON conversion for us. Column names are schema identifiers (never
+    // user input), so they are safe to interpolate.
+    let obj_args = meta
+        .columns
+        .iter()
+        .map(|c| format!("'{c}', \"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT json_object({obj_args}) AS row_json FROM \"{}\" WHERE \"{}\" = $1",
+        table, meta.primary_key_column
+    );
+    let result = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            &sql,
+            [pk.into()],
+        ))
+        .await
+        .ok()
+        .flatten();
+    let Some(qr) = result else {
+        return Vec::new();
+    };
+    let Ok(raw) = qr.try_get::<String>("", "row_json") else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Strip the RETURNING clause from a SQL statement.
 #[cfg(test)]
 pub(super) fn strip_returning(sql: &str) -> String {
@@ -1760,6 +1844,107 @@ mod tests {
     }
 
     // ── apply_remote_changeset tests ──
+
+    /// REGRESSION — a remote changeset carrying only a SUBSET of a row's
+    /// columns must still produce a user notification.
+    ///
+    /// RBSR (#82) delivers a row's columns as individual cells that can be split
+    /// across separate changesets, so the columns in any one apply call may be a
+    /// strict subset of the row. A `#[derive(SyncNotify)]` policy needs every
+    /// required column to rebuild the typed row, so the notification is
+    /// reconstructed from the committed row state — not just the batch's columns.
+    /// Before the fix, the absent `done` column made row reconstruction fail and
+    /// the notification was silently dropped even though the data synced.
+    #[tokio::test]
+    async fn notify_reconstructs_full_row_from_partial_changeset() {
+        struct Task {
+            id: String,
+            title: String,
+            #[allow(dead_code)]
+            done: i64,
+        }
+        impl crate::SyncedModel for Task {
+            fn wavesync_apply_change(&mut self, _c: &str, _v: &serde_json::Value) {}
+            fn wavesync_from_changes(
+                _pk_col: &str,
+                pk: &str,
+                changes: &[(String, serde_json::Value)],
+            ) -> Option<Self> {
+                let mut title = None;
+                let mut done = None;
+                for (c, v) in changes {
+                    match c.as_str() {
+                        "title" => title = v.as_str().map(str::to_string),
+                        "done" => done = v.as_i64(),
+                        _ => {}
+                    }
+                }
+                // Both `title` and `done` are required — reconstruction fails if
+                // either is absent, which is the crux of the dropped-notification bug.
+                Some(Task {
+                    id: pk.to_string(),
+                    title: title?,
+                    done: done?,
+                })
+            }
+            fn wavesync_pk_string(&self) -> String {
+                self.id.clone()
+            }
+        }
+        impl crate::SyncNotify for Task {
+            fn on_sync(ev: &crate::SyncEvent<Self>) -> Option<crate::Notification> {
+                ev.row
+                    .as_ref()
+                    .map(|t| crate::Notification::new("task", &t.title))
+            }
+        }
+
+        let (db, registry) = setup_engine_test_db().await;
+        let (change_tx, _crx) = broadcast::channel::<ChangeNotification>(16);
+
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        notif_registry.register("tasks".to_string(), crate::notify::make_dispatch::<Task>());
+        let (notif_tx, mut notif_rx) = broadcast::channel::<crate::Notification>(16);
+
+        // Deliver ONLY the "title" cell — "done" is absent and falls to the
+        // table default. This is the shape RBSR produces when a row's cells are
+        // split across batches.
+        let changes = vec![ColumnChange {
+            table: "tasks".into(),
+            pk: "t1".into(),
+            cid: "title".into(),
+            val: Some(serde_json::json!("Hello")),
+            site_id: NodeId([7u8; 16]),
+            col_version: 1,
+            cl: 1,
+            seq: 0,
+            db_version: 0,
+        }];
+
+        let ctx = NotifyCtx {
+            registry: &notif_registry,
+            tx: &notif_tx,
+        };
+        apply_remote_changeset(
+            &db,
+            &change_tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Remote {
+                peer_site: NodeId([9u8; 16]),
+            },
+            Some(ctx),
+        )
+        .await;
+
+        let got = notif_rx.try_recv();
+        assert!(
+            got.is_ok(),
+            "a subset-of-columns changeset must still notify (full row read from committed state)"
+        );
+        assert_eq!(got.unwrap().body, "Hello");
+    }
 
     /// REGRESSION — WSDB-PoC-1 (was: SQL injection via unsanitised `cid`).
     ///

@@ -181,6 +181,12 @@ impl NotificationRegistry {
         self.dispatch.read().unwrap().is_empty()
     }
 
+    /// Whether a notification policy is registered for `table`. Lets the apply
+    /// path skip the extra full-row read for tables that never notify.
+    pub fn has(&self, table: &str) -> bool {
+        self.dispatch.read().unwrap().contains_key(table)
+    }
+
     /// Run the policy for this change (if the table has one), then apply the
     /// anti-spam gate. Returns the notification to surface, or `None` if the
     /// policy declined or the change was coalesced away.
