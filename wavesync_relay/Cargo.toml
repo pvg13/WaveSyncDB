@@ -1,6 +1,6 @@
 [package]
 name = "wavesync_relay"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
 description = "Relay and rendezvous server for WaveSyncDB WAN peer discovery and NAT traversal"

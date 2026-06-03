@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+## v0.7.1 — 03/06/2026
+
+Crate versions: `wavesyncdb` 0.7.1, `wavesyncdb_derive` 0.3.0,
+`wavesync_relay` 0.2.2.
+
+Connectivity hardening and bug fixes. Headline: fixes a circuit-relay storm in
+which a client could open a fresh relay circuit to the same peer every ~300 ms
+until the relay's per-peer circuit cap was exhausted (`ResourceLimitExceeded`),
+stalling sync even for two foreground devices on the same Wi-Fi.
+
+### Fixed
+- **Circuit-relay storm.** When a direct path to a peer already exists, the
+  relay's repeated re-introduction of that peer's circuit address is no longer
+  re-dialed. The DERP-style demotion (#84) closed a redundant relay connection,
+  but the re-dial guard only checked `is_connected` — which flickers false the
+  instant a connection closes — so each re-introduction re-opened a circuit that
+  was immediately closed again, piling up accepted-but-unreleased circuits on
+  the relay. The decision is now keyed on a stable "direct path preferred"
+  marker that survives the flicker, and circuit addresses are filtered out of
+  introduced address sets for directly-reached peers.
+- **Out-of-group push redelivery loop (multi-group).** A peer that receives a
+  push for a group it isn't a member of now answers with `PushAck` instead of
+  dropping the response channel. Dropping it made the sender treat the push as
+  un-acked and redeliver it every few seconds forever — a permanent
+  battery/bandwidth drain for any two peers with asymmetric group membership.
+- **`SyncNotify` dropped notifications for rows with bool columns**; the full
+  row is reconstructed so RBSR-delivered changes notify correctly.
+- **iOS:** bind QUIC to the device's default-route interface rather than every
+  interface, fixing WAN sync from a loopback-bound listener.
+
+### Changed
+- **Per-peer dial backoff** (go-libp2p style: `5s + n²`, capped at 5 min, reset
+  on any successful connection) on the relay-introduced and `OutboundFailure`
+  redial paths; a **deterministic single-closer** for relay demotion; and an
+  **anti-thrash dwell** before a relay connection is closed once a direct path
+  appears, so a flaky DCUtR upgrade doesn't force an immediate re-reservation.
+- **Prefer LAN:** peers discovered on the local network via mDNS suppress
+  relay-circuit dials entirely (the LAN path is closer and more reliable).
+- App resume / network transition now clears stale dial backoff and LAN-
+  preference markers so reconnects aren't throttled or mis-classified.
+- **QUIC idle timeout raised 10 s → 30 s** (client + relay) to tolerate
+  transient mobile/Wi-Fi blips without tearing the connection down.
+- **Android:** hold a foreground multicast lock so mDNS finds LAN peers.
+- **Relay:** per-peer caps tuned to generous-but-sane headroom now that the
+  client-side churn is fixed — `max_circuits_per_peer` default 32,
+  `max_reservations_per_peer` default 16. Effective relay limits are logged at
+  startup. **Redeploy the relay with these lower caps only after clients
+  carrying the storm fix are rolled out** (an un-patched client hits the cap
+  sooner).
+
 ## v0.7.0 — 03/06/2026
 
 Crate versions: `wavesyncdb` 0.7.0, `wavesyncdb_derive` 0.3.0,
