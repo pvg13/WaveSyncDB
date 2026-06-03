@@ -2056,10 +2056,22 @@ impl WaveSyncDbBuilder {
         // entity linked into the binary (mirrors SyncEntityInfo discovery). Keyed
         // by table name; only fires for tables that actually emit changes.
         let notification_registry = Arc::new(crate::registry::NotificationRegistry::new());
+        let mut notify_tables: Vec<String> = Vec::new();
         for info in inventory::iter::<crate::notify::NotifyEntityInfo> {
             let (table_name, dispatch) = (info.make)();
+            notify_tables.push(table_name.clone());
             notification_registry.register(table_name, dispatch);
         }
+        // Diagnostic: 0 here means no entity derives `SyncNotify`, so no user
+        // notification will ever fire regardless of sync working. A populated
+        // list but no "notification: generated" logs means `on_sync` returned
+        // None for the changes that arrived.
+        log::info!(
+            "SyncNotify: {} notification polic{} registered: [{}]",
+            notify_tables.len(),
+            if notify_tables.len() == 1 { "y" } else { "ies" },
+            notify_tables.join(", "),
+        );
         let registry_ready = Arc::new(Notify::new());
 
         // Create peer versions table
@@ -2328,10 +2340,18 @@ impl WaveSyncNode {
         // other group does — one `use_sync_notifications` covers the whole node.
         let notification_tx = self.inner.notification_tx.clone();
         let notification_registry = Arc::new(crate::registry::NotificationRegistry::new());
+        let mut notify_tables: Vec<String> = Vec::new();
         for info in inventory::iter::<crate::notify::NotifyEntityInfo> {
             let (table_name, dispatch) = (info.make)();
+            notify_tables.push(table_name.clone());
             notification_registry.register(table_name, dispatch);
         }
+        log::info!(
+            "SyncNotify (group): {} notification polic{} registered: [{}]",
+            notify_tables.len(),
+            if notify_tables.len() == 1 { "y" } else { "ies" },
+            notify_tables.join(", "),
+        );
 
         let node_id = site_id;
 
