@@ -324,6 +324,33 @@ pub(crate) fn start_engine(
 /// will bind once one appears.
 #[cfg(target_os = "ios")]
 fn routable_listen_ips(ipv6: bool) -> Vec<std::net::IpAddr> {
+    // Prefer the single *default-route* interface address(es). A real iOS device
+    // usually has several non-loopback interfaces up simultaneously — Wi-Fi
+    // (`en0`), cellular kept warm under Wi-Fi (`pdp_ip0`), and VPN / iCloud
+    // Private Relay (`utunN`). Binding a QUIC listener on every one of them lets
+    // libp2p-quic's `PortUse::Reuse` dialer source an outbound dial from the
+    // wrong interface (cellular / Private-Relay), which is unroutable — so
+    // relay / rendezvous / direct dials silently fail and the device never
+    // reaches the relay. The Simulator only ever has the Mac's single
+    // interface, so it has no wrong choice to make — which is why WAN sync works
+    // there but not on hardware. Asking the kernel which source address it would
+    // use to reach the public internet pins QUIC to the one interface a WAN dial
+    // must originate from.
+    let mut ips = Vec::new();
+    if let Some(v4) = default_route_ip(false) {
+        ips.push(v4);
+    }
+    if ipv6 && let Some(v6) = default_route_ip(true) {
+        ips.push(v6);
+    }
+    if !ips.is_empty() {
+        return ips;
+    }
+
+    // Fallback (no default route — e.g. transiently offline / between handoffs):
+    // enumerate routable interfaces so we still bind *something*. The
+    // interface-watch tick re-runs this and converges onto the default-route
+    // address once connectivity returns.
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(i) => i,
         Err(e) => {
@@ -340,6 +367,42 @@ fn routable_listen_ips(ipv6: bool) -> Vec<std::net::IpAddr> {
         .map(|iface| iface.ip())
         .filter(|ip| ipv6 || ip.is_ipv4())
         .collect()
+}
+
+/// iOS: the source IP the kernel would use to reach the public internet over
+/// `ipv6`, discovered via a connected (but otherwise unused) UDP socket.
+///
+/// A connected UDP socket sends no packets — `connect` only fixes the route and
+/// the local source address, which `local_addr` then reveals. That is exactly
+/// the interface a relay / peer dial must originate from, so binding QUIC to it
+/// keeps libp2p-quic's reuse-dialer on the routable interface. Returns `None`
+/// when offline or when the resolved address is loopback / unspecified.
+#[cfg(target_os = "ios")]
+fn default_route_ip(ipv6: bool) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+    let (bind, dst): (SocketAddr, SocketAddr) = if ipv6 {
+        (
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            // Cloudflare public resolver (2606:4700:4700::1111); no packet sent.
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+                53,
+            ),
+        )
+    } else {
+        (
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        )
+    };
+    let sock = UdpSocket::bind(bind).ok()?;
+    sock.connect(dst).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// iOS: build a `/ip{4,6}/<addr>/udp/0/quic-v1` listen multiaddr for `ip`
