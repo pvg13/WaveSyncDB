@@ -2393,9 +2393,22 @@ impl EngineRunner {
                 peer_id,
                 connection_id,
                 num_established,
+                cause,
                 ..
             } => {
-                log::debug!("Connection closed with {peer_id} ({num_established} remaining)");
+                // Surface the close cause — essential for diagnosing relay churn
+                // (idle timeout vs keep-alive vs transport reset vs remote close).
+                // Logged at info for infrastructure peers (relay/rendezvous), whose
+                // churn breaks circuit reservations, and at debug otherwise.
+                if self.infrastructure_peers.contains(&peer_id) {
+                    log::info!(
+                        "Connection closed with infra peer {peer_id} ({num_established} remaining); cause: {cause:?}"
+                    );
+                } else {
+                    log::debug!(
+                        "Connection closed with {peer_id} ({num_established} remaining); cause: {cause:?}"
+                    );
+                }
                 // Prune this connection from the relay-demotion tracking (#84).
                 if let Some(ids) = self.relayed_conn_ids.get_mut(&peer_id) {
                     ids.remove(&connection_id);
