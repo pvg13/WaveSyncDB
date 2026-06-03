@@ -564,10 +564,31 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            // Push for a topic none of our groups hold — silently ignore (a
-            // group we don't have doesn't mean we share no group with this
-            // peer over the shared connection). Rule 2.8, multi-group.
-            log::debug!("Ignoring push from {peer} for unknown topic {effective}");
+            // Push for a topic none of our groups hold — don't apply it (a group
+            // we don't have doesn't mean we share no group with this peer over
+            // the shared connection; Rule 2.8, multi-group). But we MUST still
+            // answer the request: libp2p request-response requires a response
+            // per inbound request, and dropping the channel here makes the
+            // sender see an `unexpected end of file`, never receive its PushAck,
+            // and redeliver this push to us every few seconds forever (#81
+            // un-acked-redelivery loop) — a permanent battery/bandwidth drain
+            // for any two peers with asymmetric group membership. PushAck just
+            // completes the substream ("received"); it does not apply the data
+            // and does not reject the peer, so Rules 2.7/2.8 are preserved. It
+            // carries no HMAC (unit variant), identical to the success path, so
+            // the sender accepts it regardless of which group key it holds.
+            log::debug!(
+                "Ignoring push from {peer} for unknown topic {effective} (acking so the sender stops redelivering)"
+            );
+            let resp_tx = self.snapshot_resp_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = resp_tx
+                    .send((channel, crate::protocol::SyncResponse::PushAck))
+                    .await
+                {
+                    log::error!("Failed to send PushAck for unknown topic: {e}");
+                }
+            });
             return;
         };
 
