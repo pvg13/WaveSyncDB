@@ -3,8 +3,10 @@ package dev.dioxus.main
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.util.Log
 
 /**
@@ -18,6 +20,41 @@ import android.util.Log
  */
 class WaveSyncInitProvider : ContentProvider() {
 
+    companion object {
+        private const val TAG = "WaveSyncInitProvider"
+
+        /// Held for the process lifetime so libp2p mDNS works in the FOREGROUND
+        /// app, not just during background sync. Android silently filters
+        /// incoming/outgoing Wi-Fi multicast unless a `MulticastLock` is held —
+        /// the only one the library took was the per-sync lock in
+        /// [WaveSyncService], so a foregrounded app could neither answer nor
+        /// hear `_p2p._udp` mDNS and never discovered LAN peers, forcing every
+        /// same-Wi-Fi sync (e.g. desktop ↔ phone) onto the relay. Static so it
+        /// outlives `onCreate` and isn't garbage-collected.
+        @Volatile
+        private var multicastLock: WifiManager.MulticastLock? = null
+
+        private fun acquireMulticastLock(context: Context) {
+            if (multicastLock?.isHeld == true) return
+            try {
+                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                if (wm == null) {
+                    Log.w(TAG, "WifiManager unavailable; foreground mDNS may not work")
+                    return
+                }
+                multicastLock = wm.createMulticastLock("wavesync.mdns.foreground").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.i(TAG, "Acquired foreground mDNS multicast lock")
+            } catch (e: Exception) {
+                // Best-effort: without it mDNS won't work, but the relay/
+                // rendezvous path still functions.
+                Log.w(TAG, "Could not acquire foreground multicast lock: ${e.message}")
+            }
+        }
+    }
+
     override fun onCreate(): Boolean {
         val ctx = context ?: return false
         Log.i("WaveSyncInitProvider", "Initializing Firebase and writing FCM token")
@@ -27,6 +64,12 @@ class WaveSyncInitProvider : ContentProvider() {
         // post notifications via NotificationHelper.showFromNative. Runs in every
         // process because ContentProviders initialize per-process at startup.
         NotificationHelper.appContext = ctx.applicationContext
+
+        // Hold a multicast lock for the foreground app so libp2p mDNS can
+        // discover LAN peers directly (and stay off the relay on a shared
+        // Wi-Fi). Without it Android filters multicast outside the brief
+        // background-sync windows that WaveSyncService covers.
+        acquireMulticastLock(ctx)
 
         // Run token fetch on a background thread to avoid blocking app startup,
         // but it will still complete before most Rust code runs.
