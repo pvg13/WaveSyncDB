@@ -767,6 +767,7 @@ async fn run_engine(
         circuit_listen_pending: false,
         relay_dial_pending: false,
         dcutr_retries: HashMap::new(),
+        peer_dial_backoff: HashMap::new(),
         diagnostics,
         protocol_mismatch_peers: std::collections::HashSet::new(),
         peer_via_relay: std::collections::HashMap::new(),
@@ -894,6 +895,26 @@ fn rejection_backoff(attempts: u32) -> Duration {
     const MAX_SECS: u64 = 3600;
     let shift = attempts.saturating_sub(1).min(20);
     let secs = BASE_SECS.saturating_mul(1u64 << shift).min(MAX_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Per-peer dial backoff schedule, lifted from go-libp2p's swarm: a peer is
+/// re-dialable after `BASE + COEF * priorFailures²`, capped at `MAX`. With
+/// `priorFailures` 1-based (1 = "one consecutive failure so far"), this yields
+/// 6s, 9s, 14s, 21s, … capped at 5 minutes. Quadratic (not exponential) growth
+/// keeps early retries responsive while still throttling a peer that keeps
+/// failing — the anti-storm guard for redials on shared networks where mDNS /
+/// the relay keep re-surfacing an unreachable peer. A successful connection
+/// clears the entry entirely (`clear_dial_backoff`), so this never penalises a
+/// peer that has recovered.
+fn peer_dial_backoff(prior_failures: u32) -> Duration {
+    const BASE_SECS: u64 = 5;
+    const COEF_SECS: u64 = 1;
+    const MAX_SECS: u64 = 300;
+    let n = u64::from(prior_failures);
+    let secs = BASE_SECS
+        .saturating_add(COEF_SECS.saturating_mul(n.saturating_mul(n)))
+        .min(MAX_SECS);
     Duration::from_secs(secs)
 }
 
@@ -1027,6 +1048,15 @@ struct EngineRunner {
     /// [`relay_manager::process_dcutr_retries`].
     pub(crate) dcutr_retries:
         HashMap<libp2p::PeerId, crate::engine::relay_manager::DcutrRetryState>,
+    /// Per-peer dial backoff (anti-storm). Maps a peer to its consecutive dial
+    /// failure count and the earliest instant it may be re-dialed. Consulted by
+    /// the sync-peer dial paths (`dial_introduced_peer`, the `OutboundFailure`
+    /// redial, mDNS re-dials) via [`EngineRunner::dial_backoff_ok`]; the next
+    /// allowed instant grows per [`peer_dial_backoff`]. A successful
+    /// `ConnectionEstablished` clears the entry. Infrastructure peers (relay /
+    /// rendezvous) are exempt — their reconnect cadence is governed separately
+    /// by `maybe_reconnect_relay`.
+    pub(crate) peer_dial_backoff: HashMap<libp2p::PeerId, (u32, tokio::time::Instant)>,
     /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
     /// All increments are `Relaxed` atomic ops on the hot path; readers
     /// (UI / debug panel / test assertions) snapshot via
@@ -1468,6 +1498,52 @@ impl EngineRunner {
     /// of one redundant connection.
     pub(crate) fn prefers_direct(&self, peer: &libp2p::PeerId) -> bool {
         self.peer_via_relay.get(peer) == Some(&false)
+    }
+
+    /// Deterministic single-closer rule for relay demotion: only the peer with
+    /// the numerically smaller PeerId actively closes a redundant relay
+    /// connection. A relay circuit is one shared connection, so a single close
+    /// tears it down for both ends; the other end prunes its tracking on the
+    /// resulting `ConnectionClosed`. Picking one closer (rather than both
+    /// closing in lockstep) avoids a close race and keeps the demotion decision
+    /// symmetric and predictable across the two peers. Both ends compute the
+    /// same comparison over the same pair of ids, so exactly one closes.
+    fn should_demote_locally(&self, peer: &libp2p::PeerId) -> bool {
+        self.local_peer_id.to_bytes() < peer.to_bytes()
+    }
+
+    /// Whether `peer` may be dialed now, or is still inside its backoff window
+    /// after recent consecutive dial failures. Infrastructure peers are always
+    /// allowed (their reconnect cadence is handled by `maybe_reconnect_relay`).
+    /// See [`peer_dial_backoff`].
+    pub(crate) fn dial_backoff_ok(&self, peer: &libp2p::PeerId) -> bool {
+        if self.infrastructure_peers.contains(peer) {
+            return true;
+        }
+        match self.peer_dial_backoff.get(peer) {
+            Some((_, next_allowed)) => tokio::time::Instant::now() >= *next_allowed,
+            None => true,
+        }
+    }
+
+    /// Record a failed dial to `peer`, growing its backoff window. No-op for
+    /// infrastructure peers.
+    pub(crate) fn record_dial_failure(&mut self, peer: libp2p::PeerId) {
+        if self.infrastructure_peers.contains(&peer) {
+            return;
+        }
+        let entry = self
+            .peer_dial_backoff
+            .entry(peer)
+            .or_insert((0, tokio::time::Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = tokio::time::Instant::now() + peer_dial_backoff(entry.0);
+    }
+
+    /// Clear any dial backoff for `peer` — called on a successful connection so
+    /// a recovered peer is never penalised by stale failure history.
+    pub(crate) fn clear_dial_backoff(&mut self, peer: &libp2p::PeerId) {
+        self.peer_dial_backoff.remove(peer);
     }
 
     /// Handle peer disconnection: clean up tracking, reconnect relay/rendezvous.
@@ -2377,6 +2453,9 @@ impl EngineRunner {
                     self.diagnostics
                         .peer_dial_successes
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // A successful connection clears any dial-failure backoff so a
+                    // recovered peer is re-dialable at full speed.
+                    self.clear_dial_backoff(&peer_id);
 
                     // Relay-cost telemetry: classify this connection as relayed
                     // (carried by the relay server) or direct. A DCUtR upgrade
@@ -2387,16 +2466,33 @@ impl EngineRunner {
                             .relayed_connections_established
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if self.peer_via_relay.get(&peer_id) == Some(&false) {
-                            // A direct path to this peer already exists — don't
-                            // keep a redundant relay connection (#84 demotion).
-                            if self.swarm.close_connection(connection_id) {
-                                self.diagnostics
-                                    .relay_connections_demoted
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // A direct path to this peer already exists — this
+                            // relay connection is redundant (#84 demotion). Only
+                            // the lower-PeerId peer actively closes the shared
+                            // connection; the other end tracks it and prunes on
+                            // the resulting ConnectionClosed. See
+                            // `should_demote_locally`.
+                            if self.should_demote_locally(&peer_id) {
+                                if self.swarm.close_connection(connection_id) {
+                                    self.diagnostics
+                                        .relay_connections_demoted
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                log::info!(
+                                    "Relay demotion: dropped redundant relay connection to {peer_id} (direct already up)"
+                                );
+                            } else {
+                                // Defer the close to the lower-id peer; keep the
+                                // connection tracked so we prune it on close and
+                                // clean it on full disconnect.
+                                self.relayed_conn_ids
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .insert(connection_id);
+                                log::debug!(
+                                    "Relay demotion deferred to lower-PeerId peer for {peer_id} (direct already up)"
+                                );
                             }
-                            log::info!(
-                                "Relay demotion: dropped redundant relay connection to {peer_id} (direct already up)"
-                            );
                         } else {
                             self.peer_via_relay.entry(peer_id).or_insert(true);
                             self.relayed_conn_ids
@@ -2422,8 +2518,14 @@ impl EngineRunner {
                         // the paid relay — it reverts to wake/fallback only.
                         // In-flight requests on the closed connection fail and
                         // self-heal via the push-redelivery (#81) + reconcile
-                        // paths, so this is safe to do immediately.
-                        if let Some(ids) = self.relayed_conn_ids.remove(&peer_id) {
+                        // paths, so this is safe to do immediately. Only the
+                        // lower-PeerId peer actively closes (see
+                        // `should_demote_locally`); the other end keeps the ids
+                        // tracked and prunes them on the resulting
+                        // ConnectionClosed / full disconnect.
+                        if self.should_demote_locally(&peer_id)
+                            && let Some(ids) = self.relayed_conn_ids.remove(&peer_id)
+                        {
                             let mut closed = 0u64;
                             for cid in ids {
                                 if self.swarm.close_connection(cid) {
@@ -2546,6 +2648,9 @@ impl EngineRunner {
                     self.diagnostics
                         .peer_dial_failures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Grow this peer's dial backoff window (anti-storm). Cleared
+                    // on the next successful connection.
+                    self.record_dial_failure(pid);
 
                     // Bump fail_count on cached addresses for this peer
                     // (#29). No-op if the peer isn't cached yet — cache rows
@@ -2889,6 +2994,25 @@ mod tests {
         for a in 1..=12 {
             let d = rejection_backoff(a);
             assert!(d >= prev, "backoff must be non-decreasing");
+            prev = d;
+        }
+    }
+
+    #[test]
+    fn peer_dial_backoff_grows_quadratically_and_caps() {
+        // 6s, 9s, 14s, 21s, … (5 + n²), capped at 5 minutes.
+        assert_eq!(peer_dial_backoff(1), Duration::from_secs(6));
+        assert_eq!(peer_dial_backoff(2), Duration::from_secs(9));
+        assert_eq!(peer_dial_backoff(3), Duration::from_secs(14));
+        assert_eq!(peer_dial_backoff(4), Duration::from_secs(21));
+        // Caps at 300s and never overflows for large failure counts.
+        assert_eq!(peer_dial_backoff(100), Duration::from_secs(300));
+        assert_eq!(peer_dial_backoff(u32::MAX), Duration::from_secs(300));
+        // Non-decreasing.
+        let mut prev = Duration::ZERO;
+        for n in 0..=40 {
+            let d = peer_dial_backoff(n);
+            assert!(d >= prev, "dial backoff must be non-decreasing");
             prev = d;
         }
     }

@@ -324,6 +324,7 @@ impl EngineRunner {
                     if let Some(addr) = self.peers.get(&peer).cloned()
                         && !self.swarm.is_connected(&peer)
                         && !self.dialing_peers.contains(&peer)
+                        && self.dial_backoff_ok(&peer)
                         && !(addr_is_relayed(&addr) && self.prefers_direct(&peer))
                     {
                         log::info!("Re-dialing {peer} after outbound failure");

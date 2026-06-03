@@ -692,6 +692,7 @@ impl EngineRunner {
             || rejected_by_all
             || self.swarm.is_connected(&peer_id)
             || self.dialing_peers.contains(&peer_id)
+            || !self.dial_backoff_ok(&peer_id)
         {
             return;
         }

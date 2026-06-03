@@ -133,8 +133,10 @@ impl EngineRunner {
                     log::info!("Discovered peer {peer_id} at {multiaddr}");
                     // Dial if not currently connected (handles both new peers and reconnections
                     // after network disruption where the peer is still in self.peers but the
-                    // TCP/QUIC connection is dead)
-                    if !self.swarm.is_connected(&peer_id) {
+                    // TCP/QUIC connection is dead). Respect the per-peer dial backoff so an
+                    // unreachable peer that mDNS keeps re-announcing every query cycle isn't
+                    // re-dialed in a tight loop (anti-storm).
+                    if !self.swarm.is_connected(&peer_id) && self.dial_backoff_ok(&peer_id) {
                         match self.swarm.dial(multiaddr.clone()) {
                             Ok(()) => {
                                 self.diagnostics
