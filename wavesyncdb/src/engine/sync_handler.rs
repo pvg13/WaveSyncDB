@@ -312,12 +312,27 @@ impl EngineRunner {
                     self.note_protocol_mismatch(peer);
                 } else {
                     log::warn!("Sync request to {peer} failed: {error}");
-                    // Connection might be dead — re-dial if we know the peer's address
+                    // Connection might be dead — re-dial if we know the peer's
+                    // address. Storm guards (#84 regression): (1) never re-dial a
+                    // circuit address for a peer we already reach directly — the
+                    // failure was likely the demotion closing a redundant relay
+                    // connection, and redialing just re-opens the circuit;
+                    // (2) dedup against in-flight dials; (3) route through a
+                    // `DialOpts::peer_id` build (default `DisconnectedAndNotDialing`
+                    // condition) instead of a raw address dial so concurrent
+                    // attempts fold into one.
                     if let Some(addr) = self.peers.get(&peer).cloned()
                         && !self.swarm.is_connected(&peer)
+                        && !self.dialing_peers.contains(&peer)
+                        && !(addr_is_relayed(&addr) && self.prefers_direct(&peer))
                     {
                         log::info!("Re-dialing {peer} after outbound failure");
-                        let _ = self.swarm.dial(addr);
+                        let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+                            .addresses(vec![addr])
+                            .build();
+                        if self.swarm.dial(dial_opts).is_ok() {
+                            self.dialing_peers.insert(peer);
+                        }
                     }
                 }
             }

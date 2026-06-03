@@ -429,6 +429,30 @@ fn addr_is_relayed(addr: &libp2p::Multiaddr) -> bool {
         .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
 }
 
+/// Given a peer's introduced address set, drop circuit-relay addresses when a
+/// direct path to that peer already exists (`prefers_direct`). Pure helper so
+/// the storm-prevention rule is unit-testable without a swarm.
+///
+/// This is the core fix for the circuit-relay storm (#84 regression): the relay
+/// re-introduces a peer's circuit address on every presence announce, and the
+/// `#84` demotion immediately closes any circuit connection to a peer we already
+/// reach directly. Re-dialing that circuit each time it is re-introduced is an
+/// establish→close→redial loop that exhausts the relay's per-peer circuit cap
+/// (`ResourceLimitExceeded`). Filtering circuit addresses here — keyed on the
+/// stable `peer_via_relay == false` marker, which survives the brief
+/// `is_connected` flicker right after a demotion close — breaks the loop while
+/// still allowing the circuit path when no direct path exists.
+fn dialable_addrs_preferring_direct(
+    addrs: Vec<libp2p::Multiaddr>,
+    prefers_direct: bool,
+) -> Vec<libp2p::Multiaddr> {
+    if prefers_direct {
+        addrs.into_iter().filter(|a| !addr_is_relayed(a)).collect()
+    } else {
+        addrs
+    }
+}
+
 /// QUIC transport tuning shared by every swarm builder.
 ///
 /// libp2p-quic's default `max_idle_timeout` is **10s** — far too aggressive for
@@ -1434,6 +1458,18 @@ impl EngineRunner {
         });
     }
 
+    /// Whether we currently prefer a direct path to `peer` — i.e. a direct
+    /// connection has been established and not fully torn down. While true, the
+    /// relay/circuit path to this peer is suppressed (see
+    /// [`dialable_addrs_preferring_direct`] and the `OutboundFailure` redial
+    /// guard) to prevent the demote→re-dial circuit storm. The marker survives
+    /// the brief `is_connected` flicker after a demotion close because
+    /// `peer_via_relay` is only cleared on a *full* disconnect, not on the close
+    /// of one redundant connection.
+    pub(crate) fn prefers_direct(&self, peer: &libp2p::PeerId) -> bool {
+        self.peer_via_relay.get(peer) == Some(&false)
+    }
+
     /// Handle peer disconnection: clean up tracking, reconnect relay/rendezvous.
     fn handle_connection_closed(&mut self, peer_id: libp2p::PeerId, num_established: u32) {
         for g in self.groups.values_mut() {
@@ -1450,6 +1486,15 @@ impl EngineRunner {
         // peer. Re-attempts only make sense while the relay-circuit
         // connection is still alive (DCUtR coordinates through it).
         self.dcutr_retries.remove(&peer_id);
+
+        // Clear the path classification on a *full* disconnect so a later
+        // reconnect can re-establish via whatever path wins (including the
+        // relay). While ANY connection to the peer remains (num_established>0,
+        // handled by the early return above) we deliberately keep
+        // `peer_via_relay==false` as the "direct preferred, suppress circuit
+        // re-dials" marker — see `prefers_direct` / `dialable_addrs_preferring_direct`.
+        self.peer_via_relay.remove(&peer_id);
+        self.relayed_conn_ids.remove(&peer_id);
 
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
@@ -2364,6 +2409,13 @@ impl EngineRunner {
                             .direct_connections_established
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.peer_via_relay.insert(peer_id, false);
+                        // Prefer the direct address for any future redial /
+                        // status: `self.peers` may still hold the circuit
+                        // address that was inserted when the relay first
+                        // introduced this peer (`dial_introduced_peer`), and
+                        // we must not redial that once a direct path is up.
+                        self.peers
+                            .insert(peer_id, endpoint.get_remote_address().clone());
                         // DERP demotion (#84): a direct path to this peer just
                         // came up (typically a DCUtR hole-punch). Close any
                         // relay-carried connections so steady-state data leaves
@@ -2839,6 +2891,53 @@ mod tests {
             assert!(d >= prev, "backoff must be non-decreasing");
             prev = d;
         }
+    }
+
+    // Regression: the circuit-relay storm (#84). When a direct path to a peer
+    // already exists, the relay's repeated re-introduction of that peer's
+    // circuit address must NOT be re-dialed — otherwise each re-dial re-opens a
+    // circuit the demotion logic immediately closes, exhausting the relay's
+    // per-peer circuit cap (ResourceLimitExceeded). The pure filter below is the
+    // decision that breaks the loop; here we pin its behaviour both ways.
+    #[test]
+    fn dialable_addrs_drops_circuit_when_direct_preferred() {
+        let pid: libp2p::PeerId = "12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3"
+            .parse()
+            .unwrap();
+        let direct: libp2p::Multiaddr = format!("/ip4/192.168.1.150/udp/39981/quic-v1/p2p/{pid}")
+            .parse()
+            .unwrap();
+        let circuit: libp2p::Multiaddr =
+            format!("/ip4/77.37.125.212/udp/4001/quic-v1/p2p/{pid}/p2p-circuit/p2p/{pid}")
+                .parse()
+                .unwrap();
+
+        // Direct preferred: circuit address is dropped, direct kept.
+        let kept = dialable_addrs_preferring_direct(
+            vec![direct.clone(), circuit.clone()],
+            /* prefers_direct */ true,
+        );
+        assert_eq!(kept, vec![direct.clone()], "circuit must be filtered out");
+
+        // Direct preferred but ONLY a circuit address available: result is
+        // empty so the caller skips the dial entirely (no storm).
+        let none = dialable_addrs_preferring_direct(vec![circuit.clone()], true);
+        assert!(
+            none.is_empty(),
+            "a circuit-only set must yield no dialable address when direct is preferred"
+        );
+
+        // No direct path yet: nothing is filtered — the circuit is the only way
+        // to reach the peer and must still be dialable.
+        let all = dialable_addrs_preferring_direct(
+            vec![direct.clone(), circuit.clone()],
+            /* prefers_direct */ false,
+        );
+        assert_eq!(
+            all,
+            vec![direct, circuit],
+            "without a direct path, keep all"
+        );
     }
 
     #[test]

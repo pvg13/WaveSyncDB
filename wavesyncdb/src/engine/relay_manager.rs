@@ -696,7 +696,18 @@ impl EngineRunner {
             return;
         }
 
+        // Storm guard (#84 regression): if a direct path to this peer already
+        // exists, never dial its circuit-relay address. The relay re-introduces
+        // peers on every presence announce; without this each re-introduction
+        // re-opens a circuit that the demotion logic immediately closes — an
+        // establish→close→redial loop that exhausts the relay's per-peer circuit
+        // cap. See `dialable_addrs_preferring_direct`.
+        let addrs = dialable_addrs_preferring_direct(addrs, self.prefers_direct(&peer_id));
+
         if addrs.is_empty() {
+            log::debug!(
+                "Skipping dial to {peer_id}: no non-circuit address while a direct path is preferred"
+            );
             return;
         }
 
