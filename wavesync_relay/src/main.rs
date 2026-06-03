@@ -61,15 +61,20 @@ struct Cli {
     #[arg(long, env = "MAX_CIRCUITS", default_value_t = 256)]
     max_circuits: usize,
 
-    /// Maximum simultaneous relay circuits per peer (default: 64). libp2p's
-    /// stock default is 4 — far too low for a multi-member group on shared
-    /// infrastructure: each member opens circuits to several peers across
-    /// multiple group topics, and reconnect/retry churn briefly stacks more
-    /// before the old ones close. At 4, the cap is hit within seconds and the
-    /// relay denies every further circuit with `ResourceLimitExceeded`, so
-    /// peers can't reach each other and sync stalls. Must be set explicitly —
-    /// it is NOT covered by `max_circuits` (that's the global cap).
-    #[arg(long, env = "MAX_CIRCUITS_PER_PEER", default_value_t = 64)]
+    /// Maximum simultaneous relay circuits per peer (default: 32). libp2p's
+    /// stock default is 4 — too low for a multi-member group on shared
+    /// infrastructure, where one peer can be the destination of several
+    /// concurrent circuits across multiple group topics. This was briefly
+    /// raised to 64 to absorb a client-side circuit-redial storm; that storm is
+    /// now fixed in the client (it no longer re-dials a circuit to a peer it
+    /// already reaches directly, and demotion no longer thrashes), so this is
+    /// walked back to 32 — still ~8x the libp2p default and ample headroom for
+    /// legitimate multi-group fan-out, without the extreme value that masked
+    /// the bug. Must be set explicitly — it is NOT covered by `max_circuits`.
+    /// NOTE: redeploy the relay with this lower cap only after clients carrying
+    /// the storm fix are rolled out; an old client would hit the lower cap
+    /// slightly sooner.
+    #[arg(long, env = "MAX_CIRCUITS_PER_PEER", default_value_t = 32)]
     max_circuits_per_peer: usize,
 
     /// Maximum circuit duration in seconds (default: 3600 = 1 hour)
@@ -86,14 +91,15 @@ struct Cli {
     #[arg(long, env = "MAX_RESERVATIONS", default_value_t = 1024)]
     max_reservations: usize,
 
-    /// Maximum reservations per peer (default: 32). libp2p's stock default
-    /// is 4. With FCM-driven reconnect bursts (each new connection asks for
-    /// a fresh reservation while the old one is still in its
-    /// `reservation_duration` window) clients hit the per-peer cap within
-    /// minutes, every subsequent request is denied with
-    /// `ResourceLimitExceeded`, and circuit-relay sync stops working for
-    /// that peer.
-    #[arg(long, env = "MAX_RESERVATIONS_PER_PEER", default_value_t = 32)]
+    /// Maximum reservations per peer (default: 16). libp2p's stock default
+    /// is 4. A well-behaved client needs roughly one reservation per relay it
+    /// listens on; the headroom above that covers FCM-driven reconnect bursts
+    /// (a new connection can ask for a fresh reservation while the old one is
+    /// still inside its `reservation_duration` window). This was briefly raised
+    /// to 32 alongside the circuit storm; with the client-side churn fixed it
+    /// is walked back to 16 — still 4x the libp2p default. Same rollout caveat
+    /// as `max_circuits_per_peer`.
+    #[arg(long, env = "MAX_RESERVATIONS_PER_PEER", default_value_t = 16)]
     max_reservations_per_peer: usize,
 
     /// Reservation duration in seconds (default: 600 = 10 min). libp2p's
@@ -706,8 +712,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             log::info!("Relay: reservation accepted for {src_peer_id}");
                         }
                     }
-                    RelayEvent::ReservationReqDenied { src_peer_id, status } => {
-                        log::warn!("Relay: reservation denied for {src_peer_id} (status {status:?})");
+                    RelayEvent::ReservationReqDenied {
+                        src_peer_id,
+                        status,
+                    } => {
+                        log::warn!(
+                            "Relay: reservation denied for {src_peer_id} (status {status:?})"
+                        );
                     }
                     RelayEvent::ReservationClosed { src_peer_id } => {
                         log::debug!("Relay: reservation closed for {src_peer_id}");
@@ -735,12 +746,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dst_peer_id,
                         error,
                     } => match error {
-                        Some(e) => log::debug!(
-                            "Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}"
-                        ),
-                        None => log::debug!(
-                            "Relay: circuit closed {src_peer_id} → {dst_peer_id}"
-                        ),
+                        Some(e) => {
+                            log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}")
+                        }
+                        None => log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}"),
                     },
                     // Deprecated *Failed variants and any future additions:
                     // keep them off the steady-state log but available at debug.
