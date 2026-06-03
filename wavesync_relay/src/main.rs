@@ -61,6 +61,17 @@ struct Cli {
     #[arg(long, env = "MAX_CIRCUITS", default_value_t = 256)]
     max_circuits: usize,
 
+    /// Maximum simultaneous relay circuits per peer (default: 64). libp2p's
+    /// stock default is 4 — far too low for a multi-member group on shared
+    /// infrastructure: each member opens circuits to several peers across
+    /// multiple group topics, and reconnect/retry churn briefly stacks more
+    /// before the old ones close. At 4, the cap is hit within seconds and the
+    /// relay denies every further circuit with `ResourceLimitExceeded`, so
+    /// peers can't reach each other and sync stalls. Must be set explicitly —
+    /// it is NOT covered by `max_circuits` (that's the global cap).
+    #[arg(long, env = "MAX_CIRCUITS_PER_PEER", default_value_t = 64)]
+    max_circuits_per_peer: usize,
+
     /// Maximum circuit duration in seconds (default: 3600 = 1 hour)
     #[arg(long, env = "MAX_CIRCUIT_DURATION_SECS", default_value_t = 3600)]
     max_circuit_duration: u64,
@@ -434,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let relay_config = relay::Config {
         max_circuits: cli.max_circuits,
+        max_circuits_per_peer: cli.max_circuits_per_peer,
         max_circuit_duration: std::time::Duration::from_secs(cli.max_circuit_duration),
         max_circuit_bytes: cli.max_circuit_bytes,
         max_reservations: cli.max_reservations,
