@@ -9,14 +9,16 @@ impl EngineRunner {
         match cmd {
             EngineCommand::Resume => {
                 while let Ok(EngineCommand::Resume) = self.cmd_rx.try_recv() {}
-                self.handle_resume().await;
+                // Plain resume: keep healthy relay/peer connections (no churn).
+                self.handle_resume(false).await;
                 false
             }
             EngineCommand::NetworkTransition => {
                 // Drain duplicate NetworkTransition commands
                 while let Ok(EngineCommand::NetworkTransition) = self.cmd_rx.try_recv() {}
                 log::info!("Network transition detected — force-disconnecting all peers");
-                self.handle_resume().await;
+                // Network changed: old sockets are dead, force a clean reconnect.
+                self.handle_resume(true).await;
                 false
             }
             EngineCommand::RequestFullSync => {
@@ -211,7 +213,16 @@ impl EngineRunner {
         }
     }
 
-    pub(super) async fn handle_resume(&mut self) {
+    /// Re-establish connectivity after an app resume or a network change.
+    ///
+    /// `force_relay_reset` controls how aggressive the teardown is:
+    /// - `false` (plain app resume on the same network): keep the existing relay
+    ///   reservation and peer circuits — they're still valid. Only rediscover
+    ///   and re-sync.
+    /// - `true` (network transition): the old sockets are bound to a departed
+    ///   interface and are dead, so force-disconnect the relay and all peers to
+    ///   re-establish on the new interface.
+    pub(super) async fn handle_resume(&mut self, force_relay_reset: bool) {
         log::info!("App resumed — triggering rediscovery and sync");
 
         // Clear version maps so the next sync requests all changes since the
@@ -225,20 +236,32 @@ impl EngineRunner {
         self.dialing_peers.clear();
         self.pending_rendezvous_dials.clear();
 
-        // Force-disconnect relay — the TCP socket is likely dead on the old
-        // network interface. ConnectionClosed handler will reset relay_state
-        // and trigger reconnect.
-        if let RelayState::Connected { relay_peer_id, .. }
-        | RelayState::Listening { relay_peer_id } = self.relay_state
-        {
-            log::info!("Resume: disconnecting relay {relay_peer_id} for clean reconnection");
-            let _ = self.swarm.disconnect_peer_id(relay_peer_id);
-        }
+        // Only tear down live connections on an actual network transition. On a
+        // plain app resume (same network) the relay reservation and peer
+        // circuits are still valid — force-reconnecting them here caused a
+        // reservation-churn storm: every resume dropped the relay, the reconnect
+        // asked for a fresh reservation, and with the relay's long
+        // `reservation_duration` the stale ones lingered until the per-peer cap
+        // was hit and every new circuit was denied with `ResourceLimitExceeded`,
+        // silently breaking sync for the whole group. A genuinely dead relay
+        // connection is still caught by the ping / idle timeout and reconnected.
+        if force_relay_reset {
+            // The old sockets are bound to a now-departed interface and are
+            // dead. ConnectionClosed handler resets relay_state and reconnects.
+            if let RelayState::Connected { relay_peer_id, .. }
+            | RelayState::Listening { relay_peer_id } = self.relay_state
+            {
+                log::info!(
+                    "Network transition: disconnecting relay {relay_peer_id} for clean reconnection"
+                );
+                let _ = self.swarm.disconnect_peer_id(relay_peer_id);
+            }
 
-        // Force-disconnect all non-infrastructure peers (likely dead sockets)
-        let stale: Vec<_> = self.peers.keys().cloned().collect();
-        for pid in stale {
-            let _ = self.swarm.disconnect_peer_id(pid);
+            // Force-disconnect all non-infrastructure peers (dead sockets).
+            let stale: Vec<_> = self.peers.keys().cloned().collect();
+            for pid in stale {
+                let _ = self.swarm.disconnect_peer_id(pid);
+            }
         }
 
         // 1. Trigger mDNS rediscovery (LAN)
