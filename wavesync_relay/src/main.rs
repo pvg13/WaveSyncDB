@@ -555,7 +555,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_quic()
+        .with_quic_config(|mut cfg| {
+            // Match the client's raised idle timeout. QUIC's effective idle
+            // timeout is the min of both endpoints, so leaving the relay at the
+            // 10s default would cap every client connection at 10s regardless of
+            // the client's setting — causing constant reconnects on mobile/Wi-Fi
+            // links. 30s tolerates transient blips; keep-alive holds NAT mappings.
+            cfg.max_idle_timeout = 30_000;
+            cfg.keep_alive_interval = std::time::Duration::from_secs(5);
+            cfg
+        })
         // Stack a WebSocket transport on top so browser peers (libp2p
         // websocket-websys) can dial the relay. The transport itself is
         // unconditional — `listen_on(.../ws)` is what actually opens the

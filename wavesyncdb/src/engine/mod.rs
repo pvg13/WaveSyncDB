@@ -429,6 +429,22 @@ fn addr_is_relayed(addr: &libp2p::Multiaddr) -> bool {
         .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
 }
 
+/// QUIC transport tuning shared by every swarm builder.
+///
+/// libp2p-quic's default `max_idle_timeout` is **10s** — far too aggressive for
+/// relay-carried mobile connections. A brief Wi-Fi/radio/NAT interruption stops
+/// packets for longer than 10s, the connection is declared dead with
+/// `ConnectionError(TimedOut)`, and the whole stack reconnects (new reservation,
+/// circuit re-dials, presence re-announce) — which on a flaky link produces a
+/// continuous reconnect/circuit storm against the relay. Raise the idle timeout
+/// to 30s so transient blips are tolerated, and keep a frequent keep-alive so
+/// NAT UDP mappings stay open between heartbeats.
+fn tune_quic(mut cfg: libp2p::quic::Config) -> libp2p::quic::Config {
+    cfg.max_idle_timeout = 30_000;
+    cfg.keep_alive_interval = Duration::from_secs(5);
+    cfg
+}
+
 fn build_swarm(
     keypair: identity::Keypair,
     mdns_config: Option<mdns::Config>,
@@ -461,7 +477,7 @@ fn build_swarm(
     // networks can opt in via `WaveSyncDbBuilder::with_tcp_enabled(true)`.
     let system_result = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_quic()
+        .with_quic_config(tune_quic)
         .with_dns();
 
     match system_result {
@@ -485,7 +501,7 @@ fn build_swarm(
             let ping_interval = keep_alive_interval;
             Ok(SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_quic()
+                .with_quic_config(tune_quic)
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
                 .with_behaviour(move |key, relay_client| {
@@ -520,7 +536,7 @@ fn build_swarm_with_tcp(
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_quic()
+        .with_quic_config(tune_quic)
         .with_dns();
 
     match system_result {
@@ -549,7 +565,7 @@ fn build_swarm_with_tcp(
                     noise::Config::new,
                     yamux::Config::default,
                 )?
-                .with_quic()
+                .with_quic_config(tune_quic)
                 .with_dns_config(dns::ResolverConfig::google(), dns::ResolverOpts::default())
                 .with_relay_client(noise::Config::new, yamux::Config::default)?
                 .with_behaviour(move |key, relay_client| {
