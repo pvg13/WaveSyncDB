@@ -1385,19 +1385,38 @@ async fn apply_changeset_chunk<'a>(
     for n in pending_notifications {
         // Run the per-table notification policy (remote-only) before broadcasting
         // the raw change. The gate inside `dispatch` de-spams bursts.
-        if let Some(ctx) = notify
-            && let Some(user_notif) = ctx.registry.dispatch(&n)
-        {
-            // Visibility: confirms the SyncNotify policy fired and passed the
-            // anti-spam gate. If you see this but no OS notification, the gap is
-            // downstream (no `use_sync_notifications` subscriber in this process
-            // — e.g. a background wake — or the native display call failed).
-            log::info!(
-                "notification: generated for table {} ({} receiver(s) subscribed)",
-                user_notif.table,
-                ctx.tx.receiver_count(),
-            );
-            let _ = ctx.tx.send(user_notif);
+        if let Some(ctx) = notify {
+            // Diagnostic: for every applied change on a table that HAS a policy,
+            // record the write kind and the dispatch outcome. This pins down why
+            // a notification did or didn't fire — "Insert DECLINED" means the
+            // policy's `on_sync` returned None (e.g. the typed row couldn't be
+            // rebuilt); "Update DECLINED" is the expected silence for edits;
+            // "generated" means it fired and was queued for display.
+            if ctx.registry.has(&n.table.0) {
+                match ctx.registry.dispatch(&n) {
+                    Some(user_notif) => {
+                        log::info!(
+                            "notification: generated for table {} kind={:?} pk={} ({} receiver(s) subscribed)",
+                            n.table.0,
+                            n.kind,
+                            n.primary_key.0,
+                            ctx.tx.receiver_count(),
+                        );
+                        let _ = ctx.tx.send(user_notif);
+                    }
+                    None => {
+                        log::info!(
+                            "notification: policy DECLINED table {} kind={:?} pk={} cols={:?} (on_sync returned None)",
+                            n.table.0,
+                            n.kind,
+                            n.primary_key.0,
+                            n.column_values
+                                .as_ref()
+                                .map(|cv| cv.iter().map(|(c, _)| c.0.as_str()).collect::<Vec<_>>()),
+                        );
+                    }
+                }
+            }
         }
         let _ = change_tx.send(n);
     }
