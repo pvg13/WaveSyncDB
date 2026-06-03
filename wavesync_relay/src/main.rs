@@ -453,6 +453,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reservation_duration: std::time::Duration::from_secs(cli.reservation_duration),
         ..Default::default()
     };
+    // Log the effective limits so a running instance can be verified against the
+    // intended config (e.g. confirm max_circuits_per_peer is no longer the
+    // stock default of 4 after a redeploy).
+    log::info!(
+        "Relay limits: max_circuits={} max_circuits_per_peer={} max_circuit_duration={}s \
+         max_circuit_bytes={} max_reservations={} max_reservations_per_peer={} reservation_duration={}s",
+        cli.max_circuits,
+        cli.max_circuits_per_peer,
+        cli.max_circuit_duration,
+        cli.max_circuit_bytes,
+        cli.max_reservations,
+        cli.max_reservations_per_peer,
+        cli.reservation_duration,
+    );
 
     // Initialize push notification subsystem if configured
     let push_notifier = if let Some(ref push_db_path) = cli.push_db {
