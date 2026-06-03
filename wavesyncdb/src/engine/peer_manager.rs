@@ -131,14 +131,27 @@ impl EngineRunner {
                         continue;
                     }
                     log::info!("Discovered peer {peer_id} at {multiaddr}");
+                    // A peer announced on the LAN via mDNS is reachable directly;
+                    // mark it so we suppress relay-circuit dials to it (prefer the
+                    // closer, more reliable LAN path — and avoid a circuit during
+                    // the window before the direct connection establishes).
+                    if addr_is_lan(&multiaddr) {
+                        self.lan_peers.insert(peer_id);
+                    }
                     // Dial if not currently connected (handles both new peers and reconnections
                     // after network disruption where the peer is still in self.peers but the
                     // TCP/QUIC connection is dead). Respect the per-peer dial backoff so an
                     // unreachable peer that mDNS keeps re-announcing every query cycle isn't
-                    // re-dialed in a tight loop (anti-storm).
-                    if !self.swarm.is_connected(&peer_id) && self.dial_backoff_ok(&peer_id) {
+                    // re-dialed in a tight loop (anti-storm). Track the in-flight dial in
+                    // `dialing_peers` so a concurrent relay introduction doesn't open a
+                    // second (circuit) connection to the same peer.
+                    if !self.swarm.is_connected(&peer_id)
+                        && !self.dialing_peers.contains(&peer_id)
+                        && self.dial_backoff_ok(&peer_id)
+                    {
                         match self.swarm.dial(multiaddr.clone()) {
                             Ok(()) => {
+                                self.dialing_peers.insert(peer_id);
                                 self.diagnostics
                                     .peer_dial_attempts
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -193,6 +206,9 @@ impl EngineRunner {
                 for (peer_id, multiaddr) in list {
                     log::debug!("Expired peer {peer_id} at {multiaddr}");
                     self.peers.remove(&peer_id);
+                    // No longer seen on the LAN — drop the LAN-preference marker
+                    // so the relay path becomes available again if needed.
+                    self.lan_peers.remove(&peer_id);
                     for g in self.groups.values_mut() {
                         g.pending_sync_peers.remove(&peer_id);
                         g.verified_peers.remove(&peer_id);

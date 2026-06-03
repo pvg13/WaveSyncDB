@@ -453,6 +453,31 @@ fn dialable_addrs_preferring_direct(
     }
 }
 
+/// Whether a multiaddr is on the local network — RFC1918 private IPv4, IPv4
+/// link-local, loopback, or IPv6 ULA (`fc00::/7`) / link-local (`fe80::/10`).
+/// Such a peer is reachable directly over the LAN, so the relay circuit to it
+/// is both unnecessary and (with router hairpinning often unsupported) less
+/// reliable — prefer the LAN path on the same-Wi-Fi case. Looks at the first IP
+/// literal; non-IP (e.g. `/dns4`) and public addresses return false.
+fn addr_is_lan(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(ip) => {
+                return ip.is_private() || ip.is_link_local() || ip.is_loopback();
+            }
+            Protocol::Ip6(ip) => {
+                let seg = ip.segments();
+                let ula = (seg[0] & 0xfe00) == 0xfc00;
+                let link_local = (seg[0] & 0xffc0) == 0xfe80;
+                return ip.is_loopback() || ula || link_local;
+            }
+            _ => continue,
+        }
+    }
+    false
+}
+
 /// QUIC transport tuning shared by every swarm builder.
 ///
 /// libp2p-quic's default `max_idle_timeout` is **10s** — far too aggressive for
@@ -768,6 +793,8 @@ async fn run_engine(
         relay_dial_pending: false,
         dcutr_retries: HashMap::new(),
         peer_dial_backoff: HashMap::new(),
+        lan_peers: std::collections::HashSet::new(),
+        pending_demotions: HashMap::new(),
         diagnostics,
         protocol_mismatch_peers: std::collections::HashSet::new(),
         peer_via_relay: std::collections::HashMap::new(),
@@ -907,6 +934,14 @@ fn rejection_backoff(attempts: u32) -> Duration {
 /// the relay keep re-surfacing an unreachable peer. A successful connection
 /// clears the entry entirely (`clear_dial_backoff`), so this never penalises a
 /// peer that has recovered.
+/// Anti-thrash dwell before a relay connection is closed once a direct path to
+/// the peer comes up (#84 demotion). A DCUtR hole-punch can succeed and then
+/// drop seconds later; holding the relay open for this window lets the direct
+/// path prove it will hold before we pay to re-establish the relay. ~10s is
+/// inside Tailscale's published "keep the fallback warm, switch only when the
+/// new path is stable" guidance and well under a human-perceptible sync delay.
+const DEMOTION_DWELL: Duration = Duration::from_secs(10);
+
 fn peer_dial_backoff(prior_failures: u32) -> Duration {
     const BASE_SECS: u64 = 5;
     const COEF_SECS: u64 = 1;
@@ -1057,6 +1092,27 @@ struct EngineRunner {
     /// rendezvous) are exempt — their reconnect cadence is governed separately
     /// by `maybe_reconnect_relay`.
     pub(crate) peer_dial_backoff: HashMap<libp2p::PeerId, (u32, tokio::time::Instant)>,
+    /// Peers we have discovered on the local network via mDNS (their announced
+    /// address was RFC1918/link-local/ULA). For these we suppress relay-circuit
+    /// dials entirely — the LAN path is closer and more reliable than a circuit
+    /// (router hairpinning is often unsupported anyway). Populated on mDNS
+    /// `Discovered`, cleared on mDNS `Expired` and on full disconnect. See
+    /// [`EngineRunner::suppress_relay_dial`].
+    pub(crate) lan_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Relay connections scheduled for demotion once a freshly-established
+    /// direct path proves stable (anti-thrash dwell, #84). Maps a peer to the
+    /// instant the relay connection(s) may be closed and the ids to close.
+    /// Processed by [`EngineRunner::process_pending_demotions`] on the periodic
+    /// tick: if the direct path is still up at the deadline the relay is closed;
+    /// if it was lost in the meantime the demotion is cancelled and the relay
+    /// kept — preventing a teardown before a flaky DCUtR upgrade proves it holds.
+    pub(crate) pending_demotions: HashMap<
+        libp2p::PeerId,
+        (
+            tokio::time::Instant,
+            std::collections::HashSet<libp2p::swarm::ConnectionId>,
+        ),
+    >,
     /// Engine-wide diagnostics counters, shared with `WaveSyncDbInner`.
     /// All increments are `Relaxed` atomic ops on the hot path; readers
     /// (UI / debug panel / test assertions) snapshot via
@@ -1500,6 +1556,15 @@ impl EngineRunner {
         self.peer_via_relay.get(peer) == Some(&false)
     }
 
+    /// Whether to suppress relay-circuit dials to `peer`: either a direct
+    /// connection is already up (`prefers_direct`) or the peer was discovered on
+    /// the local network via mDNS (`lan_peers`) and should be reached over the
+    /// LAN. The mDNS case proactively avoids opening a circuit during the brief
+    /// window between LAN discovery and the direct connection establishing.
+    pub(crate) fn suppress_relay_dial(&self, peer: &libp2p::PeerId) -> bool {
+        self.prefers_direct(peer) || self.lan_peers.contains(peer)
+    }
+
     /// Deterministic single-closer rule for relay demotion: only the peer with
     /// the numerically smaller PeerId actively closes a redundant relay
     /// connection. A relay circuit is one shared connection, so a single close
@@ -1546,6 +1611,50 @@ impl EngineRunner {
         self.peer_dial_backoff.remove(peer);
     }
 
+    /// Close relay connections whose anti-thrash demotion dwell has elapsed,
+    /// provided the direct path that triggered the demotion is still up. If the
+    /// direct path was lost during the dwell, cancel the demotion and keep the
+    /// relay connection as the active path (restoring it to `relayed_conn_ids`
+    /// so a later direct path can demote it again). Called from the periodic
+    /// tick. See [`DEMOTION_DWELL`].
+    fn process_pending_demotions(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<libp2p::PeerId> = self
+            .pending_demotions
+            .iter()
+            .filter(|(_, (deadline, _))| *deadline <= now)
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in due {
+            let Some((_, ids)) = self.pending_demotions.remove(&peer) else {
+                continue;
+            };
+            if self.prefers_direct(&peer) && self.swarm.is_connected(&peer) {
+                let mut closed = 0u64;
+                for cid in &ids {
+                    if self.swarm.close_connection(*cid) {
+                        closed += 1;
+                    }
+                }
+                if closed > 0 {
+                    self.diagnostics
+                        .relay_connections_demoted
+                        .fetch_add(closed, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "Relay demotion: closed {closed} relay connection(s) to {peer} after dwell (direct path held)"
+                    );
+                }
+            } else {
+                // Direct path didn't hold — keep the relay as the active path and
+                // restore tracking so a future direct path can demote it again.
+                log::info!(
+                    "Relay demotion cancelled for {peer}: direct path did not hold during dwell; keeping relay"
+                );
+                self.relayed_conn_ids.entry(peer).or_default().extend(ids);
+            }
+        }
+    }
+
     /// Handle peer disconnection: clean up tracking, reconnect relay/rendezvous.
     fn handle_connection_closed(&mut self, peer_id: libp2p::PeerId, num_established: u32) {
         for g in self.groups.values_mut() {
@@ -1571,6 +1680,8 @@ impl EngineRunner {
         // re-dials" marker — see `prefers_direct` / `dialable_addrs_preferring_direct`.
         self.peer_via_relay.remove(&peer_id);
         self.relayed_conn_ids.remove(&peer_id);
+        self.lan_peers.remove(&peer_id);
+        self.pending_demotions.remove(&peer_id);
 
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
@@ -1863,6 +1974,10 @@ impl EngineRunner {
                     // one 5s timer keeps the wakeup count low (saves a
                     // bit of mobile battery vs. running two timers).
                     self.process_dcutr_retries();
+                    // Close relay connections whose demotion dwell has elapsed
+                    // (and the direct path held). Relay-only book-keeping, so it
+                    // belongs on the same has_relay tick.
+                    self.process_pending_demotions();
                     // Reconcile push-token registration against the current
                     // group set. Registration is otherwise only attempted at
                     // discrete moments (relay-connect, token set, join-while-
@@ -2513,33 +2628,28 @@ impl EngineRunner {
                         self.peers
                             .insert(peer_id, endpoint.get_remote_address().clone());
                         // DERP demotion (#84): a direct path to this peer just
-                        // came up (typically a DCUtR hole-punch). Close any
-                        // relay-carried connections so steady-state data leaves
-                        // the paid relay — it reverts to wake/fallback only.
-                        // In-flight requests on the closed connection fail and
-                        // self-heal via the push-redelivery (#81) + reconcile
-                        // paths, so this is safe to do immediately. Only the
-                        // lower-PeerId peer actively closes (see
-                        // `should_demote_locally`); the other end keeps the ids
-                        // tracked and prunes them on the resulting
-                        // ConnectionClosed / full disconnect.
+                        // came up (typically a DCUtR hole-punch). Schedule the
+                        // relay-carried connection(s) for close after an
+                        // anti-thrash dwell (process_pending_demotions) rather
+                        // than closing immediately — a DCUtR upgrade can be flaky
+                        // and drop right after establishing, and tearing the relay
+                        // down instantly would force an immediate, costly
+                        // re-reservation. If the direct path is still up at the
+                        // deadline the relay is closed; otherwise the demotion is
+                        // cancelled and the relay kept. Only the lower-PeerId peer
+                        // schedules the active close (see `should_demote_locally`);
+                        // the other end keeps the ids tracked and prunes on the
+                        // resulting ConnectionClosed / full disconnect.
                         if self.should_demote_locally(&peer_id)
                             && let Some(ids) = self.relayed_conn_ids.remove(&peer_id)
+                            && !ids.is_empty()
                         {
-                            let mut closed = 0u64;
-                            for cid in ids {
-                                if self.swarm.close_connection(cid) {
-                                    closed += 1;
-                                }
-                            }
-                            if closed > 0 {
-                                self.diagnostics
-                                    .relay_connections_demoted
-                                    .fetch_add(closed, std::sync::atomic::Ordering::Relaxed);
-                                log::info!(
-                                    "Relay demotion: closed {closed} relay connection(s) to {peer_id} now that a direct path exists"
-                                );
-                            }
+                            let deadline = tokio::time::Instant::now() + DEMOTION_DWELL;
+                            self.pending_demotions.insert(peer_id, (deadline, ids));
+                            log::debug!(
+                                "Relay demotion scheduled for {peer_id} in ~{}s (direct path just came up)",
+                                DEMOTION_DWELL.as_secs()
+                            );
                         }
                     }
 
@@ -2584,6 +2694,14 @@ impl EngineRunner {
                     ids.remove(&connection_id);
                     if ids.is_empty() {
                         self.relayed_conn_ids.remove(&peer_id);
+                    }
+                }
+                // Also prune it from any pending (dwelling) demotion so a relay
+                // connection that closed on its own isn't "closed" again later.
+                if let Some((_, ids)) = self.pending_demotions.get_mut(&peer_id) {
+                    ids.remove(&connection_id);
+                    if ids.is_empty() {
+                        self.pending_demotions.remove(&peer_id);
                     }
                 }
                 self.handle_connection_closed(peer_id, num_established);
@@ -2995,6 +3113,40 @@ mod tests {
             let d = rejection_backoff(a);
             assert!(d >= prev, "backoff must be non-decreasing");
             prev = d;
+        }
+    }
+
+    #[test]
+    fn addr_is_lan_classifies_local_vs_public() {
+        let lan = [
+            "/ip4/192.168.1.150/udp/4001/quic-v1",
+            "/ip4/10.0.0.5/tcp/4001",
+            "/ip4/172.16.3.4/tcp/4001",
+            "/ip4/169.254.1.1/tcp/4001",        // link-local
+            "/ip4/127.0.0.1/tcp/4001",          // loopback
+            "/ip6/fd00::abcd/udp/4001/quic-v1", // ULA
+            "/ip6/fe80::1/tcp/4001",            // link-local
+            "/ip6/::1/tcp/4001",                // loopback
+        ];
+        for s in lan {
+            assert!(
+                addr_is_lan(&s.parse().unwrap()),
+                "{s} should be classified LAN"
+            );
+        }
+        let public = [
+            "/ip4/77.37.125.212/udp/4001/quic-v1",
+            "/ip4/8.8.8.8/tcp/4001",
+            "/ip6/2606:4700::1/tcp/4001",
+            // A circuit address's first IP literal is the relay's public IP →
+            // not LAN (and circuit addrs are filtered separately anyway).
+            "/ip4/77.37.125.212/tcp/4001/p2p/12D3KooWFnxFFxCm5ywp5j2WhBV4HbtCLDDh1jAr1QYa3xMtkAy3/p2p-circuit",
+        ];
+        for s in public {
+            assert!(
+                !addr_is_lan(&s.parse().unwrap()),
+                "{s} should NOT be classified LAN"
+            );
         }
     }
 

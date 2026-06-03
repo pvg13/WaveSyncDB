@@ -325,7 +325,7 @@ impl EngineRunner {
                         && !self.swarm.is_connected(&peer)
                         && !self.dialing_peers.contains(&peer)
                         && self.dial_backoff_ok(&peer)
-                        && !(addr_is_relayed(&addr) && self.prefers_direct(&peer))
+                        && !(addr_is_relayed(&addr) && self.suppress_relay_dial(&peer))
                     {
                         log::info!("Re-dialing {peer} after outbound failure");
                         let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)

@@ -703,7 +703,7 @@ impl EngineRunner {
         // re-opens a circuit that the demotion logic immediately closes — an
         // establish→close→redial loop that exhausts the relay's per-peer circuit
         // cap. See `dialable_addrs_preferring_direct`.
-        let addrs = dialable_addrs_preferring_direct(addrs, self.prefers_direct(&peer_id));
+        let addrs = dialable_addrs_preferring_direct(addrs, self.suppress_relay_dial(&peer_id));
 
         if addrs.is_empty() {
             log::debug!(
