@@ -1328,36 +1328,39 @@ async fn apply_changeset_chunk<'a>(
             };
             // `column_values` feeds both the reactive-hook fast path and the
             // SyncNotify row reconstruction. A catch-up path (RBSR, #82) can
-            // deliver a row's columns across several changesets, so the columns
-            // in this batch may be only a subset of the row. When the table has a
-            // notification policy, read the committed full row so `on_sync`
-            // always sees a complete model regardless of how the cells were
-            // batched; otherwise keep just the applied columns (the hook only
-            // needs the delta).
+            // deliver a row's columns across several changesets, so this batch
+            // may carry only a subset of the row. When the table has a
+            // notification policy, use the committed full row as a base so
+            // `on_sync` sees a complete model regardless of how the cells were
+            // batched — BUT the changeset's own values must win where present:
+            // they carry correct JSON types (e.g. booleans as `true`/`false`),
+            // whereas a generic `json_object` read returns SQLite-typed values
+            // (booleans as `0`/`1`) that fail typed deserialization and would
+            // make `wavesync_from_changes` — and thus the notification — return
+            // None. Merge: full row first, then overlay the changeset values.
             let column_values: Option<Vec<(crate::ColumnName, serde_json::Value)>> = if is_delete {
                 None
             } else {
-                let full_row = if notify.is_some_and(|ctx| ctx.registry.has(table)) {
+                let mut merged: std::collections::BTreeMap<String, serde_json::Value> =
+                    std::collections::BTreeMap::new();
+                if notify.is_some_and(|ctx| ctx.registry.has(table)) {
                     // Read from the open transaction so we see the just-applied
                     // (not-yet-committed) row state.
-                    read_row_values(&txn, table, &meta, pk).await
-                } else {
-                    Vec::new()
-                };
-                if !full_row.is_empty() {
-                    Some(
-                        full_row
-                            .into_iter()
-                            .map(|(c, v)| (crate::ColumnName(c), v))
-                            .collect(),
-                    )
-                } else if changed_pairs.is_empty() {
+                    for (c, v) in read_row_values(&txn, table, &meta, pk).await {
+                        merged.insert(c, v);
+                    }
+                }
+                // Overlay the changeset's correctly-typed values (these win).
+                for (c, v) in &changed_pairs {
+                    merged.insert(c.clone(), v.clone());
+                }
+                if merged.is_empty() {
                     None
                 } else {
                     Some(
-                        changed_pairs
-                            .iter()
-                            .map(|(c, v)| (crate::ColumnName(c.clone()), v.clone()))
+                        merged
+                            .into_iter()
+                            .map(|(c, v)| (crate::ColumnName(c), v))
                             .collect(),
                     )
                 }
@@ -1963,6 +1966,119 @@ mod tests {
             "a subset-of-columns changeset must still notify (full row read from committed state)"
         );
         assert_eq!(got.unwrap().body, "Hello");
+    }
+
+    /// REGRESSION — a `bool` column must not break notification reconstruction.
+    ///
+    /// SQLite stores booleans as integers `0/1`, so the full-row read used to
+    /// rebuild the typed model returns them as JSON numbers. Typed
+    /// deserialization (`wavesync_from_changes`) of a `bool` field then fails on
+    /// `0/1`, `on_sync` gets `row = None`, and the notification is silently
+    /// dropped — exactly what broke notifications for `grocery_item`
+    /// (`checked`/`is_recurring`). The changeset carries the correctly-typed
+    /// `true/false`, so the apply path must let the changeset value win over the
+    /// SQLite-typed full-row read.
+    #[tokio::test]
+    async fn notify_reconstructs_bool_column_from_changeset_value() {
+        struct Task {
+            id: String,
+            #[allow(dead_code)]
+            title: String,
+            done: bool,
+        }
+        impl crate::SyncedModel for Task {
+            fn wavesync_apply_change(&mut self, _c: &str, _v: &serde_json::Value) {}
+            fn wavesync_from_changes(
+                _pk_col: &str,
+                pk: &str,
+                changes: &[(String, serde_json::Value)],
+            ) -> Option<Self> {
+                let mut title = None;
+                let mut done = None;
+                for (c, v) in changes {
+                    match c.as_str() {
+                        "title" => title = v.as_str().map(str::to_string),
+                        // Strict bool deserialization — fails on JSON 0/1,
+                        // which is the crux of the regression.
+                        "done" => done = serde_json::from_value::<bool>(v.clone()).ok(),
+                        _ => {}
+                    }
+                }
+                Some(Task {
+                    id: pk.to_string(),
+                    title: title?,
+                    done: done?,
+                })
+            }
+            fn wavesync_pk_string(&self) -> String {
+                self.id.clone()
+            }
+        }
+        impl crate::SyncNotify for Task {
+            fn on_sync(ev: &crate::SyncEvent<Self>) -> Option<crate::Notification> {
+                ev.row
+                    .as_ref()
+                    .map(|t| crate::Notification::new("task", if t.done { "done" } else { "todo" }))
+            }
+        }
+
+        let (db, registry) = setup_engine_test_db().await;
+        let (change_tx, _crx) = broadcast::channel::<ChangeNotification>(16);
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        notif_registry.register("tasks".to_string(), crate::notify::make_dispatch::<Task>());
+        let (notif_tx, mut notif_rx) = broadcast::channel::<crate::Notification>(16);
+
+        // New row; `done` arrives as a proper JSON bool in the changeset but is
+        // stored in SQLite as integer 1 — the full-row read would surface it as
+        // `1`, which must not clobber the changeset's `true`.
+        let changes = vec![
+            ColumnChange {
+                table: "tasks".into(),
+                pk: "t1".into(),
+                cid: "title".into(),
+                val: Some(serde_json::json!("Hello")),
+                site_id: NodeId([7u8; 16]),
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+                db_version: 0,
+            },
+            ColumnChange {
+                table: "tasks".into(),
+                pk: "t1".into(),
+                cid: "done".into(),
+                val: Some(serde_json::json!(true)),
+                site_id: NodeId([7u8; 16]),
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+                db_version: 0,
+            },
+        ];
+
+        let ctx = NotifyCtx {
+            registry: &notif_registry,
+            tx: &notif_tx,
+        };
+        apply_remote_changeset(
+            &db,
+            &change_tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Remote {
+                peer_site: NodeId([9u8; 16]),
+            },
+            Some(ctx),
+        )
+        .await;
+
+        let got = notif_rx.try_recv();
+        assert!(
+            got.is_ok(),
+            "a bool column must reconstruct from the changeset's typed value, not the SQLite int"
+        );
+        assert_eq!(got.unwrap().body, "done");
     }
 
     /// REGRESSION — WSDB-PoC-1 (was: SQL injection via unsanitised `cid`).
