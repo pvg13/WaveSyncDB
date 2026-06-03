@@ -140,18 +140,15 @@ impl EngineRunner {
                     }
                     // Dial if not currently connected (handles both new peers and reconnections
                     // after network disruption where the peer is still in self.peers but the
-                    // TCP/QUIC connection is dead). Respect the per-peer dial backoff so an
-                    // unreachable peer that mDNS keeps re-announcing every query cycle isn't
-                    // re-dialed in a tight loop (anti-storm). Track the in-flight dial in
-                    // `dialing_peers` so a concurrent relay introduction doesn't open a
-                    // second (circuit) connection to the same peer.
-                    if !self.swarm.is_connected(&peer_id)
-                        && !self.dialing_peers.contains(&peer_id)
-                        && self.dial_backoff_ok(&peer_id)
-                    {
+                    // TCP/QUIC connection is dead). The LAN path is deliberately NOT gated by
+                    // `dialing_peers` or the dial backoff: mDNS reports several addresses per
+                    // peer (TCP+QUIC × interfaces) and libp2p races them, so de-duping here
+                    // would dial only the first (possibly unreachable) address and skip the
+                    // rest. mDNS is also not a storm vector — the backoff that guards the
+                    // relay/circuit paths is not needed for fast, local LAN reconnects.
+                    if !self.swarm.is_connected(&peer_id) {
                         match self.swarm.dial(multiaddr.clone()) {
                             Ok(()) => {
-                                self.dialing_peers.insert(peer_id);
                                 self.diagnostics
                                     .peer_dial_attempts
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
