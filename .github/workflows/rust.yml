@@ -26,3 +26,9 @@ jobs:
       run: cargo test -p wavesyncdb --lib -p wavesyncdb_derive -p wavesync_relay --verbose
     - name: Run integration tests
       run: cargo test -p wavesyncdb --test integration -- --test-threads=1
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Check browser (wasm32) build
+      run: cargo check -p wavesyncdb --features web --target wasm32-unknown-unknown
+    - name: Run web sync-core and web/native convergence tests
+      run: cargo test -p wavesyncdb --features web --test web_core --test web_native_convergence -- --test-threads=1
