@@ -351,3 +351,247 @@ async fn applied_changes_round_trip_through_catch_up() {
     let none = store.get_changes_since(1).await.unwrap();
     assert!(none.is_empty());
 }
+
+// ── delete semantics (mirrors native should_apply_delete + tombstones) ───
+
+use wavesyncdb::messages::DeletePolicy;
+use wavesyncdb::web_sync_core::{DELETED_COLUMN, WebTableConfig, submit_local_delete_core};
+
+fn delete_change(table: &str, pk: &str, site: NodeId, cl: u64) -> ColumnChange {
+    ColumnChange {
+        table: TableName(table.into()),
+        pk: PrimaryKey(pk.into()),
+        cid: ColumnName(DELETED_COLUMN.into()),
+        val: None,
+        site_id: site,
+        col_version: cl,
+        cl,
+        seq: 0,
+        db_version: 0,
+    }
+}
+
+fn cfg_with_policy(policy: DeletePolicy) -> WebSyncConfig {
+    WebSyncConfig::default().with_table(
+        "tasks",
+        WebTableConfig {
+            delete_policy: policy,
+            primary_key_column: Some("id".into()),
+        },
+    )
+}
+
+/// Seed a row with two columns at cv=1 (local max cv = 1).
+async fn seed_row(store: &MemoryStore) {
+    submit_local_write_core(
+        store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![
+            ("title".into(), serde_json::json!("t")),
+            ("done".into(), serde_json::json!(false)),
+        ],
+        1,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn remote_delete_with_higher_cl_wins_and_tombstones() {
+    let store = MemoryStore::new();
+    let cfg = cfg_with_policy(DeletePolicy::DeleteWins);
+    seed_row(&store).await; // local max cv = 1
+
+    let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 2)]);
+    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
+        .await
+        .unwrap();
+    assert_eq!(
+        applied.len(),
+        1,
+        "winning delete is surfaced to subscribers"
+    );
+    assert_eq!(applied[0].cid.0, DELETED_COLUMN);
+
+    // Per-column clock entries are gone; only the tombstone remains —
+    // mirrors native delete_clock_entries + insert_tombstone.
+    assert_eq!(store.row_entry_count("tasks", "p1"), 1);
+    let tomb = store
+        .get_shadow("tasks", "p1", DELETED_COLUMN)
+        .await
+        .unwrap()
+        .expect("tombstone written");
+    assert_eq!(tomb.val, None);
+    assert_eq!(tomb.col_version, 2);
+    assert_eq!(tomb.seq, 0);
+    assert_eq!(tomb.site_id, SITE_B.0);
+}
+
+#[tokio::test]
+async fn remote_delete_with_lower_cl_is_a_noop() {
+    let store = MemoryStore::new();
+    let cfg = cfg_with_policy(DeletePolicy::DeleteWins);
+    seed_row(&store).await;
+    // Bump title to cv=3 (local max cv = 3).
+    submit_local_write_core(
+        &store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![("title".into(), serde_json::json!("t2"))],
+        2,
+    )
+    .await
+    .unwrap();
+    submit_local_write_core(
+        &store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![("title".into(), serde_json::json!("t3"))],
+        3,
+    )
+    .await
+    .unwrap();
+
+    let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 2)]);
+    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 4, Some("peer-b"))
+        .await
+        .unwrap();
+    assert!(applied.is_empty(), "stale delete must not apply");
+    assert_eq!(store.row_entry_count("tasks", "p1"), 2, "row untouched");
+    assert!(
+        store
+            .get_shadow("tasks", "p1", DELETED_COLUMN)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn delete_tie_respects_policy() {
+    // Tie: delete cl == local max cv. DeleteWins applies it; AddWins keeps
+    // the row — mirrors native sync_handler AddWins-tie test.
+    for (policy, expect_deleted) in [
+        (DeletePolicy::DeleteWins, true),
+        (DeletePolicy::AddWins, false),
+    ] {
+        let store = MemoryStore::new();
+        let cfg = cfg_with_policy(policy.clone());
+        seed_row(&store).await; // local max cv = 1
+
+        let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 1)]);
+        let applied = apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
+            .await
+            .unwrap();
+        if expect_deleted {
+            assert_eq!(applied.len(), 1, "{policy:?}: tie should delete");
+            assert_eq!(store.row_entry_count("tasks", "p1"), 1, "tombstone only");
+        } else {
+            assert!(applied.is_empty(), "{policy:?}: tie should keep the row");
+            assert_eq!(store.row_entry_count("tasks", "p1"), 2, "row intact");
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_branch_skips_sibling_column_changes() {
+    // A changeset carrying both a delete and column changes for the same
+    // pk: only the delete branch runs (native sync_handler.rs:1332-1347).
+    let store = MemoryStore::new();
+    let cfg = cfg_with_policy(DeletePolicy::DeleteWins);
+    seed_row(&store).await;
+
+    let cs = changeset(
+        SITE_B,
+        9,
+        vec![
+            change(
+                "tasks",
+                "p1",
+                "title",
+                serde_json::json!("zombie"),
+                SITE_B,
+                5,
+            ),
+            delete_change("tasks", "p1", SITE_B, 5),
+        ],
+    );
+    apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
+        .await
+        .unwrap();
+
+    assert_eq!(store.row_entry_count("tasks", "p1"), 1, "tombstone only");
+    assert!(
+        store
+            .get_shadow("tasks", "p1", "title")
+            .await
+            .unwrap()
+            .is_none(),
+        "sibling column change must NOT survive a winning delete"
+    );
+}
+
+#[tokio::test]
+async fn local_delete_emits_native_shaped_tombstone() {
+    let store = MemoryStore::new();
+    seed_row(&store).await; // max cv = 1
+
+    let changes = submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
+        .await
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    let del = &changes[0];
+    assert_eq!(del.cid.0, DELETED_COLUMN);
+    assert_eq!(del.val, None);
+    assert_eq!(del.col_version, 2, "tombstone cv = max_cv + 1");
+    assert_eq!(del.cl, 2, "delete: cl == col_version");
+    assert_eq!(del.seq, 0);
+
+    // Native local delete leaves per-column clock entries in place (only
+    // the receiving side clears them when the delete wins there).
+    assert_eq!(store.row_entry_count("tasks", "p1"), 3);
+    assert!(
+        store
+            .get_shadow("tasks", "p1", DELETED_COLUMN)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn local_write_resurrects_tombstoned_row() {
+    let store = MemoryStore::new();
+    seed_row(&store).await;
+    submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
+        .await
+        .unwrap();
+
+    // Re-insert: tombstone cleared, per-column clocks continue (not reset).
+    let written = submit_local_write_core(
+        &store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![("title".into(), serde_json::json!("back"))],
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(
+        store
+            .get_shadow("tasks", "p1", DELETED_COLUMN)
+            .await
+            .unwrap()
+            .is_none(),
+        "tombstone cleared on resurrection"
+    );
+    assert_eq!(
+        written[0].col_version, 2,
+        "col_version continues from the pre-delete value"
+    );
+}

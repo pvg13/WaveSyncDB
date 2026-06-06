@@ -227,7 +227,7 @@ impl ShadowStore for EphemeralStore {
 /// broadcast — strictly after the batch committed.
 pub async fn apply_remote_changeset_core<S: ShadowStore>(
     store: &S,
-    _cfg: &WebSyncConfig,
+    cfg: &WebSyncConfig,
     changeset: &SyncChangeset,
     next_db_version: u64,
     peer_key: Option<&str>,
@@ -263,6 +263,40 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
             .await?
             .into_iter()
             .collect();
+
+        // A row-level delete is resolved against the row as a whole and —
+        // when present — runs INSTEAD of the row's column changes, exactly
+        // like the native apply path (sync_handler.rs:1332-1347): a winning
+        // delete supersedes sibling column changes in the same changeset, a
+        // losing delete leaves the row untouched.
+        if let Some(del) = row_changes.iter().find(|c| c.cid.0 == DELETED_COLUMN) {
+            let local_max_cv = local_entries
+                .values()
+                .map(|r| r.col_version)
+                .max()
+                .unwrap_or(0);
+            if conflict::should_apply_delete(del.cl, local_max_cv, &cfg.delete_policy_for(table)) {
+                // Clear every clock entry for the row, then write the
+                // tombstone — mirrors native delete_clock_entries +
+                // insert_tombstone (shadow.rs:613-673).
+                batch.row_deletes.push((table.clone(), pk.clone()));
+                batch.shadow_puts.push((
+                    table.clone(),
+                    pk.clone(),
+                    DELETED_COLUMN.to_string(),
+                    ShadowRow {
+                        val: None,
+                        site_id: del.site_id.0,
+                        col_version: del.col_version,
+                        cl: del.cl,
+                        seq: 0,
+                        db_version: next_db_version,
+                    },
+                ));
+                applied.push((*del).clone());
+            }
+            continue;
+        }
 
         for change in row_changes {
             let remote_val = match &change.val {
@@ -339,6 +373,15 @@ pub async fn submit_local_write_core<S: ShadowStore>(
         db_version: Some(next_db_version),
         ..Default::default()
     };
+    // An insert/update on a tombstoned pk resurrects the row: clear the
+    // tombstone but PRESERVE the per-column clock entries so col_versions
+    // continue from their previous values — mirrors native clear_tombstone
+    // (connection.rs:1039-1054).
+    if local_entries.contains_key(DELETED_COLUMN) {
+        batch
+            .tombstone_clears
+            .push((table.to_string(), pk.to_string()));
+    }
     let mut changes: Vec<ColumnChange> = Vec::with_capacity(columns.len());
 
     for (seq, (cid, val)) in columns.into_iter().enumerate() {
@@ -374,4 +417,60 @@ pub async fn submit_local_write_core<S: ShadowStore>(
 
     store.apply_batch(batch).await?;
     Ok(changes)
+}
+
+/// Record a local row deletion with native-parity tombstone semantics
+/// (connection.rs:983-1037): the tombstone's `col_version` (== its causal
+/// length `cl`) is one above the row's max `col_version`, so it beats every
+/// prior column write. Per-column clock entries are left in place — only a
+/// *receiving* peer clears them when the delete wins there.
+///
+/// Returns the single `__deleted` `ColumnChange` to fan out — only after
+/// the batch committed.
+pub async fn submit_local_delete_core<S: ShadowStore>(
+    store: &S,
+    site_id: &NodeId,
+    table: &str,
+    pk: &str,
+    next_db_version: u64,
+) -> Result<Vec<ColumnChange>, StoreError> {
+    let max_cv = store
+        .get_row_entries(table, pk)
+        .await?
+        .into_iter()
+        .map(|(_, r)| r.col_version)
+        .max()
+        .unwrap_or(0);
+    let tombstone_cv = max_cv + 1;
+
+    let batch = WriteBatch {
+        db_version: Some(next_db_version),
+        shadow_puts: vec![(
+            table.to_string(),
+            pk.to_string(),
+            DELETED_COLUMN.to_string(),
+            ShadowRow {
+                val: None,
+                site_id: site_id.0,
+                col_version: tombstone_cv,
+                cl: tombstone_cv,
+                seq: 0,
+                db_version: next_db_version,
+            },
+        )],
+        ..Default::default()
+    };
+    store.apply_batch(batch).await?;
+
+    Ok(vec![ColumnChange {
+        table: TableName(table.to_string()),
+        pk: PrimaryKey(pk.to_string()),
+        cid: ColumnName(DELETED_COLUMN.to_string()),
+        val: None,
+        site_id: *site_id,
+        col_version: tombstone_cv,
+        cl: tombstone_cv,
+        seq: 0,
+        db_version: next_db_version,
+    }])
 }

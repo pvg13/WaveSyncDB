@@ -29,19 +29,20 @@
 //! - **Local db_version** — incremented on every local write and persisted
 //!   so version-vector catch-up (when added) starts from the right place.
 //!
-//! ## What persistence does NOT cover (yet)
+//! ## What persistence does NOT cover
 //!
 //! - **Application data.** The browser app owns its own data store
 //!   (IndexedDB rows, in-memory state, etc.). The engine emits resolved
 //!   `ColumnChange` events via [`WebSyncClient::subscribe_resolved`]; the
 //!   app applies them.
-//! - **Version-vector catch-up.** Per-peer `last_db_version` is written
-//!   but never read on this branch; a future revision will add the
-//!   request/response side.
-//! - **Tombstones / deletes.** Local writes go through `submit_local_write`,
-//!   which is insert/update only. Apps that need deletes can build a
-//!   `SyncChangeset` with `__deleted` columns by hand and call
-//!   [`WebSyncClient::publish`].
+//!
+//! ## Deletes
+//!
+//! [`WebSyncClient::submit_local_delete`] writes a `__deleted` tombstone
+//! with native-parity causal-length semantics; incoming deletes are
+//! resolved through the same `should_apply_delete` + `DeletePolicy` logic
+//! the native engine uses (configure per-table policies via the
+//! `*_with_config` constructors so they match the native registry).
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -65,7 +66,8 @@ use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
 use crate::web_store::BrowserStore;
 use crate::web_sync_core::{
-    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, submit_local_write_core,
+    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, submit_local_delete_core,
+    submit_local_write_core,
 };
 
 // Re-use the native engine's snapshot codec — same wire format, same
@@ -354,6 +356,13 @@ enum Command {
         table: String,
         pk: String,
         columns: Vec<(String, serde_json::Value)>,
+        ack: oneshot::Sender<Result<u64, WebSyncError>>,
+    },
+    /// High-level local row deletion — engine writes a `__deleted`
+    /// tombstone (native-parity causal length), persists, then broadcasts.
+    SubmitLocalDelete {
+        table: String,
+        pk: String,
         ack: oneshot::Sender<Result<u64, WebSyncError>>,
     },
 }
@@ -916,6 +925,29 @@ impl WebSyncClient {
         rx.await.map_err(|_| WebSyncError::NotRunning)?
     }
 
+    /// High-level local row deletion.
+    ///
+    /// Writes a `__deleted` tombstone whose causal length is one above the
+    /// row's max `col_version` (so it beats every prior column write),
+    /// persists it atomically with the `db_version` bump, and broadcasts
+    /// the tombstone changeset to all connected peers. Receiving peers —
+    /// native or browser — resolve it through their delete policy
+    /// (`DeleteWins` by default; see
+    /// [`WebTableConfig`](crate::web_sync_core::WebTableConfig)).
+    ///
+    /// Returns the new `db_version`.
+    pub async fn submit_local_delete(&self, table: &str, pk: &str) -> Result<u64, WebSyncError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::SubmitLocalDelete {
+                table: table.to_string(),
+                pk: pk.to_string(),
+                ack: tx,
+            })
+            .map_err(|_| WebSyncError::NotRunning)?;
+        rx.await.map_err(|_| WebSyncError::NotRunning)?
+    }
+
     /// Type-safe wrapper around [`Self::submit_local_write`].
     ///
     /// Apps implement [`BrowserEntity`] for their domain types and call
@@ -1383,6 +1415,26 @@ async fn run_loopback(
                         .await;
                         let _ = ack.send(result);
                     }
+                    Some(Command::SubmitLocalDelete { table, pk, ack }) => {
+                        let result = match submit_local_delete_inner(&state, &table, &pk).await {
+                            Ok(changeset) => {
+                                let dv = changeset.db_version;
+                                let req = build_push_request(
+                                    &state.topic,
+                                    state.group_key.as_ref(),
+                                    changeset,
+                                );
+                                if link.is_online() {
+                                    let _ = end.out_tx.send(req);
+                                } else {
+                                    pending_out.push_back(req);
+                                }
+                                Ok(dv)
+                            }
+                            Err(e) => Err(e),
+                        };
+                        let _ = ack.send(result);
+                    }
                     None => {
                         log::info!("WebSyncClient (loopback): command channel closed");
                         return;
@@ -1818,6 +1870,10 @@ async fn run_swarm(
                         let result = handle_submit_local(&state, &mut swarm, &connected, table, pk, columns).await;
                         let _ = ack.send(result);
                     }
+                    Some(Command::SubmitLocalDelete { table, pk, ack }) => {
+                        let result = handle_submit_local_delete(&state, &mut swarm, &connected, table, pk).await;
+                        let _ = ack.send(result);
+                    }
                     None => {
                         log::info!("WebSyncClient: command channel closed, exiting");
                         return;
@@ -1952,6 +2008,52 @@ async fn submit_local_inner(
     })
 }
 
+/// Local row deletion through the shared sync core — same atomic /
+/// fail-closed shape as [`submit_local_inner`], producing the single
+/// `__deleted` tombstone change.
+async fn submit_local_delete_inner(
+    state: &EngineState,
+    table: &str,
+    pk: &str,
+) -> Result<SyncChangeset, WebSyncError> {
+    let next_db_version = {
+        let mut dv = state.db_version.lock().await;
+        *dv += 1;
+        *dv
+    };
+
+    let written = match &state.store {
+        Some(store) => {
+            submit_local_delete_core(store.as_ref(), &state.site_id, table, pk, next_db_version)
+                .await
+        }
+        None => {
+            submit_local_delete_core(&EphemeralStore, &state.site_id, table, pk, next_db_version)
+                .await
+        }
+    };
+    let changes = match written {
+        Ok(c) => c,
+        Err(e) => {
+            let mut dv = state.db_version.lock().await;
+            if *dv == next_db_version {
+                *dv -= 1;
+            }
+            return Err(WebSyncError::Store(e.to_string()));
+        }
+    };
+
+    for ch in &changes {
+        let _ = state.resolved_tx.send(ch.clone());
+    }
+
+    Ok(SyncChangeset {
+        site_id: state.site_id,
+        db_version: next_db_version,
+        changes,
+    })
+}
+
 async fn handle_submit_local(
     state: &EngineState,
     swarm: &mut Swarm<WebBehaviour>,
@@ -1961,8 +2063,29 @@ async fn handle_submit_local(
     columns: Vec<(String, serde_json::Value)>,
 ) -> Result<u64, WebSyncError> {
     let changeset = submit_local_inner(state, &table, &pk, columns).await?;
-    let new_db_version = changeset.db_version;
+    Ok(fan_out_push(state, swarm, connected, changeset))
+}
 
+async fn handle_submit_local_delete(
+    state: &EngineState,
+    swarm: &mut Swarm<WebBehaviour>,
+    connected: &HashSet<LibPeerId>,
+    table: String,
+    pk: String,
+) -> Result<u64, WebSyncError> {
+    let changeset = submit_local_delete_inner(state, &table, &pk).await?;
+    Ok(fan_out_push(state, swarm, connected, changeset))
+}
+
+/// Broadcast an already-committed changeset to every connected sync peer.
+/// Returns its `db_version` for the submit ack.
+fn fan_out_push(
+    state: &EngineState,
+    swarm: &mut Swarm<WebBehaviour>,
+    connected: &HashSet<LibPeerId>,
+    changeset: SyncChangeset,
+) -> u64 {
+    let new_db_version = changeset.db_version;
     let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
     let peers: Vec<LibPeerId> = connected.iter().copied().collect();
     log::info!(
@@ -1977,7 +2100,7 @@ async fn handle_submit_local(
             .send_request(peer, req.clone());
         log::debug!("WebSyncClient: send_request → peer {peer} req_id={id:?}");
     }
-    Ok(new_db_version)
+    new_db_version
 }
 
 async fn handle_event(
