@@ -45,6 +45,7 @@ pub mod diagnostics;
 pub mod messages;
 pub mod network_status;
 pub mod protocol;
+pub mod reconcile;
 pub mod registry;
 pub mod synced_model;
 pub mod synced_table;
