@@ -595,3 +595,183 @@ async fn local_write_resurrects_tombstoned_row() {
         "col_version continues from the pre-delete value"
     );
 }
+
+// ── reconciliation digest + range exchange (#82) ──────────────────────────
+
+use wavesyncdb::reconcile;
+use wavesyncdb::web_sync_core::{compute_store_digest, reconcile_range_step};
+
+#[tokio::test]
+async fn store_digest_matches_shared_core_and_excludes_pk_column() {
+    let store = MemoryStore::new();
+    let cfg = cfg_with_policy(DeletePolicy::DeleteWins);
+
+    // Write the PK column ("id") alongside data columns — like a browser
+    // app that mirrors the full row into the column bag.
+    submit_local_write_core(
+        &store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![
+            ("id".into(), serde_json::json!("p1")),
+            ("title".into(), serde_json::json!("hello")),
+        ],
+        1,
+    )
+    .await
+    .unwrap();
+
+    let digest = compute_store_digest(&store, &cfg).await.unwrap();
+
+    // Reference digest from the SAME shared core over the expected cells:
+    // the PK column cell is excluded, mirroring the native registry filter.
+    let cells = store.get_changes_since(0).await.unwrap();
+    assert_eq!(cells.len(), 2);
+    let expected: Vec<_> = cells.into_iter().filter(|c| c.cid.0 != "id").collect();
+    assert_eq!(expected.len(), 1);
+    assert_eq!(digest, reconcile::digest_cells(&expected));
+
+    // Without PK config nothing is excluded → different digest.
+    let digest_unfiltered = compute_store_digest(&store, &WebSyncConfig::default())
+        .await
+        .unwrap();
+    assert_ne!(digest, digest_unfiltered);
+}
+
+#[tokio::test]
+async fn equal_stores_produce_equal_digests_and_empty_range_reply() {
+    let cfg = WebSyncConfig::default();
+    let a = MemoryStore::new();
+    let b = MemoryStore::new();
+    for store in [&a, &b] {
+        for i in 0..40u32 {
+            // Same site + clocks on both stores = identical logical state.
+            let cs = changeset(
+                SITE_A,
+                i as u64 + 1,
+                vec![change(
+                    "tasks",
+                    &format!("p{i:04}"),
+                    "title",
+                    serde_json::json!(i),
+                    SITE_A,
+                    1,
+                )],
+            );
+            apply_remote_changeset_core(store, &cfg, &cs, i as u64 + 1, None)
+                .await
+                .unwrap();
+        }
+    }
+
+    let da = compute_store_digest(&a, &cfg).await.unwrap();
+    let db = compute_store_digest(&b, &cfg).await.unwrap();
+    assert_eq!(da, db, "identical stores must produce identical digests");
+
+    // A converged digest also means an initial range exchange terminates
+    // immediately: every fingerprint matches → empty reply.
+    let a_cells = store_cells(&a, &cfg).await;
+    let initial = reconcile::initial_entries(&a_cells);
+    let (reply, to_apply) = reconcile_range_step(&b, &cfg, &initial).await.unwrap();
+    assert!(reply.is_empty(), "converged peers exchange nothing");
+    assert!(to_apply.is_empty());
+}
+
+async fn store_cells(store: &MemoryStore, cfg: &WebSyncConfig) -> Vec<reconcile::LocalCell> {
+    let changes = store.get_changes_since(0).await.unwrap();
+    reconcile::sorted_cells_from_changes(changes, |t| cfg.pk_column_of(t))
+}
+
+#[tokio::test]
+async fn web_peers_reconcile_single_differing_cell_to_convergence() {
+    // Mirrors reconcile.rs's `reconciles_single_differing_value`, but over
+    // two real web stores with the apply path in the loop. One cell
+    // differs (same key, different value+cv); RBSR must find and repair it.
+    let cfg = WebSyncConfig::default();
+    let a = MemoryStore::new();
+    let b = MemoryStore::new();
+    let mut dv_a = 0u64;
+    let mut dv_b = 0u64;
+    for i in 0..60u32 {
+        let (cv_a, val_a) = if i == 42 { (2, "newer") } else { (1, "same") };
+        let cs_a = changeset(
+            SITE_A,
+            1,
+            vec![change(
+                "tasks",
+                &format!("p{i:04}"),
+                "title",
+                serde_json::json!(val_a),
+                SITE_A,
+                cv_a,
+            )],
+        );
+        dv_a += 1;
+        apply_remote_changeset_core(&a, &cfg, &cs_a, dv_a, None)
+            .await
+            .unwrap();
+
+        let cs_b = changeset(
+            SITE_A,
+            1,
+            vec![change(
+                "tasks",
+                &format!("p{i:04}"),
+                "title",
+                serde_json::json!("same"),
+                SITE_A,
+                1,
+            )],
+        );
+        dv_b += 1;
+        apply_remote_changeset_core(&b, &cfg, &cs_b, dv_b, None)
+            .await
+            .unwrap();
+    }
+    assert_ne!(
+        compute_store_digest(&a, &cfg).await.unwrap(),
+        compute_store_digest(&b, &cfg).await.unwrap()
+    );
+
+    // Drive the exchange: A initiates, both sides apply what they receive
+    // through the normal conflict-resolving path.
+    let mut msg = reconcile::initial_entries(&store_cells(&a, &cfg).await);
+    for _round in 0..32 {
+        let (b_reply, b_apply) = reconcile_range_step(&b, &cfg, &msg).await.unwrap();
+        if !b_apply.is_empty() {
+            dv_b += 1;
+            let cs = changeset(SITE_A, 0, b_apply);
+            apply_remote_changeset_core(&b, &cfg, &cs, dv_b, None)
+                .await
+                .unwrap();
+        }
+        if b_reply.is_empty() {
+            break;
+        }
+        let (a_reply, a_apply) = reconcile_range_step(&a, &cfg, &b_reply).await.unwrap();
+        if !a_apply.is_empty() {
+            dv_a += 1;
+            let cs = changeset(SITE_A, 0, a_apply);
+            apply_remote_changeset_core(&a, &cfg, &cs, dv_a, None)
+                .await
+                .unwrap();
+        }
+        if a_reply.is_empty() {
+            break;
+        }
+        msg = a_reply;
+    }
+
+    assert_eq!(
+        compute_store_digest(&a, &cfg).await.unwrap(),
+        compute_store_digest(&b, &cfg).await.unwrap(),
+        "range exchange must repair the differing cell — proven by digest equality"
+    );
+    let row_b = b
+        .get_shadow("tasks", "p0042", "title")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row_b.val, Some(serde_json::json!("newer")));
+}

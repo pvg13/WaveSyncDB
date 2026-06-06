@@ -44,6 +44,8 @@ use crate::conflict;
 use crate::messages::{
     ColumnChange, ColumnName, DeletePolicy, NodeId, PrimaryKey, SyncChangeset, TableName,
 };
+use crate::protocol::RangeEntry;
+use crate::reconcile;
 
 /// Sentinel column id marking a row tombstone — same constant as native.
 pub const DELETED_COLUMN: &str = "__deleted";
@@ -473,4 +475,50 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
         seq: 0,
         db_version: next_db_version,
     }])
+}
+
+// ── reconciliation (#82) ───────────────────────────────────────────────────
+
+/// Enumerate this store's reconciliation cells, sorted by key, with each
+/// table's PK column excluded per [`WebSyncConfig::pk_column_of`] —
+/// the browser counterpart of the native `enumerate_sorted_cells`
+/// (`engine/reconcile.rs`), built on the SAME shared fingerprint code, so
+/// equal logical state produces an equal digest across targets.
+pub async fn enumerate_store_cells<S: ShadowStore>(
+    store: &S,
+    cfg: &WebSyncConfig,
+) -> Result<Vec<reconcile::LocalCell>, StoreError> {
+    let changes = store.get_changes_since(0).await?;
+    Ok(reconcile::sorted_cells_from_changes(changes, |t| {
+        cfg.pk_column_of(t)
+    }))
+}
+
+/// The value-inclusive convergence digest of this store (XOR of every cell
+/// fingerprint). Equal to a native peer's `compute_group_digest` iff the
+/// two replicas hold identical data — THE convergence proof for the
+/// web↔native path.
+pub async fn compute_store_digest<S: ShadowStore>(
+    store: &S,
+    cfg: &WebSyncConfig,
+) -> Result<[u8; 32], StoreError> {
+    Ok(reconcile::range_fp(
+        &enumerate_store_cells(store, cfg).await?,
+    ))
+}
+
+/// Process one incoming `ReconcileRange` message against this store's
+/// cells via the shared [`reconcile::reconcile_step`].
+///
+/// Returns `(reply_entries, changes_to_apply)`. The caller applies
+/// `changes_to_apply` through the normal conflict-resolving apply path
+/// (do NOT advance any peer catch-up cursor for them — reconcile
+/// transfers carry the originator's clocks, not the peer's `db_version`).
+pub async fn reconcile_range_step<S: ShadowStore>(
+    store: &S,
+    cfg: &WebSyncConfig,
+    entries: &[RangeEntry],
+) -> Result<(Vec<RangeEntry>, Vec<ColumnChange>), StoreError> {
+    let cells = enumerate_store_cells(store, cfg).await?;
+    Ok(reconcile::reconcile_step(&cells, entries))
 }

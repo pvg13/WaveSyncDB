@@ -66,8 +66,8 @@ use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
 use crate::web_store::BrowserStore;
 use crate::web_sync_core::{
-    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, submit_local_delete_core,
-    submit_local_write_core,
+    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, compute_store_digest,
+    reconcile_range_step, submit_local_delete_core, submit_local_write_core,
 };
 
 // Re-use the native engine's snapshot codec — same wire format, same
@@ -1721,8 +1721,10 @@ async fn handle_loopback_request(
             // online flag, so we ignore.
         }
         SyncRequest::ReconcileDigest { .. } | SyncRequest::ReconcileRange { .. } => {
-            // Convergence-digest / range reconciliation (#82) is a native-engine
-            // feature; the loopback path has no peer to reconcile with.
+            // Reconciliation (#82) is handled on the real-network path
+            // (`handle_snapshot_event`); the loopback transport collapses
+            // request-response onto a one-way channel, has no native peer
+            // on the other end, and stays converged via the version-vector.
         }
     }
 }
@@ -1734,7 +1736,7 @@ async fn apply_remote_changeset_loopback(
     peer: &str,
     changeset: &SyncChangeset,
 ) {
-    apply_remote_changeset_inner(state, peer, changeset).await;
+    apply_remote_changeset_inner(state, Some(peer), changeset).await;
 }
 
 /// Apply an incoming changeset through the shared sync core
@@ -1752,9 +1754,12 @@ async fn apply_remote_changeset_loopback(
 /// broadcast, the in-memory counter rolls back, and the peer cursor stays
 /// put, so the same data is re-requested by the next catch-up instead of
 /// being silently lost.
+/// `peer_key: None` applies the data WITHOUT advancing any peer's catch-up
+/// cursor — used for reconcile-transferred cells, whose changeset carries
+/// the originator's clocks rather than the sending peer's `db_version`.
 async fn apply_remote_changeset_inner(
     state: &EngineState,
-    peer_key: &str,
+    peer_key: Option<&str>,
     changeset: &SyncChangeset,
 ) {
     // Lamport receive rule: jump to max(local, remote), then one step for
@@ -1775,7 +1780,7 @@ async fn apply_remote_changeset_inner(
                 &state.config,
                 changeset,
                 next_db_version,
-                Some(peer_key),
+                peer_key,
             )
             .await
         }
@@ -2602,15 +2607,69 @@ async fn handle_snapshot_event(
                     .snapshot
                     .send_response(channel, SyncResponse::IdentityAck);
             }
-            SyncRequest::ReconcileDigest { .. } => {
-                // The browser engine doesn't compute reconciliation digests
-                // (#82). Reply "diverged" with a zero digest so the native peer
-                // falls back to the version-vector catch-up (which web supports).
-                // Signed when a passphrase is configured (Rule 2.7) so native
-                // accepts the response.
+            SyncRequest::ReconcileDigest {
+                digest: remote_digest,
+                topic: req_topic,
+                hmac,
+            } => {
+                // Convergence-digest exchange (#82). The digest is computed
+                // by the SAME shared fingerprint code the native engine
+                // uses (`crate::reconcile`), so converged here means
+                // *proven identical* with the native peer — which then
+                // marks this client reconcile-capable and stops both the
+                // periodic digest chatter and the redundant version-vector.
+                if req_topic != state.topic {
+                    log::debug!(
+                        "WebSyncClient: dropping ReconcileDigest from {peer} — topic mismatch"
+                    );
+                    return;
+                }
+                if let Some(gk) = &state.group_key {
+                    let verify = SyncRequest::ReconcileDigest {
+                        digest: remote_digest,
+                        topic: req_topic.clone(),
+                        hmac: None,
+                    };
+                    let bytes = match serde_json::to_vec(&verify) {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let tag = match hmac {
+                        Some(t) => t,
+                        None => {
+                            log::debug!(
+                                "WebSyncClient: dropping ReconcileDigest from {peer} — missing HMAC"
+                            );
+                            return;
+                        }
+                    };
+                    if !gk.verify(&bytes, &tag) {
+                        log::debug!(
+                            "WebSyncClient: dropping ReconcileDigest from {peer} — bad HMAC"
+                        );
+                        return;
+                    }
+                }
+
+                let local_digest = match &state.store {
+                    Some(store) => {
+                        match compute_store_digest(store.as_ref(), &state.config).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                log::warn!("WebSyncClient: digest computation failed: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    None => compute_store_digest(&EphemeralStore, &state.config)
+                        .await
+                        .unwrap_or([0u8; 32]),
+                };
+                let converged = local_digest == remote_digest;
+                log::debug!("WebSyncClient: ReconcileDigest from {peer} → converged={converged}");
                 let mut resp = SyncResponse::ReconcileResult {
-                    converged: false,
-                    digest: [0u8; 32],
+                    converged,
+                    digest: local_digest,
                     topic: state.topic.clone(),
                     hmac: None,
                 };
@@ -2624,14 +2683,75 @@ async fn handle_snapshot_event(
                 }
                 let _ = swarm.behaviour_mut().snapshot.send_response(channel, resp);
             }
-            SyncRequest::ReconcileRange { .. } => {
-                // The browser engine doesn't run range reconciliation (#82).
-                // Reply with an empty result so the native peer's exchange ends
-                // immediately; native never marks web reconcile-capable (only a
-                // *converged digest* does that, and web always answers digests
-                // 'diverged'), so web↔native sync stays on the version-vector.
+            SyncRequest::ReconcileRange {
+                entries,
+                site_id: remote_site,
+                topic: req_topic,
+                hmac,
+            } => {
+                // Recursive range reconciliation (#82): drop converged
+                // ranges, split/itemize mismatching ones, apply cells the
+                // peer transferred — all via the shared `reconcile` core.
+                if req_topic != state.topic {
+                    log::debug!(
+                        "WebSyncClient: dropping ReconcileRange from {peer} — topic mismatch"
+                    );
+                    return;
+                }
+                if let Some(gk) = &state.group_key {
+                    let verify = SyncRequest::ReconcileRange {
+                        entries: entries.clone(),
+                        site_id: remote_site,
+                        topic: req_topic.clone(),
+                        hmac: None,
+                    };
+                    let bytes = match serde_json::to_vec(&verify) {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    };
+                    let tag = match hmac {
+                        Some(t) => t,
+                        None => {
+                            log::debug!(
+                                "WebSyncClient: dropping ReconcileRange from {peer} — missing HMAC"
+                            );
+                            return;
+                        }
+                    };
+                    if !gk.verify(&bytes, &tag) {
+                        log::debug!(
+                            "WebSyncClient: dropping ReconcileRange from {peer} — bad HMAC"
+                        );
+                        return;
+                    }
+                }
+
+                let step = match &state.store {
+                    Some(store) => {
+                        reconcile_range_step(store.as_ref(), &state.config, &entries).await
+                    }
+                    None => reconcile_range_step(&EphemeralStore, &state.config, &entries).await,
+                };
+                let (reply, to_apply) = match step {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("WebSyncClient: reconcile range step failed: {e}");
+                        return;
+                    }
+                };
+                if !to_apply.is_empty() {
+                    // Reconcile transfers carry the originator's clocks —
+                    // apply through the normal conflict path WITHOUT
+                    // advancing the peer's catch-up cursor.
+                    let cs = SyncChangeset {
+                        site_id: remote_site,
+                        db_version: 0,
+                        changes: to_apply,
+                    };
+                    apply_remote_changeset_inner(state, None, &cs).await;
+                }
                 let mut resp = SyncResponse::ReconcileRangeResult {
-                    entries: Vec::new(),
+                    entries: reply,
                     site_id: state.site_id,
                     topic: state.topic.clone(),
                     hmac: None,
@@ -2751,7 +2871,7 @@ async fn handle_snapshot_event(
 /// and emitted unchanged, since there is no local state to compare.
 /// Swarm alias for [`apply_remote_changeset_inner`].
 async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset: &SyncChangeset) {
-    apply_remote_changeset_inner(state, &peer.to_string(), changeset).await;
+    apply_remote_changeset_inner(state, Some(&peer.to_string()), changeset).await;
 }
 
 fn build_push_request(
