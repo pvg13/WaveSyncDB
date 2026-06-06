@@ -55,13 +55,11 @@ const META_KEYPAIR: &str = "keypair";
 /// missing stores so older databases migrate forward without losing data.
 const SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("indexeddb error: {0}")]
-    Idb(String),
-    #[error("serde error: {0}")]
-    Serde(String),
-}
+// The error and shadow-row types are defined in the target-independent
+// `web_sync_core` (so the sync logic is testable on native) and re-exported
+// here to keep the established `web_store::{ShadowRow, StoreError}` paths.
+use crate::web_sync_core::{DELETED_COLUMN, ShadowStore};
+pub use crate::web_sync_core::{ShadowRow, StoreError, WriteBatch};
 
 impl From<IdbError> for StoreError {
     fn from(e: IdbError) -> Self {
@@ -75,21 +73,6 @@ impl From<IdbError> for StoreError {
 pub struct ResolvedRow {
     pub pk: String,
     pub columns: std::collections::HashMap<String, serde_json::Value>,
-}
-
-/// One persisted shadow-table row — the per-(table, pk, cid) Lamport state.
-///
-/// The shape mirrors `shadow::ShadowRow` on native, except `val` is JSON
-/// (browser doesn't have SQLite blob types) and field types use plain
-/// integers for IndexedDB-friendly serialization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShadowRow {
-    pub val: Option<serde_json::Value>,
-    pub site_id: [u8; 16],
-    pub col_version: u64,
-    pub cl: u64,
-    pub seq: u32,
-    pub db_version: u64,
 }
 
 /// Async-friendly handle to the IndexedDB-backed store.
@@ -261,6 +244,102 @@ impl BrowserStore {
         let js_val =
             serde_wasm_bindgen::to_value(row).map_err(|e| StoreError::Serde(e.to_string()))?;
         store.put(&js_val, Some(&JsValue::from_str(&key)))?.await?;
+        tx.commit()?.await?;
+        Ok(())
+    }
+
+    /// Every shadow entry for `(table, pk)` as `(cid, row)` pairs — the
+    /// browser analogue of native `shadow::get_clock_entries_for_row`.
+    /// Uses an IndexedDB key range over the `"<table>|<pk>|"` prefix, same
+    /// sentinel trick as [`Self::list_table_rows`].
+    pub async fn row_entries(
+        &self,
+        table: &str,
+        pk: &str,
+    ) -> Result<Vec<(String, ShadowRow)>, StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_SHADOW], TransactionMode::ReadOnly)?;
+        let store = tx.object_store(STORE_SHADOW)?;
+        let lower = JsValue::from_str(&format!("{table}|{pk}|"));
+        let upper = JsValue::from_str(&format!("{table}|{pk}|\u{ffff}"));
+        let range = KeyRange::bound(&lower, &upper, None, None)?;
+        let q = Query::from(range);
+        let keys: Vec<JsValue> = store.get_all_keys(Some(q.clone()), None)?.await?;
+        let values: Vec<JsValue> = store.get_all(Some(q), None)?.await?;
+        tx.commit()?.await?;
+
+        let mut out = Vec::with_capacity(keys.len());
+        for (k_js, v_js) in keys.into_iter().zip(values.into_iter()) {
+            let key = match k_js.as_string() {
+                Some(s) => s,
+                None => continue,
+            };
+            let parts: Vec<&str> = key.splitn(3, '|').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let row: ShadowRow = serde_wasm_bindgen::from_value(v_js)
+                .map_err(|e| StoreError::Serde(e.to_string()))?;
+            out.push((parts[2].to_string(), row));
+        }
+        Ok(out)
+    }
+
+    /// Apply one logical write's mutations in a SINGLE IndexedDB
+    /// transaction across the `meta`, `shadow`, and `peer_versions`
+    /// stores — they all commit or none do.
+    ///
+    /// This is the only write path the sync engine uses. Splitting it into
+    /// per-store transactions (the historical behavior) left a window
+    /// where `db_version` was durably advanced past shadow rows that never
+    /// landed — a tab close mid-batch then silently un-synced that write
+    /// forever, because the catch-up cursor had already moved past it.
+    pub async fn batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.transaction(
+            &[STORE_META, STORE_SHADOW, STORE_PEER_VERSIONS],
+            TransactionMode::ReadWrite,
+        )?;
+        let shadow = tx.object_store(STORE_SHADOW)?;
+
+        // Row deletions first (a winning delete clears the row's clock
+        // entries before its tombstone upsert lands), then tombstone
+        // clears, then upserts, then the meta / cursor singletons.
+        for (table, pk) in &batch.row_deletes {
+            let lower = JsValue::from_str(&format!("{table}|{pk}|"));
+            let upper = JsValue::from_str(&format!("{table}|{pk}|\u{ffff}"));
+            let range = KeyRange::bound(&lower, &upper, None, None)?;
+            let keys: Vec<JsValue> = shadow.get_all_keys(Some(Query::from(range)), None)?.await?;
+            for k in keys {
+                shadow.delete(Query::from(k))?.await?;
+            }
+        }
+        for (table, pk) in &batch.tombstone_clears {
+            let key = shadow_key(table, pk, DELETED_COLUMN);
+            shadow.delete(Query::from(JsValue::from_str(&key)))?.await?;
+        }
+        for (table, pk, cid, row) in &batch.shadow_puts {
+            let key = shadow_key(table, pk, cid);
+            let js_val =
+                serde_wasm_bindgen::to_value(row).map_err(|e| StoreError::Serde(e.to_string()))?;
+            shadow.put(&js_val, Some(&JsValue::from_str(&key)))?.await?;
+        }
+        if let Some(v) = batch.db_version {
+            let meta = tx.object_store(STORE_META)?;
+            let js_val = serde_wasm_bindgen::to_value(&v.to_le_bytes().to_vec())
+                .map_err(|e| StoreError::Serde(e.to_string()))?;
+            meta.put(&js_val, Some(&JsValue::from_str(META_DB_VERSION)))?
+                .await?;
+        }
+        if let Some((peer, v)) = &batch.peer_version {
+            let pv = tx.object_store(STORE_PEER_VERSIONS)?;
+            let js_val =
+                serde_wasm_bindgen::to_value(v).map_err(|e| StoreError::Serde(e.to_string()))?;
+            pv.put(&js_val, Some(&JsValue::from_str(peer)))?.await?;
+        }
         tx.commit()?.await?;
         Ok(())
     }
@@ -629,6 +708,39 @@ impl BrowserStore {
         store.put(&js, Some(&JsValue::from_str(&key)))?.await?;
         tx.commit()?.await?;
         Ok(())
+    }
+}
+
+// The sync core drives all convergence-critical reads/writes through this
+// trait so the exact same logic is exercised natively against an in-memory
+// store in `tests/web_core.rs` / `tests/web_native_convergence.rs`.
+impl ShadowStore for BrowserStore {
+    async fn get_shadow(
+        &self,
+        table: &str,
+        pk: &str,
+        cid: &str,
+    ) -> Result<Option<ShadowRow>, StoreError> {
+        BrowserStore::get_shadow(self, table, pk, cid).await
+    }
+
+    async fn get_row_entries(
+        &self,
+        table: &str,
+        pk: &str,
+    ) -> Result<Vec<(String, ShadowRow)>, StoreError> {
+        BrowserStore::row_entries(self, table, pk).await
+    }
+
+    async fn get_changes_since(
+        &self,
+        since: u64,
+    ) -> Result<Vec<crate::messages::ColumnChange>, StoreError> {
+        BrowserStore::get_changes_since(self, since).await
+    }
+
+    async fn apply_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
+        BrowserStore::batch(self, batch).await
     }
 }
 

@@ -60,11 +60,13 @@ use libp2p::{
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
 
 use crate::auth::GroupKey;
-use crate::conflict;
-use crate::messages::{ColumnChange, ColumnName, NodeId, PrimaryKey, SyncChangeset, TableName};
+use crate::messages::{ColumnChange, NodeId, SyncChangeset};
 use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
-use crate::web_store::{BrowserStore, ShadowRow};
+use crate::web_store::BrowserStore;
+use crate::web_sync_core::{
+    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, submit_local_write_core,
+};
 
 // Re-use the native engine's snapshot codec — same wire format, same
 // protocol id. Cargo gates engine/* away from wasm32, so we cannot pull
@@ -433,12 +435,29 @@ impl WebSyncClient {
         user_topic: &str,
         passphrase: Option<&str>,
     ) -> Result<Self, WebSyncError> {
+        Self::connect_with_config(
+            peer_multiaddr,
+            user_topic,
+            passphrase,
+            WebSyncConfig::default(),
+        )
+    }
+
+    /// [`Self::connect`] with explicit per-table sync configuration
+    /// (delete policies, PK columns). See [`WebSyncConfig`].
+    pub fn connect_with_config(
+        peer_multiaddr: &str,
+        user_topic: &str,
+        passphrase: Option<&str>,
+        config: WebSyncConfig,
+    ) -> Result<Self, WebSyncError> {
         let keypair = identity::Keypair::generate_ed25519();
         let site_id = NodeId(rand_site_id());
         Self::start(
             peer_multiaddr,
             user_topic,
             passphrase,
+            config,
             keypair,
             site_id,
             0,
@@ -461,6 +480,25 @@ impl WebSyncClient {
         user_topic: &str,
         passphrase: Option<&str>,
         store_name: &str,
+    ) -> Result<Self, WebSyncError> {
+        Self::connect_persistent_with_config(
+            peer_multiaddr,
+            user_topic,
+            passphrase,
+            store_name,
+            WebSyncConfig::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_persistent`] with explicit per-table sync
+    /// configuration (delete policies, PK columns). See [`WebSyncConfig`].
+    pub async fn connect_persistent_with_config(
+        peer_multiaddr: &str,
+        user_topic: &str,
+        passphrase: Option<&str>,
+        store_name: &str,
+        config: WebSyncConfig,
     ) -> Result<Self, WebSyncError> {
         let store = BrowserStore::open(store_name)
             .await
@@ -511,6 +549,7 @@ impl WebSyncClient {
             peer_multiaddr,
             user_topic,
             passphrase,
+            config,
             keypair,
             site_id,
             db_version,
@@ -567,6 +606,25 @@ impl WebSyncClient {
         user_topic: &str,
         passphrase: Option<&str>,
         store_name: &str,
+    ) -> Result<Self, WebSyncError> {
+        Self::connect_via_relay_with_config(
+            relay_addr,
+            user_topic,
+            passphrase,
+            store_name,
+            WebSyncConfig::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_via_relay`] with explicit per-table sync
+    /// configuration (delete policies, PK columns). See [`WebSyncConfig`].
+    pub async fn connect_via_relay_with_config(
+        relay_addr: &str,
+        user_topic: &str,
+        passphrase: Option<&str>,
+        store_name: &str,
+        config: WebSyncConfig,
     ) -> Result<Self, WebSyncError> {
         // Parse the relay multiaddr early so we fail fast on malformed
         // input, and extract the peer-id so the engine can recognize
@@ -655,6 +713,7 @@ impl WebSyncClient {
             relay_addr,
             user_topic,
             passphrase,
+            config,
             keypair,
             site_id,
             db_version,
@@ -664,10 +723,12 @@ impl WebSyncClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         peer_multiaddr: &str,
         user_topic: &str,
         passphrase: Option<&str>,
+        config: WebSyncConfig,
         keypair: identity::Keypair,
         site_id: NodeId,
         db_version: u64,
@@ -793,6 +854,7 @@ impl WebSyncClient {
             db_version: Arc::new(Mutex::new(db_version)),
             topic: effective_topic,
             group_key,
+            config,
             store: store.clone(),
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
@@ -946,6 +1008,25 @@ impl WebSyncClient {
         passphrase: Option<&str>,
         store_name: &str,
     ) -> Result<Self, WebSyncError> {
+        Self::connect_loopback_with_config(
+            end,
+            user_topic,
+            passphrase,
+            store_name,
+            WebSyncConfig::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect_loopback`] with explicit per-table sync
+    /// configuration (delete policies, PK columns). See [`WebSyncConfig`].
+    pub async fn connect_loopback_with_config(
+        end: LoopbackEnd,
+        user_topic: &str,
+        passphrase: Option<&str>,
+        store_name: &str,
+        config: WebSyncConfig,
+    ) -> Result<Self, WebSyncError> {
         let store = BrowserStore::open(store_name)
             .await
             .map_err(|e| WebSyncError::Store(e.to_string()))?;
@@ -1024,6 +1105,7 @@ impl WebSyncClient {
             db_version: Arc::new(Mutex::new(db_version)),
             topic: effective_topic,
             group_key,
+            config,
             store: Some(store_arc.clone()),
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
@@ -1148,6 +1230,11 @@ struct EngineState {
     db_version: Arc<Mutex<u64>>,
     topic: String,
     group_key: Option<GroupKey>,
+    /// Per-table delete policies + PK column names. Defaults are correct
+    /// for tables that only ever insert/update; tables with deletes (or
+    /// reconcile digests against native peers) must be configured via the
+    /// `*_with_config` constructors to match the native registry.
+    config: WebSyncConfig,
     store: Option<Arc<BrowserStore>>,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
@@ -1443,79 +1530,11 @@ async fn handle_submit_local_loopback(
     pk: String,
     columns: Vec<(String, serde_json::Value)>,
 ) -> Result<u64, WebSyncError> {
-    // Mirrors handle_submit_local — bumps db_version, persists shadow per
-    // column, then ships the changeset. The only difference is the
-    // out-of-engine transport: a channel send instead of swarm.send_request.
-    let mut dv = state.db_version.lock().await;
-    *dv += 1;
-    let new_db_version = *dv;
-    if let Some(store) = &state.store {
-        store
-            .put_db_version(new_db_version)
-            .await
-            .map_err(|e| WebSyncError::Store(e.to_string()))?;
-    }
-    drop(dv);
-
-    let mut changes: Vec<ColumnChange> = Vec::with_capacity(columns.len());
-    for (seq, (cid, val)) in columns.into_iter().enumerate() {
-        let prev = if let Some(store) = &state.store {
-            store
-                .get_shadow(&table, &pk, &cid)
-                .await
-                .map_err(|e| WebSyncError::Store(e.to_string()))?
-        } else {
-            None
-        };
-        let next_col_version = prev.as_ref().map(|r| r.col_version + 1).unwrap_or(1);
-        let next_cl = prev
-            .as_ref()
-            .map(|r| r.cl.max(next_col_version))
-            .unwrap_or(next_col_version);
-
-        if let Some(store) = &state.store {
-            let row = ShadowRow {
-                val: Some(val.clone()),
-                site_id: state.site_id.0,
-                col_version: next_col_version,
-                cl: next_cl,
-                seq: seq as u32,
-                db_version: new_db_version,
-            };
-            store
-                .put_shadow(&table, &pk, &cid, &row)
-                .await
-                .map_err(|e| WebSyncError::Store(e.to_string()))?;
-        }
-
-        changes.push(ColumnChange {
-            table: TableName(table.clone()),
-            pk: PrimaryKey(pk.clone()),
-            cid: ColumnName(cid),
-            val: Some(val),
-            site_id: state.site_id,
-            col_version: next_col_version,
-            cl: next_cl,
-            seq: seq as u32,
-            db_version: new_db_version,
-        });
-    }
-
-    // Echo the local writes on resolved_tx so reactive subscribers
-    // (e.g. `dioxus::use_synced_table`) update their in-memory views
-    // for local edits the same way they do for remote ones. The shadow
-    // is already durably persisted; this is purely a wake-up for
-    // listeners. Lagged subscribers drop messages — fine, they'd
-    // re-materialize from the store on next mount.
-    for ch in &changes {
-        let _ = state.resolved_tx.send(ch.clone());
-    }
-
-    let changeset = SyncChangeset {
-        site_id: state.site_id,
-        db_version: new_db_version,
-        changes,
-    };
+    // Mirrors handle_submit_local — same shared core, the only difference
+    // is the out-of-engine transport: a channel send instead of
+    // swarm.send_request.
+    let changeset = submit_local_inner(state, &table, &pk, columns).await?;
+    let new_db_version = changeset.db_version;
 
     let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
     if link.is_online() {
@@ -1576,19 +1595,8 @@ async fn handle_loopback_request(
                     return;
                 }
             }
-            // Lamport bump — in loopback, catch-up responses arrive as
-            // Push (not ChangesetResponse), so the bump goes here.
-            {
-                let mut dv = state.db_version.lock().await;
-                if changeset.db_version > *dv {
-                    *dv = changeset.db_version;
-                    if let Some(store) = &state.store {
-                        if let Err(e) = store.put_db_version(*dv).await {
-                            log::warn!("loopback: Lamport bump persist failed: {e}");
-                        }
-                    }
-                }
-            }
+            // The Lamport max-bump happens inside the apply (committed
+            // atomically with the data) — no separate persist here.
             let _ = state.inbound_tx.send(changeset.clone());
             apply_remote_changeset_loopback(state, LOOPBACK_PEER_KEY, &changeset).await;
         }
@@ -1667,95 +1675,88 @@ async fn handle_loopback_request(
     }
 }
 
-/// Conflict-resolve every column change against persisted shadow state.
-/// Same logic as `apply_remote_changeset` but takes a string peer id
-/// (since loopback has no real `libp2p::PeerId`).
+/// Loopback alias for [`apply_remote_changeset_inner`] (loopback peers are
+/// identified by a string key, not a `libp2p::PeerId`).
 async fn apply_remote_changeset_loopback(
     state: &EngineState,
     peer: &str,
     changeset: &SyncChangeset,
 ) {
-    let store = match &state.store {
-        Some(s) => s,
-        None => {
-            for change in &changeset.changes {
-                let _ = state.resolved_tx.send(change.clone());
-            }
-            return;
-        }
-    };
+    apply_remote_changeset_inner(state, peer, changeset).await;
+}
 
-    let local_db_version = {
+/// Apply an incoming changeset through the shared sync core
+/// (`web_sync_core::apply_remote_changeset_core` — the same code paths the
+/// native-run parity tests exercise):
+///
+/// 1. Bump the local Lamport `db_version` once for the batch.
+/// 2. Conflict-resolve every change and commit the winners, the new
+///    `db_version`, and the peer's catch-up cursor in ONE atomic
+///    IndexedDB transaction.
+/// 3. Only after that commit, surface the winners on `resolved_tx`
+///    (notify-after-commit).
+///
+/// **Fail-closed:** on a store error nothing was persisted — nothing is
+/// broadcast, the in-memory counter rolls back, and the peer cursor stays
+/// put, so the same data is re-requested by the next catch-up instead of
+/// being silently lost.
+async fn apply_remote_changeset_inner(
+    state: &EngineState,
+    peer_key: &str,
+    changeset: &SyncChangeset,
+) {
+    // Lamport receive rule: jump to max(local, remote), then one step for
+    // this apply event. The new value is persisted inside the SAME atomic
+    // batch as the data (previously the max-bump was a separate
+    // transaction — one more partial-persistence window).
+    let (prev_db_version, next_db_version) = {
         let mut dv = state.db_version.lock().await;
-        *dv += 1;
-        let v = *dv;
-        if let Err(e) = store.put_db_version(v).await {
-            log::warn!("loopback: db_version persist failed: {e}");
-        }
-        v
+        let prev = *dv;
+        *dv = prev.max(changeset.db_version) + 1;
+        (prev, *dv)
     };
 
-    for change in &changeset.changes {
-        let local = match store
-            .get_shadow(&change.table.0, &change.pk.0, &change.cid.0)
+    let result = match &state.store {
+        Some(store) => {
+            apply_remote_changeset_core(
+                store.as_ref(),
+                &state.config,
+                changeset,
+                next_db_version,
+                Some(peer_key),
+            )
             .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("loopback: shadow read failed: {e}");
-                continue;
-            }
-        };
-
-        let remote_val = match &change.val {
-            Some(v) => serde_json::to_vec(v).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let (local_col_version, local_val_bytes, local_site_id) = match &local {
-            Some(r) => {
-                let bytes = r
-                    .val
-                    .as_ref()
-                    .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                    .unwrap_or_default();
-                (r.col_version, bytes, NodeId(r.site_id))
-            }
-            None => (0, Vec::new(), NodeId([0u8; 16])),
-        };
-
-        let apply = conflict::should_apply_column(
-            change.col_version,
-            &remote_val,
-            &change.site_id,
-            local_col_version,
-            &local_val_bytes,
-            &local_site_id,
-        );
-        if !apply {
-            continue;
         }
-
-        let new_row = ShadowRow {
-            val: change.val.clone(),
-            site_id: change.site_id.0,
-            col_version: change.col_version,
-            cl: change.cl,
-            seq: change.seq,
-            db_version: local_db_version,
-        };
-        if let Err(e) = store
-            .put_shadow(&change.table.0, &change.pk.0, &change.cid.0, &new_row)
+        // Ephemeral: empty local state, every change applies, nothing
+        // persists — same surface behavior as before persistence existed.
+        None => {
+            apply_remote_changeset_core(
+                &EphemeralStore,
+                &state.config,
+                changeset,
+                next_db_version,
+                None,
+            )
             .await
-        {
-            log::warn!("loopback: shadow write failed: {e}");
-            continue;
         }
+    };
 
-        let _ = state.resolved_tx.send(change.clone());
-    }
-
-    if let Err(e) = store.set_peer_version(peer, changeset.db_version).await {
-        log::debug!("loopback: peer_version write failed: {e}");
+    match result {
+        Ok(applied) => {
+            for change in applied {
+                let _ = state.resolved_tx.send(change);
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "WebSyncClient: changeset apply failed — nothing persisted, \
+                 peer cursor unchanged, will re-request on next catch-up: {e}"
+            );
+            let mut dv = state.db_version.lock().await;
+            if *dv == next_db_version {
+                *dv = prev_db_version;
+            }
+        }
     }
 }
 
@@ -1883,6 +1884,74 @@ async fn run_swarm(
     }
 }
 
+/// Record a local write through the shared sync core: one Lamport step,
+/// all column shadow rows + `db_version` committed in ONE atomic batch,
+/// winners echoed on `resolved_tx` only after the commit. Fail-closed: a
+/// store error persists nothing, broadcasts nothing, rolls the in-memory
+/// counter back, and surfaces the error to the caller.
+async fn submit_local_inner(
+    state: &EngineState,
+    table: &str,
+    pk: &str,
+    columns: Vec<(String, serde_json::Value)>,
+) -> Result<SyncChangeset, WebSyncError> {
+    // Bump db_version once for the whole batch — matches native semantics
+    // (every local write is exactly one `db_version` step).
+    let next_db_version = {
+        let mut dv = state.db_version.lock().await;
+        *dv += 1;
+        *dv
+    };
+
+    let written = match &state.store {
+        Some(store) => {
+            submit_local_write_core(
+                store.as_ref(),
+                &state.site_id,
+                table,
+                pk,
+                columns,
+                next_db_version,
+            )
+            .await
+        }
+        None => {
+            submit_local_write_core(
+                &EphemeralStore,
+                &state.site_id,
+                table,
+                pk,
+                columns,
+                next_db_version,
+            )
+            .await
+        }
+    };
+    let changes = match written {
+        Ok(c) => c,
+        Err(e) => {
+            let mut dv = state.db_version.lock().await;
+            if *dv == next_db_version {
+                *dv -= 1;
+            }
+            return Err(WebSyncError::Store(e.to_string()));
+        }
+    };
+
+    // Echo local writes on resolved_tx so reactive subscribers update
+    // for local edits the same way they do for remote ones. The batch is
+    // already durably committed; this is purely a wake-up for listeners.
+    for ch in &changes {
+        let _ = state.resolved_tx.send(ch.clone());
+    }
+
+    Ok(SyncChangeset {
+        site_id: state.site_id,
+        db_version: next_db_version,
+        changes,
+    })
+}
+
 async fn handle_submit_local(
     state: &EngineState,
     swarm: &mut Swarm<WebBehaviour>,
@@ -1891,76 +1960,8 @@ async fn handle_submit_local(
     pk: String,
     columns: Vec<(String, serde_json::Value)>,
 ) -> Result<u64, WebSyncError> {
-    // Bump db_version once for the whole batch — matches native semantics
-    // (every local write is exactly one `db_version` step).
-    let mut dv = state.db_version.lock().await;
-    *dv += 1;
-    let new_db_version = *dv;
-    if let Some(store) = &state.store {
-        store
-            .put_db_version(new_db_version)
-            .await
-            .map_err(|e| WebSyncError::Store(e.to_string()))?;
-    }
-    drop(dv);
-
-    let mut changes: Vec<ColumnChange> = Vec::with_capacity(columns.len());
-    for (seq, (cid, val)) in columns.into_iter().enumerate() {
-        // Look up current shadow → next col_version.
-        let prev = if let Some(store) = &state.store {
-            store
-                .get_shadow(&table, &pk, &cid)
-                .await
-                .map_err(|e| WebSyncError::Store(e.to_string()))?
-        } else {
-            None
-        };
-        let next_col_version = prev.as_ref().map(|r| r.col_version + 1).unwrap_or(1);
-        let next_cl = prev
-            .as_ref()
-            .map(|r| r.cl.max(next_col_version))
-            .unwrap_or(next_col_version);
-
-        if let Some(store) = &state.store {
-            let row = ShadowRow {
-                val: Some(val.clone()),
-                site_id: state.site_id.0,
-                col_version: next_col_version,
-                cl: next_cl,
-                seq: seq as u32,
-                db_version: new_db_version,
-            };
-            store
-                .put_shadow(&table, &pk, &cid, &row)
-                .await
-                .map_err(|e| WebSyncError::Store(e.to_string()))?;
-        }
-
-        changes.push(ColumnChange {
-            table: TableName(table.clone()),
-            pk: PrimaryKey(pk.clone()),
-            cid: ColumnName(cid),
-            val: Some(val),
-            site_id: state.site_id,
-            col_version: next_col_version,
-            cl: next_cl,
-            seq: seq as u32,
-            db_version: new_db_version,
-        });
-    }
-
-    // Echo local writes on resolved_tx so reactive subscribers update
-    // for local edits the same way they do for remote ones. See the
-    // matching block in `handle_submit_local_loopback`.
-    for ch in &changes {
-        let _ = state.resolved_tx.send(ch.clone());
-    }
-
-    let changeset = SyncChangeset {
-        site_id: state.site_id,
-        db_version: new_db_version,
-        changes,
-    };
+    let changeset = submit_local_inner(state, &table, &pk, columns).await?;
+    let new_db_version = changeset.db_version;
 
     let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
     let peers: Vec<LibPeerId> = connected.iter().copied().collect();
@@ -2588,21 +2589,9 @@ async fn handle_snapshot_event(
                     "WebSyncClient: received ChangesetResponse from {peer} with {} changes (their db_version={my_db_version})",
                     changes.len()
                 );
-                // Lamport bump — the peer's db_version may be ahead of
-                // ours. Mirrors native sync_handler.rs:118-136. Must
-                // happen BEFORE apply_remote_changeset so the increment
-                // inside it starts from the correct base.
-                {
-                    let mut dv = state.db_version.lock().await;
-                    if my_db_version > *dv {
-                        *dv = my_db_version;
-                        if let Some(store) = &state.store {
-                            if let Err(e) = store.put_db_version(*dv).await {
-                                log::warn!("WebSyncClient: Lamport bump persist failed: {e}");
-                            }
-                        }
-                    }
-                }
+                // The Lamport max-bump against the peer's db_version
+                // happens inside the apply, committed atomically with the
+                // data (mirrors native sync_handler.rs:118-136 semantics).
                 let changeset = SyncChangeset {
                     site_id: peer_site_id,
                     db_version: my_db_version,
@@ -2637,97 +2626,9 @@ async fn handle_snapshot_event(
 /// data side — browser apps own that and apply via `subscribe_resolved`.
 /// On ephemeral clients (no store), every change is treated as a winner
 /// and emitted unchanged, since there is no local state to compare.
+/// Swarm alias for [`apply_remote_changeset_inner`].
 async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset: &SyncChangeset) {
-    let store = match &state.store {
-        Some(s) => s,
-        None => {
-            // Ephemeral: surface every change as resolved.
-            for change in &changeset.changes {
-                let _ = state.resolved_tx.send(change.clone());
-            }
-            return;
-        }
-    };
-
-    // Increment local db_version once for the batch — mirrors native
-    // `shadow::increment_db_version` (sync_handler.rs:538-546). Shadow
-    // rows must carry the LOCAL engine's version so `get_changes_since`
-    // returns a coherent monotonic sequence for catch-up responses.
-    let local_db_version = {
-        let mut dv = state.db_version.lock().await;
-        *dv += 1;
-        let v = *dv;
-        if let Err(e) = store.put_db_version(v).await {
-            log::warn!("WebSyncClient: db_version persist failed: {e}");
-        }
-        v
-    };
-
-    for change in &changeset.changes {
-        let local = match store
-            .get_shadow(&change.table.0, &change.pk.0, &change.cid.0)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("WebSyncClient: shadow read failed: {e}");
-                continue;
-            }
-        };
-
-        let remote_val = match &change.val {
-            Some(v) => serde_json::to_vec(v).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let (local_col_version, local_val_bytes, local_site_id) = match &local {
-            Some(r) => {
-                let bytes = r
-                    .val
-                    .as_ref()
-                    .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                    .unwrap_or_default();
-                (r.col_version, bytes, NodeId(r.site_id))
-            }
-            None => (0, Vec::new(), NodeId([0u8; 16])),
-        };
-
-        let apply = conflict::should_apply_column(
-            change.col_version,
-            &remote_val,
-            &change.site_id,
-            local_col_version,
-            &local_val_bytes,
-            &local_site_id,
-        );
-        if !apply {
-            continue;
-        }
-
-        let new_row = ShadowRow {
-            val: change.val.clone(),
-            site_id: change.site_id.0,
-            col_version: change.col_version,
-            cl: change.cl,
-            seq: change.seq,
-            db_version: local_db_version,
-        };
-        if let Err(e) = store
-            .put_shadow(&change.table.0, &change.pk.0, &change.cid.0, &new_row)
-            .await
-        {
-            log::warn!("WebSyncClient: shadow write failed: {e}");
-            continue;
-        }
-
-        let _ = state.resolved_tx.send(change.clone());
-    }
-
-    if let Err(e) = store
-        .set_peer_version(&peer.to_string(), changeset.db_version)
-        .await
-    {
-        log::debug!("WebSyncClient: peer_version write failed: {e}");
-    }
+    apply_remote_changeset_inner(state, &peer.to_string(), changeset).await;
 }
 
 fn build_push_request(

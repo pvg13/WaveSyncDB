@@ -50,6 +50,13 @@ pub mod registry;
 pub mod synced_model;
 pub mod synced_table;
 
+// Target-independent core of the browser sync engine: conflict application,
+// delete semantics, and digest enumeration over a small store trait. Compiled
+// on native under `--features web` so its semantics are testable (and proven
+// against the native engine) in plain `cargo test`; wasm32 always gets it.
+#[cfg(any(feature = "web", target_arch = "wasm32"))]
+pub mod web_sync_core;
+
 // Native-only modules: anything that touches sea-orm (SQLite), libp2p
 // transports, tokio I/O, the local filesystem, or platform FFI. The
 // browser/wasm32 build skips all of these — a future browser sync path

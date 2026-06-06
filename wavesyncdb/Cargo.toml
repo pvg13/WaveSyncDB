@@ -104,6 +104,13 @@ env_logger = "0.11"
 # the `derive` feature on the main crate.
 wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.3.0" }
 
+# Browser-sync-core tests run on native against an in-memory store; they need
+# the `web` feature to compile `web_sync_core`, so gate the binaries on it
+# instead of failing when the default feature set is tested.
+[[test]]
+name = "web_core"
+required-features = ["web"]
+
 [features]
 default = []
 derive = ["dep:wavesyncdb_derive"]
