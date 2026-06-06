@@ -111,6 +111,10 @@ wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.3.0" }
 name = "web_core"
 required-features = ["web"]
 
+[[test]]
+name = "web_native_convergence"
+required-features = ["web"]
+
 [features]
 default = []
 derive = ["dep:wavesyncdb_derive"]

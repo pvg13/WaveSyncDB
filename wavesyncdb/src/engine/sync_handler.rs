@@ -1226,12 +1226,15 @@ const CHANGESET_CHUNK_SIZE: usize = 50;
 /// applied. Bundled so the apply functions take one optional parameter; `None`
 /// in unit tests and whenever no `#[derive(SyncNotify)]` policy is registered.
 #[derive(Clone, Copy)]
-pub(super) struct NotifyCtx<'a> {
+pub struct NotifyCtx<'a> {
     pub registry: &'a crate::registry::NotificationRegistry,
     pub tx: &'a broadcast::Sender<crate::notify::Notification>,
 }
 
-pub(super) async fn apply_remote_changeset(
+// `pub` (reachable only through the hidden `engine::convergence` re-export)
+// so the cross-implementation convergence test suite can push changesets
+// through the real native apply path.
+pub async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
     registry: &TableRegistry,

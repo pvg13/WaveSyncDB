@@ -775,3 +775,52 @@ async fn web_peers_reconcile_single_differing_cell_to_convergence() {
         .unwrap();
     assert_eq!(row_b.val, Some(serde_json::json!("newer")));
 }
+
+// ── enumeration visibility: tombstoned rows hide their stale cells ────────
+
+use wavesyncdb::web_sync_core::changes_since_core;
+
+#[tokio::test]
+async fn tombstoned_row_exposes_only_its_tombstone() {
+    // Native's get_changes_since LEFT JOINs the user table, so a deleted
+    // row's stale per-column clock entries vanish from catch-up responses
+    // and digests (shadow.rs:585-587 skips val-less cells). The web store
+    // has no user table — the equivalent rule is: a pk with a __deleted
+    // entry exposes ONLY the tombstone. Without this, the deleter's stale
+    // cells leak into web digests and changesets that native peers would
+    // never produce, and web↔native digests can never match after a delete.
+    let store = MemoryStore::new();
+    seed_row(&store).await; // title + done at cv=1
+    submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
+        .await
+        .unwrap();
+
+    // Raw store still holds the stale cells (native keeps them too —
+    // clock continuity for resurrection)...
+    assert_eq!(store.row_entry_count("tasks", "p1"), 3);
+
+    // ...but the sync-visible view is the tombstone alone.
+    let visible = changes_since_core(&store, 0).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].cid.0, DELETED_COLUMN);
+
+    // And the digest sees exactly the same view.
+    let cfg = WebSyncConfig::default();
+    let digest = compute_store_digest(&store, &cfg).await.unwrap();
+    assert_eq!(digest, reconcile::digest_cells(&visible));
+
+    // Resurrection makes the cells visible again (tombstone cleared).
+    submit_local_write_core(
+        &store,
+        &SITE_A,
+        "tasks",
+        "p1",
+        vec![("title".into(), serde_json::json!("back"))],
+        3,
+    )
+    .await
+    .unwrap();
+    let visible = changes_since_core(&store, 0).await.unwrap();
+    assert!(visible.iter().all(|c| c.cid.0 != DELETED_COLUMN));
+    assert_eq!(visible.len(), 2, "title + done visible again");
+}

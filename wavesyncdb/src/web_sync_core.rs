@@ -477,6 +477,41 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
     }])
 }
 
+/// The sync-visible changes of this store since `since` — the browser
+/// counterpart of native `shadow::get_changes_since`.
+///
+/// Native LEFT JOINs the user table, so a deleted row's stale per-column
+/// clock entries produce no value and are skipped (shadow.rs); only the
+/// tombstone flows. The web store has no user table, so the equivalent
+/// rule is applied here: a pk with a `__deleted` entry exposes ONLY its
+/// tombstone. The stale cells stay in the store (clock continuity for
+/// resurrection — same reason native keeps them) but never reach catch-up
+/// responses or digests. Without this filter, web digests and changesets
+/// would include cells no native peer ever produces.
+pub async fn changes_since_core<S: ShadowStore>(
+    store: &S,
+    since: u64,
+) -> Result<Vec<ColumnChange>, StoreError> {
+    // Full scan, then window-filter: the tombstone that hides a cell may
+    // live outside the `since` window, so visibility must be computed over
+    // the whole store. (The underlying store scan is full-table anyway.)
+    let all = store.get_changes_since(0).await?;
+    let tombstoned: std::collections::HashSet<(&str, &str)> = all
+        .iter()
+        .filter(|c| c.cid.0 == DELETED_COLUMN)
+        .map(|c| (c.table.0.as_str(), c.pk.0.as_str()))
+        .collect();
+    Ok(all
+        .iter()
+        .filter(|c| {
+            c.db_version > since
+                && (c.cid.0 == DELETED_COLUMN
+                    || !tombstoned.contains(&(c.table.0.as_str(), c.pk.0.as_str())))
+        })
+        .cloned()
+        .collect())
+}
+
 // ── reconciliation (#82) ───────────────────────────────────────────────────
 
 /// Enumerate this store's reconciliation cells, sorted by key, with each
@@ -488,7 +523,7 @@ pub async fn enumerate_store_cells<S: ShadowStore>(
     store: &S,
     cfg: &WebSyncConfig,
 ) -> Result<Vec<reconcile::LocalCell>, StoreError> {
-    let changes = store.get_changes_since(0).await?;
+    let changes = changes_since_core(store, 0).await?;
     Ok(reconcile::sorted_cells_from_changes(changes, |t| {
         cfg.pk_column_of(t)
     }))

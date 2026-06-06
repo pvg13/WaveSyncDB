@@ -22,6 +22,19 @@ pub(crate) mod relay_manager;
 pub(crate) mod snapshot_protocol;
 pub(crate) mod sync_handler;
 
+/// Cross-implementation convergence checks — hidden test support, not a
+/// stable API.
+///
+/// The web↔native convergence suite (`tests/web_native_convergence.rs`)
+/// drives changesets through the REAL native apply path and compares the
+/// native group digest against a browser store's digest. Both re-exports
+/// are crate-internal otherwise; this module is the only public doorway.
+#[doc(hidden)]
+pub mod convergence {
+    pub use super::reconcile::compute_group_digest;
+    pub use super::sync_handler::apply_remote_changeset;
+}
+
 use sync_handler::apply_remote_changeset;
 
 use std::collections::{HashMap, VecDeque};

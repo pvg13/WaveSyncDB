@@ -66,8 +66,8 @@ use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
 use crate::web_store::BrowserStore;
 use crate::web_sync_core::{
-    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, compute_store_digest,
-    reconcile_range_step, submit_local_delete_core, submit_local_write_core,
+    EphemeralStore, WebSyncConfig, apply_remote_changeset_core, changes_since_core,
+    compute_store_digest, reconcile_range_step, submit_local_delete_core, submit_local_write_core,
 };
 
 // Re-use the native engine's snapshot codec — same wire format, same
@@ -1688,12 +1688,13 @@ async fn handle_loopback_request(
                 }
             }
 
-            // Build catch-up changeset from local shadow.
+            // Build catch-up changeset from local shadow (tombstoned rows
+            // expose only their tombstone, mirroring native's JOIN view).
             let store = match &state.store {
                 Some(s) => s,
                 None => return, // ephemeral clients have nothing to send
             };
-            let changes = match store.get_changes_since(since).await {
+            let changes = match changes_since_core(store.as_ref(), since).await {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn!("loopback: catch-up scan failed: {e}");
@@ -2554,8 +2555,10 @@ async fn handle_snapshot_event(
                     }
                 }
 
+                // Tombstoned rows expose only their tombstone — same view a
+                // native peer's user-table JOIN produces.
                 let changes: Vec<ColumnChange> = match &state.store {
-                    Some(store) => match store.get_changes_since(since).await {
+                    Some(store) => match changes_since_core(store.as_ref(), since).await {
                         Ok(c) => c,
                         Err(e) => {
                             log::warn!("WebSyncClient: catch-up scan failed: {e}");

@@ -26,6 +26,9 @@ pub struct MemoryStore {
     inner: Mutex<Inner>,
 }
 
+// Each test binary compiles this module independently, so helpers used by
+// one suite look dead in another.
+#[allow(dead_code)]
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()

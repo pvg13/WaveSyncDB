@@ -29,9 +29,8 @@ pub(super) async fn enumerate_sorted_cells(
 
 /// The single value-inclusive convergence digest for one group (XOR of every
 /// cell fingerprint). Equal across two peers iff their data is byte-identical.
-pub(super) async fn compute_group_digest(
-    db: &DatabaseConnection,
-    registry: &TableRegistry,
-) -> [u8; 32] {
+/// (`pub` so the cross-implementation convergence test suite can compare it
+/// against a browser store's digest — see `engine::convergence`.)
+pub async fn compute_group_digest(db: &DatabaseConnection, registry: &TableRegistry) -> [u8; 32] {
     range_fp(&enumerate_sorted_cells(db, registry).await)
 }
