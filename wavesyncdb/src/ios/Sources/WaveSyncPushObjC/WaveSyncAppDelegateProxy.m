@@ -37,6 +37,10 @@
 extern void wavesync_push_bridge_did_register(const void *device_token);
 extern void wavesync_push_bridge_did_fail(const void *error);
 extern void wavesync_push_bridge_did_receive(const void *user_info, const void *completion_wrapper);
+// Installs the foreground-notification presentation delegate (no-op if the host
+// app already set its own). Must run on the main thread; the caller below is
+// already on the main queue at DidFinishLaunching.
+extern void wavesync_install_notification_delegate(void);
 
 #pragma mark - Swizzled method implementations
 
@@ -127,6 +131,14 @@ static void dispatch_cold_start_notification(UIApplication *application, NSDicti
 
 static void install_delegate_methods(NSNotification *note) {
     UIApplication *application = note.object;
+
+    // Opt foreground notifications into banner display. iOS suppresses banners
+    // while the app is active unless the notification center has a delegate; set
+    // it now (on the main thread) so the first sync notification is never missed.
+    // This is independent of APNs delegate injection, so do it before the
+    // app-delegate guard below.
+    wavesync_install_notification_delegate();
+
     id <UIApplicationDelegate> delegate = application.delegate;
     if (delegate == nil) {
         NSLog(@"[WaveSync] No UIApplicationDelegate found at DidFinishLaunching — "

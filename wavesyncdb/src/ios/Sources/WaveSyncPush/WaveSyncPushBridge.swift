@@ -24,6 +24,51 @@ public func wavesync_push_bridge_did_fail(_ errorPtr: UnsafeRawPointer?) {
           error.localizedDescription)
 }
 
+/// Minimal `UNUserNotificationCenterDelegate` that opts foreground
+/// notifications into banner + sound presentation.
+///
+/// iOS suppresses notification banners while the app is in the foreground
+/// unless the notification center has a delegate whose `willPresent` callback
+/// returns presentation options. Without this, locally-posted sync
+/// notifications (e.g. "Ana added milk") are silently queued and never shown
+/// while the user has the app open.
+private final class WaveSyncNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = WaveSyncNotificationDelegate()
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+}
+
+/// Install the foreground-presentation delegate on the shared notification
+/// center, unless the host app has already set its own.
+///
+/// Called from the ObjC AppDelegate proxy at `UIApplicationDidFinishLaunching`
+/// (already on the main thread) so the delegate is set before the first sync
+/// notification can arrive. Setting it this early means even the very first
+/// foreground notification presents as a banner.
+///
+/// The `delegate == nil` guard makes this a no-op when the host app installs
+/// its own `UNUserNotificationCenterDelegate` — we never clobber it.
+@_cdecl("wavesync_install_notification_delegate")
+public func wavesync_install_notification_delegate() {
+    let install = {
+        let center = UNUserNotificationCenter.current()
+        if center.delegate == nil {
+            center.delegate = WaveSyncNotificationDelegate.shared
+        }
+    }
+    if Thread.isMainThread {
+        install()
+    } else {
+        DispatchQueue.main.async(execute: install)
+    }
+}
+
 /// Show a local user notification for an incoming synced change.
 ///
 /// Called from Rust (the `use_sync_notifications` Dioxus hook) via `dlsym`. The
