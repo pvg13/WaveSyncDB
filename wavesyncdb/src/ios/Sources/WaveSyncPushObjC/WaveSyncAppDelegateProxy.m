@@ -41,6 +41,10 @@ extern void wavesync_push_bridge_did_receive(const void *user_info, const void *
 // app already set its own). Must run on the main thread; the caller below is
 // already on the main queue at DidFinishLaunching.
 extern void wavesync_install_notification_delegate(void);
+// Requests notification authorization (idempotent — iOS prompts only once).
+// Called before registerForRemoteNotifications so silent pushes to a killed,
+// never-authorized app aren't throttled by iOS.
+extern void wavesync_request_push_authorization(void);
 
 #pragma mark - Swizzled method implementations
 
@@ -168,6 +172,13 @@ static void install_delegate_methods(NSNotification *note) {
 
     // Cold-start push payload, if any.
     dispatch_cold_start_notification(application, note.userInfo);
+
+    // Request notification authorization before registering. iOS throttles
+    // silent (content-available) pushes to an app the user has never authorized
+    // — exactly the killed-app background-sync wake path — so prompt here. The
+    // call is async and does not gate registration; it's idempotent (iOS only
+    // prompts once).
+    wavesync_request_push_authorization();
 
     // Ask iOS for a device token. The swizzled `didRegister…` handler will fire
     // asynchronously once APNs responds.

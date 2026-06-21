@@ -69,6 +69,29 @@ public func wavesync_install_notification_delegate() {
     }
 }
 
+/// Request user authorization for notifications at launch.
+///
+/// iOS heavily throttles silent (`content-available`) pushes to an app the user
+/// has never authorized for notifications — especially when the app is killed,
+/// which is exactly the background-sync wake path. Requesting authorization
+/// early (idempotently — iOS caches the choice and only prompts once) keeps that
+/// wake reliable, and also lets the locally-posted sync notifications display.
+///
+/// Called from the ObjC AppDelegate proxy at `UIApplicationDidFinishLaunching`,
+/// just before `registerForRemoteNotifications`. The request itself is async and
+/// does not block registration; silent pushes work regardless of the prompt's
+/// outcome, but an authorized app is not throttled.
+@_cdecl("wavesync_request_push_authorization")
+public func wavesync_request_push_authorization() {
+    UNUserNotificationCenter.current()
+        .requestAuthorization(options: [.alert, .sound, .badge]) { _, error in
+            if let error = error {
+                NSLog("[WaveSync] Push authorization request error: %@",
+                      error.localizedDescription)
+            }
+        }
+}
+
 /// Show a local user notification for an incoming synced change.
 ///
 /// Called from Rust (the `use_sync_notifications` Dioxus hook) via `dlsym`. The

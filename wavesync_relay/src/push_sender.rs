@@ -295,12 +295,24 @@ impl PushSender {
             "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
         });
 
+        // Retain the wake for 10 minutes. Without `apns-expiration`, APNs uses
+        // expiry 0 = "deliver now or discard"; combined with `apns-priority: 5`
+        // (throttled background delivery), a device that's asleep/offline at
+        // send time would never get woken. A future expiry makes APNs store and
+        // retry, which is what the "wake a killed device" use case needs.
+        let expiration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+
         match self
             .client
             .post(&url)
             .bearer_auth(&jwt)
             .header("apns-push-type", "background")
             .header("apns-priority", "5")
+            .header("apns-expiration", expiration.to_string())
             .header("apns-topic", &apns.bundle_id)
             .json(&body)
             .send()
