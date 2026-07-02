@@ -10,7 +10,7 @@ use super::auth_protocol::{
     AUTH_CHALLENGE_PROTOCOL, AUTH_RESULT_PROTOCOL, AuthChallengeCodec, AuthResultCodec,
 };
 use super::push_protocol::{PUSH_PROTOCOL, PushCodec};
-use super::snapshot_protocol::{SNAPSHOT_PROTOCOL, SnapshotCodec};
+use super::snapshot_protocol::{SNAPSHOT_PROTOCOLS, SnapshotCodec};
 
 #[derive(NetworkBehaviour)]
 pub struct WaveSyncBehaviour {
@@ -93,7 +93,11 @@ impl WaveSyncBehaviour {
         let rendezvous_behaviour = rendezvous::client::Behaviour::new(key.clone());
 
         let snapshot_behaviour = request_response::Behaviour::new(
-            [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
+            // Advertise the whole ladder (newest first) so request-response
+            // negotiates the best common rung with each peer.
+            SNAPSHOT_PROTOCOLS
+                .iter()
+                .map(|p| (p.clone(), request_response::ProtocolSupport::Full)),
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         );
 

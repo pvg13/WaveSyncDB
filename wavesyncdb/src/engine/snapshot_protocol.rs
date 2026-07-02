@@ -11,8 +11,33 @@ use libp2p::request_response;
 
 use crate::protocol::{SyncRequest, SyncResponse};
 
-/// Protocol identifier for the sync protocol.
+/// Protocol identifier for the sync protocol (current / newest rung).
 pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/3.0.0");
+
+/// The supported sync-protocol ladder, **newest first**. libp2p's request-response
+/// negotiates the newest identifier both peers advertise per stream, turning what
+/// used to be an all-or-nothing single identifier into a version-negotiation
+/// ladder: a future breaking change adds its new id at the front here (and bumps
+/// the wire format behind it) while keeping the old rung for a transition window,
+/// so mixed-version fleets keep syncing on the common rung instead of failing
+/// silently (see CLAUDE.md §5). Today it is a single rung — behaviourally
+/// identical to advertising `SNAPSHOT_PROTOCOL` alone.
+pub const SNAPSHOT_PROTOCOLS: &[StreamProtocol] = &[SNAPSHOT_PROTOCOL];
+
+/// Given the protocol identifiers a peer advertises (via libp2p identify),
+/// return the newest ladder rung both sides support as its index into
+/// [`SNAPSHOT_PROTOCOLS`] (0 = newest), or `None` if the peer advertises none of
+/// our sync protocols — i.e. it cannot do version-vector sync with us at all
+/// (a different application, or a version whose transition window has closed).
+pub fn negotiate_snapshot_protocol<'a>(
+    peer_protocols: impl IntoIterator<Item = &'a str>,
+) -> Option<usize> {
+    let advertised: std::collections::HashSet<&str> = peer_protocols.into_iter().collect();
+    // Newest-first order means the first match is the best common rung.
+    SNAPSHOT_PROTOCOLS
+        .iter()
+        .position(|p| advertised.contains(p.as_ref()))
+}
 
 /// Codec for serializing/deserializing sync messages.
 #[derive(Debug, Clone, Default)]
@@ -209,5 +234,34 @@ mod tests {
         let result = codec.read_request(&protocol, &mut reader).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_negotiate_matches_current_rung() {
+        // A peer advertising our current protocol (amongst unrelated ones)
+        // negotiates the newest rung (index 0).
+        assert_eq!(SNAPSHOT_PROTOCOL.as_ref(), "/wavesync/snapshot/3.0.0");
+        let peer = [
+            "/ipfs/id/1.0.0",
+            "/wavesync/snapshot/3.0.0",
+            "/wavesync/push/1.0.0",
+        ];
+        assert_eq!(negotiate_snapshot_protocol(peer), Some(0));
+    }
+
+    #[test]
+    fn test_negotiate_no_common_protocol() {
+        // A peer that advertises no wavesync sync protocol (different app, or a
+        // version past the transition window) cannot sync with us.
+        let peer = ["/ipfs/id/1.0.0", "/some/other/app/2.0.0"];
+        assert_eq!(negotiate_snapshot_protocol(peer), None);
+    }
+
+    #[test]
+    fn test_negotiate_prefers_newest_common() {
+        // Newest-first selection: with the current single rung plus a hypothetical
+        // older one the peer also advertises, the newest (index 0) wins.
+        let peer = ["/wavesync/snapshot/3.0.0", "/wavesync/snapshot/2.0.0"];
+        assert_eq!(negotiate_snapshot_protocol(peer), Some(0));
     }
 }
