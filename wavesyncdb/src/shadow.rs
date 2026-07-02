@@ -403,12 +403,20 @@ pub async fn upsert_clock_entries_batch(
     columns: &[(String, u32)], // (cid, seq)
     db_version: u64,
     site_id: &NodeId,
+    // Lower bound on the resulting col_version. Pass 0 for a normal write. On a
+    // local re-insert after a *won* delete, pass `tombstone.cl + 1` so the revived
+    // cells outrank the tombstone that a DeleteWins peer still holds — otherwise
+    // the re-insert lands exactly at `cl` (a tie the peer's delete wins) and the
+    // row diverges. See N8 / the resurrection-floor note in `connection.rs`.
+    floor: u64,
 ) -> Result<std::collections::HashMap<String, u64>, DbErr> {
     if columns.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
 
     let shadow_name = format!("_wavesync_{}_clock", table);
+    // Initial col_version for a brand-new (pk, cid): at least 1, at least the floor.
+    let initial_cv = 1u64.max(floor) as i64;
 
     // Build the multi-row VALUES clause with positional placeholders.
     let mut placeholders = String::new();
@@ -430,24 +438,26 @@ pub async fn upsert_clock_entries_batch(
         values.push(pk.into());
         values.push(cid.clone().into());
         // Initial col_version for new (pk, cid) pairs. The ON CONFLICT
-        // branch overrides this with `existing.col_version + 1`.
-        values.push(1i64.into());
+        // branch overrides this with `max(existing + 1, floor)`.
+        values.push(initial_cv.into());
         values.push((db_version as i64).into());
         values.push(site_id.0.to_vec().into());
         values.push((*seq as i32).into());
     }
 
+    // `floor` is a validated u64 (never remote-controlled), safe to inline.
     let sql = format!(
         r#"INSERT INTO "{shadow}" (pk, cid, col_version, db_version, site_id, seq)
            VALUES {values}
            ON CONFLICT(pk, cid) DO UPDATE SET
-               col_version = "{shadow}".col_version + 1,
+               col_version = MAX("{shadow}".col_version + 1, {floor}),
                db_version = excluded.db_version,
                site_id    = excluded.site_id,
                seq        = excluded.seq
            RETURNING cid, col_version"#,
         shadow = shadow_name,
         values = placeholders,
+        floor = floor,
     );
 
     #[derive(Debug, FromQueryResult)]
@@ -631,6 +641,33 @@ pub async fn insert_tombstone(
     .await
 }
 
+/// Read the causal length (`col_version`) of a row's `__deleted` tombstone, if
+/// one is present. Used by the remote apply path to decide whether an incoming
+/// column change provably outlives a local delete (and thus must clear it).
+pub async fn get_tombstone_cl(
+    db: &impl ConnectionTrait,
+    table: &str,
+    pk: &str,
+) -> Result<Option<u64>, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct Cl {
+        col_version: i64,
+    }
+    let shadow_name = format!("_wavesync_{}_clock", table);
+    let sql = format!(
+        "SELECT col_version FROM \"{}\" WHERE pk = $1 AND cid = '__deleted'",
+        shadow_name
+    );
+    let row = Cl::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        [pk.into()],
+    ))
+    .one(db)
+    .await?;
+    Ok(row.map(|r| r.col_version as u64))
+}
+
 /// Remove just the `__deleted` tombstone sentinel for a row.
 ///
 /// Used when a row is re-inserted or updated after deletion — preserves
@@ -670,6 +707,69 @@ pub async fn delete_clock_entries(
         [pk.into()],
     ))
     .await
+}
+
+/// One-time repair of rows left in the N8 anomalous state: a live user row that
+/// still carries a `__deleted` tombstone (a losing delete whose tombstone was
+/// never cleared by the pre-fix remote-apply path). Such a row's cell set is a
+/// strict superset of a converged peer's, so reconciliation can never close the
+/// gap on its own — it only ever ships the tombstone toward the peer, which
+/// correctly rejects it. This sweep clears the defeated tombstone directly so the
+/// digest can match again.
+///
+/// Runs at engine start, once, across every registered table. Only touches rows
+/// where the user row exists AND a tombstone is present AND the delete provably
+/// lost (`!should_apply_delete(cl, max_col_version, policy)`) — a normal deleted
+/// row (no user row) is left untouched. Returns the number of tombstones cleared.
+pub async fn heal_lost_tombstones(
+    db: &impl ConnectionTrait,
+    registry: &TableRegistry,
+) -> Result<usize, DbErr> {
+    let mut healed = 0usize;
+
+    for meta in registry.all_tables() {
+        if !shadow_table_exists(db, &meta.table_name).await? {
+            continue;
+        }
+        let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
+        let pk_col = &meta.primary_key_column;
+
+        // Tombstones whose user row still exists, with the row's max non-tombstone
+        // col_version alongside (NULL → 0 when the row has no column entries).
+        let sql = format!(
+            "SELECT s.pk AS pk, s.col_version AS cl, \
+                    (SELECT MAX(s2.col_version) FROM \"{shadow}\" s2 \
+                     WHERE s2.pk = s.pk AND s2.cid != '__deleted') AS max_cv \
+             FROM \"{shadow}\" s \
+             JOIN \"{table}\" t ON t.\"{pk_col}\" = s.pk \
+             WHERE s.cid = '__deleted'",
+            shadow = shadow_name,
+            table = meta.table_name,
+        );
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                &sql,
+                [],
+            ))
+            .await?;
+
+        for row in rows {
+            let pk: String = row.try_get("", "pk")?;
+            let cl: i64 = row.try_get("", "cl")?;
+            let max_cv: Option<i64> = row.try_get("", "max_cv").ok().flatten();
+            let max_cv = max_cv.unwrap_or(0) as u64;
+            if !crate::conflict::should_apply_delete(cl as u64, max_cv, &meta.delete_policy) {
+                clear_tombstone(db, &meta.table_name, &pk).await?;
+                healed += 1;
+            }
+        }
+    }
+
+    if healed > 0 {
+        log::info!("Healed {healed} row(s) stuck with a defeated tombstone (N8 repair)");
+    }
+    Ok(healed)
 }
 
 /// Check if a shadow table exists for the given table name.
@@ -971,5 +1071,57 @@ mod tests {
         // Get all changes (since 0)
         let all_changes = get_changes_since(&db, &registry, 0).await.unwrap();
         assert_eq!(all_changes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_heal_lost_tombstones() {
+        let db = setup_with_shadow().await;
+        let site = NodeId([7u8; 16]);
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::AddWins,
+        });
+
+        // Anomalous row "live": a live user row that still carries a defeated
+        // tombstone (title cv=2, tombstone cl=2 → AddWins tie, delete lost).
+        db.execute_unprepared("INSERT INTO tasks (id, title, done) VALUES ('live', 'x', 0)")
+            .await
+            .unwrap();
+        upsert_clock_entry(&db, "tasks", "live", "title", 2, 1, &site, 0)
+            .await
+            .unwrap();
+        insert_tombstone(&db, "tasks", "live", 2, 1, &site)
+            .await
+            .unwrap();
+
+        // Normally-deleted row "gone": tombstone present, NO user row. Must be left
+        // alone (it is a correct deleted state, not the anomaly).
+        insert_tombstone(&db, "tasks", "gone", 3, 1, &site)
+            .await
+            .unwrap();
+
+        let healed = heal_lost_tombstones(&db, &registry).await.unwrap();
+        assert_eq!(healed, 1, "only the live-row anomaly should be healed");
+
+        // "live" tombstone cleared, its column clock preserved.
+        assert!(
+            get_tombstone_cl(&db, "tasks", "live")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let live_entries = get_clock_entries_for_row(&db, "tasks", "live")
+            .await
+            .unwrap();
+        assert!(live_entries.iter().any(|e| e.cid == "title"));
+        // "gone" tombstone untouched.
+        assert_eq!(
+            get_tombstone_cl(&db, "tasks", "gone").await.unwrap(),
+            Some(3)
+        );
     }
 }
