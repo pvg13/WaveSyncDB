@@ -32,5 +32,30 @@
     <array>
         <string>_p2p._udp</string>
     </array>
+
+    <!--
+        Background execution for server-initiated sync. `remote-notification`
+        is what lets a silent APNs push (`content-available: 1`) wake a
+        backgrounded app so it can reconnect and run a catch-up sync — the
+        entire cold-/background-sync path depends on it.
+
+        This is declared EXPLICITLY here (not left solely to dx's
+        `[background] remote-notifications = true` mapping) as belt-and-braces:
+        if the generated Info.plist ever ships without this key, iOS silently
+        never delivers the wake push to a backgrounded app and background sync
+        fails with no error and no log — the hardest failure to diagnose. dx
+        merges this file with its generated plist, so an explicit entry
+        guarantees the mode is present. Confirm on-device with:
+        `/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' <App>.app/Info.plist`
+
+        `processing` / `fetch` are intentionally OMITTED: iOS 26 does not
+        guarantee opportunistic background windows, so the design relies on the
+        silent-push wake, not BGTaskScheduler. Add them only if a best-effort
+        BGProcessingTask top-up is introduced.
+    -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>remote-notification</string>
+    </array>
 </dict>
 </plist>
