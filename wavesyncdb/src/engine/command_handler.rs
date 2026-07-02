@@ -154,7 +154,7 @@ impl EngineRunner {
             rendezvous_registered: false,
             rejected_peers: std::collections::HashMap::new(),
             verified_peers: std::collections::HashSet::new(),
-            pending_sync_peers: std::collections::HashSet::new(),
+            pending_sync_peers: std::collections::HashMap::new(),
             pending_pushes: std::collections::BTreeMap::new(),
         };
         self.groups.insert(effective_topic.clone(), group);
