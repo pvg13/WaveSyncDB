@@ -98,7 +98,15 @@ async fn read_length_prefixed<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<Ve
 
 /// Write a 4-byte big-endian length prefix followed by the payload.
 async fn write_length_prefixed<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -> io::Result<()> {
-    let len = data.len() as u32;
+    // Reject rather than silently truncate a payload that doesn't fit the 4-byte
+    // prefix (a `as u32` cast would wrap a >4 GiB frame to a small length and emit
+    // a corrupt, undecodable stream).
+    let len = u32::try_from(data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload too large for u32 length prefix: {} bytes", data.len()),
+        )
+    })?;
     io.write_all(&len.to_be_bytes()).await?;
     io.write_all(data).await?;
     io.flush().await?;

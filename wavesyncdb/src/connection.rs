@@ -523,7 +523,15 @@ impl WaveSyncDb {
     ///
     /// This is a cheap read from shared memory — no network round-trip.
     pub fn network_status(&self) -> crate::network_status::NetworkStatus {
-        self.inner.node.network_status.read().unwrap().clone()
+        // Recover from a poisoned lock rather than cascading the panic: the
+        // status is plain readable data, and one writer panicking must not make
+        // every later status read panic too.
+        self.inner
+            .node
+            .network_status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Subscribe to network events (peer connect/disconnect, relay changes, etc.).
@@ -747,7 +755,12 @@ impl WaveSyncDb {
     pub fn peers_by_identity(
         &self,
     ) -> std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> {
-        let status = self.inner.node.network_status.read().unwrap();
+        let status = self
+            .inner
+            .node
+            .network_status
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let mut map: std::collections::HashMap<String, Vec<crate::network_status::PeerInfo>> =
             std::collections::HashMap::new();
         for peer in &status.connected_peers {
