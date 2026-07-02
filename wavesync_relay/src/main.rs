@@ -383,12 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "IDENTITY_FILE",
         "EXTERNAL_ADDRESS",
     ] {
+        // Report only presence + length. Several of these carry secret material
+        // (the relay's private keypair, FCM/APNs credentials); echoing even a short
+        // prefix of a private key to the logs is needless exposure.
         match std::env::var(var) {
-            Ok(v) => log::info!(
-                "env {var}: set (len={}, starts_with={:?})",
-                v.len(),
-                v.chars().take(8).collect::<String>()
-            ),
+            Ok(v) => log::info!("env {var}: set (len={})", v.len()),
             Err(_) => log::info!("env {var}: <unset>"),
         }
     }
@@ -593,7 +592,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let conn_limits = connection_limits::ConnectionLimits::default()
                 .with_max_pending_outgoing(Some(8))
-                .with_max_established_outgoing(Some(16));
+                .with_max_established_outgoing(Some(16))
+                // Inbound caps: a relay must accept many clients, so the global
+                // ceiling is generous, but no single peer should be able to open
+                // unbounded connections (a cheap Noise handshake per socket is a
+                // memory/CPU DoS otherwise).
+                .with_max_established_per_peer(Some(8))
+                .with_max_established_incoming(Some(2048));
 
             RelayServerBehaviour {
                 connection_limits: connection_limits::Behaviour::new(conn_limits),
@@ -1035,6 +1040,29 @@ async fn handle_push_request(
             topic,
             sender_site_id,
         } => {
+            // Require the notifier to already hold a registered token for this
+            // topic. The relay can't prove group membership (no key), but this
+            // forces an evictable handle and blocks drive-by wake-spam from a peer
+            // that merely learned the topic string. A genuine group member always
+            // registers its own token before it writes.
+            match store.peer_registered_on_topic(topic, peer_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::warn!(
+                        "Rejecting NotifyTopic from unregistered peer {peer_id} for {}",
+                        short_topic(topic),
+                    );
+                    return PushResponse::Error {
+                        message: "sender is not registered for this topic".to_string(),
+                    };
+                }
+                Err(e) => {
+                    log::error!("NotifyTopic registration check failed for {peer_id}: {e}");
+                    return PushResponse::Error {
+                        message: "registration check failed".to_string(),
+                    };
+                }
+            }
             log::info!(
                 "NotifyTopic from {peer_id} (site {sender_site_id}) for {}",
                 short_topic(topic),
