@@ -39,3 +39,6 @@ wavesync_relay/secrets/
 # Maestro / FCM test harness runtime artifacts
 examples/dioxus_fcm_sync/.test-logs/
 examples/dioxus_fcm_sync/.test-pids/
+
+# Session-local scheduled-task lock (changes every session)
+.claude/scheduled_tasks.lock
