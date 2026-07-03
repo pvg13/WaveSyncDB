@@ -43,6 +43,13 @@ struct Cli {
     #[arg(long, env = "WS_LISTEN_ADDR", default_value = "")]
     ws_listen_addr: String,
 
+    /// Prometheus metrics listen address ("host:port"). Default binds
+    /// loopback only — expose deliberately (reverse proxy / compose
+    /// network) if scraping from outside the host. Empty string disables
+    /// the endpoint.
+    #[arg(long, env = "METRICS_ADDR", default_value = "127.0.0.1:9464")]
+    metrics_addr: String,
+
     /// Path to a file containing the persistent identity keypair.
     /// If the file does not exist, a new keypair is generated and saved.
     #[arg(long, env = "IDENTITY_FILE")]
@@ -655,6 +662,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ws_addr: Multiaddr = cli.ws_listen_addr.parse()?;
         swarm.listen_on(ws_addr.clone())?;
         log::info!("Also listening on WebSocket {ws_addr} (browser peers)");
+    }
+
+    // Registry + metric families. `RelayMetrics`/`CircuitLedger` aren't
+    // wired into the event loop yet (that lands in the next change), so
+    // they're bound as unused for now — the registry itself is already
+    // live behind the /metrics endpoint below.
+    let mut metrics_registry = prometheus_client::registry::Registry::default();
+    let _relay_metrics = metrics::RelayMetrics::new(&mut metrics_registry);
+    let _circuit_ledger = metrics::CircuitLedger::new(&mut metrics_registry);
+    let metrics_registry = Arc::new(std::sync::Mutex::new(metrics_registry));
+
+    if !cli.metrics_addr.is_empty() {
+        let addr: std::net::SocketAddr = cli
+            .metrics_addr
+            .parse()
+            .map_err(|e| format!("bad METRICS_ADDR '{}': {e}", cli.metrics_addr))?;
+        let registry = metrics_registry.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve_metrics(addr, registry).await {
+                log::error!("Metrics endpoint failed: {e}");
+            }
+        });
     }
 
     // Track connected peer addresses for FCM push payloads.

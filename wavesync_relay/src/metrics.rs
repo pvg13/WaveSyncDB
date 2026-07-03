@@ -408,6 +408,50 @@ impl CircuitLedger {
     }
 }
 
+/// Serves `/metrics` (OpenMetrics text exposition of `registry`) and
+/// `/healthz` (plain liveness check) on `addr`. Runs until the returned
+/// future is dropped/aborted — callers `tokio::spawn` this alongside the
+/// swarm event loop.
+pub async fn serve_metrics(
+    addr: std::net::SocketAddr,
+    registry: std::sync::Arc<std::sync::Mutex<Registry>>,
+) -> std::io::Result<()> {
+    use axum::response::IntoResponse;
+    use axum::{Router, routing::get};
+
+    let app = Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let registry = registry.clone();
+                async move {
+                    let mut body = String::new();
+                    let reg = registry.lock().expect("metrics registry poisoned");
+                    match prometheus_client::encoding::text::encode(&mut body, &reg) {
+                        Ok(()) => (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                            )],
+                            body,
+                        )
+                            .into_response(),
+                        Err(e) => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("encode error: {e}"),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        )
+        .route("/healthz", get(|| async { "ok" }));
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    log::info!("Metrics endpoint on http://{addr}/metrics");
+    axum::serve(listener, app).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +612,33 @@ mod tests {
             assert!(text.contains(family), "missing {family}");
         }
         assert!(text.contains("outcome=\"budget_denied\""));
+    }
+
+    #[tokio::test]
+    async fn endpoint_serves_openmetrics_and_health() {
+        let mut reg = prometheus_client::registry::Registry::default();
+        let m = RelayMetrics::new(&mut reg);
+        m.connection_established(false);
+        let reg = std::sync::Arc::new(std::sync::Mutex::new(reg));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // free it; serve_metrics rebinds (fine for a test port)
+        let server = tokio::spawn(serve_metrics(addr, reg));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let body = reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("relay_connections_total"));
+        assert!(body.contains("# EOF"), "OpenMetrics text ends with # EOF");
+        let health = reqwest::get(format!("http://{addr}/healthz"))
+            .await
+            .unwrap();
+        assert_eq!(health.status(), 200);
+        server.abort();
     }
 }
