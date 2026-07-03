@@ -252,7 +252,10 @@ fn extract_insert_value_rows(sql: &str) -> Vec<&str> {
 
 /// Extract column-value pairs from an UPDATE SET clause.
 fn extract_column_values_update(sql: &str) -> Vec<(String, serde_json::Value)> {
-    let upper = sql.to_uppercase();
+    // ASCII-only uppercasing: `SET`/`WHERE` are ASCII, and unlike `to_uppercase`
+    // it never changes byte lengths, so offsets computed here stay valid when we
+    // slice the original `sql` even if it contains multi-byte Unicode values.
+    let upper = sql.to_ascii_uppercase();
     let set_pos = match upper.find("SET ") {
         Some(i) => i + 4,
         None => return vec![],
@@ -1192,17 +1195,78 @@ fn extract_pk_from_where(sql: &str, pk_column: &str) -> String {
     };
 
     let after_col = &after_where[col_pos..];
-    let eq_pos = match after_col.find('=') {
-        Some(i) => i + 1,
+
+    // Skip the matched column token (quoted `"col"` or a bare identifier) so the
+    // operator we inspect next is the one that binds this column, not a stray `=`.
+    let after_col_name = skip_column_token(after_col);
+    let after_col_name = after_col_name.trim_start();
+
+    // Only a plain equality identifies a single primary key. A range/inequality
+    // predicate (`>=`, `<=`, `<>`, `!=`, `<`, `>`) does not, and must never be
+    // mis-parsed as one — the old code matched the `=` inside `>=` and returned
+    // the range bound as if it were the PK. Return empty so the caller treats the
+    // write as non-PK-targeted rather than corrupting a row's identity.
+    let value_part = match after_col_name.strip_prefix('=') {
+        // Reject `==` (not SQL, but be defensive) and any operator whose first
+        // char is `=` only when it's a lone `=`.
+        Some(rest) => rest.trim_start(),
         None => return String::new(),
     };
 
-    let value_part = after_col[eq_pos..].trim_start();
-    let end = value_part
-        .find([' ', '\n', '\r'])
-        .unwrap_or(value_part.len());
-    let value = &value_part[..end];
-    value.trim().trim_matches('\'').to_string()
+    parse_sql_value(value_part)
+}
+
+/// Skip a leading column token — either a double-quoted identifier `"col"`
+/// (SeaORM's form) or a bare `identifier` — and return the remainder. Used to
+/// position parsing at the comparison operator that follows the column.
+fn skip_column_token(s: &str) -> &str {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        // Quoted identifier: consume through the closing quote.
+        if let Some(end) = rest.find('"') {
+            return &rest[end + 1..];
+        }
+        return "";
+    }
+    // Bare identifier: consume word characters.
+    let end = s
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(s.len());
+    &s[end..]
+}
+
+/// Parse a single SQL value literal from the start of `s`.
+///
+/// Handles quoted strings with SQL `''` escapes (so `'value with spaces'` and
+/// `'O''Brien'` parse correctly — the old whitespace-terminated scan truncated
+/// both), and unquoted literals (numbers, `NULL`) terminated by whitespace or a
+/// clause/expression delimiter. Returns the unquoted, unescaped value.
+fn parse_sql_value(s: &str) -> String {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('\'') {
+        // Quoted: read until a lone closing quote; a doubled '' is an escaped quote.
+        let mut out = String::new();
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    out.push('\'');
+                    chars.next();
+                } else {
+                    break; // closing quote
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        // Unquoted literal: stop at whitespace or a delimiter that ends the value.
+        let end = s
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ';' | ','))
+            .unwrap_or(s.len());
+        s[..end].trim().to_string()
+    }
 }
 
 /// Find `needle` in `haystack` only at word boundaries.
@@ -1225,15 +1289,24 @@ fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
-/// Split a SQL VALUES list respecting single-quoted strings.
+/// Split a SQL VALUES list on top-level commas, respecting single-quoted strings.
+///
+/// A doubled `''` inside a quoted string is a SQL-escaped apostrophe, not a
+/// quote toggle, so it is consumed as a unit. Handling it explicitly (rather than
+/// relying on two toggles cancelling out) keeps the quote state correct for
+/// values that end in an escaped quote or contain commas next to `''`.
 fn split_sql_values(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0;
     let mut in_quote = false;
-    for (i, c) in s.char_indices() {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
         match c {
-            '\'' if !in_quote => in_quote = true,
-            '\'' if in_quote => in_quote = false,
+            '\'' if in_quote && chars.peek().map(|&(_, c)| c) == Some('\'') => {
+                // Escaped quote: skip the second `'` and stay inside the string.
+                chars.next();
+            }
+            '\'' => in_quote = !in_quote,
             ',' if !in_quote => {
                 result.push(&s[start..i]);
                 start = i + 1;
@@ -1259,7 +1332,7 @@ fn extract_columns(sql: &str, kind: &WriteKind) -> Option<Vec<String>> {
             Some(cols)
         }
         WriteKind::Update => {
-            let upper = sql.to_uppercase();
+            let upper = sql.to_ascii_uppercase();
             let set_pos = upper.find("SET ")? + 4;
             let end_pos = upper[set_pos..]
                 .find("WHERE")
@@ -2656,6 +2729,69 @@ mod tests {
         assert_eq!(pk, "abc-123");
     }
 
+    #[test]
+    fn test_extract_pk_quoted_value_with_spaces() {
+        // H5/#3: a space-containing quoted PK must not be truncated at the space.
+        let sql = r#"UPDATE "tasks" SET "done" = 1 WHERE "id" = 'value with spaces'"#;
+        let pk = extract_pk_from_where(sql, "id");
+        assert_eq!(pk, "value with spaces");
+    }
+
+    #[test]
+    fn test_extract_pk_escaped_quote_value() {
+        // H5/#3: SQL `''` escape inside a quoted PK unescapes to a single quote.
+        let sql = r#"DELETE FROM "people" WHERE "id" = 'O''Brien'"#;
+        let pk = extract_pk_from_where(sql, "id");
+        assert_eq!(pk, "O'Brien");
+    }
+
+    #[test]
+    fn test_extract_pk_rejects_range_operators() {
+        // H5/#3: a range predicate is not a single-PK equality — the `=` inside
+        // `>=`/`<=`/`!=` must never be parsed as one and return the bound.
+        for sql in [
+            r#"UPDATE "t" SET "x" = 1 WHERE "id" >= 10"#,
+            r#"UPDATE "t" SET "x" = 1 WHERE "id" <= 10"#,
+            r#"UPDATE "t" SET "x" = 1 WHERE "id" != 10"#,
+        ] {
+            assert_eq!(extract_pk_from_where(sql, "id"), "", "sql: {sql}");
+        }
+        // A plain equality still works with or without surrounding spaces.
+        assert_eq!(
+            extract_pk_from_where(r#"UPDATE "t" SET "x" = 1 WHERE "id"=42"#, "id"),
+            "42"
+        );
+    }
+
+    #[test]
+    fn test_extract_pk_bare_identifier() {
+        let sql = "UPDATE tasks SET done = 1 WHERE id = 'plain-pk'";
+        assert_eq!(extract_pk_from_where(sql, "id"), "plain-pk");
+    }
+
+    #[test]
+    fn test_update_column_values_non_ascii_offsets() {
+        // M12/#10: multi-byte Unicode in the SET clause must not misalign the
+        // SET/WHERE byte offsets (the old to_uppercase() could shift them).
+        let sql = r#"UPDATE "tasks" SET "title" = 'café — déjà', "n" = 3 WHERE "id" = 'x'"#;
+        let cols = extract_column_values_update(sql);
+        assert_eq!(
+            cols,
+            vec![
+                ("title".to_string(), serde_json::json!("café — déjà")),
+                ("n".to_string(), serde_json::json!(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_sql_values_escaped_quote_and_comma() {
+        // M5/#11: an escaped quote adjacent to a comma inside a string must not
+        // desync the quote state and split the value.
+        let values = split_sql_values("'a'',b', 7");
+        assert_eq!(values, vec!["'a'',b'", " 7"]);
+    }
+
     // split_sql_values tests
 
     #[test]
@@ -2840,29 +2976,24 @@ mod tests {
         assert_eq!(rows[0].primary_key, "only");
     }
 
-    /// H5: PK with spaces is truncated by extract_pk_from_where
+    /// H5/#3: a PK with spaces is extracted whole (previously truncated).
     #[test]
     fn test_h5_pk_with_spaces_truncated() {
         let sql = r#"UPDATE "tasks" SET "title" = 'x' WHERE "id" = 'hello world'"#;
         let pk = extract_pk_from_where(sql, "id");
-        // H5 bug: PK is truncated at the space
-        assert!(
-            pk == "hello" || pk == "hello world",
-            "H5: PK '{}' — expected 'hello world' (fixed) or 'hello' (bug)",
-            pk
-        );
+        assert_eq!(pk, "hello world");
     }
 
-    /// H5: comparison operator >= confuses the parser
+    /// H5/#3: a range operator is not a single-PK equality. The `=` inside `>=`
+    /// must not be mis-parsed as one; the parser now returns empty rather than
+    /// treating the range bound as a primary key.
     #[test]
     fn test_h5_pk_with_comparison_operators() {
         let sql = r#"DELETE FROM "tasks" WHERE "id" >= 10"#;
         let pk = extract_pk_from_where(sql, "id");
-        // The parser finds '=' inside '>=' — the PK extracted may be wrong
-        // This documents the known limitation
-        assert!(
-            !pk.is_empty(),
-            "H5: parser should extract something even with >="
+        assert_eq!(
+            pk, "",
+            "H5: a range predicate must not yield a PK, got {pk:?}"
         );
     }
 
