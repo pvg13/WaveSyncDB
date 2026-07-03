@@ -1334,18 +1334,40 @@ async fn apply_changeset_chunk<'a>(
 
         let delete_change = row_changes.iter().find(|c| c.cid.0 == "__deleted");
         if let Some(change) = delete_change {
-            if apply_remote_delete(&txn, table, pk, change, &meta, local_db_version).await {
-                any_applied = true;
-                is_delete = true;
+            match apply_remote_delete(&txn, table, pk, change, &meta, local_db_version).await {
+                Ok(true) => {
+                    any_applied = true;
+                    is_delete = true;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // Fail closed: a shadow/row write failed mid-apply. Roll back
+                    // the entire chunk rather than commit a partially-applied row
+                    // whose clock state would diverge silently. The changeset is
+                    // idempotent and will be re-delivered / re-reconciled.
+                    log::error!("Remote delete {table}/{pk} failed, rolling back chunk: {e}");
+                    let _ = txn.rollback().await;
+                    return;
+                }
             }
         } else {
-            let (applied, row_existed, pairs) =
-                apply_remote_column_changes(&txn, table, pk, row_changes, &meta, local_db_version)
-                    .await;
-            if applied {
-                any_applied = true;
-                existed = row_existed;
-                changed_pairs = pairs;
+            match apply_remote_column_changes(&txn, table, pk, row_changes, &meta, local_db_version)
+                .await
+            {
+                Ok((applied, row_existed, pairs)) => {
+                    if applied {
+                        any_applied = true;
+                        existed = row_existed;
+                        changed_pairs = pairs;
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Remote column apply {table}/{pk} failed, rolling back chunk: {e}"
+                    );
+                    let _ = txn.rollback().await;
+                    return;
+                }
             }
         }
 
@@ -1466,7 +1488,12 @@ async fn apply_changeset_chunk<'a>(
 }
 
 /// Apply a remote delete: check conflict resolution, delete row, update shadow.
-/// Returns `true` if the delete was applied.
+///
+/// Returns `Ok(true)` if the delete was applied, `Ok(false)` if it lost the
+/// conflict check (a legitimate skip). Any *database* failure — the row delete,
+/// the clock-entry clear, or the tombstone insert — is returned as `Err` so the
+/// caller fails closed and rolls back: a row deleted without its tombstone
+/// landing could never be adjudicated against a later resurrection.
 async fn apply_remote_delete(
     db: &impl ConnectionTrait,
     table: &str,
@@ -1474,7 +1501,7 @@ async fn apply_remote_delete(
     change: &ColumnChange,
     meta: &crate::registry::TableMeta,
     local_db_version: u64,
-) -> bool {
+) -> Result<bool, sea_orm::DbErr> {
     let local_entries = shadow::get_clock_entries_for_row(db, table, pk)
         .await
         .unwrap_or_default();
@@ -1485,27 +1512,22 @@ async fn apply_remote_delete(
         .unwrap_or(0);
 
     if !conflict::should_apply_delete(change.cl, local_max_cv, &meta.delete_policy) {
-        return false;
+        return Ok(false);
     }
 
     let delete_sql = format!(
         "DELETE FROM \"{}\" WHERE \"{}\" = $1",
         table, meta.primary_key_column
     );
-    if let Err(e) = db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            &delete_sql,
-            [pk.to_string().into()],
-        ))
-        .await
-    {
-        log::error!("Failed to delete row {}/{}: {}", table, pk, e);
-        return false;
-    }
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        &delete_sql,
+        [pk.to_string().into()],
+    ))
+    .await?;
 
-    let _ = shadow::delete_clock_entries(db, table, pk).await;
-    let _ = shadow::insert_tombstone(
+    shadow::delete_clock_entries(db, table, pk).await?;
+    shadow::insert_tombstone(
         db,
         table,
         pk,
@@ -1513,9 +1535,9 @@ async fn apply_remote_delete(
         local_db_version,
         &change.site_id,
     )
-    .await;
+    .await?;
 
-    true
+    Ok(true)
 }
 
 /// Apply non-delete column changes: resolve conflicts per-column, write winning values,
@@ -1525,6 +1547,7 @@ async fn apply_remote_delete(
 /// `changed_column_pairs` is `(column_name, post_write_json_value)` for the columns
 /// that actually got applied. Reactive hooks consume the JSON values to update signal
 /// state in place without re-querying SeaORM.
+#[allow(clippy::type_complexity)]
 async fn apply_remote_column_changes(
     db: &impl ConnectionTrait,
     table: &str,
@@ -1532,7 +1555,7 @@ async fn apply_remote_column_changes(
     row_changes: &[&ColumnChange],
     meta: &crate::registry::TableMeta,
     local_db_version: u64,
-) -> (bool, bool, Vec<(String, serde_json::Value)>) {
+) -> Result<(bool, bool, Vec<(String, serde_json::Value)>), sea_orm::DbErr> {
     let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
     let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
     let mut pending_shadow_updates: Vec<(String, u64, crate::messages::NodeId, u32)> = Vec::new();
@@ -1608,29 +1631,27 @@ async fn apply_remote_column_changes(
     }
 
     if winning_columns.is_empty() {
-        return (false, exists, changed_columns);
+        return Ok((false, exists, changed_columns));
     }
 
     if exists {
-        // UPDATE each winning column
+        // UPDATE each winning column. A DB failure here propagates so the caller
+        // rolls back the whole chunk — committing the user value without its
+        // matching shadow clock (flushed just below) is the silent-divergence bug.
         for (col, val) in &winning_columns {
             let update_sql = format!(
                 "UPDATE \"{}\" SET \"{}\" = $1 WHERE \"{}\" = $2",
                 table, col, meta.primary_key_column
             );
-            if let Err(e) = db
-                .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    &update_sql,
-                    [val.clone(), pk.to_string().into()],
-                ))
-                .await
-            {
-                log::error!("Failed to update column {}/{}/{}: {}", table, pk, col, e);
-            }
+            db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                &update_sql,
+                [val.clone(), pk.to_string().into()],
+            ))
+            .await?;
         }
-        flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await;
-        return (true, exists, changed_columns);
+        flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await?;
+        return Ok((true, exists, changed_columns));
     }
 
     // INSERT OR IGNORE — silently skips if row was created by a concurrent task
@@ -1652,13 +1673,12 @@ async fn apply_remote_column_changes(
         placeholders.join(", ")
     );
 
-    let _ = db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            &insert_sql,
-            values,
-        ))
-        .await;
+    db.execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        &insert_sql,
+        values,
+    ))
+    .await?;
 
     // UPDATE each winning column individually — works whether INSERT
     // succeeded or was ignored due to concurrent insert
@@ -1668,23 +1688,22 @@ async fn apply_remote_column_changes(
                 "UPDATE \"{}\" SET \"{}\" = $1 WHERE \"{}\" = $2",
                 table, col, meta.primary_key_column
             );
-            if let Err(e) = db
-                .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Sqlite,
-                    &update_sql,
-                    [val.clone(), pk.to_string().into()],
-                ))
-                .await
-            {
-                log::error!("Failed to update column {}/{}/{}: {}", table, pk, col, e);
-            }
+            db.execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                &update_sql,
+                [val.clone(), pk.to_string().into()],
+            ))
+            .await?;
         }
     }
 
-    // Verify INSERT actually created the row before writing shadow
+    // Verify INSERT actually created the row before writing shadow. A row that
+    // wasn't created (e.g. missing NOT NULL columns from out-of-order delivery)
+    // is a legitimate deferral, not an error — return Ok((false, ...)) and let a
+    // later changeset complete it. Only genuine DB failures above roll back.
     if row_exists(db, table, &meta.primary_key_column, pk).await {
-        flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await;
-        (true, exists, changed_columns)
+        flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await?;
+        Ok((true, exists, changed_columns))
     } else {
         log::debug!(
             "Row {}/{} not created (likely missing NOT NULL columns from \
@@ -1692,7 +1711,7 @@ async fn apply_remote_column_changes(
             table,
             pk
         );
-        (false, exists, changed_columns)
+        Ok((false, exists, changed_columns))
     }
 }
 
@@ -1703,11 +1722,15 @@ async fn flush_shadow_updates(
     pk: &str,
     updates: &[(String, u64, crate::messages::NodeId, u32)],
     local_db_version: u64,
-) {
+) -> Result<(), sea_orm::DbErr> {
+    // Propagate any shadow-clock write failure instead of swallowing it. A user
+    // row committed without its authoritative col_version is the seed of silent
+    // divergence (a peer applies the value but never learns the correct version),
+    // so the caller must fail closed and roll back the whole changeset for retry.
     for (cid, cv, site, seq) in updates {
-        let _ =
-            shadow::upsert_clock_entry(db, table, pk, cid, *cv, local_db_version, site, *seq).await;
+        shadow::upsert_clock_entry(db, table, pk, cid, *cv, local_db_version, site, *seq).await?;
     }
+    Ok(())
 }
 
 /// Check if a row exists in a table.
