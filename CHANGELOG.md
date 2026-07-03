@@ -2,6 +2,70 @@
 
 ## Unreleased
 
+## v0.8.0 — 03/07/2026
+
+Crate versions: `wavesyncdb` 0.8.0, `wavesyncdb_derive` 0.3.0,
+`wavesync_relay` 0.3.0.
+
+Consolidation release: merges the July hardening wave — security audit fixes,
+SQL-parsing correctness, fail-closed remote apply, edit-vs-delete convergence,
+network hardening, iOS cold-sync groundwork, and protocol-version negotiation.
+
+### Security
+- **Constant-time MAC verification.** Message authentication now compares
+  digests in constant time; the previous comparison was an early-exit `==`.
+- **Relay abuse limits.** `NotifyTopic` now requires the sender to be
+  registered on the topic it wakes; push tokens get a per-token daily wake
+  budget and a per-peer registration cap; inbound connections are capped.
+- **Argon2id key derivation (foundation).** `GroupKey::from_passphrase_v2`
+  derives keys via Argon2id salted with the user topic, with a dual v1/v2
+  `GroupKeySet` for a future transition window. Not yet wired into the engine
+  topic derivation — the wire format is unchanged in this release.
+- The on-disk config file is written with mode 600 on Unix, and secret
+  environment values are no longer partially logged.
+- Trust-model limits (replay tolerance via CRDT idempotence, self-asserted
+  site_id, relay membership visibility) are now documented in `auth.rs`.
+
+### Fixed
+- **Quoted / range-operator WHERE parsing.** Primary-key extraction now
+  handles quoted values containing spaces and rejects range operators
+  (`>=`, `<=`, `<>`, `!=`) instead of misparsing them as equality — both were
+  silent-divergence vectors for UPDATE/DELETE.
+- **Unicode UPDATE parsing.** Column extraction uses byte-length-preserving
+  ASCII uppercasing; non-ASCII SQL no longer risks misaligned slices.
+- **Escaped-quote value splitting.** Values ending in SQL-escaped quotes
+  (`'it'''`) no longer desynchronize the value splitter.
+- **Remote apply is fail-closed.** A shadow-write failure while applying a
+  remote changeset rolls back the whole chunk and leaves the peer cursor
+  unmoved, so the change is re-requested instead of silently skipped.
+  Oversized payload lengths are rejected explicitly (`u32::try_from` guard),
+  and a poisoned network-status lock recovers instead of propagating.
+- **Edit-vs-delete convergence (N8).** After a concurrent edit-vs-delete
+  conflict, both engines now clear a provably-lost tombstone (and native drops
+  residue clock entries on resurrection), local re-inserts outrank stale
+  tombstones under DeleteWins, and a one-time startup sweep
+  (`heal_lost_tombstones`) repairs rows stuck in the pre-fix state. The
+  reconcile digest for such pairs now converges instead of churning forever.
+- **Stale sync-request recovery.** In-flight catch-up requests are re-issued
+  after 10s instead of hanging until reconnect; on connect, catch-up runs for
+  all shared groups; pushes only fan out to currently-connected peers (#38).
+
+### Added
+- **Sync-protocol version ladder (#85).** The snapshot protocol is advertised
+  as a newest-first ladder with per-stream negotiation; peers sharing no rung
+  log an explicit protocol-mismatch warning at identify time instead of
+  failing silently. See REQUESTS.md for the breaking-change process.
+- **iOS background-sync groundwork.** Explicit `UIBackgroundModes` in the
+  example Info.plist, malformed-JSON logging in the FFI layer, and a
+  production entitlements checklist (`docs/ios-background-sync-checklist.md`).
+
+### Internal
+- Clippy/rustfmt alignment with current stable; `resume_trigger` is gated
+  behind the `dioxus` feature.
+- `test_n4` rewritten for the single-transaction bookkeeping architecture:
+  asserts stale-meta version recovery via the shadow MAX and fail-closed
+  writes when shadow bookkeeping cannot commit.
+
 ## v0.7.1 — 03/06/2026
 
 Crate versions: `wavesyncdb` 0.7.1, `wavesyncdb_derive` 0.3.0,
