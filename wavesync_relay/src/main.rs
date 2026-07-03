@@ -8,17 +8,18 @@ mod push_store;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use clap::Parser;
 use libp2p::{
-    Multiaddr, SwarmBuilder, connection_limits, futures::StreamExt, identify, identity, noise,
-    ping, relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
+    Multiaddr, SwarmBuilder, connection_limits, futures::StreamExt, identify, identity,
+    metrics::Recorder, noise, ping, relay, rendezvous, request_response, swarm::SwarmEvent, yamux,
 };
 use libp2p_swarm_derive::NetworkBehaviour;
 use rand::rngs::OsRng;
 
+use metrics::{CircuitLedger, RelayMetrics, ReservationOutcome};
 use push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
 use push_sender::{ApnsConfig, FcmConfig, PushSender};
 use push_store::PushStore;
@@ -481,6 +482,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.reservation_duration,
     );
 
+    // Registry + app-layer metric families. Registered up front (before the
+    // swarm is built and before the registry is wrapped for the exporter)
+    // so `RelayMetrics` can be handed to the push subsystem below, and so
+    // the swarm builder chain can register libp2p's own bandwidth metrics
+    // into the same `Registry` a few statements down.
+    let mut metrics_registry = prometheus_client::registry::Registry::default();
+    let relay_metrics = RelayMetrics::new(&mut metrics_registry);
+    let mut circuit_ledger = CircuitLedger::new(&mut metrics_registry);
+
     // Initialize push notification subsystem if configured
     let push_notifier = if let Some(ref push_db_path) = cli.push_db {
         let store = Arc::new(
@@ -553,7 +563,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let sender = Arc::new(PushSender::new(fcm_config, apns_config));
         let debounce = Duration::from_secs(cli.push_debounce_secs);
-        let notifier = push_notifier::PushNotifier::spawn(store.clone(), sender, debounce);
+        let notifier = push_notifier::PushNotifier::spawn(
+            store.clone(),
+            sender,
+            debounce,
+            relay_metrics.clone(),
+        );
 
         log::info!("Push notifications enabled (db: {push_db_path})");
         Some((store, notifier))
@@ -587,6 +602,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_dns()?
         .with_websocket(noise::Config::new, yamux::Config::default)
         .await?
+        // Registers libp2p's global bandwidth counters (bytes in/out per
+        // transport) into the same registry the app-layer metrics use.
+        // Must run here — this is the phase the builder exposes it at,
+        // between the transport stack and `with_behaviour`.
+        .with_bandwidth_metrics(&mut metrics_registry)
         .with_behaviour(|key| {
             let identify = identify::Behaviour::new(identify::Config::new(
                 "/wavesync-relay/1.0.0".into(),
@@ -664,13 +684,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("Also listening on WebSocket {ws_addr} (browser peers)");
     }
 
-    // Registry + metric families. `RelayMetrics`/`CircuitLedger` aren't
-    // wired into the event loop yet (that lands in the next change), so
-    // they're bound as unused for now — the registry itself is already
-    // live behind the /metrics endpoint below.
-    let mut metrics_registry = prometheus_client::registry::Registry::default();
-    let _relay_metrics = metrics::RelayMetrics::new(&mut metrics_registry);
-    let _circuit_ledger = metrics::CircuitLedger::new(&mut metrics_registry);
+    // libp2p's own aggregate Swarm/protocol metrics (connection counts,
+    // dial attempts, per-protocol event counters) register into the same
+    // registry as the app-layer families above. Registered last, right
+    // before the registry is handed to the exporter, since nothing else
+    // needs mutable access to it after this point.
+    let libp2p_metrics = libp2p::metrics::Metrics::new(&mut metrics_registry);
     let metrics_registry = Arc::new(std::sync::Mutex::new(metrics_registry));
 
     if !cli.metrics_addr.is_empty() {
@@ -706,8 +725,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not survive a relay restart (peers will re-announce when they reconnect).
     let mut topic_peers: HashMap<String, HashSet<libp2p::PeerId>> = HashMap::new();
 
+    // Rendezvous-namespace membership per peer, for circuit topic
+    // attribution (`topics_for_peer` below). Populated on `PeerRegistered`,
+    // pruned when the peer's last connection closes — mirrors `topic_peers`'
+    // lifecycle but keyed the other way round (peer -> topics rather than
+    // topic -> peers) since rendezvous namespaces are a different membership
+    // source than `AnnouncePresence`.
+    let mut rendezvous_topics: HashMap<libp2p::PeerId, HashSet<String>> = HashMap::new();
+
+    // Leak guard for `circuit_ledger`'s in-flight circuit tracking: a missed
+    // `CircuitClosed` (relay bug, or a circuit that predates this process)
+    // would otherwise pin an entry forever. Sweeping every 10 minutes at a
+    // 24h max age is cheap and keeps the ledger bounded without disturbing
+    // legitimate long-lived circuits.
+    let mut sweep_interval = tokio::time::interval(Duration::from_secs(10 * 60));
+
     loop {
-        match swarm.select_next_some().await {
+        let event = tokio::select! {
+            event = swarm.select_next_some() => event,
+            _ = sweep_interval.tick() => {
+                circuit_ledger.sweep(Instant::now(), Duration::from_secs(24 * 3600));
+                log::debug!("CircuitLedger: {} circuit(s) currently tracked as active", circuit_ledger.active_count());
+                continue;
+            }
+        };
+        libp2p_metrics.record(&event);
+        match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 log::info!("Listening on {address}/p2p/{peer_id}");
             }
@@ -715,6 +758,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer_id, endpoint, ..
             } => {
                 log::info!("Peer connected: {peer_id}");
+                relay_metrics.connection_established(matches!(
+                    endpoint,
+                    libp2p::core::ConnectedPoint::Listener { .. }
+                ));
                 let addr = endpoint.get_remote_address().clone();
                 let addrs = peer_addresses.entry(peer_id).or_default();
                 if !addrs.contains(&addr) {
@@ -728,6 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } => {
                 log::info!("Peer disconnected: {peer_id}");
+                relay_metrics.connection_closed();
                 if num_established == 0 {
                     peer_addresses.remove(&peer_id);
                     // Drop from every topic set; leave empty sets so the
@@ -736,10 +784,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         set.remove(&peer_id);
                         !set.is_empty()
                     });
+                    rendezvous_topics.remove(&peer_id);
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
                 use libp2p::relay::Event as RelayEvent;
+                libp2p_metrics.record(&event);
                 match event {
                     RelayEvent::ReservationReqAccepted {
                         src_peer_id,
@@ -749,8 +799,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // the first acceptance is interesting at info level.
                         if renewed {
                             log::debug!("Relay: reservation renewed for {src_peer_id}");
+                            relay_metrics.reservation(ReservationOutcome::Renewed);
                         } else {
                             log::info!("Relay: reservation accepted for {src_peer_id}");
+                            relay_metrics.reservation(ReservationOutcome::Accepted);
                         }
                     }
                     RelayEvent::ReservationReqDenied {
@@ -760,18 +812,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::warn!(
                             "Relay: reservation denied for {src_peer_id} (status {status:?})"
                         );
+                        relay_metrics.reservation(ReservationOutcome::Denied);
                     }
                     RelayEvent::ReservationClosed { src_peer_id } => {
                         log::debug!("Relay: reservation closed for {src_peer_id}");
+                        // `ReservationClosed`/`ReservationTimedOut` each fire exactly
+                        // once per reservation (libp2p never emits both for the same
+                        // one), so this decrement is balanced by the single earlier
+                        // `Accepted`/`Renewed` increment — never call this from any
+                        // other arm.
+                        relay_metrics.reservation_ended();
                     }
                     RelayEvent::ReservationTimedOut { src_peer_id } => {
                         log::debug!("Relay: reservation timed out for {src_peer_id}");
+                        // See the comment on the `ReservationClosed` arm above.
+                        relay_metrics.reservation_ended();
                     }
                     RelayEvent::CircuitReqAccepted {
                         src_peer_id,
                         dst_peer_id,
                     } => {
                         log::info!("Relay: circuit {src_peer_id} → {dst_peer_id}");
+                        circuit_ledger.open(src_peer_id, dst_peer_id, Instant::now(), &|p| {
+                            topics_for_peer(&topic_peers, &rendezvous_topics, p)
+                        });
                     }
                     RelayEvent::CircuitReqDenied {
                         src_peer_id,
@@ -781,21 +845,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::warn!(
                             "Relay: circuit denied {src_peer_id} → {dst_peer_id} (status {status:?})"
                         );
+                        circuit_ledger.denied();
                     }
                     RelayEvent::CircuitClosed {
                         src_peer_id,
                         dst_peer_id,
                         error,
-                    } => match error {
-                        Some(e) => {
-                            log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}")
+                    } => {
+                        circuit_ledger.close(
+                            src_peer_id,
+                            dst_peer_id,
+                            Instant::now(),
+                            error.is_none(),
+                        );
+                        match error {
+                            Some(e) => log::debug!(
+                                "Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}"
+                            ),
+                            None => {
+                                log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}")
+                            }
                         }
-                        None => log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}"),
-                    },
+                    }
                     // Deprecated *Failed variants and any future additions:
                     // keep them off the steady-state log but available at debug.
                     other => log::debug!("Relay: {other:?}"),
                 }
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Ping(event)) => {
+                libp2p_metrics.record(&event);
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Rendezvous(event)) => {
                 use libp2p::rendezvous::server::Event as RzEvent;
@@ -805,11 +883,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // steady-state log stays readable; the previous `{event:?}`
                     // dumped the full SignedEnvelope (hundreds of bytes/line).
                     RzEvent::PeerRegistered { peer, registration } => {
+                        let namespace = registration.namespace.to_string();
                         log::debug!(
                             "Rendezvous: {peer} registered ns={} ttl={}s",
-                            short_topic(&registration.namespace.to_string()),
+                            short_topic(&namespace),
                             registration.ttl,
                         );
+                        relay_metrics.rendezvous_registered(&namespace);
+                        rendezvous_topics.entry(peer).or_default().insert(namespace);
                     }
                     RzEvent::DiscoverServed {
                         enquirer,
@@ -819,6 +900,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Rendezvous: served discover to {enquirer} ({} registration(s))",
                             registrations.len(),
                         );
+                        relay_metrics.rendezvous_discover_served();
                     }
                     RzEvent::DiscoverNotServed { enquirer, error } => {
                         // Mostly the benign first-page / expired-cookie case the
@@ -851,27 +933,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(
-                identify::Event::Received { info, peer_id, .. },
-            )) => {
-                log::info!(
-                    "Identify from {peer_id}: {} listen addr(s) ({})",
-                    info.listen_addrs.len(),
-                    info.protocol_version,
-                );
-                // Replace, don't union. Identify is a snapshot of the peer's
-                // current reachable addresses; treating it as additive
-                // accumulates stale entries across reconnects (every NAT-mapped
-                // outbound port that AutoNAT happened to observe at some point
-                // gets stuck in the table forever). Replace-on-identify means
-                // the relay's view tracks the peer's actual current state, so
-                // FCM payloads contain only addresses that are live *right
-                // now*. The peer pushes identify updates on listen-addr change
-                // (with_push_listen_addr_updates(true)), so this stays current
-                // even within a session.
-                peer_addresses.insert(peer_id, info.listen_addrs.clone());
-                if let Some(addrs) = peer_addresses.get_mut(&peer_id) {
-                    cap_peer_addresses(addrs);
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(event)) => {
+                libp2p_metrics.record(&event);
+                if let identify::Event::Received { info, peer_id, .. } = event {
+                    log::info!(
+                        "Identify from {peer_id}: {} listen addr(s) ({})",
+                        info.listen_addrs.len(),
+                        info.protocol_version,
+                    );
+                    // Replace, don't union. Identify is a snapshot of the peer's
+                    // current reachable addresses; treating it as additive
+                    // accumulates stale entries across reconnects (every NAT-mapped
+                    // outbound port that AutoNAT happened to observe at some point
+                    // gets stuck in the table forever). Replace-on-identify means
+                    // the relay's view tracks the peer's actual current state, so
+                    // FCM payloads contain only addresses that are live *right
+                    // now*. The peer pushes identify updates on listen-addr change
+                    // (with_push_listen_addr_updates(true)), so this stays current
+                    // even within a session.
+                    peer_addresses.insert(peer_id, info.listen_addrs.clone());
+                    if let Some(addrs) = peer_addresses.get_mut(&peer_id) {
+                        cap_peer_addresses(addrs);
+                    }
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
@@ -958,6 +1041,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &request,
                             &peer.to_string(),
                             sender_addrs_fcm,
+                            &relay_metrics,
                         )
                         .await
                     }
@@ -1021,11 +1105,33 @@ pub(crate) fn short_topic(s: &str) -> String {
     }
 }
 
+/// Every topic `peer` is known to belong to, for circuit-topic attribution
+/// (`CircuitLedger::open`). Union of two independent membership sources:
+/// `AnnouncePresence` (the push-notification presence map, topic -> peers)
+/// and rendezvous registration (peer -> namespaces). A peer that only uses
+/// one of the two subsystems still gets attributed correctly.
+fn topics_for_peer(
+    topic_peers: &HashMap<String, HashSet<libp2p::PeerId>>,
+    rendezvous_topics: &HashMap<libp2p::PeerId, HashSet<String>>,
+    peer: &libp2p::PeerId,
+) -> Vec<String> {
+    let mut topics: HashSet<String> = topic_peers
+        .iter()
+        .filter(|(_, peers)| peers.contains(peer))
+        .map(|(topic, _)| topic.clone())
+        .collect();
+    if let Some(ns) = rendezvous_topics.get(peer) {
+        topics.extend(ns.iter().cloned());
+    }
+    topics.into_iter().collect()
+}
+
 async fn handle_push_request(
     push_state: &Option<(Arc<PushStore>, push_notifier::PushNotifier)>,
     request: &PushRequest,
     peer_id: &str,
     sender_addrs: Vec<String>,
+    relay_metrics: &RelayMetrics,
 ) -> PushResponse {
     let (store, notifier) = match push_state {
         Some(s) => s,
@@ -1054,6 +1160,7 @@ async fn handle_push_request(
                     log::info!(
                         "Registered {platform_str} push token for topic {topic} from {peer_id}"
                     );
+                    relay_metrics.set_registered_tokens(store.count_tokens().await.unwrap_or(-1));
                     PushResponse::Ok
                 }
                 Err(e) => PushResponse::Error {
@@ -1065,6 +1172,7 @@ async fn handle_push_request(
             match store.unregister_token(topic, token).await {
                 Ok(()) => {
                     log::info!("Unregistered push token for topic {topic} from {peer_id}");
+                    relay_metrics.set_registered_tokens(store.count_tokens().await.unwrap_or(-1));
                     PushResponse::Ok
                 }
                 Err(e) => PushResponse::Error {
@@ -1103,6 +1211,7 @@ async fn handle_push_request(
                 "NotifyTopic from {peer_id} (site {sender_site_id}) for {}",
                 short_topic(topic),
             );
+            relay_metrics.push_notify(topic);
             // Pass the sender's peer id so the fan-out skips the writer's own
             // registered token (no self-wake on a local write).
             notifier.notify(topic.clone(), peer_id.to_string(), sender_addrs);

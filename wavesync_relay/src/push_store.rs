@@ -509,6 +509,15 @@ impl PushStore {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// Total number of currently registered push tokens, across all topics
+    /// and platforms. Feeds the `relay_registered_tokens` gauge so it stays
+    /// in sync with the persistent store after every register/unregister.
+    pub async fn count_tokens(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM push_tokens")
+            .fetch_one(&self.pool)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +553,22 @@ mod tests {
             .register_token("topic1", "Fcm", "other", "peer-2")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn count_tokens_counts() {
+        let store = mem_store().await;
+        assert_eq!(store.count_tokens().await.unwrap(), 0);
+        store
+            .register_token("topic1", "Fcm", "tok1", "peer-1")
+            .await
+            .unwrap();
+        assert_eq!(store.count_tokens().await.unwrap(), 1);
+        store
+            .register_token("topic2", "Apns", "tok2", "peer-2")
+            .await
+            .unwrap();
+        assert_eq!(store.count_tokens().await.unwrap(), 2);
     }
 
     #[tokio::test]

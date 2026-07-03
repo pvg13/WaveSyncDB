@@ -24,6 +24,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::metrics::RelayMetrics;
 use crate::push_retry::{self, MAX_AGE_SECS, compute_delay};
 use crate::push_sender::{PushResult, PushSender, TransientError};
 use crate::push_store::{PushStore, RetryRow};
@@ -75,6 +76,7 @@ impl PushNotifier {
         store: Arc<PushStore>,
         sender: Arc<PushSender>,
         cooldown_duration: Duration,
+        metrics: RelayMetrics,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<TopicNotification>(256);
         let (nudge_tx, nudge_rx) = mpsc::channel::<RetryNudge>(64);
@@ -83,7 +85,12 @@ impl PushNotifier {
         // any push attempt could create a fresh retry row. (The
         // notifier loop hasn't started yet — there's no race, but the
         // ordering is also the natural read.)
-        tokio::spawn(retry_worker_loop(store.clone(), sender.clone(), nudge_rx));
+        tokio::spawn(retry_worker_loop(
+            store.clone(),
+            sender.clone(),
+            nudge_rx,
+            metrics.clone(),
+        ));
 
         tokio::spawn(notifier_loop(
             rx,
@@ -91,6 +98,7 @@ impl PushNotifier {
             sender,
             cooldown_duration,
             nudge_tx,
+            metrics,
         ));
 
         Self { tx }
@@ -124,6 +132,7 @@ async fn notifier_loop(
     sender: Arc<PushSender>,
     cooldown_duration: Duration,
     nudge_tx: mpsc::Sender<RetryNudge>,
+    metrics: RelayMetrics,
 ) {
     let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
 
@@ -145,7 +154,7 @@ async fn notifier_loop(
                         if let Some(state) = cooldowns.get_mut(&topic) {
                             if now >= state.expires_at {
                                 // Cooldown expired — fire immediately (leading edge)
-                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx).await;
+                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics).await;
                                 state.expires_at = now + cooldown_duration;
                                 state.pending = None;
                             } else {
@@ -154,7 +163,7 @@ async fn notifier_loop(
                             }
                         } else {
                             // First notification for this topic — fire immediately
-                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx).await;
+                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics).await;
                             cooldowns.insert(topic, CooldownState {
                                 expires_at: now + cooldown_duration,
                                 pending: None,
@@ -179,7 +188,7 @@ async fn notifier_loop(
                     .collect();
 
                 for (topic, (notifying_peer, peer_addrs)) in expired {
-                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx).await;
+                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx, &metrics).await;
                     if let Some(state) = cooldowns.get_mut(&topic) {
                         state.expires_at = now + cooldown_duration;
                         state.pending = None;
@@ -213,6 +222,7 @@ async fn fire_notifications(
     notifying_peer: &str,
     peer_addrs: &[String],
     nudge_tx: &mpsc::Sender<RetryNudge>,
+    metrics: &RelayMetrics,
 ) {
     // Exclude the writer's own token: a device uses the same libp2p peer id for
     // its RegisterToken and its NotifyTopic, so a local write must not wake the
@@ -265,11 +275,13 @@ async fn fire_notifications(
                     "Daily push budget exhausted for token={short}... ({}); skipping wake for {topic_short}",
                     token_entry.platform
                 );
+                metrics.push_sent(&token_entry.platform, "budget_denied");
                 continue;
             }
             Err(e) => {
                 log::error!("Daily budget check failed for {topic_short}: {e}");
                 // Fail closed on the budget check: skip rather than risk unbounded sends.
+                metrics.push_sent(&token_entry.platform, "budget_check_error");
                 continue;
             }
         }
@@ -291,6 +303,7 @@ async fn fire_notifications(
         match result {
             PushResult::Sent => {
                 log::info!("Push sent ({}) to token={}...", token_entry.platform, short);
+                metrics.push_sent(&token_entry.platform, "sent");
                 // A fresh send succeeded — clear any stale retry row
                 // that had been queued from an earlier failure for the
                 // same (topic, token). Latest peer_addrs already won
@@ -304,6 +317,7 @@ async fn fire_notifications(
                     "Pruning invalid push token {short}... ({}): {reason:?}",
                     token_entry.platform
                 );
+                metrics.push_sent(&token_entry.platform, "token_invalid");
                 if let Err(e) = store.remove_token(&token_entry.token).await {
                     log::error!("Failed to remove invalid token: {e}");
                 }
@@ -329,6 +343,7 @@ async fn fire_notifications(
                     token_entry.platform,
                     next_delay,
                 );
+                metrics.push_sent(&token_entry.platform, "transient");
                 if let Err(e) = store
                     .enqueue_retry(
                         topic,
@@ -355,6 +370,7 @@ async fn fire_notifications(
                      (dropping; misconfiguration won't resolve itself)",
                     token_entry.platform
                 );
+                metrics.push_sent(&token_entry.platform, "permanent");
                 // Clear any retry row that might be in flight for this
                 // (topic, token) — once we've classified the failure as
                 // permanent, retries won't help.
@@ -406,6 +422,7 @@ async fn retry_worker_loop(
     store: Arc<PushStore>,
     sender: Arc<PushSender>,
     mut nudge_rx: mpsc::Receiver<RetryNudge>,
+    metrics: RelayMetrics,
 ) {
     // Startup smear + stale purge. Without smear, a relay that was down
     // for an hour wakes up and slams FCM/APNs with every queued retry
@@ -444,7 +461,7 @@ async fn retry_worker_loop(
         };
 
         for row in due {
-            process_retry(&store, &sender, row).await;
+            process_retry(&store, &sender, row, &metrics).await;
         }
 
         // Sleep until the next row's deadline, or until a nudge wakes
@@ -468,7 +485,12 @@ async fn retry_worker_loop(
     }
 }
 
-async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
+async fn process_retry(
+    store: &PushStore,
+    sender: &PushSender,
+    row: RetryRow,
+    metrics: &RelayMetrics,
+) {
     // The row was inserted at attempts=N meaning "next retry is the
     // Nth". Now that we're firing it, the *result* should be processed
     // at attempts=N+1 if it fails again.
@@ -500,6 +522,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                  (attempt {})",
                 row.attempts
             );
+            metrics.push_sent(&platform_label, "sent");
             let _ = store.remove_retry(&row.topic, &row.token).await;
         }
         PushResult::TokenInvalid { reason } => {
@@ -507,6 +530,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                 "Push retry hit TokenInvalid for {short}... ({platform_label}): {reason:?}; \
                  pruning token + retries"
             );
+            metrics.push_sent(&platform_label, "token_invalid");
             let _ = store.remove_token(&row.token).await;
             let _ = store.purge_retries_for_token(&row.token).await;
         }
@@ -515,6 +539,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                 "Push retry hit Permanent for {short}... ({platform_label}): {err:?}; \
                  dropping"
             );
+            metrics.push_sent(&platform_label, "permanent");
             let _ = store.remove_retry(&row.topic, &row.token).await;
         }
         PushResult::Transient(err) => {
@@ -525,6 +550,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                      age exceeded ({}s old)",
                     now - row.first_failed_at
                 );
+                metrics.push_sent(&platform_label, "age_exceeded");
                 let _ = store.remove_retry(&row.topic, &row.token).await;
                 return;
             }
@@ -547,6 +573,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                     // row we just read; if a fresh NotifyTopic arrives
                     // during this update window it will UPSERT again
                     // with newer addrs.
+                    metrics.push_sent(&platform_label, "transient");
                     let _ = store
                         .enqueue_retry(
                             &row.topic,
@@ -570,6 +597,7 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
                          after {} attempts; dropping",
                         row.attempts
                     );
+                    metrics.push_sent(&platform_label, "retry_budget_exhausted");
                     let _ = store.remove_retry(&row.topic, &row.token).await;
                 }
             }

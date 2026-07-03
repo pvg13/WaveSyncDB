@@ -5,18 +5,13 @@
 //! limits), so duration is the exact meterable quantity; global bytes come
 //! from the bandwidth transport metrics. Label discipline: never PeerId
 //! (unbounded cardinality); topics use the short 12-char prefix.
-//!
-//! The event loop and HTTP exporter that call into this module land in a
-//! later change, so the compiler can't yet see most of these items in use
-//! outside their own unit tests.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -58,7 +53,7 @@ pub struct DirectionLabel {
     pub direction: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum ReservationOutcome {
     Accepted,
     Denied,
