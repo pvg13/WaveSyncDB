@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Security
+- **Argon2id passphrase derivation (breaking).** The group key is now
+  derived exclusively with Argon2id (19 MiB, 2 passes, salted with the user
+  topic) instead of a single fast BLAKE3 call. Each offline guess costs
+  ~100 ms + 19 MiB instead of nanoseconds, closing the dictionary-attack
+  vector against observers of the cleartext derived topic — including the
+  relay operator. The salt makes precomputed tables useless across
+  deployments. Breaking: `GroupKey::from_passphrase(passphrase, user_topic)`
+  gains the salt parameter, and upgraded passphrase groups derive new
+  `wavesync2-` topics — all peers of a group must run the same version
+  (pre-1.0, no deployed users; older peers are silently ignored, never
+  rejected). One-time derivation cost: ~100 ms native, a few seconds in
+  the browser.
+
 ### Changed
 - **Trigger-driven change capture.** Write capture no longer parses SQL text.
   Every registered table gets `AFTER INSERT/UPDATE/DELETE` triggers recording
