@@ -534,6 +534,12 @@ pub async fn run_table_driver<E>(
 
     let mut last_full_reload = Instant::now();
     let mut refresh_rx = db.refresh_rx();
+    // Closed means every sender is gone. While this driver holds `db` the
+    // inner sender field cannot drop, so this is effectively unreachable —
+    // but if it ever fires (future refactor weakens the hold), re-subscribe
+    // from the handle and reload once; a second immediate Closed means the
+    // handle is truly dead and the driver exits cleanly.
+    let mut closed_retry = false;
 
     loop {
         // Wait for either a change notification or a resume/refresh tick.
@@ -553,14 +559,31 @@ pub async fn run_table_driver<E>(
                             last_full_reload = Instant::now();
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        if closed_retry {
+                            return;
+                        }
+                        closed_retry = true;
+                        rx = db.change_rx();
+                        refresh_rx = db.refresh_rx();
+                        if let Ok(r) = E::find().all(&db).await {
+                            rows = r;
+                            rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                            db.set_table_cache(rows.clone());
+                            publish(rows.clone());
+                        }
+                        continue;
+                    }
                 }
                 continue;
             }
             n = rx.recv() => n,
         };
         let first = match first {
-            Ok(n) => n,
+            Ok(n) => {
+                closed_retry = false;
+                n
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 log::warn!("Missed {} change notifications for {}", n, target_table);
                 if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
@@ -574,7 +597,21 @@ pub async fn run_table_driver<E>(
                 }
                 continue;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                if closed_retry {
+                    return;
+                }
+                closed_retry = true;
+                rx = db.change_rx();
+                refresh_rx = db.refresh_rx();
+                if let Ok(r) = E::find().all(&db).await {
+                    rows = r;
+                    rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                    db.set_table_cache(rows.clone());
+                    publish(rows.clone());
+                }
+                continue;
+            }
         };
 
         // Drain additional notifications within the batch window.
@@ -597,7 +634,7 @@ pub async fn run_table_driver<E>(
                     }
                     break;
                 }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
                 Err(_timeout) => break,
             }
         }
@@ -825,6 +862,12 @@ pub async fn run_row_driver<E>(
 
     let mut last_full_reload = Instant::now();
     let mut refresh_rx = db.refresh_rx();
+    // Closed means every sender is gone. While this driver holds `db` the
+    // inner sender field cannot drop, so this is effectively unreachable —
+    // but if it ever fires (future refactor weakens the hold), re-subscribe
+    // from the handle and reload once; a second immediate Closed means the
+    // handle is truly dead and the driver exits cleanly.
+    let mut closed_retry = false;
 
     loop {
         // Either a change notification or a resume/refresh tick. A tick
@@ -841,14 +884,29 @@ pub async fn run_row_driver<E>(
                             last_full_reload = Instant::now();
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        if closed_retry {
+                            return;
+                        }
+                        closed_retry = true;
+                        rx = db.change_rx();
+                        refresh_rx = db.refresh_rx();
+                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                            current = row;
+                            publish(current.clone());
+                        }
+                        continue;
+                    }
                 }
                 continue;
             }
             n = rx.recv() => n,
         };
         let first = match first {
-            Ok(n) => n,
+            Ok(n) => {
+                closed_retry = false;
+                n
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 log::warn!("Missed {} change notifications for {}", n, target_table);
                 if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
@@ -860,7 +918,19 @@ pub async fn run_row_driver<E>(
                 }
                 continue;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                if closed_retry {
+                    return;
+                }
+                closed_retry = true;
+                rx = db.change_rx();
+                refresh_rx = db.refresh_rx();
+                if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                    current = row;
+                    publish(current.clone());
+                }
+                continue;
+            }
         };
 
         let mut batch = vec![first];
@@ -880,7 +950,7 @@ pub async fn run_row_driver<E>(
                     }
                     break;
                 }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
                 Err(_timeout) => break,
             }
         }

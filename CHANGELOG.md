@@ -29,6 +29,28 @@
 - The catch-up path no longer fails outright on tables containing BLOB
   columns ("JSON cannot hold BLOB values").
 
+### Added
+- **`use_synced_table_loaded` / `use_synced_row_loaded`.** Loading-aware
+  Dioxus hooks that distinguish "still loading" from "loaded and empty/absent"
+  — outer `None` only until the initial query resolves, `Some(..)` from then
+  on (including on a failed initial query, which still counts as loaded).
+  For one-shot hydration latches that must not fire on a mid-load empty read.
+- **`WaveSyncDbBuilder::with_change_channel_capacity`.** Configures the
+  per-group `ChangeNotification` broadcast channel capacity (default 1024,
+  floor 16) for bursty writers whose subscribers need to keep per-row deltas
+  instead of falling back to a debounced full-table reload.
+
+### Fixed
+- **Engine-swap zombie/leak in Dioxus hooks.** After `InitDb::reset()` +
+  re-init, a mounted `use_synced_table`/`use_synced_row` used to keep the old
+  engine's `WaveSyncDb` clone alive in its driver task, pinning the dead
+  engine's SQLite file open and silently going stale — no crash, no error,
+  just a signal that stopped updating. Effects are now generation-reactive
+  (driven by `use_wavesync_generation()`) so a reset cancels the stale driver
+  task and respawns it against the new instance. As belt-and-braces, the
+  drivers' `RecvError::Closed` arms also re-subscribe once before giving up,
+  in case a future refactor weakens the task's hold on `db`.
+
 ## v0.8.0 — 03/07/2026
 
 Crate versions: `wavesyncdb` 0.8.0, `wavesyncdb_derive` 0.3.0,
