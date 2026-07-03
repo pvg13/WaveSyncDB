@@ -761,7 +761,7 @@ async fn run_engine(
         rendezvous_registered: false,
         rejected_peers: std::collections::HashMap::new(),
         verified_peers: std::collections::HashSet::new(),
-        pending_sync_peers: std::collections::HashSet::new(),
+        pending_sync_peers: std::collections::HashMap::new(),
         pending_pushes: std::collections::BTreeMap::new(),
     };
     let mut groups = HashMap::new();
@@ -884,8 +884,14 @@ pub(crate) struct GroupState {
     pub(crate) rejected_peers: std::collections::HashMap<libp2p::PeerId, RejectionState>,
     /// Peers verified via successful HMAC exchange for THIS group.
     pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
-    /// Peers with an in-flight sync request for THIS group.
-    pub(crate) pending_sync_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Peers with an in-flight sync request for THIS group, each stamped with
+    /// when the request was sent. The stamp lets a stale entry (whose response
+    /// was lost) stop blocking a re-request after `PENDING_SYNC_STALE` instead of
+    /// waiting out the full request-response timeout — the p95 tail-killer under
+    /// packet loss. Duplicate in-flight requests are harmless (responses are
+    /// idempotent), so failing open toward re-request is safe.
+    pub(crate) pending_sync_peers:
+        std::collections::HashMap<libp2p::PeerId, tokio::time::Instant>,
     /// Recently fanned-out local changesets not yet confirmed delivered to every
     /// connected peer, keyed by their `db_version` (#81 Option A). A real-time
     /// push is fire-and-forget; if it's dropped to a still-connected peer the
@@ -954,6 +960,12 @@ fn rejection_backoff(attempts: u32) -> Duration {
 /// inside Tailscale's published "keep the fallback warm, switch only when the
 /// new path is stable" guidance and well under a human-perceptible sync delay.
 const DEMOTION_DWELL: Duration = Duration::from_secs(10);
+
+/// How long an in-flight version-vector request blocks a re-request to the same
+/// peer before it is treated as stale (its response presumed lost). Shorter than
+/// the request-response timeout so a dropped response recovers on the next tick
+/// instead of stalling the peer for the full timeout window.
+pub(crate) const PENDING_SYNC_STALE: Duration = Duration::from_secs(10);
 
 fn peer_dial_backoff(prior_failures: u32) -> Duration {
     const BASE_SECS: u64 = 5;
@@ -1419,21 +1431,32 @@ impl EngineRunner {
             self.handle_bootstrap_peer_connected(peer_id, endpoint);
         }
 
-        if self.default_group().registry_is_ready
-            && !self.default_group().is_rejected(&peer_id)
-            && !self.infrastructure_peers.contains(&peer_id)
-        {
+        if !self.infrastructure_peers.contains(&peer_id) {
             // Ensure reconnecting peer is tracked for future periodic syncs
             self.peers
                 .entry(peer_id)
                 .or_insert_with(|| endpoint.get_remote_address().clone());
-            let effective_topic = self.default_effective_topic.clone();
-            if let Some(g) = self.groups.get_mut(&effective_topic) {
-                g.local_db_version = g
-                    .db_version_cache
-                    .load(std::sync::atomic::Ordering::Acquire);
+            // Kick an immediate catch-up for EVERY ready group this peer isn't
+            // rejected for — not just the default group. A multi-group node
+            // otherwise leaves its non-default groups to wait for the next 30s
+            // periodic tick before syncing a freshly-connected peer. The peer is
+            // already connected, so each request rides the existing connection
+            // (no new dial). Collect topics first to avoid holding a `groups`
+            // borrow across the `&mut self` sync calls.
+            let topics: Vec<String> = self
+                .groups
+                .iter()
+                .filter(|(_, g)| g.registry_is_ready && !g.is_rejected(&peer_id))
+                .map(|(t, _)| t.clone())
+                .collect();
+            for effective_topic in topics {
+                if let Some(g) = self.groups.get_mut(&effective_topic) {
+                    g.local_db_version = g
+                        .db_version_cache
+                        .load(std::sync::atomic::Ordering::Acquire);
+                }
+                self.initiate_sync_for_peer(peer_id, &effective_topic);
             }
-            self.initiate_sync_for_peer(peer_id, &effective_topic);
         }
 
         self.dialing_peers.remove(&peer_id);
@@ -2262,6 +2285,12 @@ impl EngineRunner {
             .keys()
             .filter(|p| !rejected.contains(p))
             .filter(|p| !self.infrastructure_peers.contains(p))
+            // Only fan out / redeliver to peers we currently hold a connection to.
+            // `send_request` to a known-but-disconnected peer makes request_response
+            // implicitly dial it — a redelivery tick firing against stale entries is
+            // a latent dial-storm vector. A disconnected peer picks the data up via
+            // the catch-up sync it runs on its next ConnectionEstablished anyway.
+            .filter(|p| self.swarm.is_connected(p))
             .copied()
             .collect()
     }

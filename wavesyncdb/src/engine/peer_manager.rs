@@ -51,7 +51,13 @@ impl EngineRunner {
             let Some(g) = self.groups.get(effective_topic) else {
                 return;
             };
-            if g.pending_sync_peers.contains(&peer_id) || g.is_rejected(&peer_id) {
+            // Skip only if a *recent* request is still in flight. A stale entry
+            // (response presumably lost) no longer blocks a re-request.
+            let fresh_pending = g
+                .pending_sync_peers
+                .get(&peer_id)
+                .is_some_and(|sent| sent.elapsed() < crate::engine::PENDING_SYNC_STALE);
+            if fresh_pending || g.is_rejected(&peer_id) {
                 return;
             }
             (
@@ -91,7 +97,8 @@ impl EngineRunner {
             .snapshot
             .send_request(&peer_id, req);
         if let Some(g) = self.groups.get_mut(effective_topic) {
-            g.pending_sync_peers.insert(peer_id);
+            g.pending_sync_peers
+                .insert(peer_id, tokio::time::Instant::now());
         }
     }
 
