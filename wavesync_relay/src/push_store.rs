@@ -3,10 +3,46 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{ConnectOptions, Row, SqlitePool};
+
+/// Maximum distinct `(topic, token)` rows a single peer may register. Bounds the
+/// persistent token store against an unauthenticated peer flooding registrations.
+/// Generous enough for a real multi-group device (a handful of groups × platforms).
+pub const MAX_TOKENS_PER_PEER: i64 = 32;
+
+/// Per-token silent-push budget per UTC day. Kept at/under the platform ceiling
+/// (APNs background pushes are throttled to only a few per device per day) so a
+/// hostile or misbehaving notifier cannot burn a device's budget and silence
+/// legitimate wakes. Bursts within a day are additionally coalesced by the
+/// notifier's debounce; this is the hard sustained-rate cap.
+pub const MAX_PUSHES_PER_TOKEN_PER_DAY: i64 = 5;
+
+/// Failure modes of [`PushStore::register_token`].
+#[derive(Debug)]
+pub enum RegisterError {
+    /// The registering peer already holds [`MAX_TOKENS_PER_PEER`] rows.
+    TooManyRegistrations,
+    /// Underlying storage error.
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for RegisterError {
+    fn from(e: sqlx::Error) -> Self {
+        RegisterError::Db(e)
+    }
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterError::TooManyRegistrations => {
+                write!(f, "too many token registrations for this peer")
+            }
+            RegisterError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
 
 /// A registered push token entry.
 #[derive(Debug, Clone)]
@@ -123,17 +159,53 @@ impl PushStore {
         .execute(&pool)
         .await?;
 
+        // Per-token silent-push budget ledger. One row per token per UTC day,
+        // holding the count of wakes fired that day. Enforces the platform push
+        // budget (APNs throttles background pushes to only a few per device per
+        // day) so a spammy or hostile notifier cannot exhaust it and silence
+        // legitimate wakes for the whole group. Old rows are pruned lazily.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS push_budget (
+                token   TEXT NOT NULL,
+                day     INTEGER NOT NULL,
+                count   INTEGER NOT NULL,
+                PRIMARY KEY (token, day)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self { pool })
     }
 
     /// Register a push token for a topic.
+    ///
+    /// Rejected with `TooManyRegistrations` once a single peer already holds
+    /// [`MAX_TOKENS_PER_PEER`] distinct `(topic, token)` rows — an unauthenticated
+    /// peer must not be able to grow the persistent token store without bound.
+    /// Re-registering an existing `(topic, token)` is always allowed (it refreshes
+    /// `registered_at` / `peer_id` and does not add a row).
     pub async fn register_token(
         &self,
         topic: &str,
         platform: &str,
         token: &str,
         peer_id: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), RegisterError> {
+        // Count this peer's existing rows, excluding the one being (re)written.
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM push_tokens
+             WHERE peer_id = ?1 AND NOT (topic = ?2 AND token = ?3)",
+        )
+        .bind(peer_id)
+        .bind(topic)
+        .bind(token)
+        .fetch_one(&self.pool)
+        .await?;
+        if existing >= MAX_TOKENS_PER_PEER {
+            return Err(RegisterError::TooManyRegistrations);
+        }
+
         sqlx::query(
             "INSERT OR REPLACE INTO push_tokens (topic, platform, token, peer_id, registered_at)
              VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
@@ -145,6 +217,59 @@ impl PushStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Whether `peer_id` currently holds a registered token for `topic`.
+    ///
+    /// The relay cannot verify group membership (it has no group key), but
+    /// requiring a `NotifyTopic` sender to first hold a token for the topic forces
+    /// an evictable, rate-limitable handle and blocks drive-by wake-spam from a
+    /// peer that merely learned the topic string.
+    pub async fn peer_registered_on_topic(
+        &self,
+        topic: &str,
+        peer_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM push_tokens WHERE topic = ?1 AND peer_id = ?2",
+        )
+        .bind(topic)
+        .bind(peer_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    /// Atomically charge one wake against `token`'s daily budget.
+    ///
+    /// Returns `true` if the wake is within [`MAX_PUSHES_PER_TOKEN_PER_DAY`] and was
+    /// counted, `false` if the token has already hit its budget for the current UTC
+    /// day (caller must skip the send). `day` is `unix_secs / 86400`.
+    pub async fn charge_daily_budget(&self, token: &str, day: i64) -> Result<bool, sqlx::Error> {
+        // Upsert-increment, then read back the post-increment count in one txn so
+        // concurrent notifiers can't both squeak past the cap.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO push_budget (token, day, count) VALUES (?1, ?2, 1)
+             ON CONFLICT(token, day) DO UPDATE SET count = count + 1",
+        )
+        .bind(token)
+        .bind(day)
+        .execute(&mut *tx)
+        .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count FROM push_budget WHERE token = ?1 AND day = ?2")
+                .bind(token)
+                .bind(day)
+                .fetch_one(&mut *tx)
+                .await?;
+        // Prune ledger rows older than yesterday to keep the table bounded.
+        sqlx::query("DELETE FROM push_budget WHERE day < ?1")
+            .bind(day - 1)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(count <= MAX_PUSHES_PER_TOKEN_PER_DAY)
     }
 
     /// Unregister a specific token from a topic.
@@ -168,23 +293,22 @@ impl PushStore {
         topic: &str,
         exclude_peer_id: Option<&str>,
     ) -> Result<Vec<PushToken>, sqlx::Error> {
-        let rows = match exclude_peer_id {
-            Some(peer) => {
-                sqlx::query(
+        let rows =
+            match exclude_peer_id {
+                Some(peer) => sqlx::query(
                     "SELECT platform, token FROM push_tokens WHERE topic = ?1 AND peer_id <> ?2",
                 )
                 .bind(topic)
                 .bind(peer)
                 .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query("SELECT platform, token FROM push_tokens WHERE topic = ?1")
-                    .bind(topic)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-        };
+                .await?,
+                None => {
+                    sqlx::query("SELECT platform, token FROM push_tokens WHERE topic = ?1")
+                        .bind(topic)
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+            };
 
         Ok(rows
             .iter()
@@ -393,6 +517,75 @@ mod tests {
 
     async fn mem_store() -> PushStore {
         PushStore::open(":memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_registration_cap_per_peer() {
+        let store = mem_store().await;
+        // Fill the peer's quota with distinct tokens.
+        for i in 0..MAX_TOKENS_PER_PEER {
+            store
+                .register_token("topic1", "Fcm", &format!("tok-{i}"), "peer-1")
+                .await
+                .unwrap();
+        }
+        // One more distinct token is rejected.
+        let err = store
+            .register_token("topic1", "Fcm", "tok-overflow", "peer-1")
+            .await;
+        assert!(matches!(err, Err(RegisterError::TooManyRegistrations)));
+        // Re-registering an existing (topic, token) still works (no new row).
+        store
+            .register_token("topic1", "Fcm", "tok-0", "peer-1")
+            .await
+            .unwrap();
+        // A different peer has its own quota.
+        store
+            .register_token("topic1", "Fcm", "other", "peer-2")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_peer_registered_on_topic() {
+        let store = mem_store().await;
+        store
+            .register_token("topicX", "Fcm", "tok", "peer-1")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .peer_registered_on_topic("topicX", "peer-1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .peer_registered_on_topic("topicX", "peer-2")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .peer_registered_on_topic("topicY", "peer-1")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daily_budget_cap() {
+        let store = mem_store().await;
+        let day = 20_000;
+        // First MAX allowed, then over budget.
+        for _ in 0..MAX_PUSHES_PER_TOKEN_PER_DAY {
+            assert!(store.charge_daily_budget("tok", day).await.unwrap());
+        }
+        assert!(!store.charge_daily_budget("tok", day).await.unwrap());
+        // A new day resets the budget.
+        assert!(store.charge_daily_budget("tok", day + 1).await.unwrap());
+        // A different token has its own budget.
+        assert!(store.charge_daily_budget("tok2", day).await.unwrap());
     }
 
     #[tokio::test]

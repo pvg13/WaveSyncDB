@@ -776,11 +776,13 @@ impl WaveSyncDb {
         // (which only fires for `registry_is_ready` groups) and syncs only via
         // the slow periodic tick, leaving it one-directional/asymmetric.
         if !self.inner.is_default_group {
-            let _ = self.inner.node.cmd_tx.try_send(
-                crate::engine::EngineCommand::GroupRegistryReady {
-                    effective_topic: self.inner.effective_topic.clone(),
-                },
-            );
+            let _ =
+                self.inner
+                    .node
+                    .cmd_tx
+                    .try_send(crate::engine::EngineCommand::GroupRegistryReady {
+                        effective_topic: self.inner.effective_topic.clone(),
+                    });
         }
     }
 
@@ -1656,13 +1658,19 @@ impl SyncConfig {
     }
 
     /// Save this config to the database directory.
+    ///
+    /// The file holds the group passphrase(s) in cleartext. On mobile the app
+    /// sandbox already isolates it, but on a shared desktop the default umask can
+    /// leave it world-readable, so restrict it to owner-only (`0600`) on Unix.
     fn save(&self) -> Result<(), String> {
         let path = Self::config_path(&self.database_url)
             .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
         std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write config to {}: {e}", path.display()))
+            .map_err(|e| format!("Failed to write config to {}: {e}", path.display()))?;
+        restrict_file_permissions(&path);
+        Ok(())
     }
 
     /// Record a runtime-joined group in the persisted config (load → upsert by
@@ -1687,6 +1695,21 @@ impl SyncConfig {
         }
         config.save()
     }
+}
+
+/// Restrict a file to owner read/write (`0600`) on Unix. No-op elsewhere and
+/// best-effort — a failure to tighten permissions must not fail the write that
+/// already succeeded, but it is logged so a misconfigured environment is visible.
+fn restrict_file_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            log::warn!("Could not restrict permissions on {}: {e}", path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Builder for `WaveSyncDb`.

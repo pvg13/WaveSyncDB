@@ -83,11 +83,7 @@ impl PushNotifier {
         // any push attempt could create a fresh retry row. (The
         // notifier loop hasn't started yet — there's no race, but the
         // ordering is also the natural read.)
-        tokio::spawn(retry_worker_loop(
-            store.clone(),
-            sender.clone(),
-            nudge_rx,
-        ));
+        tokio::spawn(retry_worker_loop(store.clone(), sender.clone(), nudge_rx));
 
         tokio::spawn(notifier_loop(
             rx,
@@ -254,7 +250,30 @@ async fn fire_notifications(
 
     let peer_addrs_json = serde_json::to_string(peer_addrs).unwrap_or_else(|_| "[]".to_string());
 
+    let today = now_unix() / 86_400;
+
     for token_entry in &tokens {
+        // Enforce the per-token daily silent-push budget. Beyond it the platform
+        // would throttle/drop wakes anyway; skipping here keeps a spammy or hostile
+        // notifier from burning a device's budget and silencing legitimate wakes.
+        // The device still catches up on its next foreground resume / periodic sync.
+        match store.charge_daily_budget(&token_entry.token, today).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let short = token_entry.token.chars().take(20).collect::<String>();
+                log::warn!(
+                    "Daily push budget exhausted for token={short}... ({}); skipping wake for {topic_short}",
+                    token_entry.platform
+                );
+                continue;
+            }
+            Err(e) => {
+                log::error!("Daily budget check failed for {topic_short}: {e}");
+                // Fail closed on the budget check: skip rather than risk unbounded sends.
+                continue;
+            }
+        }
+
         let result = match token_entry.platform.as_str() {
             "Fcm" => sender.send_fcm(&token_entry.token, topic, peer_addrs).await,
             "Apns" => {
@@ -296,8 +315,7 @@ async fn fire_notifications(
             }
             PushResult::Transient(err) => {
                 let now = now_unix();
-                let (error_kind, error_code, error_body, retry_after) =
-                    classify_transient(&err);
+                let (error_kind, error_code, error_body, retry_after) = classify_transient(&err);
 
                 let next_delay = match compute_delay(1, retry_after) {
                     Some(d) => d,
@@ -377,7 +395,7 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         let mut t = s[..max].to_string();
-        t.push_str("…");
+        t.push('…');
         t
     }
 }
@@ -458,7 +476,11 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
     let platform_label = row.platform.clone();
 
     let result = match row.platform.as_str() {
-        "Fcm" => sender.send_fcm(&row.token, &row.topic, &row.peer_addrs).await,
+        "Fcm" => {
+            sender
+                .send_fcm(&row.token, &row.topic, &row.peer_addrs)
+                .await
+        }
         "Apns" => {
             sender
                 .send_apns(&row.token, &row.topic, &row.peer_addrs)
@@ -554,4 +576,3 @@ async fn process_retry(store: &PushStore, sender: &PushSender, row: RetryRow) {
         }
     }
 }
-

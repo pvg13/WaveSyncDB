@@ -25,6 +25,8 @@ async-trait = "0.1"
 wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.3.0", optional = true }
 dioxus = { version = "0.7.6", optional = true }
 manganis = { version = "0.7.6", optional = true }
+subtle = "2.6.1"
+argon2 = "0.5.3"
 
 # Native targets: full sync engine, libp2p transports, sea-orm with sqlx-sqlite,
 # tokio with the OS-I/O surface. None of these compile on wasm32-unknown-unknown.
