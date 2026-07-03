@@ -674,16 +674,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_registry = Arc::new(std::sync::Mutex::new(metrics_registry));
 
     if !cli.metrics_addr.is_empty() {
-        let addr: std::net::SocketAddr = cli
-            .metrics_addr
-            .parse()
-            .map_err(|e| format!("bad METRICS_ADDR '{}': {e}", cli.metrics_addr))?;
-        let registry = metrics_registry.clone();
-        tokio::spawn(async move {
-            if let Err(e) = metrics::serve_metrics(addr, registry).await {
-                log::error!("Metrics endpoint failed: {e}");
+        match cli.metrics_addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let registry = metrics_registry.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = metrics::serve_metrics(addr, registry).await {
+                        log::error!("Metrics endpoint failed: {e}");
+                    }
+                });
             }
-        });
+            Err(e) => {
+                log::error!(
+                    "Invalid METRICS_ADDR '{}': {e}; metrics endpoint disabled",
+                    cli.metrics_addr
+                );
+            }
+        }
     }
 
     // Track connected peer addresses for FCM push payloads.

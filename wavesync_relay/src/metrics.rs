@@ -426,7 +426,10 @@ pub async fn serve_metrics(
                 let registry = registry.clone();
                 async move {
                     let mut body = String::new();
-                    let reg = registry.lock().expect("metrics registry poisoned");
+                    // A poisoned mutex is still structurally readable; scrape endpoint must degrade gracefully.
+                    let reg = registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match prometheus_client::encoding::text::encode(&mut body, &reg) {
                         Ok(()) => (
                             [(
