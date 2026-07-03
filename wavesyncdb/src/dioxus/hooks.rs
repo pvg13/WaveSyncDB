@@ -420,6 +420,38 @@ where
     signal
 }
 
+/// Like [`use_synced_table_db`] but distinguishes "still loading" from
+/// "loaded and empty": `None` until the initial query resolves, then
+/// `Some(rows)` forever — including when deletes empty the table. On a
+/// failed initial query the driver logs and publishes the empty snapshot
+/// (see the comment on that fallback in [`run_table_driver`]), so
+/// consumers never block on `None` indefinitely. Use this for one-shot
+/// hydration latches that must not fire on a mid-load empty read.
+pub fn use_synced_table_loaded<E>(db: WaveSyncDb) -> Signal<Option<Vec<E::Model>>>
+where
+    E: EntityTrait,
+    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value> + From<String>,
+{
+    let signal: Signal<Option<Vec<E::Model>>> = use_signal(|| None);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_auto_resume(&db);
+
+    use_driver_task(db, move |db| {
+        // Same `!Send` bridging as `use_synced_table_db` — see that hook's
+        // comment. `publish_some` wraps each snapshot in `Some(..)` so the
+        // first publish is the observable loading -> loaded transition.
+        let mut publish = LocalPublish(signal);
+        spawn(async move {
+            run_table_driver::<E>(db, move |rows| publish.publish_some(rows)).await;
+        })
+    });
+
+    signal
+}
+
 /// Bridges a `!Send` closure capture (a Dioxus `Signal`) across the `Send`
 /// bound that [`run_table_driver`] and [`run_row_driver`] require of their
 /// `publish` callback.
@@ -435,6 +467,17 @@ struct LocalPublish<T>(Signal<T>);
 impl<T: 'static> LocalPublish<T> {
     fn publish(&mut self, value: T) {
         self.0.set(value);
+    }
+}
+
+impl<T: 'static> LocalPublish<Option<T>> {
+    /// Wraps `value` in `Some` before publishing. Used by the `_loaded`
+    /// hook variants, whose signal is `Signal<Option<Inner>>` starting at
+    /// `None` (still loading) — the driver's callback only ever hands back
+    /// the unwrapped `Inner`, so this is where the `Some(..)` distinguishing
+    /// "loaded" from "loading" gets applied.
+    fn publish_some(&mut self, value: T) {
+        self.0.set(Some(value));
     }
 }
 
@@ -472,6 +515,11 @@ pub async fn run_table_driver<E>(
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed initial table load: {}", e);
+                // Falls through to `publish(rows.clone())` below with the
+                // empty Vec, same as a legitimately empty table. This is
+                // load-bearing for `use_synced_table_loaded`: a failed
+                // initial query still counts as "loaded" (Some([])), so a
+                // `_loaded` consumer never blocks on `None` forever.
                 Vec::new()
             }
         }
@@ -687,6 +735,41 @@ where
     signal
 }
 
+/// Like [`use_synced_row`] but distinguishes "still loading" from "row
+/// absent": outer `None` = loading; `Some(None)` = loaded, row absent;
+/// `Some(Some(model))` = loaded and present. On a failed initial query the
+/// driver logs and publishes `Some(None)` (see the comment on that
+/// fallback in [`run_row_driver`]), so consumers never block on the outer
+/// `None` indefinitely.
+pub fn use_synced_row_loaded<E>(
+    db: WaveSyncDb,
+    pk: <E::PrimaryKey as PrimaryKeyTrait>::ValueType,
+) -> Signal<Option<Option<E::Model>>>
+where
+    E: EntityTrait,
+    E::Model: FromQueryResult + SyncedModel + Clone + Send + Sync + 'static,
+    <E::PrimaryKey as PrimaryKeyTrait>::ValueType:
+        Clone + Send + Sync + 'static + Into<sea_orm::Value> + std::fmt::Display,
+{
+    let signal: Signal<Option<Option<E::Model>>> = use_signal(|| None);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ensure_auto_resume(&db);
+
+    use_driver_task(db, move |db| {
+        let pk = pk.clone();
+        // Same `!Send` bridging as `use_synced_row` — see that hook's
+        // comment. `publish_some` wraps each snapshot in `Some(..)` so the
+        // first publish is the observable loading -> loaded transition.
+        let mut publish = LocalPublish(signal);
+        spawn(async move {
+            run_row_driver::<E>(db, pk, move |row| publish.publish_some(row)).await;
+        })
+    });
+
+    signal
+}
+
 /// Drives one row subscription: initial load (cache fast path, falling back
 /// to `find_by_id`), then change-notification batches — filtered to this
 /// row's primary key — applied in place, publishing a snapshot after the
@@ -729,6 +812,11 @@ pub async fn run_row_driver<E>(
             Ok(row) => row,
             Err(e) => {
                 log::error!("Failed initial row load: {}", e);
+                // Falls through to `publish(current.clone())` below with
+                // None, same as a legitimately absent row. Load-bearing for
+                // `use_synced_row_loaded`: a failed initial query still
+                // counts as "loaded" (Some(None)), so a `_loaded` consumer
+                // never blocks on the outer `None` forever.
                 None
             }
         };

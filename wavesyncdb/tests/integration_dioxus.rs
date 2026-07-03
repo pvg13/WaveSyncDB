@@ -612,3 +612,34 @@ async fn row_driver_publishes_initial_and_incremental_snapshots() {
 
     drv.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1 contract: before the initial load resolves NOTHING is
+// published (a _loaded consumer reads None = loading); the FIRST publish
+// is the loaded snapshot, even when the table is legitimately empty.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn loaded_contract_none_until_first_publish_even_when_empty() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_loaded"), "test-drv-loaded")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    // Simulate the _loaded wrapper: publish wraps into Some(...).
+    let state: Arc<Mutex<Option<Vec<task::Model>>>> = Arc::new(Mutex::new(None));
+    let s2 = state.clone();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        move |rows| *s2.lock().unwrap() = Some(rows),
+    ));
+
+    // The distinguishable moment: None (loading) → Some([]) (loaded-empty).
+    wait_for(
+        || state.lock().unwrap().is_some(),
+        "loaded-empty transition",
+    )
+    .await;
+    assert_eq!(state.lock().unwrap().as_deref(), Some(&[][..]));
+    drv.abort();
+}

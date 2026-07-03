@@ -13,6 +13,11 @@
 //! - [`use_synced_table_db`] / [`use_synced_table_client`] — backend-
 //!   specific escape hatches when a [`SyncHandle`] isn't available.
 //! - [`use_synced_row`] — reactive signal for a single row by primary key.
+//! - [`use_synced_table_loaded`] — like `use_synced_table_db`, but
+//!   distinguishes "still loading" (`None`) from "loaded" (`Some`, even
+//!   when empty) for one-shot hydration latches.
+//! - [`use_synced_row_loaded`] — like `use_synced_row`, but distinguishes
+//!   "still loading" (`None`) from "loaded, row absent" (`Some(None)`).
 //! - [`SyncHandle`] — opaque transport wrapper (`WaveSyncDb` on native,
 //!   `Signal<Option<WebSyncClient>>` on wasm32) with a unified
 //!   [`SyncHandle::submit`] for writes.
