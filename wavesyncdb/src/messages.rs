@@ -5,6 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default tombstone retention when none is configured: 7 days. Shared by
+/// the native and web engines — both must age tombstones by the same rule
+/// or reconcile digests drift between them.
+pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 = 7 * 24 * 3600;
+
 // ── Newtypes for domain concepts ──
 
 /// A validated table name (e.g. "tasks", "expenses")

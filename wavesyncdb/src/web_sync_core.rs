@@ -74,6 +74,13 @@ pub struct ShadowRow {
     pub cl: u64,
     pub seq: u32,
     pub db_version: u64,
+    /// Deleter's wall-clock stamp (unix seconds) — `Some` only on
+    /// `__deleted` rows. Same wire-carried value as native, so both
+    /// engines age a given tombstone from the same instant. serde default
+    /// keeps pre-retention IndexedDB rows loadable (they read as `None`
+    /// and are backfilled at client init).
+    #[serde(default)]
+    pub deleted_ts: Option<u64>,
 }
 
 /// Per-table sync configuration for the browser engine.
@@ -98,6 +105,11 @@ pub struct WebTableConfig {
 #[derive(Debug, Clone, Default)]
 pub struct WebSyncConfig {
     pub tables: HashMap<String, WebTableConfig>,
+    /// Tombstone retention in seconds. `None` = the 7-day default
+    /// (mirroring native's absent-meta-key semantics); `Some(0)` disables
+    /// GC entirely. Must match the native peers' setting or the two sides
+    /// age tombstones differently and digests drift.
+    pub tombstone_retention_secs: Option<u64>,
 }
 
 impl WebSyncConfig {
@@ -120,6 +132,28 @@ impl WebSyncConfig {
         self.tables
             .get(table)
             .and_then(|t| t.primary_key_column.clone())
+    }
+
+    /// The retention exclusion cutoff for a given `now`: tombstones with
+    /// `deleted_ts < cutoff` are treated as nonexistent on EVERY surface,
+    /// identical to native's rule.
+    pub fn tombstone_cutoff(&self, now_secs: u64) -> Option<u64> {
+        match self.tombstone_retention_secs {
+            Some(0) => None,
+            Some(secs) => Some(now_secs.saturating_sub(secs)),
+            None => {
+                Some(now_secs.saturating_sub(crate::messages::DEFAULT_TOMBSTONE_RETENTION_SECS))
+            }
+        }
+    }
+}
+
+/// True when a tombstone row is still live under `cutoff` (aged = absent).
+fn tombstone_live(row_deleted_ts: Option<u64>, cutoff: Option<u64>) -> bool {
+    match (row_deleted_ts, cutoff) {
+        (Some(ts), Some(c)) => ts >= c,
+        // No stamp (defensive) or GC disabled: never ages out.
+        _ => true,
     }
 }
 
@@ -236,7 +270,9 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
     changeset: &SyncChangeset,
     next_db_version: u64,
     peer_key: Option<&str>,
+    now_secs: u64,
 ) -> Result<Vec<ColumnChange>, StoreError> {
+    let cutoff = cfg.tombstone_cutoff(now_secs);
     let mut batch = WriteBatch {
         db_version: Some(next_db_version),
         peer_version: peer_key.map(|p| (p.to_string(), changeset.db_version)),
@@ -275,6 +311,12 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
         // delete supersedes sibling column changes in the same changeset, a
         // losing delete leaves the row untouched.
         if let Some(del) = row_changes.iter().find(|c| c.cid.0 == DELETED_COLUMN) {
+            // An incoming tombstone already past the retention cutoff is
+            // semantically nonexistent — same skip as native's
+            // apply_remote_delete.
+            if !tombstone_live(del.deleted_ts, cutoff) {
+                continue;
+            }
             let local_max_cv = local_entries
                 .values()
                 .map(|r| r.col_version)
@@ -296,6 +338,10 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
                         cl: del.cl,
                         seq: 0,
                         db_version: next_db_version,
+                        // The DELETER's stamp, stored verbatim so this
+                        // replica ages the tombstone from the same instant
+                        // as everyone else.
+                        deleted_ts: Some(del.deleted_ts.unwrap_or(now_secs)),
                     },
                 ));
                 applied.push((*del).clone());
@@ -309,7 +355,10 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
         // (no resurrection); a delete that provably lost is cleared so the pair
         // reconverges. The web store keeps values, so a cleared tombstone makes
         // the surviving cells visible again with no residue drop needed.
-        if let Some(tomb) = local_entries.get(DELETED_COLUMN) {
+        if let Some(tomb) = local_entries
+            .get(DELETED_COLUMN)
+            .filter(|t| tombstone_live(t.deleted_ts, cutoff))
+        {
             let incoming_max = row_changes
                 .iter()
                 .filter(|c| c.cid.0 != DELETED_COLUMN)
@@ -362,6 +411,7 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
                     cl: change.cl,
                     seq: change.seq,
                     db_version: next_db_version,
+                    deleted_ts: change.deleted_ts,
                 },
             ));
             applied.push((*change).clone());
@@ -381,12 +431,15 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
 /// only after the batch committed.
 pub async fn submit_local_write_core<S: ShadowStore>(
     store: &S,
+    cfg: &WebSyncConfig,
     site_id: &NodeId,
     table: &str,
     pk: &str,
     columns: Vec<(String, serde_json::Value)>,
     next_db_version: u64,
+    now_secs: u64,
 ) -> Result<Vec<ColumnChange>, StoreError> {
+    let cutoff = cfg.tombstone_cutoff(now_secs);
     let local_entries: HashMap<String, ShadowRow> = store
         .get_row_entries(table, pk)
         .await?
@@ -406,11 +459,13 @@ pub async fn submit_local_write_core<S: ShadowStore>(
     // still holds the tombstone would let its equal-cl delete win the tie and the
     // row would diverge. Mirrors the native floor in connection.rs. 0 = no
     // tombstone = normal write.
-    let floor = local_entries
+    // Aged tombstones are absent everywhere: they neither raise the
+    // resurrection floor nor need clearing (physical GC will reap them).
+    let live_tomb = local_entries
         .get(DELETED_COLUMN)
-        .map(|t| t.cl + 1)
-        .unwrap_or(0);
-    if local_entries.contains_key(DELETED_COLUMN) {
+        .filter(|t| tombstone_live(t.deleted_ts, cutoff));
+    let floor = live_tomb.map(|t| t.cl + 1).unwrap_or(0);
+    if live_tomb.is_some() {
         batch
             .tombstone_clears
             .push((table.to_string(), pk.to_string()));
@@ -433,6 +488,7 @@ pub async fn submit_local_write_core<S: ShadowStore>(
                 cl: next_cl,
                 seq: seq as u32,
                 db_version: next_db_version,
+                deleted_ts: None,
             },
         ));
         changes.push(ColumnChange {
@@ -463,15 +519,22 @@ pub async fn submit_local_write_core<S: ShadowStore>(
 /// the batch committed.
 pub async fn submit_local_delete_core<S: ShadowStore>(
     store: &S,
+    cfg: &WebSyncConfig,
     site_id: &NodeId,
     table: &str,
     pk: &str,
     next_db_version: u64,
+    now_secs: u64,
 ) -> Result<Vec<ColumnChange>, StoreError> {
+    let cutoff = cfg.tombstone_cutoff(now_secs);
+    // An aged prior tombstone must not raise this delete's clock — a peer
+    // that already collected it physically would compute a different
+    // tombstone_cv for the same operation.
     let max_cv = store
         .get_row_entries(table, pk)
         .await?
         .into_iter()
+        .filter(|(cid, r)| cid != DELETED_COLUMN || tombstone_live(r.deleted_ts, cutoff))
         .map(|(_, r)| r.col_version)
         .max()
         .unwrap_or(0);
@@ -490,6 +553,7 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
                 cl: tombstone_cv,
                 seq: 0,
                 db_version: next_db_version,
+                deleted_ts: Some(now_secs),
             },
         )],
         ..Default::default()
@@ -506,7 +570,7 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
         cl: tombstone_cv,
         seq: 0,
         db_version: next_db_version,
-        deleted_ts: None,
+        deleted_ts: Some(now_secs),
     }])
 }
 
@@ -523,23 +587,33 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
 /// would include cells no native peer ever produces.
 pub async fn changes_since_core<S: ShadowStore>(
     store: &S,
+    cfg: &WebSyncConfig,
     since: u64,
+    now_secs: u64,
 ) -> Result<Vec<ColumnChange>, StoreError> {
+    let cutoff = cfg.tombstone_cutoff(now_secs);
     // Full scan, then window-filter: the tombstone that hides a cell may
     // live outside the `since` window, so visibility must be computed over
     // the whole store. (The underlying store scan is full-table anyway.)
     let all = store.get_changes_since(0).await?;
+    // Only LIVE tombstones hide their row's cells or travel themselves;
+    // aged ones are absent from every surface (native parity — the same
+    // predicate guards shadow::get_changes_since).
     let tombstoned: std::collections::HashSet<(&str, &str)> = all
         .iter()
-        .filter(|c| c.cid.0 == DELETED_COLUMN)
+        .filter(|c| c.cid.0 == DELETED_COLUMN && tombstone_live(c.deleted_ts, cutoff))
         .map(|c| (c.table.0.as_str(), c.pk.0.as_str()))
         .collect();
     Ok(all
         .iter()
         .filter(|c| {
-            c.db_version > since
-                && (c.cid.0 == DELETED_COLUMN
-                    || !tombstoned.contains(&(c.table.0.as_str(), c.pk.0.as_str())))
+            if c.db_version <= since {
+                return false;
+            }
+            if c.cid.0 == DELETED_COLUMN {
+                return tombstone_live(c.deleted_ts, cutoff);
+            }
+            !tombstoned.contains(&(c.table.0.as_str(), c.pk.0.as_str()))
         })
         .cloned()
         .collect())
@@ -555,8 +629,9 @@ pub async fn changes_since_core<S: ShadowStore>(
 pub async fn enumerate_store_cells<S: ShadowStore>(
     store: &S,
     cfg: &WebSyncConfig,
+    now_secs: u64,
 ) -> Result<Vec<reconcile::LocalCell>, StoreError> {
-    let changes = changes_since_core(store, 0).await?;
+    let changes = changes_since_core(store, cfg, 0, now_secs).await?;
     Ok(reconcile::sorted_cells_from_changes(changes, |t| {
         cfg.pk_column_of(t)
     }))
@@ -569,9 +644,10 @@ pub async fn enumerate_store_cells<S: ShadowStore>(
 pub async fn compute_store_digest<S: ShadowStore>(
     store: &S,
     cfg: &WebSyncConfig,
+    now_secs: u64,
 ) -> Result<[u8; 32], StoreError> {
     Ok(reconcile::range_fp(
-        &enumerate_store_cells(store, cfg).await?,
+        &enumerate_store_cells(store, cfg, now_secs).await?,
     ))
 }
 
@@ -586,7 +662,8 @@ pub async fn reconcile_range_step<S: ShadowStore>(
     store: &S,
     cfg: &WebSyncConfig,
     entries: &[RangeEntry],
+    now_secs: u64,
 ) -> Result<(Vec<RangeEntry>, Vec<ColumnChange>), StoreError> {
-    let cells = enumerate_store_cells(store, cfg).await?;
+    let cells = enumerate_store_cells(store, cfg, now_secs).await?;
     Ok(reconcile::reconcile_step(&cells, entries))
 }

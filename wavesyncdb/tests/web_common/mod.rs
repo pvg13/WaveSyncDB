@@ -114,7 +114,8 @@ impl ShadowStore for MemoryStore {
                 cl: row.cl,
                 seq: row.seq,
                 db_version: row.db_version,
-                deleted_ts: None,
+                // Carry the tombstone stamp through — the trait is the wire.
+                deleted_ts: row.deleted_ts,
             })
             .collect();
         out.sort_by_key(|c| (c.db_version, c.seq));
@@ -148,4 +149,14 @@ impl ShadowStore for MemoryStore {
         }
         Ok(())
     }
+}
+
+/// Real wall clock for retention params in tests: native peers stamp real
+/// times, so the web side must age against the same clock. Nothing ages
+/// out under the 7-day default within a test run.
+pub fn test_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

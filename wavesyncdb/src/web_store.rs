@@ -490,6 +490,9 @@ impl BrowserStore {
                 cl: row.cl,
                 seq: row.seq,
                 db_version: row.db_version,
+                // Carry the tombstone stamp through — losing it here would
+                // strip retention aging from every change this store serves.
+                deleted_ts: row.deleted_ts,
             });
         }
 
@@ -776,7 +779,7 @@ fn peer_addr_key(peer_id: &str, multiaddr: &str) -> String {
 /// Wall-clock seconds since UNIX epoch via `js_sys::Date::now()`.
 /// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown`, so
 /// every timestamp written by this module routes through here.
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     let ms = js_sys::Date::now();
     if ms.is_finite() && ms >= 0.0 {
         (ms / 1000.0) as u64

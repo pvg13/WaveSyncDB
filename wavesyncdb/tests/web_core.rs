@@ -63,11 +63,13 @@ async fn remote_higher_col_version_wins() {
     // Local state at cv=1 via a local write.
     let written = submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("local"))],
         1,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -87,9 +89,10 @@ async fn remote_higher_col_version_wins() {
             2,
         )],
     );
-    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
-        .await
-        .unwrap();
+    let applied =
+        apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"), web_common::test_now())
+            .await
+            .unwrap();
     assert_eq!(applied.len(), 1);
 
     let row = store
@@ -110,21 +113,25 @@ async fn remote_lower_col_version_loses() {
     // Local at cv=2 (two writes).
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("v1"))],
         1,
+        web_common::test_now(),
     )
     .await
     .unwrap();
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("v2"))],
         2,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -141,9 +148,10 @@ async fn remote_lower_col_version_loses() {
             1,
         )],
     );
-    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 3, Some("peer-b"))
-        .await
-        .unwrap();
+    let applied =
+        apply_remote_changeset_core(&store, &cfg, &cs, 3, Some("peer-b"), web_common::test_now())
+            .await
+            .unwrap();
     assert!(applied.is_empty(), "stale remote change must not apply");
 
     let row = store
@@ -177,6 +185,7 @@ async fn equal_col_version_ties_break_deterministically() {
         &changeset(SITE_A, 1, vec![a.clone()]),
         1,
         None,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -186,15 +195,30 @@ async fn equal_col_version_ties_break_deterministically() {
         &changeset(SITE_B, 1, vec![b.clone()]),
         2,
         None,
+        web_common::test_now(),
     )
     .await
     .unwrap();
-    apply_remote_changeset_core(&store_y, &cfg, &changeset(SITE_B, 1, vec![b]), 1, None)
-        .await
-        .unwrap();
-    apply_remote_changeset_core(&store_y, &cfg, &changeset(SITE_A, 1, vec![a]), 2, None)
-        .await
-        .unwrap();
+    apply_remote_changeset_core(
+        &store_y,
+        &cfg,
+        &changeset(SITE_B, 1, vec![b]),
+        1,
+        None,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
+    apply_remote_changeset_core(
+        &store_y,
+        &cfg,
+        &changeset(SITE_A, 1, vec![a]),
+        2,
+        None,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
 
     let row_x = store_x
         .get_shadow("tasks", "p1", "title")
@@ -230,7 +254,9 @@ async fn failed_batch_persists_nothing_and_returns_err() {
             1,
         )],
     );
-    let res = apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b")).await;
+    let res =
+        apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b"), web_common::test_now())
+            .await;
     assert!(res.is_err(), "store failure must surface as Err");
 
     // Fail-closed: NOTHING persisted — no shadow row, no db_version, no
@@ -246,9 +272,10 @@ async fn failed_batch_persists_nothing_and_returns_err() {
     assert_eq!(store.peer_version("peer-b"), 0);
 
     // The same changeset applies cleanly afterwards (no poisoned state).
-    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b"))
-        .await
-        .unwrap();
+    let applied =
+        apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b"), web_common::test_now())
+            .await
+            .unwrap();
     assert_eq!(applied.len(), 1);
     assert_eq!(store.db_version(), 1);
     assert_eq!(store.peer_version("peer-b"), 7);
@@ -261,11 +288,13 @@ async fn failed_local_write_persists_nothing() {
     store.fail_next_batch();
     let res = submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("x"))],
         1,
+        web_common::test_now(),
     )
     .await;
     assert!(res.is_err());
@@ -287,6 +316,7 @@ async fn local_write_increments_col_version_per_column() {
 
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
@@ -295,16 +325,19 @@ async fn local_write_increments_col_version_per_column() {
             ("done".into(), serde_json::json!(false)),
         ],
         1,
+        web_common::test_now(),
     )
     .await
     .unwrap();
     let written = submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("t2"))],
         2,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -340,7 +373,7 @@ async fn applied_changes_round_trip_through_catch_up() {
             change("tasks", "p2", "title", serde_json::json!("b"), SITE_B, 1),
         ],
     );
-    apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b"))
+    apply_remote_changeset_core(&store, &cfg, &cs, 1, Some("peer-b"), web_common::test_now())
         .await
         .unwrap();
 
@@ -387,6 +420,7 @@ fn cfg_with_policy(policy: DeletePolicy) -> WebSyncConfig {
 async fn seed_row(store: &MemoryStore) {
     submit_local_write_core(
         store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
@@ -395,6 +429,7 @@ async fn seed_row(store: &MemoryStore) {
             ("done".into(), serde_json::json!(false)),
         ],
         1,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -407,9 +442,10 @@ async fn remote_delete_with_higher_cl_wins_and_tombstones() {
     seed_row(&store).await; // local max cv = 1
 
     let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 2)]);
-    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
-        .await
-        .unwrap();
+    let applied =
+        apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"), web_common::test_now())
+            .await
+            .unwrap();
     assert_eq!(
         applied.len(),
         1,
@@ -439,29 +475,34 @@ async fn remote_delete_with_lower_cl_is_a_noop() {
     // Bump title to cv=3 (local max cv = 3).
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("t2"))],
         2,
+        web_common::test_now(),
     )
     .await
     .unwrap();
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("t3"))],
         3,
+        web_common::test_now(),
     )
     .await
     .unwrap();
 
     let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 2)]);
-    let applied = apply_remote_changeset_core(&store, &cfg, &cs, 4, Some("peer-b"))
-        .await
-        .unwrap();
+    let applied =
+        apply_remote_changeset_core(&store, &cfg, &cs, 4, Some("peer-b"), web_common::test_now())
+            .await
+            .unwrap();
     assert!(applied.is_empty(), "stale delete must not apply");
     assert_eq!(store.row_entry_count("tasks", "p1"), 2, "row untouched");
     assert!(
@@ -486,9 +527,16 @@ async fn delete_tie_respects_policy() {
         seed_row(&store).await; // local max cv = 1
 
         let cs = changeset(SITE_B, 9, vec![delete_change("tasks", "p1", SITE_B, 1)]);
-        let applied = apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
-            .await
-            .unwrap();
+        let applied = apply_remote_changeset_core(
+            &store,
+            &cfg,
+            &cs,
+            2,
+            Some("peer-b"),
+            web_common::test_now(),
+        )
+        .await
+        .unwrap();
         if expect_deleted {
             assert_eq!(applied.len(), 1, "{policy:?}: tie should delete");
             assert_eq!(store.row_entry_count("tasks", "p1"), 1, "tombstone only");
@@ -522,7 +570,7 @@ async fn delete_branch_skips_sibling_column_changes() {
             delete_change("tasks", "p1", SITE_B, 5),
         ],
     );
-    apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"))
+    apply_remote_changeset_core(&store, &cfg, &cs, 2, Some("peer-b"), web_common::test_now())
         .await
         .unwrap();
 
@@ -542,9 +590,17 @@ async fn local_delete_emits_native_shaped_tombstone() {
     let store = MemoryStore::new();
     seed_row(&store).await; // max cv = 1
 
-    let changes = submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
-        .await
-        .unwrap();
+    let changes = submit_local_delete_core(
+        &store,
+        &WebSyncConfig::default(),
+        &SITE_A,
+        "tasks",
+        "p1",
+        2,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
     assert_eq!(changes.len(), 1);
     let del = &changes[0];
     assert_eq!(del.cid.0, DELETED_COLUMN);
@@ -569,18 +625,28 @@ async fn local_delete_emits_native_shaped_tombstone() {
 async fn local_write_resurrects_tombstoned_row() {
     let store = MemoryStore::new();
     seed_row(&store).await;
-    submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
-        .await
-        .unwrap();
+    submit_local_delete_core(
+        &store,
+        &WebSyncConfig::default(),
+        &SITE_A,
+        "tasks",
+        "p1",
+        2,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
 
     // Re-insert: tombstone cleared, per-column clocks continue (not reset).
     let written = submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("back"))],
         3,
+        web_common::test_now(),
     )
     .await
     .unwrap();
@@ -592,9 +658,13 @@ async fn local_write_resurrects_tombstoned_row() {
             .is_none(),
         "tombstone cleared on resurrection"
     );
+    // Resurrection floor (N8): the revived cell must outrank the tombstone
+    // (cl 2), so col_version = cl + 1 = 3 — NOT the pre-delete cv + 1.
+    // Otherwise a DeleteWins peer still holding the tombstone lets its
+    // equal-cl delete win the tie and the row diverges.
     assert_eq!(
-        written[0].col_version, 2,
-        "col_version continues from the pre-delete value"
+        written[0].col_version, 3,
+        "revived col_version must clear the tombstone's causal length"
     );
 }
 
@@ -612,6 +682,7 @@ async fn store_digest_matches_shared_core_and_excludes_pk_column() {
     // app that mirrors the full row into the column bag.
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
@@ -620,11 +691,14 @@ async fn store_digest_matches_shared_core_and_excludes_pk_column() {
             ("title".into(), serde_json::json!("hello")),
         ],
         1,
+        web_common::test_now(),
     )
     .await
     .unwrap();
 
-    let digest = compute_store_digest(&store, &cfg).await.unwrap();
+    let digest = compute_store_digest(&store, &cfg, web_common::test_now())
+        .await
+        .unwrap();
 
     // Reference digest from the SAME shared core over the expected cells:
     // the PK column cell is excluded, mirroring the native registry filter.
@@ -635,9 +709,10 @@ async fn store_digest_matches_shared_core_and_excludes_pk_column() {
     assert_eq!(digest, reconcile::digest_cells(&expected));
 
     // Without PK config nothing is excluded → different digest.
-    let digest_unfiltered = compute_store_digest(&store, &WebSyncConfig::default())
-        .await
-        .unwrap();
+    let digest_unfiltered =
+        compute_store_digest(&store, &WebSyncConfig::default(), web_common::test_now())
+            .await
+            .unwrap();
     assert_ne!(digest, digest_unfiltered);
 }
 
@@ -661,21 +736,34 @@ async fn equal_stores_produce_equal_digests_and_empty_range_reply() {
                     1,
                 )],
             );
-            apply_remote_changeset_core(store, &cfg, &cs, i as u64 + 1, None)
-                .await
-                .unwrap();
+            apply_remote_changeset_core(
+                store,
+                &cfg,
+                &cs,
+                i as u64 + 1,
+                None,
+                web_common::test_now(),
+            )
+            .await
+            .unwrap();
         }
     }
 
-    let da = compute_store_digest(&a, &cfg).await.unwrap();
-    let db = compute_store_digest(&b, &cfg).await.unwrap();
+    let da = compute_store_digest(&a, &cfg, web_common::test_now())
+        .await
+        .unwrap();
+    let db = compute_store_digest(&b, &cfg, web_common::test_now())
+        .await
+        .unwrap();
     assert_eq!(da, db, "identical stores must produce identical digests");
 
     // A converged digest also means an initial range exchange terminates
     // immediately: every fingerprint matches → empty reply.
     let a_cells = store_cells(&a, &cfg).await;
     let initial = reconcile::initial_entries(&a_cells);
-    let (reply, to_apply) = reconcile_range_step(&b, &cfg, &initial).await.unwrap();
+    let (reply, to_apply) = reconcile_range_step(&b, &cfg, &initial, web_common::test_now())
+        .await
+        .unwrap();
     assert!(reply.is_empty(), "converged peers exchange nothing");
     assert!(to_apply.is_empty());
 }
@@ -710,7 +798,7 @@ async fn web_peers_reconcile_single_differing_cell_to_convergence() {
             )],
         );
         dv_a += 1;
-        apply_remote_changeset_core(&a, &cfg, &cs_a, dv_a, None)
+        apply_remote_changeset_core(&a, &cfg, &cs_a, dv_a, None, web_common::test_now())
             .await
             .unwrap();
 
@@ -727,35 +815,43 @@ async fn web_peers_reconcile_single_differing_cell_to_convergence() {
             )],
         );
         dv_b += 1;
-        apply_remote_changeset_core(&b, &cfg, &cs_b, dv_b, None)
+        apply_remote_changeset_core(&b, &cfg, &cs_b, dv_b, None, web_common::test_now())
             .await
             .unwrap();
     }
     assert_ne!(
-        compute_store_digest(&a, &cfg).await.unwrap(),
-        compute_store_digest(&b, &cfg).await.unwrap()
+        compute_store_digest(&a, &cfg, web_common::test_now())
+            .await
+            .unwrap(),
+        compute_store_digest(&b, &cfg, web_common::test_now())
+            .await
+            .unwrap()
     );
 
     // Drive the exchange: A initiates, both sides apply what they receive
     // through the normal conflict-resolving path.
     let mut msg = reconcile::initial_entries(&store_cells(&a, &cfg).await);
     for _round in 0..32 {
-        let (b_reply, b_apply) = reconcile_range_step(&b, &cfg, &msg).await.unwrap();
+        let (b_reply, b_apply) = reconcile_range_step(&b, &cfg, &msg, web_common::test_now())
+            .await
+            .unwrap();
         if !b_apply.is_empty() {
             dv_b += 1;
             let cs = changeset(SITE_A, 0, b_apply);
-            apply_remote_changeset_core(&b, &cfg, &cs, dv_b, None)
+            apply_remote_changeset_core(&b, &cfg, &cs, dv_b, None, web_common::test_now())
                 .await
                 .unwrap();
         }
         if b_reply.is_empty() {
             break;
         }
-        let (a_reply, a_apply) = reconcile_range_step(&a, &cfg, &b_reply).await.unwrap();
+        let (a_reply, a_apply) = reconcile_range_step(&a, &cfg, &b_reply, web_common::test_now())
+            .await
+            .unwrap();
         if !a_apply.is_empty() {
             dv_a += 1;
             let cs = changeset(SITE_A, 0, a_apply);
-            apply_remote_changeset_core(&a, &cfg, &cs, dv_a, None)
+            apply_remote_changeset_core(&a, &cfg, &cs, dv_a, None, web_common::test_now())
                 .await
                 .unwrap();
         }
@@ -766,8 +862,12 @@ async fn web_peers_reconcile_single_differing_cell_to_convergence() {
     }
 
     assert_eq!(
-        compute_store_digest(&a, &cfg).await.unwrap(),
-        compute_store_digest(&b, &cfg).await.unwrap(),
+        compute_store_digest(&a, &cfg, web_common::test_now())
+            .await
+            .unwrap(),
+        compute_store_digest(&b, &cfg, web_common::test_now())
+            .await
+            .unwrap(),
         "range exchange must repair the differing cell — proven by digest equality"
     );
     let row_b = b
@@ -793,36 +893,52 @@ async fn tombstoned_row_exposes_only_its_tombstone() {
     // never produce, and web↔native digests can never match after a delete.
     let store = MemoryStore::new();
     seed_row(&store).await; // title + done at cv=1
-    submit_local_delete_core(&store, &SITE_A, "tasks", "p1", 2)
-        .await
-        .unwrap();
+    submit_local_delete_core(
+        &store,
+        &WebSyncConfig::default(),
+        &SITE_A,
+        "tasks",
+        "p1",
+        2,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
 
     // Raw store still holds the stale cells (native keeps them too —
     // clock continuity for resurrection)...
     assert_eq!(store.row_entry_count("tasks", "p1"), 3);
 
     // ...but the sync-visible view is the tombstone alone.
-    let visible = changes_since_core(&store, 0).await.unwrap();
+    let visible = changes_since_core(&store, &WebSyncConfig::default(), 0, web_common::test_now())
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].cid.0, DELETED_COLUMN);
 
     // And the digest sees exactly the same view.
     let cfg = WebSyncConfig::default();
-    let digest = compute_store_digest(&store, &cfg).await.unwrap();
+    let digest = compute_store_digest(&store, &cfg, web_common::test_now())
+        .await
+        .unwrap();
     assert_eq!(digest, reconcile::digest_cells(&visible));
 
     // Resurrection makes the cells visible again (tombstone cleared).
     submit_local_write_core(
         &store,
+        &WebSyncConfig::default(),
         &SITE_A,
         "tasks",
         "p1",
         vec![("title".into(), serde_json::json!("back"))],
         3,
+        web_common::test_now(),
     )
     .await
     .unwrap();
-    let visible = changes_since_core(&store, 0).await.unwrap();
+    let visible = changes_since_core(&store, &WebSyncConfig::default(), 0, web_common::test_now())
+        .await
+        .unwrap();
     assert!(visible.iter().all(|c| c.cid.0 != DELETED_COLUMN));
     assert_eq!(visible.len(), 2, "title + done visible again");
 }

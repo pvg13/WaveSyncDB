@@ -1694,7 +1694,14 @@ async fn handle_loopback_request(
                 Some(s) => s,
                 None => return, // ephemeral clients have nothing to send
             };
-            let changes = match changes_since_core(store.as_ref(), since).await {
+            let changes = match changes_since_core(
+                store.as_ref(),
+                &state.config,
+                since,
+                crate::web_store::now_secs(),
+            )
+            .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn!("loopback: catch-up scan failed: {e}");
@@ -1782,6 +1789,7 @@ async fn apply_remote_changeset_inner(
                 changeset,
                 next_db_version,
                 peer_key,
+                crate::web_store::now_secs(),
             )
             .await
         }
@@ -1794,6 +1802,7 @@ async fn apply_remote_changeset_inner(
                 changeset,
                 next_db_version,
                 None,
+                crate::web_store::now_secs(),
             )
             .await
         }
@@ -1969,22 +1978,26 @@ async fn submit_local_inner(
         Some(store) => {
             submit_local_write_core(
                 store.as_ref(),
+                &state.config,
                 &state.site_id,
                 table,
                 pk,
                 columns,
                 next_db_version,
+                crate::web_store::now_secs(),
             )
             .await
         }
         None => {
             submit_local_write_core(
                 &EphemeralStore,
+                &state.config,
                 &state.site_id,
                 table,
                 pk,
                 columns,
                 next_db_version,
+                crate::web_store::now_secs(),
             )
             .await
         }
@@ -2030,12 +2043,28 @@ async fn submit_local_delete_inner(
 
     let written = match &state.store {
         Some(store) => {
-            submit_local_delete_core(store.as_ref(), &state.site_id, table, pk, next_db_version)
-                .await
+            submit_local_delete_core(
+                store.as_ref(),
+                &state.config,
+                &state.site_id,
+                table,
+                pk,
+                next_db_version,
+                crate::web_store::now_secs(),
+            )
+            .await
         }
         None => {
-            submit_local_delete_core(&EphemeralStore, &state.site_id, table, pk, next_db_version)
-                .await
+            submit_local_delete_core(
+                &EphemeralStore,
+                &state.config,
+                &state.site_id,
+                table,
+                pk,
+                next_db_version,
+                crate::web_store::now_secs(),
+            )
+            .await
         }
     };
     let changes = match written {
@@ -2558,7 +2587,14 @@ async fn handle_snapshot_event(
                 // Tombstoned rows expose only their tombstone — same view a
                 // native peer's user-table JOIN produces.
                 let changes: Vec<ColumnChange> = match &state.store {
-                    Some(store) => match changes_since_core(store.as_ref(), since).await {
+                    Some(store) => match changes_since_core(
+                        store.as_ref(),
+                        &state.config,
+                        since,
+                        crate::web_store::now_secs(),
+                    )
+                    .await
+                    {
                         Ok(c) => c,
                         Err(e) => {
                             log::warn!("WebSyncClient: catch-up scan failed: {e}");
@@ -2656,7 +2692,13 @@ async fn handle_snapshot_event(
 
                 let local_digest = match &state.store {
                     Some(store) => {
-                        match compute_store_digest(store.as_ref(), &state.config).await {
+                        match compute_store_digest(
+                            store.as_ref(),
+                            &state.config,
+                            crate::web_store::now_secs(),
+                        )
+                        .await
+                        {
                             Ok(d) => d,
                             Err(e) => {
                                 log::warn!("WebSyncClient: digest computation failed: {e}");
@@ -2664,9 +2706,13 @@ async fn handle_snapshot_event(
                             }
                         }
                     }
-                    None => compute_store_digest(&EphemeralStore, &state.config)
-                        .await
-                        .unwrap_or([0u8; 32]),
+                    None => compute_store_digest(
+                        &EphemeralStore,
+                        &state.config,
+                        crate::web_store::now_secs(),
+                    )
+                    .await
+                    .unwrap_or([0u8; 32]),
                 };
                 let converged = local_digest == remote_digest;
                 log::debug!("WebSyncClient: ReconcileDigest from {peer} → converged={converged}");
@@ -2731,9 +2777,23 @@ async fn handle_snapshot_event(
 
                 let step = match &state.store {
                     Some(store) => {
-                        reconcile_range_step(store.as_ref(), &state.config, &entries).await
+                        reconcile_range_step(
+                            store.as_ref(),
+                            &state.config,
+                            &entries,
+                            crate::web_store::now_secs(),
+                        )
+                        .await
                     }
-                    None => reconcile_range_step(&EphemeralStore, &state.config, &entries).await,
+                    None => {
+                        reconcile_range_step(
+                            &EphemeralStore,
+                            &state.config,
+                            &entries,
+                            crate::web_store::now_secs(),
+                        )
+                        .await
+                    }
                 };
                 let (reply, to_apply) = match step {
                     Ok(r) => r,

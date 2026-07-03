@@ -7,7 +7,7 @@
 //! asserts the literal convergence proof:
 //!
 //! `engine::convergence::compute_group_digest(native) ==
-//!  web_sync_core::compute_store_digest(web)`
+//!  web_sync_core::compute_store_digest(web, web_common::test_now())`
 //!
 //! Equal digests mean the two replicas are byte-identical under the shared
 //! cell-fingerprint definition — the same check the #82 reconciliation
@@ -80,6 +80,7 @@ impl WebPeer {
         self.dv += 1;
         submit_local_write_core(
             &self.store,
+            &self.cfg,
             &self.site,
             "tasks",
             pk,
@@ -89,6 +90,7 @@ impl WebPeer {
                 ("completed".into(), serde_json::json!(completed)),
             ],
             self.dv,
+            web_common::test_now(),
         )
         .await
         .unwrap();
@@ -96,9 +98,17 @@ impl WebPeer {
 
     async fn delete(&mut self, pk: &str) {
         self.dv += 1;
-        submit_local_delete_core(&self.store, &self.site, "tasks", pk, self.dv)
-            .await
-            .unwrap();
+        submit_local_delete_core(
+            &self.store,
+            &self.cfg,
+            &self.site,
+            "tasks",
+            pk,
+            self.dv,
+            web_common::test_now(),
+        )
+        .await
+        .unwrap();
     }
 
     async fn apply(&mut self, changes: Vec<ColumnChange>, from_site: NodeId) {
@@ -111,18 +121,29 @@ impl WebPeer {
             db_version: 0,
             changes,
         };
-        apply_remote_changeset_core(&self.store, &self.cfg, &cs, self.dv, None)
-            .await
-            .unwrap();
+        apply_remote_changeset_core(
+            &self.store,
+            &self.cfg,
+            &cs,
+            self.dv,
+            None,
+            web_common::test_now(),
+        )
+        .await
+        .unwrap();
     }
 
     /// The sync-visible state (tombstoned rows expose only their tombstone).
     async fn state(&self) -> Vec<ColumnChange> {
-        changes_since_core(&self.store, 0).await.unwrap()
+        changes_since_core(&self.store, &self.cfg, 0, web_common::test_now())
+            .await
+            .unwrap()
     }
 
     async fn digest(&self) -> [u8; 32] {
-        compute_store_digest(&self.store, &self.cfg).await.unwrap()
+        compute_store_digest(&self.store, &self.cfg, web_common::test_now())
+            .await
+            .unwrap()
     }
 }
 

@@ -703,8 +703,7 @@ pub(crate) fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Default tombstone retention when none was ever configured: 7 days.
-pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 = 7 * 24 * 3600;
+pub use crate::messages::DEFAULT_TOMBSTONE_RETENTION_SECS;
 
 /// Persist the tombstone retention window (seconds; 0 = GC disabled) in
 /// `_wavesync_meta`. Stored IN the database rather than passed through the
