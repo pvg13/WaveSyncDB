@@ -155,7 +155,9 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
             return;
         }
     };
-    log::info!("notification: posting Android notification via NotificationHelper.show (group={group})");
+    log::info!(
+        "notification: posting Android notification via NotificationHelper.show (group={group})"
+    );
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
 
     // Resolve NotificationHelper through the *application* classloader.

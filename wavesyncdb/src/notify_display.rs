@@ -139,11 +139,8 @@ mod imp {
         const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
         type ShowFn = unsafe extern "C" fn(*const c_char, *const c_char, *const c_char);
 
-        let (Ok(t), Ok(b), Ok(g)) = (
-            CString::new(title),
-            CString::new(body),
-            CString::new(group),
-        ) else {
+        let (Ok(t), Ok(b), Ok(g)) = (CString::new(title), CString::new(body), CString::new(group))
+        else {
             return;
         };
         unsafe {

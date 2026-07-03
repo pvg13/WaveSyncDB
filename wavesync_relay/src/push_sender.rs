@@ -59,10 +59,7 @@ pub enum TransientError {
     },
     /// Transport-level failure — DNS, connect, TLS, timeout,
     /// EOF mid-stream. The provider never saw the request.
-    Transport {
-        platform: Platform,
-        message: String,
-    },
+    Transport { platform: Platform, message: String },
     /// FCM OAuth2 token-exchange failure (network or 5xx from
     /// `oauth2.googleapis.com`). Treated transient — Google's OAuth
     /// occasionally 5xxs and recovers quickly.
@@ -80,10 +77,7 @@ pub enum PermanentError {
     NotConfigured { platform: Platform },
     /// JWT / OAuth credential construction failed (bad PEM, missing
     /// fields in service-account JSON). Operator action required.
-    CredentialError {
-        platform: Platform,
-        message: String,
-    },
+    CredentialError { platform: Platform, message: String },
     /// Provider returned 400/401/403 (or, for FCM, 404) with a
     /// non-token-related body — malformed payload, bad APNs topic,
     /// wrong API enabled, etc.

@@ -7,9 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, Database, EntityTrait, Set,
-};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, EntityTrait, Set};
 use uuid::Uuid;
 use wavesyncdb::{NodeId, WaveSyncDb, WaveSyncDbBuilder};
 
@@ -147,11 +145,7 @@ async fn bench_read_overhead() {
         .build()
         .await
         .unwrap();
-    db.schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
 
     // Seed data
     for i in 0..100 {
@@ -227,7 +221,8 @@ async fn bench_sql_parsing() {
     println!("--- SQL Parsing ---");
 
     let n = 10_000u32;
-    let sql = "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES ('task-1', 'Buy milk', 0)";
+    let sql =
+        "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES ('task-1', 'Buy milk', 0)";
 
     let start = Instant::now();
     for _ in 0..n {
@@ -268,12 +263,7 @@ async fn bench_sync_propagation() {
         .build()
         .await
         .unwrap();
-    peer_a
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_a.schema().register(task::Entity).sync().await.unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&db_b_url, &topic)
         .with_node_id(make_node_id(233))
@@ -283,12 +273,7 @@ async fn bench_sync_propagation() {
         .build()
         .await
         .unwrap();
-    peer_b
-        .schema()
-        .register(task::Entity)
-        .sync()
-        .await
-        .unwrap();
+    peer_b.schema().register(task::Entity).sync().await.unwrap();
 
     // Wait for peers to discover each other
     let discovery_start = Instant::now();
@@ -388,11 +373,7 @@ async fn bench_batch_writes() {
             .build()
             .await
             .unwrap();
-        db.schema()
-            .register(task::Entity)
-            .sync()
-            .await
-            .unwrap();
+        db.schema().register(task::Entity).sync().await.unwrap();
 
         let start = Instant::now();
         for i in 0..size {

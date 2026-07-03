@@ -651,6 +651,7 @@ impl WaveSyncDb {
     /// does not keep the engine alive past the last `WaveSyncDb` drop (which
     /// would resurrect the zombie-swarm / "database is locked" problems the
     /// `Weak` group map avoids). Used to auto-drive resume on app foreground.
+    #[cfg(feature = "dioxus")]
     pub(crate) fn resume_trigger(&self) -> impl Fn() + Clone + Send + 'static {
         let cmd_tx = self.inner.node.cmd_tx.clone();
         let refresh_tx = self.inner.node.refresh_tx.clone();

@@ -517,7 +517,7 @@ impl EngineRunner {
         }
         // Swap: old primary → back of fallbacks; first fallback → primary.
         let new_primary = self.config.relay_fallbacks.remove(0);
-        let old_primary = std::mem::replace(&mut self.config.relay_server, Some(new_primary));
+        let old_primary = self.config.relay_server.replace(new_primary);
         if let Some(addr) = old_primary {
             self.config.relay_fallbacks.push(addr);
         }

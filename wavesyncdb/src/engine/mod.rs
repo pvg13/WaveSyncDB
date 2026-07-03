@@ -890,8 +890,7 @@ pub(crate) struct GroupState {
     /// waiting out the full request-response timeout — the p95 tail-killer under
     /// packet loss. Duplicate in-flight requests are harmless (responses are
     /// idempotent), so failing open toward re-request is safe.
-    pub(crate) pending_sync_peers:
-        std::collections::HashMap<libp2p::PeerId, tokio::time::Instant>,
+    pub(crate) pending_sync_peers: std::collections::HashMap<libp2p::PeerId, tokio::time::Instant>,
     /// Recently fanned-out local changesets not yet confirmed delivered to every
     /// connected peer, keyed by their `db_version` (#81 Option A). A real-time
     /// push is fire-and-forget; if it's dropped to a still-connected peer the

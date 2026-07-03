@@ -158,7 +158,10 @@ async fn write_length_prefixed<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -
     let len = u32::try_from(data.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("payload too large for u32 length prefix: {} bytes", data.len()),
+            format!(
+                "payload too large for u32 length prefix: {} bytes",
+                data.len()
+            ),
         )
     })?;
     io.write_all(&len.to_be_bytes()).await?;
