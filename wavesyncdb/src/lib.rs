@@ -65,6 +65,8 @@ pub mod web_sync_core;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod background_sync;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod capture;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod connection;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
