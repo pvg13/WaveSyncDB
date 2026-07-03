@@ -130,7 +130,10 @@ impl EngineRunner {
                                     Some(t) => t,
                                     None => {
                                         tracing::debug!(
-                                            "Rejecting unauthenticated sync response from peer {peer}"
+                                            peer = %peer,
+                                            topic = %short_topic(&effective),
+                                            reason = "missing_hmac",
+                                            "rejecting unauthenticated sync response"
                                         );
                                         return;
                                     }
@@ -150,7 +153,10 @@ impl EngineRunner {
                                     self.record_wire_bytes(&peer, bytes.len() as u64, true);
                                     if !gk.verify(&bytes, &tag) {
                                         tracing::debug!(
-                                            "Rejecting sync response with invalid HMAC from peer {peer}"
+                                            peer = %peer,
+                                            topic = %short_topic(&effective),
+                                            reason = "hmac_verify_failed",
+                                            "rejecting sync response with invalid HMAC"
                                         );
                                         return;
                                     }
@@ -402,6 +408,11 @@ impl EngineRunner {
     /// Verify HMAC + topic, reject mismatched peers, then spawn a task to query
     /// changes since the peer's last known version and send a `ChangesetResponse`.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer, topic = %short_topic(&peer_topic), my_db_version, your_last_db_version)
+    )]
     fn handle_version_vector_request(
         &mut self,
         peer: libp2p::PeerId,
@@ -425,7 +436,8 @@ impl EngineRunner {
             // household), so rejecting it would also kill that shared group's
             // sync. Reject only on per-group HMAC failure (Rule 2.8, multi-group).
             tracing::debug!(
-                "Ignoring version-vector request from {peer} for unknown topic {effective}"
+                topic = %short_topic(&effective),
+                "ignoring version-vector request for unknown topic"
             );
             return;
         };
@@ -437,7 +449,12 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated sync request from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated sync request"
+                    );
                     return;
                 }
             };
@@ -599,6 +616,16 @@ impl EngineRunner {
     }
 
     /// Verify HMAC + topic, queue changeset for sequential application, send PushAck.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            peer = %peer,
+            topic = %short_topic(&peer_topic),
+            db_version = changeset.db_version,
+            n_changes = changeset.changes.len(),
+        )
+    )]
     fn handle_push_request(
         &mut self,
         peer: libp2p::PeerId,
@@ -628,7 +655,8 @@ impl EngineRunner {
             // carries no HMAC (unit variant), identical to the success path, so
             // the sender accepts it regardless of which group key it holds.
             tracing::debug!(
-                "Ignoring push from {peer} for unknown topic {effective} (acking so the sender stops redelivering)"
+                topic = %short_topic(&effective),
+                "ignoring push for unknown topic (acking so the sender stops redelivering)"
             );
             let resp_tx = self.snapshot_resp_tx.clone();
             tokio::spawn(async move {
@@ -647,7 +675,12 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated push from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated push"
+                    );
                     return;
                 }
             };
@@ -699,9 +732,9 @@ impl EngineRunner {
         }
 
         tracing::info!(
-            "Received push from peer {peer} with {} changes at db_version {}",
-            changeset.changes.len(),
-            changeset.db_version,
+            n_changes = changeset.changes.len(),
+            db_version = changeset.db_version,
+            "received push from peer"
         );
 
         // Send PushAck immediately via response channel
@@ -743,7 +776,11 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated identity announce from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated identity announce"
+                    );
                     return;
                 }
             };
@@ -757,7 +794,9 @@ impl EngineRunner {
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
                     tracing::debug!(
-                        "Rejecting identity announce with invalid HMAC from peer {peer}"
+                        peer = %peer,
+                        reason = "hmac_verify_failed",
+                        "rejecting identity announce with invalid HMAC"
                     );
                     return;
                 }
@@ -770,7 +809,11 @@ impl EngineRunner {
             .values()
             .any(|g| g.verified_peers.contains(&peer));
         if !verified_somewhere {
-            tracing::debug!("Ignoring identity announce from unverified peer {peer}");
+            tracing::debug!(
+                peer = %peer,
+                reason = "unverified_peer",
+                "ignoring identity announce"
+            );
             return;
         }
 
@@ -818,8 +861,12 @@ impl EngineRunner {
         };
         if let Some((attempts, dur)) = backoff {
             tracing::warn!(
-                "Rejecting peer {peer} for group {effective_topic} (HMAC failure, attempt \
-                 {attempts}); backing off for {dur:?}"
+                peer = %peer,
+                topic = %short_topic(effective_topic),
+                reason = "hmac_verify_failed",
+                attempts,
+                backoff_ms = dur.as_millis() as u64,
+                "rejecting peer for group"
             );
             self.emit_network_event(crate::network_status::NetworkEvent::PeerRejected(
                 crate::network_status::PeerId(peer.to_string()),
@@ -903,6 +950,11 @@ impl EngineRunner {
     /// Handle an inbound reconcile digest (#82): verify HMAC, compute our own
     /// group digest off-loop, and reply whether the two match (proven
     /// converged). A per-group HMAC failure rejects the peer (Rule 2.8 / N6).
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer, topic = %short_topic(&peer_topic))
+    )]
     fn handle_reconcile_digest_request(
         &mut self,
         peer: libp2p::PeerId,
@@ -917,7 +969,10 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            tracing::debug!("Ignoring reconcile digest from {peer} for unknown topic {effective}");
+            tracing::debug!(
+                topic = %short_topic(&effective),
+                "ignoring reconcile digest for unknown topic"
+            );
             return;
         };
         let group_key = g.group_key.clone();
@@ -926,7 +981,12 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated reconcile digest from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated reconcile digest"
+                    );
                     return;
                 }
             };
@@ -992,6 +1052,11 @@ impl EngineRunner {
     /// Handle a reconcile result (#82): verify HMAC, then either record proven
     /// convergence (emit `PeerConverged` + diagnostic) or, on divergence, nudge
     /// a version-vector catch-up to repair the diff promptly.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer, topic = %short_topic(&peer_topic), converged)
+    )]
     fn handle_reconcile_result(
         &mut self,
         peer: libp2p::PeerId,
@@ -1006,14 +1071,22 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            tracing::debug!("Ignoring reconcile result from {peer} for unknown topic {effective}");
+            tracing::debug!(
+                topic = %short_topic(&effective),
+                "ignoring reconcile result for unknown topic"
+            );
             return;
         };
         if let Some(ref gk) = g.group_key {
             let tag = match resp_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated reconcile result from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated reconcile result"
+                    );
                     return;
                 }
             };
@@ -1029,7 +1102,10 @@ impl EngineRunner {
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
                     tracing::debug!(
-                        "Rejecting reconcile result with invalid HMAC from peer {peer}"
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "hmac_verify_failed",
+                        "rejecting reconcile result with invalid HMAC"
                     );
                     return;
                 }
@@ -1047,7 +1123,7 @@ impl EngineRunner {
             self.diagnostics
                 .reconcile_converged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("Reconcile: proven converged with peer {peer} for group {effective}");
+            tracing::debug!(topic = %short_topic(&effective), "reconcile: proven converged with peer");
             // The peer holds all our data for this group — clear it from the
             // pending-push retry set so we stop re-pushing to it (#81).
             self.note_peer_converged_pushes(&effective, peer);
@@ -1062,8 +1138,8 @@ impl EngineRunner {
                 .reconcile_diverged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
-                "Reconcile: diverged with peer {peer} for group {effective}; \
-                 starting recursive range reconciliation"
+                topic = %short_topic(&effective),
+                "reconcile: diverged with peer; starting recursive range reconciliation"
             );
             // Kick off the recursive range exchange (round 1: the keyspace split
             // into fingerprinted sub-ranges).
@@ -1116,6 +1192,11 @@ impl EngineRunner {
     /// Handle an inbound `ReconcileRange` round (#82): verify HMAC, run one
     /// reconciliation step against our cells, apply anything the peer sent that
     /// we lacked, and reply with the next round's entries.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer, topic = %short_topic(&peer_topic), n_entries = entries.len())
+    )]
     fn handle_reconcile_range_request(
         &mut self,
         peer: libp2p::PeerId,
@@ -1131,7 +1212,10 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            tracing::debug!("Ignoring reconcile range from {peer} for unknown topic {effective}");
+            tracing::debug!(
+                topic = %short_topic(&effective),
+                "ignoring reconcile range for unknown topic"
+            );
             return;
         };
         let group_key = g.group_key.clone();
@@ -1140,7 +1224,12 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated reconcile range from peer {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated reconcile range"
+                    );
                     return;
                 }
             };
@@ -1224,6 +1313,11 @@ impl EngineRunner {
     /// Handle a `ReconcileRangeResult` (#82): verify HMAC, run a reconciliation
     /// step against the reply, apply what the peer sent, and — if the exchange
     /// isn't done — send the next round.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer, topic = %short_topic(&peer_topic), n_entries = entries.len())
+    )]
     fn handle_reconcile_range_result(
         &mut self,
         peer: libp2p::PeerId,
@@ -1239,7 +1333,8 @@ impl EngineRunner {
         };
         let Some(g) = self.groups.get(&effective) else {
             tracing::debug!(
-                "Ignoring reconcile range result from {peer} for unknown topic {effective}"
+                topic = %short_topic(&effective),
+                "ignoring reconcile range result for unknown topic"
             );
             return;
         };
@@ -1247,7 +1342,12 @@ impl EngineRunner {
             let tag = match resp_hmac {
                 Some(t) => t,
                 None => {
-                    tracing::debug!("Rejecting unauthenticated reconcile range result from {peer}");
+                    tracing::debug!(
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "missing_hmac",
+                        "rejecting unauthenticated reconcile range result"
+                    );
                     return;
                 }
             };
@@ -1263,7 +1363,10 @@ impl EngineRunner {
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
                     tracing::debug!(
-                        "Rejecting reconcile range result with invalid HMAC from {peer}"
+                        peer = %peer,
+                        topic = %short_topic(&effective),
+                        reason = "hmac_verify_failed",
+                        "rejecting reconcile range result with invalid HMAC"
                     );
                     return;
                 }
@@ -1391,6 +1494,11 @@ pub struct NotifyCtx<'a> {
 /// and logs on failure, so this return value is purely for the caller's own
 /// bookkeeping and never changes what got applied or rolled back.
 #[must_use = "callers must gate sync bookkeeping on the commit outcome"]
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    fields(n_changes = changes.len(), committed = tracing::field::Empty)
+)]
 pub async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
@@ -1412,8 +1520,8 @@ pub async fn apply_remote_changeset(
     };
 
     // Small changesets: single transaction (no chunking overhead).
-    if grouped.len() <= CHANGESET_CHUNK_SIZE {
-        return apply_changeset_chunk(
+    let committed = if grouped.len() <= CHANGESET_CHUNK_SIZE {
+        apply_changeset_chunk(
             db,
             change_tx,
             registry,
@@ -1422,29 +1530,31 @@ pub async fn apply_remote_changeset(
             source,
             notify,
         )
-        .await;
-    }
-
-    // Large changesets: split into chunks. A chunk that fails is logged and
-    // rolled back by `apply_changeset_chunk` itself; subsequent chunks still
-    // run (unchanged behavior) but the overall result reflects the failure.
-    let mut all_committed = true;
-    while !grouped.is_empty() {
-        let chunk_end = grouped.len().min(CHANGESET_CHUNK_SIZE);
-        let chunk: Vec<_> = grouped.drain(..chunk_end).collect();
-        let committed = apply_changeset_chunk(
-            db,
-            change_tx,
-            registry,
-            &chunk,
-            db_version_cache,
-            source,
-            notify,
-        )
-        .await;
-        all_committed &= committed;
-    }
-    all_committed
+        .await
+    } else {
+        // Large changesets: split into chunks. A chunk that fails is logged and
+        // rolled back by `apply_changeset_chunk` itself; subsequent chunks still
+        // run (unchanged behavior) but the overall result reflects the failure.
+        let mut all_committed = true;
+        while !grouped.is_empty() {
+            let chunk_end = grouped.len().min(CHANGESET_CHUNK_SIZE);
+            let chunk: Vec<_> = grouped.drain(..chunk_end).collect();
+            let chunk_committed = apply_changeset_chunk(
+                db,
+                change_tx,
+                registry,
+                &chunk,
+                db_version_cache,
+                source,
+                notify,
+            )
+            .await;
+            all_committed &= chunk_committed;
+        }
+        all_committed
+    };
+    tracing::Span::current().record("committed", committed);
+    committed
 }
 
 /// Returns `true` if this chunk's transaction committed, `false` if it was

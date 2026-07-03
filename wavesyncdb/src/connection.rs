@@ -695,6 +695,15 @@ impl WaveSyncDb {
     /// drain (or the startup drain) instead of being lost. The in-memory
     /// db_version rolls back on every failure path so it stays in sync with
     /// persisted state.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            topic = %crate::engine::short_topic(&self.inner.effective_topic),
+            db_version = tracing::field::Empty,
+            n_changes = tracing::field::Empty,
+        )
+    )]
     async fn drain_and_dispatch(&self) -> Result<(), DbErr> {
         // The mutex serializes concurrent drains for this handle — two rapid
         // writes would otherwise race on the shadow read steps and produce
@@ -724,6 +733,7 @@ impl WaveSyncDb {
         // Receivers apply the changeset as a single batch either way.
         *ver += 1;
         let new_db_version = *ver;
+        tracing::Span::current().record("db_version", new_db_version);
         self.inner
             .db_version_cache
             .store(new_db_version, Ordering::Release);
@@ -952,6 +962,7 @@ impl WaveSyncDb {
             });
         }
 
+        tracing::Span::current().record("n_changes", changes.len());
         let changeset = SyncChangeset {
             site_id,
             db_version: new_db_version,

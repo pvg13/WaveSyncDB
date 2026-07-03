@@ -975,6 +975,24 @@ pub(crate) struct RejectionState {
     pub(crate) until: tokio::time::Instant,
 }
 
+/// Shorten a derived topic / rendezvous namespace for spans and log lines.
+/// The current form is `wavesync2-<64 hex>` (post-KDF-cutover); keeping the
+/// prefix plus the first 10 hex chars stays scannable while still
+/// distinguishing groups. The pre-cutover `wavesync-<64 hex>` form is tried
+/// as a fallback (a stale peer or replayed log line might still carry it);
+/// anything else passes through unchanged.
+pub(crate) fn short_topic(s: &str) -> String {
+    if let Some(hex) = s.strip_prefix("wavesync2-")
+        && hex.len() > 10
+    {
+        return format!("wavesync2-{}…", &hex[..10]);
+    }
+    match s.strip_prefix("wavesync-") {
+        Some(hex) if hex.len() > 10 => format!("wavesync-{}…", &hex[..10]),
+        _ => s.to_string(),
+    }
+}
+
 /// Exponential rejection backoff: 30s, 60s, 120s, … capped at 1 hour. Bounds
 /// how often a persistently-mismatching (e.g. spoofed-topic) peer is
 /// re-evaluated — the Rule 2.8 anti-storm guarantee — while still letting a
@@ -2243,6 +2261,15 @@ impl EngineRunner {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            topic = %short_topic(&tc.effective_topic),
+            db_version = tc.changeset.db_version,
+            n_changes = tc.changeset.changes.len(),
+        )
+    )]
     async fn handle_local_changeset(&mut self, tc: TaggedChangeset) {
         // Route the local write to the group it originated from. Clone the
         // topic/group_key into locals up front so the group borrow ends before
@@ -2256,7 +2283,10 @@ impl EngineRunner {
         let (topic_name, group_key) = match self.groups.get(&effective_topic) {
             Some(g) => (g.topic_name.clone(), g.group_key.clone()),
             None => {
-                tracing::debug!("local changeset for unknown group {effective_topic}; dropping");
+                tracing::debug!(
+                    topic = %short_topic(&effective_topic),
+                    "local changeset for unknown group; dropping"
+                );
                 return;
             }
         };
@@ -2279,8 +2309,9 @@ impl EngineRunner {
                 if let Some(oldest) = g.pending_pushes.keys().next().copied() {
                     g.pending_pushes.remove(&oldest);
                     tracing::debug!(
-                        "pending_pushes overflow for group {effective_topic}; \
-                         evicting db_version={oldest} to the reconcile backstop"
+                        topic = %short_topic(&effective_topic),
+                        db_version = oldest,
+                        "pending_pushes overflow; evicting to the reconcile backstop"
                     );
                 }
             }
@@ -2348,9 +2379,9 @@ impl EngineRunner {
             }
 
             tracing::info!(
-                "Pushed changeset (db_version={}) to {} peers",
-                changeset.db_version,
-                peer_ids.len()
+                db_version = changeset.db_version,
+                n_peers = peer_ids.len(),
+                "pushed changeset to peers"
             );
         }
 

@@ -36,6 +36,11 @@ impl EngineRunner {
     /// Send a version-vector sync request to `peer_id` for the group identified
     /// by `effective_topic`. No-op if the group is gone, the peer is infra, or
     /// it's already pending/rejected for that group.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(peer = %peer_id, topic = %short_topic(effective_topic))
+    )]
     pub(super) fn initiate_sync_for_peer(
         &mut self,
         peer_id: libp2p::PeerId,
@@ -70,7 +75,9 @@ impl EngineRunner {
         };
 
         tracing::info!(
-            "Requesting version vector sync from peer {peer_id} for topic {topic} (their last known version: {their_last_db_version})"
+            my_db_version,
+            your_last_db_version = their_last_db_version,
+            "requesting version vector sync"
         );
 
         let mut req = SyncRequest::VersionVector {
