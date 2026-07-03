@@ -570,6 +570,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relay_metrics.clone(),
         );
 
+        // The token store is persistent across restarts, but the gauge
+        // starts at 0 until the first register/unregister touches it —
+        // seed it from the store immediately so a freshly-restarted relay
+        // reports the real count on its first scrape instead of a
+        // momentarily-wrong 0.
+        match store.count_tokens().await {
+            Ok(n) => relay_metrics.set_registered_tokens(n),
+            Err(e) => log::warn!("Failed to read initial registered token count: {e}"),
+        }
+
         log::info!("Push notifications enabled (db: {push_db_path})");
         Some((store, notifier))
     } else {
@@ -735,16 +745,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Leak guard for `circuit_ledger`'s in-flight circuit tracking: a missed
     // `CircuitClosed` (relay bug, or a circuit that predates this process)
-    // would otherwise pin an entry forever. Sweeping every 10 minutes at a
-    // 24h max age is cheap and keeps the ledger bounded without disturbing
-    // legitimate long-lived circuits.
+    // would otherwise pin an entry forever. Sweeping every 10 minutes is
+    // cheap and keeps the ledger bounded without disturbing legitimate
+    // long-lived circuits.
+    //
+    // The max age must stay above the operator-configured
+    // `max_circuit_duration` — a legitimate circuit is allowed to live that
+    // long, and pruning it before its real `CircuitClosed` arrives would
+    // otherwise cut it off mid-flight. `2x` the configured duration leaves
+    // headroom for the sweep's own 10-minute cadence plus event-delivery
+    // jitter; the 24h floor keeps the guard meaningful even when the
+    // configured duration is tiny. (Swept entries are still billed their
+    // elapsed seconds before removal — see `CircuitLedger::sweep` — so this
+    // is purely about how long a leaked entry is allowed to linger, not
+    // about losing billing data.)
+    let sweep_max_age = Duration::from_secs(std::cmp::max(24 * 3600, 2 * cli.max_circuit_duration));
     let mut sweep_interval = tokio::time::interval(Duration::from_secs(10 * 60));
 
     loop {
         let event = tokio::select! {
             event = swarm.select_next_some() => event,
             _ = sweep_interval.tick() => {
-                circuit_ledger.sweep(Instant::now(), Duration::from_secs(24 * 3600));
+                circuit_ledger.sweep(Instant::now(), sweep_max_age);
                 log::debug!("CircuitLedger: {} circuit(s) currently tracked as active", circuit_ledger.active_count());
                 continue;
             }
@@ -1098,10 +1120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Shorten a derived topic / rendezvous namespace for logs. The full form is
-/// `wavesync-<64 hex>`; keeping the prefix plus the first 10 hex chars stays
-/// scannable while still distinguishing groups. Anything else passes through.
+/// Shorten a derived topic / rendezvous namespace for logs. The current form
+/// is `wavesync2-<64 hex>` (post-KDF-cutover); keeping the prefix plus the
+/// first 10 hex chars stays scannable while still distinguishing groups.
+/// The pre-cutover `wavesync-<64 hex>` form is tried as a fallback
+/// (belt-and-braces — a stale peer or replayed log line might still carry
+/// it); anything else passes through unchanged.
 pub(crate) fn short_topic(s: &str) -> String {
+    if let Some(hex) = s.strip_prefix("wavesync2-")
+        && hex.len() > 10
+    {
+        return format!("wavesync2-{}…", &hex[..10]);
+    }
     match s.strip_prefix("wavesync-") {
         Some(hex) if hex.len() > 10 => format!("wavesync-{}…", &hex[..10]),
         _ => s.to_string(),
@@ -1450,6 +1480,30 @@ fn extract_tcp_port(addr: &Multiaddr) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod short_topic_tests {
+    use super::*;
+
+    #[test]
+    fn truncates_current_wavesync2_prefix() {
+        let hex = "c".repeat(64);
+        let topic = format!("wavesync2-{hex}");
+        assert_eq!(short_topic(&topic), format!("wavesync2-{}…", &hex[..10]));
+    }
+
+    #[test]
+    fn falls_back_to_pre_cutover_prefix() {
+        let hex = "d".repeat(64);
+        let topic = format!("wavesync-{hex}");
+        assert_eq!(short_topic(&topic), format!("wavesync-{}…", &hex[..10]));
+    }
+
+    #[test]
+    fn passes_through_unrecognized() {
+        assert_eq!(short_topic("some-other-string"), "some-other-string");
+    }
 }
 
 #[cfg(test)]

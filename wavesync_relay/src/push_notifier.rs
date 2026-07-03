@@ -303,7 +303,7 @@ async fn fire_notifications(
         match result {
             PushResult::Sent => {
                 log::info!("Push sent ({}) to token={}...", token_entry.platform, short);
-                metrics.push_sent(&token_entry.platform, "sent");
+                metrics.push_sent(&token_entry.platform, "ok");
                 // A fresh send succeeded — clear any stale retry row
                 // that had been queued from an earlier failure for the
                 // same (topic, token). Latest peer_addrs already won
@@ -522,7 +522,7 @@ async fn process_retry(
                  (attempt {})",
                 row.attempts
             );
-            metrics.push_sent(&platform_label, "sent");
+            metrics.push_sent(&platform_label, "ok");
             let _ = store.remove_retry(&row.topic, &row.token).await;
         }
         PushResult::TokenInvalid { reason } => {

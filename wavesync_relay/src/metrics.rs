@@ -19,7 +19,15 @@ use prometheus_client::registry::Registry;
 
 /// Truncates a derived topic to a bounded-cardinality label, mirroring the
 /// `short_topic` helper in `main.rs` so metric labels line up with log lines.
+/// Tries the current `wavesync2-` prefix first, then the pre-KDF-cutover
+/// `wavesync-` prefix (belt-and-braces — a stale peer or log replay might
+/// still carry the old form), then passes anything else through untouched.
 fn short(s: &str) -> String {
+    if let Some(hex) = s.strip_prefix("wavesync2-")
+        && hex.len() > 10
+    {
+        return format!("wavesync2-{}…", &hex[..10]);
+    }
     match s.strip_prefix("wavesync-") {
         Some(hex) if hex.len() > 10 => format!("wavesync-{}…", &hex[..10]),
         _ => s.to_string(),
@@ -81,7 +89,7 @@ pub struct RelayMetrics {
     reservations_total: Family<OutcomeLabel, Counter<u64>>,
     active_reservations: Gauge<i64>,
     rendezvous_registrations_total: Family<TopicLabel, Counter<u64>>,
-    rendezvous_discover_served_total: Counter<u64>,
+    rendezvous_discovers_total: Counter<u64>,
     push_notifies_total: Family<TopicLabel, Counter<u64>>,
     pushes_sent_total: Family<PushLabel, Counter<u64>>,
     registered_tokens: Gauge<i64>,
@@ -89,9 +97,16 @@ pub struct RelayMetrics {
 
 impl RelayMetrics {
     pub fn new(registry: &mut Registry) -> Self {
+        // NOTE on names: prometheus-client's OpenMetrics text encoder appends
+        // "_total" to every Counter sample unconditionally (it does not check
+        // whether the registered name already ends in "_total"). Registering
+        // a counter as "foo_total" therefore wires up as "foo_total_total".
+        // Every counter family below is registered WITHOUT the "_total"
+        // suffix so the wire name comes out right; Gauges are exempt (the
+        // encoder doesn't touch gauge names).
         let connections_total = Family::<DirectionLabel, Counter<u64>>::default();
         registry.register(
-            "relay_connections_total",
+            "relay_connections",
             "Total libp2p connections established, by direction",
             connections_total.clone(),
         );
@@ -105,7 +120,7 @@ impl RelayMetrics {
 
         let reservations_total = Family::<OutcomeLabel, Counter<u64>>::default();
         registry.register(
-            "relay_reservations_total",
+            "relay_reservations",
             "Circuit relay v2 reservation requests, by outcome",
             reservations_total.clone(),
         );
@@ -117,30 +132,36 @@ impl RelayMetrics {
             active_reservations.clone(),
         );
 
+        // Topic labels below are bounded by `short()` to a fixed-width
+        // prefix, but on a relay serving many independent groups the
+        // cardinality still grows with the number of distinct groups seen.
+        // If that ever becomes a problem on a public relay, a future
+        // `--metrics-topic-labels=off` flag could degrade these families to
+        // a single unlabeled total instead of dropping them outright.
         let rendezvous_registrations_total = Family::<TopicLabel, Counter<u64>>::default();
         registry.register(
-            "relay_rendezvous_registrations_total",
+            "relay_rendezvous_registrations",
             "Rendezvous registrations received, by topic",
             rendezvous_registrations_total.clone(),
         );
 
-        let rendezvous_discover_served_total = Counter::<u64>::default();
+        let rendezvous_discovers_total = Counter::<u64>::default();
         registry.register(
-            "relay_rendezvous_discover_served_total",
+            "relay_rendezvous_discovers",
             "Rendezvous discover requests served",
-            rendezvous_discover_served_total.clone(),
+            rendezvous_discovers_total.clone(),
         );
 
         let push_notifies_total = Family::<TopicLabel, Counter<u64>>::default();
         registry.register(
-            "relay_push_notifies_total",
+            "relay_push_notifies",
             "Push wake-up notifications triggered, by topic",
             push_notifies_total.clone(),
         );
 
         let pushes_sent_total = Family::<PushLabel, Counter<u64>>::default();
         registry.register(
-            "relay_pushes_sent_total",
+            "relay_pushes_sent",
             "Push notifications sent, by platform and outcome",
             pushes_sent_total.clone(),
         );
@@ -158,7 +179,7 @@ impl RelayMetrics {
             reservations_total,
             active_reservations,
             rendezvous_registrations_total,
-            rendezvous_discover_served_total,
+            rendezvous_discovers_total,
             push_notifies_total,
             pushes_sent_total,
             registered_tokens,
@@ -200,7 +221,7 @@ impl RelayMetrics {
     }
 
     pub fn rendezvous_discover_served(&self) {
-        self.rendezvous_discover_served_total.inc();
+        self.rendezvous_discovers_total.inc();
     }
 
     pub fn push_notify(&self, topic: &str) {
@@ -267,31 +288,37 @@ pub struct CircuitLedger {
 
 impl CircuitLedger {
     pub fn new(registry: &mut Registry) -> Self {
+        // See the NOTE in `RelayMetrics::new` above: counters register
+        // without "_total" because the OpenMetrics encoder appends it itself.
         let circuits_opened_total = Family::<TopicLabel, Counter<u64>>::default();
         registry.register(
-            "relay_circuits_opened_total",
+            "relay_circuits_opened",
             "Relay circuits opened, by attributed topic",
             circuits_opened_total.clone(),
         );
 
         let circuits_denied_total = Counter::<u64>::default();
         registry.register(
-            "relay_circuits_denied_total",
+            "relay_circuits_denied",
             "Relay circuit requests denied",
             circuits_denied_total.clone(),
         );
 
         let circuits_closed_total = Family::<TopicOutcomeLabel, Counter<u64>>::default();
         registry.register(
-            "relay_circuits_closed_total",
+            "relay_circuits_closed",
             "Relay circuits closed, by attributed topic and outcome",
             circuits_closed_total.clone(),
         );
 
+        // Topic-labeled — see the cardinality note in `RelayMetrics::new`.
         let circuit_seconds_total = Family::<TopicLabel, Counter<f64, AtomicU64>>::default();
         registry.register(
-            "relay_circuit_seconds_total",
-            "Cumulative relay circuit duration in seconds, by attributed topic — the billing meter",
+            "relay_circuit_seconds",
+            "Cumulative relay circuit duration in seconds, by attributed topic — the billing \
+             meter. Values accrue only when a circuit closes (or is pruned by the leak-guard \
+             sweep, which now bills the same way) — a relay restart loses any in-flight \
+             circuit's accumulated-but-unclosed time.",
             circuit_seconds_total.clone(),
         );
 
@@ -379,19 +406,41 @@ impl CircuitLedger {
 
     /// Prunes entries older than `max_age` that never received a matching
     /// `close` — a leak guard against missed relay events, not a normal
-    /// code path. Returns the number of entries pruned.
+    /// code path. Before dropping each pruned entry, its elapsed time is
+    /// billed to `circuit_seconds_total` under its attributed topic, same as
+    /// a normal `close`: for a billing meter, pruning without crediting the
+    /// time already spent would silently under-bill any legitimate
+    /// long-lived circuit that happens to outlive the sweep age — the real
+    /// `CircuitClosed` event, if it ever arrives, finds no matching `open`
+    /// and is counted as an orphan error instead of double-billing.
+    /// Returns the number of entries pruned.
     pub fn sweep(&mut self, now: Instant, max_age: Duration) -> usize {
         let mut pruned = 0usize;
+        // Family is cheap to clone (internally Arc'd) — cloned out here so
+        // the billing closure below doesn't need to borrow `self` while
+        // `self.active` is already mutably borrowed by `retain`.
+        let circuit_seconds_total = self.circuit_seconds_total.clone();
         self.active.retain(|_, queue| {
             let before = queue.len();
-            queue.retain(|(opened_at, _)| now.saturating_duration_since(*opened_at) <= max_age);
+            queue.retain(|(opened_at, topic)| {
+                let elapsed = now.saturating_duration_since(*opened_at);
+                let expired = elapsed > max_age;
+                if expired {
+                    circuit_seconds_total
+                        .get_or_create(&TopicLabel {
+                            topic: topic.clone(),
+                        })
+                        .inc_by(elapsed.as_secs_f64());
+                }
+                !expired
+            });
             pruned += before - queue.len();
             !queue.is_empty()
         });
         if pruned > 0 {
             self.active_circuits.dec_by(pruned as i64);
             log::warn!(
-                "CircuitLedger: swept {pruned} leaked circuit entries older than {max_age:?}"
+                "CircuitLedger: swept {pruned} leaked circuit entries older than {max_age:?} (billed elapsed seconds before removal)"
             );
         }
         pruned
@@ -471,6 +520,27 @@ mod tests {
     }
 
     #[test]
+    fn short_truncates_wavesync2_topics() {
+        let hex = "a".repeat(64);
+        let topic = format!("wavesync2-{hex}");
+        assert_eq!(short(&topic), format!("wavesync2-{}…", &hex[..10]));
+    }
+
+    #[test]
+    fn short_falls_back_to_pre_cutover_prefix() {
+        // Belt-and-braces: a stale pre-KDF-cutover topic must still
+        // truncate sensibly rather than passing through unbounded.
+        let hex = "b".repeat(64);
+        let topic = format!("wavesync-{hex}");
+        assert_eq!(short(&topic), format!("wavesync-{}…", &hex[..10]));
+    }
+
+    #[test]
+    fn short_passes_through_unrecognized_strings() {
+        assert_eq!(short("unknown"), "unknown");
+    }
+
+    #[test]
     fn circuit_seconds_accumulate_per_topic() {
         let mut reg = prometheus_client::registry::Registry::default();
         let mut ledger = CircuitLedger::new(&mut reg);
@@ -491,9 +561,17 @@ mod tests {
 
         let text = registry_text(&reg);
         // 7 + 3 seconds attributed to the single shared topic (short label).
-        assert!(text.contains("relay_circuit_seconds_total"));
-        assert!(text.contains("topic=\"wavesync2-abc\"") || text.contains("wavesync2-abc"));
-        assert!(text.contains("10")); // 7 + 3
+        // Exact sample-line prefix (not a bare substring) so a regression
+        // that doubles the "_total" suffix (`..._total_total{`) would fail
+        // this assertion instead of silently matching.
+        assert!(
+            text.contains("\nrelay_circuit_seconds_total{topic=\"wavesync2-abc\"} 10"),
+            "sample line not found as expected:\n{text}"
+        );
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
     }
 
     #[test]
@@ -528,10 +606,17 @@ mod tests {
         ledger.close(e, f, t0 + Duration::from_secs(1), true);
 
         let text = registry_text(&reg);
-        assert!(text.contains("topic=\"unknown\""));
+        assert!(
+            text.contains("\nrelay_circuits_closed_total{topic=\"unknown\",outcome=\"ok\"} 3"),
+            "sample line not found as expected:\n{text}"
+        );
         assert!(
             !text.contains("topic=\"t1\""),
             "no single-shared-topic circuit existed"
+        );
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
         );
     }
 
@@ -543,7 +628,14 @@ mod tests {
         ledger.close(a, b, Instant::now(), true); // never opened
         assert_eq!(ledger.active_count(), 0);
         let text = registry_text(&reg);
-        assert!(text.contains("outcome=\"error\""));
+        assert!(
+            text.contains("\nrelay_circuits_closed_total{topic=\"unknown\",outcome=\"error\"} 1"),
+            "sample line not found as expected:\n{text}"
+        );
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
     }
 
     #[test]
@@ -560,6 +652,41 @@ mod tests {
             1
         );
         assert_eq!(ledger.active_count(), 0);
+    }
+
+    /// A pruned entry must not be billed zero seconds just because it never
+    /// received a matching `close` — otherwise a legitimate long-lived
+    /// circuit that happens to outlive the sweep age gets its real duration
+    /// silently discarded from the billing meter.
+    #[test]
+    fn sweep_bills_pruned_entries_before_removal() {
+        let mut reg = prometheus_client::registry::Registry::default();
+        let mut ledger = CircuitLedger::new(&mut reg);
+        let t0 = Instant::now();
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let shared_topic: [(&PeerId, &[&str]); 2] =
+            [(&a, &["wavesync2-abc"]), (&b, &["wavesync2-abc"])];
+        let lookup = topics(&shared_topic);
+
+        ledger.open(a, b, t0, &lookup);
+        assert_eq!(
+            ledger.sweep(
+                t0 + Duration::from_secs(90_000),
+                Duration::from_secs(86_400)
+            ),
+            1
+        );
+        assert_eq!(ledger.active_count(), 0);
+
+        let text = registry_text(&reg);
+        assert!(
+            text.contains("\nrelay_circuit_seconds_total{topic=\"wavesync2-abc\"} 90000"),
+            "pruned entry must be credited its elapsed seconds, not dropped silently:\n{text}"
+        );
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
     }
 
     #[test]
@@ -583,7 +710,14 @@ mod tests {
         assert_eq!(ledger.active_count(), 0);
 
         let text = registry_text(&reg);
-        assert!(text.contains("18")); // 10 + 8 seconds, both billed
+        assert!(
+            text.contains("\nrelay_circuit_seconds_total{topic=\"wavesync2-abc\"} 18"),
+            "sample line not found as expected:\n{text}"
+        ); // 10 + 8 seconds, both billed
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
     }
 
     #[test]
@@ -594,22 +728,44 @@ mod tests {
         m.set_connected_peers(1);
         m.reservation(ReservationOutcome::Accepted);
         m.rendezvous_registered("wavesync2-abcdef123456");
+        m.rendezvous_discover_served();
         m.push_notify("wavesync2-abcdef123456");
         m.push_sent("fcm", "budget_denied");
         m.set_registered_tokens(3);
         let text = registry_text(&reg);
-        for family in [
-            "relay_connections_total",
-            "relay_connected_peers",
-            "relay_reservations_total",
-            "relay_rendezvous_registrations_total",
-            "relay_push_notifies_total",
-            "relay_pushes_sent_total",
-            "relay_registered_tokens",
+
+        // Exact sample-line prefixes for every counter family — a bare
+        // substring match (e.g. `text.contains("relay_connections_total")`)
+        // would still pass against a doubled `..._total_total{` suffix, so
+        // each check anchors on the `{` (or the line start for the
+        // no-label counter) immediately after the single `_total`.
+        for line_prefix in [
+            "\nrelay_connections_total{",
+            "\nrelay_reservations_total{",
+            "\nrelay_rendezvous_registrations_total{",
+            "\nrelay_rendezvous_discovers_total ",
+            "\nrelay_push_notifies_total{",
+            "\nrelay_pushes_sent_total{",
         ] {
-            assert!(text.contains(family), "missing {family}");
+            assert!(
+                text.contains(line_prefix),
+                "missing {line_prefix:?} in:\n{text}"
+            );
+        }
+        // Gauges are exempt from the encoder's "_total" suffix — assert the
+        // bare names so a regression that accidentally suffixed a gauge
+        // would also be caught.
+        for line_prefix in ["\nrelay_connected_peers ", "\nrelay_registered_tokens "] {
+            assert!(
+                text.contains(line_prefix),
+                "missing {line_prefix:?} in:\n{text}"
+            );
         }
         assert!(text.contains("outcome=\"budget_denied\""));
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
     }
 
     #[tokio::test]
@@ -631,7 +787,11 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(body.contains("relay_connections_total"));
+        assert!(body.contains("\nrelay_connections_total{"));
+        assert!(
+            !body.contains("_total_total"),
+            "doubled _total suffix:\n{body}"
+        );
         assert!(body.contains("# EOF"), "OpenMetrics text ends with # EOF");
         let health = reqwest::get(format!("http://{addr}/healthz"))
             .await
