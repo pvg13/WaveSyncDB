@@ -2510,9 +2510,28 @@ impl EngineRunner {
                 log::info!("Sent identify info to {peer_id:?}");
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(
-                identify::Event::Received { info, .. },
+                identify::Event::Received { peer_id, info, .. },
             )) => {
                 log::info!("Received identify info: {:?}", info.protocol_version);
+                // Version-negotiation diagnostic: if a peer we'd otherwise try to
+                // sync with advertises none of our sync-protocol ladder rungs, its
+                // version-vector requests will silently fail. Surface that as a
+                // clear protocol-mismatch warning instead. Infrastructure peers
+                // (relay/rendezvous) legitimately don't speak the sync protocol.
+                if !self.infrastructure_peers.contains(&peer_id)
+                    && self.peers.contains_key(&peer_id)
+                    && crate::engine::snapshot_protocol::negotiate_snapshot_protocol(
+                        info.protocols.iter().map(|p| p.as_ref()),
+                    )
+                    .is_none()
+                {
+                    log::warn!(
+                        "Peer {peer_id} advertises no compatible wavesync sync protocol \
+                         (rungs: {:?}) — version-vector sync unavailable with it; likely a \
+                         version past its transition window or a different application",
+                        crate::engine::snapshot_protocol::SNAPSHOT_PROTOCOLS,
+                    );
+                }
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Ping(ping::Event {
                 peer,
