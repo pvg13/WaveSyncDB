@@ -11,7 +11,7 @@
 //! outside their own unit tests.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
@@ -261,7 +261,14 @@ pub struct CircuitLedger {
     circuits_closed_total: Family<TopicOutcomeLabel, Counter<u64>>,
     circuit_seconds_total: Family<TopicLabel, Counter<f64, AtomicU64>>,
     active_circuits: Gauge<i64>,
-    active: HashMap<(PeerId, PeerId), (Instant, String)>,
+    // libp2p allows multiple concurrent circuits between the same (src, dst)
+    // pair, and `CircuitClosed` carries no circuit id to disambiguate which
+    // one ended. A per-pair queue (rather than a single slot) lets each
+    // concurrent circuit be tracked and billed independently; `close` pops
+    // the front (FIFO), billing the oldest still-open circuit for that pair
+    // as the deterministic fair approximation when the real identity is
+    // unknowable from the event alone.
+    active: HashMap<(PeerId, PeerId), VecDeque<(Instant, String)>>,
 }
 
 impl CircuitLedger {
@@ -325,7 +332,10 @@ impl CircuitLedger {
             })
             .inc();
         self.active_circuits.inc();
-        self.active.insert((src, dst), (now, topic));
+        self.active
+            .entry((src, dst))
+            .or_default()
+            .push_back((now, topic));
     }
 
     pub fn denied(&mut self) {
@@ -333,7 +343,18 @@ impl CircuitLedger {
     }
 
     pub fn close(&mut self, src: PeerId, dst: PeerId, now: Instant, ok: bool) {
-        match self.active.remove(&(src, dst)) {
+        let key = (src, dst);
+        let popped = match self.active.get_mut(&key) {
+            Some(queue) => {
+                let popped = queue.pop_front();
+                if queue.is_empty() {
+                    self.active.remove(&key);
+                }
+                popped
+            }
+            None => None,
+        };
+        match popped {
             Some((opened_at, topic)) => {
                 let elapsed = now.saturating_duration_since(opened_at);
                 self.circuit_seconds_total
@@ -366,10 +387,13 @@ impl CircuitLedger {
     /// `close` — a leak guard against missed relay events, not a normal
     /// code path. Returns the number of entries pruned.
     pub fn sweep(&mut self, now: Instant, max_age: Duration) -> usize {
-        let before = self.active.len();
-        self.active
-            .retain(|_, (opened_at, _)| now.saturating_duration_since(*opened_at) <= max_age);
-        let pruned = before - self.active.len();
+        let mut pruned = 0usize;
+        self.active.retain(|_, queue| {
+            let before = queue.len();
+            queue.retain(|(opened_at, _)| now.saturating_duration_since(*opened_at) <= max_age);
+            pruned += before - queue.len();
+            !queue.is_empty()
+        });
         if pruned > 0 {
             self.active_circuits.dec_by(pruned as i64);
             log::warn!(
@@ -380,7 +404,7 @@ impl CircuitLedger {
     }
 
     pub fn active_count(&self) -> usize {
-        self.active.len()
+        self.active.values().map(|q| q.len()).sum()
     }
 }
 
@@ -495,6 +519,30 @@ mod tests {
             1
         );
         assert_eq!(ledger.active_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_same_pair_circuits_bill_independently() {
+        let mut reg = prometheus_client::registry::Registry::default();
+        let mut ledger = CircuitLedger::new(&mut reg);
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let t0 = Instant::now();
+        let shared_topic: [(&PeerId, &[&str]); 2] =
+            [(&a, &["wavesync2-abc"]), (&b, &["wavesync2-abc"])];
+        let lookup = topics(&shared_topic);
+
+        ledger.open(a, b, t0, &lookup);
+        ledger.open(a, b, t0 + Duration::from_secs(2), &lookup); // concurrent 2nd circuit
+        assert_eq!(ledger.active_count(), 2);
+
+        // FIFO: first close bills the first-opened circuit (10s), second the other (8s).
+        ledger.close(a, b, t0 + Duration::from_secs(10), true);
+        assert_eq!(ledger.active_count(), 1);
+        ledger.close(a, b, t0 + Duration::from_secs(10), true);
+        assert_eq!(ledger.active_count(), 0);
+
+        let text = registry_text(&reg);
+        assert!(text.contains("18")); // 10 + 8 seconds, both billed
     }
 
     #[test]
