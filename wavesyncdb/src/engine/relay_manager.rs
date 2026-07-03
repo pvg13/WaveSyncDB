@@ -53,7 +53,7 @@ impl EngineRunner {
     pub(super) fn handle_relay_client(&mut self, event: relay::client::Event) {
         match event {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
-                log::info!("Relay reservation accepted by {relay_peer_id}");
+                tracing::info!("Relay reservation accepted by {relay_peer_id}");
                 self.relay_state = RelayState::Listening { relay_peer_id };
                 self.circuit_retry_count = 0;
                 self.circuit_accepted_at = Some(tokio::time::Instant::now());
@@ -71,7 +71,7 @@ impl EngineRunner {
                 self.update_network_status();
             }
             _ => {
-                log::info!("Relay client event (non-acceptance): {:?}", event);
+                tracing::info!("Relay client event (non-acceptance): {:?}", event);
             }
         }
     }
@@ -91,7 +91,7 @@ impl EngineRunner {
                 self.diagnostics
                     .dcutr_upgrades_succeeded
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log::info!(
+                tracing::info!(
                     "DCUtR: direct connection upgrade succeeded with {peer} (sync now goes peer-to-peer, bypassing the relay)"
                 );
             }
@@ -104,7 +104,7 @@ impl EngineRunner {
                 let next_attempts = current_attempts + 1;
                 match DcutrRetryState::schedule(next_attempts) {
                     Some(state) => {
-                        log::info!(
+                        tracing::info!(
                             "DCUtR: upgrade failed with {peer}: {error} \
                              (scheduling retry #{next_attempts}/{DCUTR_MAX_ATTEMPTS} \
                              in ~{:?})",
@@ -115,7 +115,7 @@ impl EngineRunner {
                         self.dcutr_retries.insert(peer, state);
                     }
                     None => {
-                        log::info!(
+                        tracing::info!(
                             "DCUtR: upgrade failed with {peer}: {error} \
                              (retry budget exhausted after {DCUTR_MAX_ATTEMPTS} attempts; \
                              sync stays on circuit-relay path)"
@@ -142,7 +142,7 @@ impl EngineRunner {
             .map(|(peer, _)| *peer)
             .collect();
         for peer in due {
-            log::info!("DCUtR: re-attempting direct upgrade with {peer}");
+            tracing::info!("DCUtR: re-attempting direct upgrade with {peer}");
             // Mark the next slot in advance. If this dial also fails, the
             // dcutr event handler will overwrite with a fresh schedule
             // (or remove the entry if max attempts exceeded).
@@ -160,7 +160,7 @@ impl EngineRunner {
             // implicitly held open by the existing connection.
             let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer).build();
             if let Err(e) = self.swarm.dial(dial_opts) {
-                log::debug!("DCUtR retry dial for {peer} failed to enqueue: {e}");
+                tracing::debug!("DCUtR retry dial for {peer} failed to enqueue: {e}");
             }
         }
     }
@@ -170,7 +170,7 @@ impl EngineRunner {
         self.nat_assumption_deadline = None;
         match &event.result {
             Ok(()) => {
-                log::info!(
+                tracing::info!(
                     "AutoNAT: address {} is reachable (tested by {})",
                     event.tested_addr,
                     event.server
@@ -185,7 +185,7 @@ impl EngineRunner {
                 }
             }
             Err(e) => {
-                log::info!(
+                tracing::info!(
                     "AutoNAT: address {} is NOT reachable (tested by {}): {e}",
                     event.tested_addr,
                     event.server
@@ -212,7 +212,7 @@ impl EngineRunner {
                 ttl,
                 namespace,
             } => {
-                log::info!(
+                tracing::info!(
                     "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
                 );
                 // Mark the matching group's namespace as registered.
@@ -236,7 +236,7 @@ impl EngineRunner {
                 namespace,
                 error,
             } => {
-                log::warn!(
+                tracing::warn!(
                     "Rendezvous registration failed at {rendezvous_node} namespace '{namespace}': {error:?}"
                 );
                 let ns = namespace.to_string();
@@ -263,7 +263,7 @@ impl EngineRunner {
                 // be attributed to the right group (see `rendezvous_discover`).
                 ..
             } => {
-                log::info!(
+                tracing::info!(
                     "Discovered {} peers via rendezvous at {rendezvous_node}",
                     registrations.len()
                 );
@@ -303,15 +303,15 @@ impl EngineRunner {
                 // Dial up to MAX immediately, queue the rest
                 let immediate = to_dial.len().min(MAX_CONCURRENT_RENDEZVOUS_DIALS);
                 for (peer_id, addr) in to_dial.drain(..immediate) {
-                    log::info!("Rendezvous dialing peer {peer_id} at {addr}");
+                    tracing::info!("Rendezvous dialing peer {peer_id} at {addr}");
                     if let Err(e) = self.swarm.dial(addr) {
-                        log::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
+                        tracing::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
                     } else {
                         self.dialing_peers.insert(peer_id);
                     }
                 }
                 if !to_dial.is_empty() {
-                    log::info!(
+                    tracing::info!(
                         "Queued {} rendezvous peers for rate-limited dialing",
                         to_dial.len()
                     );
@@ -323,12 +323,12 @@ impl EngineRunner {
                 namespace,
                 error,
             } => {
-                log::warn!(
+                tracing::warn!(
                     "Rendezvous discovery failed at {rendezvous_node} namespace {namespace:?}: {error:?}"
                 );
             }
             rendezvous::client::Event::Expired { peer } => {
-                log::debug!("Rendezvous registration expired for peer {peer}");
+                tracing::debug!("Rendezvous registration expired for peer {peer}");
             }
         }
     }
@@ -344,7 +344,7 @@ impl EngineRunner {
             let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
                 Ok(ns) => ns,
                 Err(e) => {
-                    log::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
+                    tracing::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
                     continue;
                 }
             };
@@ -354,10 +354,12 @@ impl EngineRunner {
                 None, // Let server assign default TTL (server MIN_TTL=7200s)
             ) {
                 Ok(()) => {
-                    log::info!("Sent rendezvous registration for '{ns_str}' to {server_peer_id}");
+                    tracing::info!(
+                        "Sent rendezvous registration for '{ns_str}' to {server_peer_id}"
+                    );
                 }
                 Err(e) => {
-                    log::warn!("Failed to send rendezvous registration for '{ns_str}': {e}");
+                    tracing::warn!("Failed to send rendezvous registration for '{ns_str}': {e}");
                 }
             }
         }
@@ -369,7 +371,7 @@ impl EngineRunner {
             Some(addr) => match addr.iter().last() {
                 Some(libp2p::multiaddr::Protocol::P2p(peer_id)) => peer_id,
                 _ => {
-                    log::debug!("Rendezvous server address has no peer ID, skipping discover");
+                    tracing::debug!("Rendezvous server address has no peer ID, skipping discover");
                     return;
                 }
             },
@@ -377,7 +379,7 @@ impl EngineRunner {
         };
 
         if !self.swarm.is_connected(&server_peer_id) {
-            log::debug!("Not connected to rendezvous server, skipping discover");
+            tracing::debug!("Not connected to rendezvous server, skipping discover");
             return;
         }
 
@@ -406,7 +408,7 @@ impl EngineRunner {
             let namespace = match rendezvous::Namespace::new(ns_str.clone()) {
                 Ok(ns) => ns,
                 Err(e) => {
-                    log::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
+                    tracing::error!("Invalid rendezvous namespace {ns_str}: {e:?}");
                     continue;
                 }
             };
@@ -450,7 +452,7 @@ impl EngineRunner {
                 // With 5s base interval: 5s, 10s, 20s, 40s, 40s, 40s...
                 let skip = 1u32 << count.min(3); // 1, 2, 4, 8, 8, 8...
                 if count % skip == 0 {
-                    log::info!("Attempting relay reconnection (attempt {})", count + 1);
+                    tracing::info!("Attempting relay reconnection (attempt {})", count + 1);
                     self.try_dial_relay();
                 }
                 // Rotate to the next fallback relay after every 4 failed
@@ -478,7 +480,7 @@ impl EngineRunner {
                 // first request is pending.
                 self.circuit_retry_count += 1;
                 if self.circuit_retry_count >= 3 {
-                    log::warn!(
+                    tracing::warn!(
                         "Circuit reservation failed {} times, forcing full relay reconnect",
                         self.circuit_retry_count
                     );
@@ -487,7 +489,7 @@ impl EngineRunner {
                     // ConnectionClosed handler will reset to Connecting and
                     // trigger full reconnect
                 } else {
-                    log::info!(
+                    tracing::info!(
                         "Relay stuck in Connected for >5s, retrying circuit reservation (attempt {})",
                         self.circuit_retry_count
                     );
@@ -522,7 +524,7 @@ impl EngineRunner {
             self.config.relay_fallbacks.push(addr);
         }
         if let Some(ref addr) = self.config.relay_server {
-            log::info!("Rotated to next relay fallback: {addr}");
+            tracing::info!("Rotated to next relay fallback: {addr}");
         }
     }
 
@@ -532,7 +534,7 @@ impl EngineRunner {
     /// to call both on relay-connect and whenever a new group is joined.
     pub(super) fn maybe_register_push_token(&mut self, relay_peer_id: libp2p::PeerId) {
         if self.push_token.is_none() {
-            log::info!(
+            tracing::info!(
                 "maybe_register_push_token skipped: no push_token set — \
                  either the platform isn't mobile, push-sync feature is off, \
                  or the FCM/APNs token file wasn't written by the OS service \
@@ -577,7 +579,7 @@ impl EngineRunner {
             "Fcm" => push_protocol::PushPlatform::Fcm,
             "Apns" => push_protocol::PushPlatform::Apns,
             other => {
-                log::warn!("Unknown push platform: {other}");
+                tracing::warn!("Unknown push platform: {other}");
                 return;
             }
         };
@@ -594,7 +596,7 @@ impl EngineRunner {
             .send_request(&relay_peer_id, req);
         self.push_pending_registrations
             .insert(request_id, topic.to_string());
-        log::info!("Sent push token registration for topic {topic} to relay {relay_peer_id}");
+        tracing::info!("Sent push token registration for topic {topic} to relay {relay_peer_id}");
     }
 
     /// Tell the relay to stop waking this device for a topic we've left, and
@@ -621,7 +623,7 @@ impl EngineRunner {
         // resurrect it into the registered set after we've left the group.
         self.push_pending_registrations.retain(|_, t| t != topic);
         self.update_network_status();
-        log::info!("Sent push token unregistration for topic {topic} to relay {relay_peer_id}");
+        tracing::info!("Sent push token unregistration for topic {topic} to relay {relay_peer_id}");
     }
 
     /// Announce this peer's presence to the relay so it can introduce us
@@ -640,7 +642,7 @@ impl EngineRunner {
                 .push
                 .send_request(&relay_peer_id, req);
         }
-        log::info!("Announced presence to relay {relay_peer_id} for all group topics");
+        tracing::info!("Announced presence to relay {relay_peer_id} for all group topics");
     }
 
     /// Dial a peer introduced by the relay (via PeerList response or
@@ -659,7 +661,7 @@ impl EngineRunner {
             .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
                 Ok(a) => Some(a),
                 Err(e) => {
-                    log::warn!("Relay introduced unparseable address {s:?}: {e}");
+                    tracing::warn!("Relay introduced unparseable address {s:?}: {e}");
                     None
                 }
             })
@@ -681,7 +683,7 @@ impl EngineRunner {
             last
         });
         let Some(peer_id) = peer_id else {
-            log::warn!("Relay introduced peer with no /p2p/ suffix on any address");
+            tracing::warn!("Relay introduced peer with no /p2p/ suffix on any address");
             return;
         };
 
@@ -706,13 +708,13 @@ impl EngineRunner {
         let addrs = dialable_addrs_preferring_direct(addrs, self.suppress_relay_dial(&peer_id));
 
         if addrs.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "Skipping dial to {peer_id}: no non-circuit address while a direct path is preferred"
             );
             return;
         }
 
-        log::info!(
+        tracing::info!(
             "Dialing relay-introduced peer {peer_id} with {} address(es): {addrs:?}",
             addrs.len()
         );
@@ -730,7 +732,7 @@ impl EngineRunner {
                 }
             }
             Err(e) => {
-                log::warn!("Failed to dial relay-introduced peer {peer_id}: {e}");
+                tracing::warn!("Failed to dial relay-introduced peer {peer_id}: {e}");
             }
         }
     }
@@ -742,7 +744,7 @@ impl EngineRunner {
             RelayState::Connected { relay_peer_id, .. }
             | RelayState::Listening { relay_peer_id } => *relay_peer_id,
             other => {
-                log::info!(
+                tracing::info!(
                     "notify_relay_topic skipped: relay_state is {other:?} \
                      (expected Connected or Listening) — relay won't send FCM \
                      for this write"
@@ -764,7 +766,7 @@ impl EngineRunner {
                 .collect::<String>(),
         };
 
-        log::info!(
+        tracing::info!(
             "Sending NotifyTopic to relay {relay_peer_id} for topic {effective_topic} \
              (this should produce a 'NotifyTopic received' log on the relay)"
         );
@@ -784,9 +786,9 @@ impl EngineRunner {
             if self.swarm.is_connected(&peer_id) || self.dialing_peers.contains(&peer_id) {
                 continue;
             }
-            log::info!("Rendezvous dialing queued peer {peer_id} at {addr}");
+            tracing::info!("Rendezvous dialing queued peer {peer_id} at {addr}");
             if let Err(e) = self.swarm.dial(addr) {
-                log::warn!("Failed to dial queued rendezvous peer {peer_id}: {e}");
+                tracing::warn!("Failed to dial queued rendezvous peer {peer_id}: {e}");
             } else {
                 self.dialing_peers.insert(peer_id);
             }

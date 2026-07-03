@@ -56,7 +56,7 @@ fn ensure_auto_resume(db: &WaveSyncDb) {
             let rt = match tokio::runtime::Builder::new_current_thread().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    log::error!("auto-resume: failed to build runtime: {e}");
+                    tracing::error!("auto-resume: failed to build runtime: {e}");
                     return;
                 }
             };
@@ -68,7 +68,9 @@ fn ensure_auto_resume(db: &WaveSyncDb) {
                     }
                     let is_foreground = *rx.borrow_and_update();
                     if is_foreground && !was_foreground {
-                        log::info!("wavesync: app returned to foreground — resync + UI refresh");
+                        tracing::info!(
+                            "wavesync: app returned to foreground — resync + UI refresh"
+                        );
                         trigger();
                     }
                     was_foreground = is_foreground;
@@ -223,7 +225,7 @@ impl InitDb {
         Fut: Future<Output = Result<(), DbErr>>,
     {
         if self.sig.read().is_some() {
-            log::warn!("use_wavesync_init: DB already initialized, ignoring");
+            tracing::warn!("use_wavesync_init: DB already initialized, ignoring");
             return Ok(());
         }
 
@@ -234,7 +236,7 @@ impl InitDb {
 
         // Check if a reset happened while we were building the DB
         if self.generation() != current_gen {
-            log::warn!("use_wavesync_init: generation changed during build, discarding new DB");
+            tracing::warn!("use_wavesync_init: generation changed during build, discarding new DB");
             db.shutdown().await;
             return Ok(());
         }
@@ -243,7 +245,7 @@ impl InitDb {
 
         // Double-check generation after setup
         if self.generation() != current_gen {
-            log::warn!("use_wavesync_init: generation changed during setup, discarding new DB");
+            tracing::warn!("use_wavesync_init: generation changed during setup, discarding new DB");
             db.shutdown().await;
             return Ok(());
         }
@@ -514,7 +516,7 @@ pub async fn run_table_driver<E>(
         match E::find().all(&db).await {
             Ok(r) => r,
             Err(e) => {
-                log::error!("Failed initial table load: {}", e);
+                tracing::error!("Failed initial table load: {}", e);
                 // Falls through to `publish(rows.clone())` below with the
                 // empty Vec, same as a legitimately empty table. This is
                 // load-bearing for `use_synced_table_loaded`: a failed
@@ -588,7 +590,7 @@ pub async fn run_table_driver<E>(
                 n
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                log::warn!("Missed {} change notifications for {}", n, target_table);
+                tracing::warn!("Missed {} change notifications for {}", n, target_table);
                 if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
                     && let Ok(r) = E::find().all(&db).await
                 {
@@ -624,7 +626,7 @@ pub async fn run_table_driver<E>(
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Ok(n)) => batch.push(n),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    log::warn!("Missed {} change notifications for {}", n, target_table);
+                    tracing::warn!("Missed {} change notifications for {}", n, target_table);
                     batch.clear();
                     if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
                         && let Ok(r) = E::find().all(&db).await
@@ -722,7 +724,7 @@ pub async fn run_table_driver<E>(
                         }
                     }
                 }
-                Err(e) => log::error!("Failed to refresh row {}: {}", pk_str, e),
+                Err(e) => tracing::error!("Failed to refresh row {}: {}", pk_str, e),
             }
         }
 
@@ -851,7 +853,7 @@ pub async fn run_row_driver<E>(
         current = match E::find_by_id(pk.clone()).one(&db).await {
             Ok(row) => row,
             Err(e) => {
-                log::error!("Failed initial row load: {}", e);
+                tracing::error!("Failed initial row load: {}", e);
                 // Falls through to `publish(current.clone())` below with
                 // None, same as a legitimately absent row. Load-bearing for
                 // `use_synced_row_loaded`: a failed initial query still
@@ -914,7 +916,7 @@ pub async fn run_row_driver<E>(
                 n
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                log::warn!("Missed {} change notifications for {}", n, target_table);
+                tracing::warn!("Missed {} change notifications for {}", n, target_table);
                 if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
                     && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
                 {
@@ -945,7 +947,7 @@ pub async fn run_row_driver<E>(
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Ok(n)) => batch.push(n),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
-                    log::warn!("Missed {} change notifications for {}", n, target_table);
+                    tracing::warn!("Missed {} change notifications for {}", n, target_table);
                     batch.clear();
                     if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
                         && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
@@ -1114,7 +1116,7 @@ pub fn use_auto_lifecycle(db: WaveSyncDb) {
                 }
                 let is_foreground = *rx.borrow_and_update();
                 if is_foreground && !was_foreground {
-                    log::info!("Auto-lifecycle: app resumed, triggering sync");
+                    tracing::info!("Auto-lifecycle: app resumed, triggering sync");
                     db.resume();
                 }
                 was_foreground = is_foreground;

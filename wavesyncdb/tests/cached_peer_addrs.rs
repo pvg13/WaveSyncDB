@@ -27,7 +27,7 @@ use common::{assert_eventually, make_peer, mem_db};
 
 #[tokio::test]
 async fn cached_addresses_used_at_cold_start() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cached-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 

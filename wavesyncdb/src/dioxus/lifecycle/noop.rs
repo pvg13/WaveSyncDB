@@ -6,5 +6,5 @@ use tokio::sync::watch;
 /// Use [`super::super::hooks::use_app_resume`] with a manual signal for
 /// desktop lifecycle control.
 pub fn start_lifecycle_listener(_tx: watch::Sender<bool>) {
-    log::debug!("Auto lifecycle detection not available on this platform");
+    tracing::debug!("Auto lifecycle detection not available on this platform");
 }

@@ -9,8 +9,8 @@ use wavesyncdb::{NetworkEvent, RelayStatus, WaveSyncDbBuilder};
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -39,18 +39,18 @@ async fn main() {
         loop {
             match rx.recv().await {
                 Ok(NetworkEvent::RelayStatusChanged(RelayStatus::Connected)) => {
-                    log::info!("Managed relay connected — auth accepted");
+                    tracing::info!("Managed relay connected — auth accepted");
                     return true;
                 }
                 Ok(NetworkEvent::EngineFailed { reason }) => {
-                    log::error!("Engine failed: {reason}");
+                    tracing::error!("Engine failed: {reason}");
                     return false;
                 }
                 Ok(event) => {
-                    log::debug!("Event: {event:?}");
+                    tracing::debug!("Event: {event:?}");
                 }
                 Err(e) => {
-                    log::error!("Event channel error: {e}");
+                    tracing::error!("Event channel error: {e}");
                     return false;
                 }
             }
@@ -60,15 +60,15 @@ async fn main() {
 
     match result {
         Ok(true) => {
-            log::info!("SUCCESS");
+            tracing::info!("SUCCESS");
             std::process::exit(0);
         }
         Ok(false) => {
-            log::error!("FAILED");
+            tracing::error!("FAILED");
             std::process::exit(1);
         }
         Err(_) => {
-            log::error!("TIMEOUT — no auth result within 15s");
+            tracing::error!("TIMEOUT — no auth result within 15s");
             std::process::exit(1);
         }
     }

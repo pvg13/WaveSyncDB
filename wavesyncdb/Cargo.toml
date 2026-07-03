@@ -16,7 +16,11 @@ categories = ["database", "network-programming"]
 [dependencies]
 serde = { workspace = true }
 futures = "0.3"
-log = { workspace = true }
+# `features = ["log"]` is the compat bridge: every tracing event is also
+# emitted as a `log` record when no tracing `Subscriber` is installed, so
+# existing env_logger/RUST_LOG consumers (and android_logger — see the
+# target-gated `log` dependency below) keep working with zero changes.
+tracing = { version = "0.1", features = ["log"] }
 thiserror = { workspace = true }
 serde_json = "1.0"
 inventory = { workspace = true }
@@ -39,6 +43,13 @@ uuid = { workspace = true }
 # Used for jitter in DCUtR retry scheduling. Already pulled in
 # transitively via libp2p; declaring here is essentially free.
 rand = "0.8"
+# The crate's own logging is tracing-native (see `tracing` above). This `log`
+# dependency is NOT used for that — it exists only because two third-party
+# APIs are typed directly against `log::LevelFilter` with no tracing
+# equivalent: SeaORM's `ConnectOptions::sqlx_logging_level` (connection.rs)
+# and, on Android, `android_logger::Config::with_max_level` (ffi.rs). Scoped
+# to native targets since neither call site exists on wasm32.
+log = { workspace = true }
 
 # Wasm32 (browser): no sqlx, no tokio I/O. Provide a minimal wasm-friendly
 # tokio for `sync` primitives only, uuid with `js` for browser entropy, and
@@ -81,10 +92,11 @@ notify-rust = { version = "4", optional = true }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", optional = true }
 ndk-context = { version = "0.1", optional = true }
-# android_logger routes `log::*` output to Android's logcat. Without it,
-# engine logs from background_sync (which runs in the FirebaseMessagingService
-# JNI thread, with no env_logger / no stderr redirection) silently disappear,
-# making "no peers found" failures uninvestigable.
+# android_logger routes engine output (tracing events, bridged through
+# `tracing`'s `log` feature) to Android's logcat. Without it, engine logs
+# from background_sync (which runs in the FirebaseMessagingService JNI
+# thread, with no stderr redirection) silently disappear, making "no peers
+# found" failures uninvestigable.
 android_logger = { version = "0.14", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -100,7 +112,7 @@ block2 = { version = "0.6", optional = true }
 if-addrs = "0.13"
 
 [dev-dependencies]
-env_logger = "0.11"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Make the SyncEntity derive available to all test binaries unconditionally,
 # so `tests/common/mod.rs` can use it without forcing every test to enable
 # the `derive` feature on the main crate.

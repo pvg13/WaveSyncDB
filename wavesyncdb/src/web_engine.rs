@@ -699,7 +699,7 @@ impl WebSyncClient {
         const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
         const MAX_FAIL_COUNT: u32 = 10;
         if let Err(e) = store.gc_peer_addresses(MAX_AGE_SECS, MAX_FAIL_COUNT).await {
-            log::debug!("WebSyncClient: peer_addrs gc failed: {e}");
+            tracing::debug!("WebSyncClient: peer_addrs gc failed: {e}");
         }
         let cached_peer_addrs = match store
             .load_recent_peer_addresses(MAX_AGE_SECS, MAX_FAIL_COUNT)
@@ -707,12 +707,12 @@ impl WebSyncClient {
         {
             Ok(v) => v,
             Err(e) => {
-                log::debug!("WebSyncClient: peer_addrs load failed: {e}");
+                tracing::debug!("WebSyncClient: peer_addrs load failed: {e}");
                 Vec::new()
             }
         };
         if !cached_peer_addrs.is_empty() {
-            log::info!(
+            tracing::info!(
                 "WebSyncClient: loaded {} cached peer address(es) from previous session",
                 cached_peer_addrs.len()
             );
@@ -853,7 +853,7 @@ impl WebSyncClient {
             connected_peer_ids: Vec::new(),
         });
 
-        log::info!(
+        tracing::info!(
             "WebSyncClient: peer {local_peer_id}, dialing {target}, topic={effective_topic}, persistent={}",
             store.is_some()
         );
@@ -1126,7 +1126,7 @@ impl WebSyncClient {
             connected_peer_ids: Vec::new(),
         });
 
-        log::info!(
+        tracing::info!(
             "WebSyncClient (loopback): site_id={:02x?}, topic={effective_topic}, store={store_name}",
             &site_id.0[..4]
         );
@@ -1383,7 +1383,7 @@ async fn run_loopback(
             // out via libp2p request-response.
             while let Some(req) = pending_out.pop_front() {
                 if end.out_tx.send(req).is_err() {
-                    log::info!("WebSyncClient (loopback): peer dropped while draining outbox");
+                    tracing::info!("WebSyncClient (loopback): peer dropped while draining outbox");
                     return;
                 }
             }
@@ -1436,7 +1436,7 @@ async fn run_loopback(
                         let _ = ack.send(result);
                     }
                     None => {
-                        log::info!("WebSyncClient (loopback): command channel closed");
+                        tracing::info!("WebSyncClient (loopback): command channel closed");
                         return;
                     }
                 }
@@ -1451,11 +1451,11 @@ async fn run_loopback(
                             // for an offline peer are dropped on the floor.
                             // The version-vector catch-up on reconnect
                             // (above) is what recovers them.
-                            log::debug!("loopback: dropping incoming while offline");
+                            tracing::debug!("loopback: dropping incoming while offline");
                         }
                     }
                     None => {
-                        log::info!("WebSyncClient (loopback): peer channel closed");
+                        tracing::info!("WebSyncClient (loopback): peer channel closed");
                         return;
                     }
                 }
@@ -1486,7 +1486,7 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
     let last_seen = match store.get_peer_version(LOOPBACK_PEER_KEY).await {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("loopback: peer_version read failed: {e}");
+            tracing::warn!("loopback: peer_version read failed: {e}");
             0
         }
     };
@@ -1506,7 +1506,7 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
             }
         }
     }
-    log::debug!(
+    tracing::debug!(
         "loopback: requesting catch-up since db_version={last_seen} (we are at {my_db_version})"
     );
     let _ = out_tx.send(req);
@@ -1547,7 +1547,7 @@ async fn send_version_vector_swarm(
     let last_seen = match store.get_peer_version(&peer_key).await {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("swarm: peer_version read for {peer_key} failed: {e}");
+            tracing::warn!("swarm: peer_version read for {peer_key} failed: {e}");
             0
         }
     };
@@ -1567,7 +1567,7 @@ async fn send_version_vector_swarm(
             }
         }
     }
-    log::debug!(
+    tracing::debug!(
         "swarm: requesting catch-up from {peer} since db_version={last_seen} (we are at {my_db_version})"
     );
     let _ = swarm.behaviour_mut().snapshot.send_request(&peer, req);
@@ -1622,7 +1622,7 @@ async fn handle_loopback_request(
             hmac,
         } => {
             if topic != state.topic {
-                log::debug!("loopback: dropping Push — topic mismatch");
+                tracing::debug!("loopback: dropping Push — topic mismatch");
                 return;
             }
             if let Some(gk) = &state.group_key {
@@ -1638,12 +1638,12 @@ async fn handle_loopback_request(
                 let tag = match hmac {
                     Some(t) => t,
                     None => {
-                        log::debug!("loopback: dropping Push — missing HMAC");
+                        tracing::debug!("loopback: dropping Push — missing HMAC");
                         return;
                     }
                 };
                 if !gk.verify(&bytes, &tag) {
-                    log::debug!("loopback: dropping Push — bad HMAC");
+                    tracing::debug!("loopback: dropping Push — bad HMAC");
                     return;
                 }
             }
@@ -1660,7 +1660,7 @@ async fn handle_loopback_request(
             hmac,
         } => {
             if topic != state.topic {
-                log::debug!("loopback: dropping VersionVector — topic mismatch");
+                tracing::debug!("loopback: dropping VersionVector — topic mismatch");
                 return;
             }
             if let Some(gk) = &state.group_key {
@@ -1678,12 +1678,12 @@ async fn handle_loopback_request(
                 let tag = match hmac {
                     Some(t) => t,
                     None => {
-                        log::debug!("loopback: dropping VersionVector — missing HMAC");
+                        tracing::debug!("loopback: dropping VersionVector — missing HMAC");
                         return;
                     }
                 };
                 if !gk.verify(&bytes, &tag) {
-                    log::debug!("loopback: dropping VersionVector — bad HMAC");
+                    tracing::debug!("loopback: dropping VersionVector — bad HMAC");
                     return;
                 }
             }
@@ -1704,11 +1704,11 @@ async fn handle_loopback_request(
             {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn!("loopback: catch-up scan failed: {e}");
+                    tracing::warn!("loopback: catch-up scan failed: {e}");
                     return;
                 }
             };
-            log::debug!(
+            tracing::debug!(
                 "loopback: VersionVector since={since} → returning {} changes",
                 changes.len()
             );
@@ -1815,7 +1815,7 @@ async fn apply_remote_changeset_inner(
             }
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "WebSyncClient: changeset apply failed — nothing persisted, \
                  peer cursor unchanged, will re-request on next catch-up: {e}"
             );
@@ -1859,7 +1859,7 @@ async fn run_swarm(
 
     loop {
         for peer in pending_announces.drain(..) {
-            log::info!("WebSyncClient: sending deferred AnnouncePresence to {peer}");
+            tracing::info!("WebSyncClient: sending deferred AnnouncePresence to {peer}");
             let req = PushRequest::AnnouncePresence {
                 topic: state.topic.clone(),
             };
@@ -1890,7 +1890,7 @@ async fn run_swarm(
                         let _ = ack.send(result);
                     }
                     None => {
-                        log::info!("WebSyncClient: command channel closed, exiting");
+                        tracing::info!("WebSyncClient: command channel closed, exiting");
                         return;
                     }
                 }
@@ -1939,13 +1939,13 @@ async fn run_swarm(
                         }
                         match swarm.dial(addr.clone()) {
                             Ok(()) => dialed += 1,
-                            Err(e) => log::debug!(
+                            Err(e) => tracing::debug!(
                                 "WebSyncClient: cached pre-dial of {addr} failed sync: {e}"
                             ),
                         }
                     }
                     if dialed > 0 {
-                        log::info!(
+                        tracing::info!(
                             "WebSyncClient: pre-dialed {dialed} cached peer address(es)"
                         );
                     }
@@ -2123,7 +2123,7 @@ fn fan_out_push(
     let new_db_version = changeset.db_version;
     let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
     let peers: Vec<LibPeerId> = connected.iter().copied().collect();
-    log::info!(
+    tracing::info!(
         "WebSyncClient: pushing changeset (db_v={new_db_version}) to {} peer(s): {:?}",
         peers.len(),
         peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()
@@ -2133,7 +2133,7 @@ fn fan_out_push(
             .behaviour_mut()
             .snapshot
             .send_request(peer, req.clone());
-        log::debug!("WebSyncClient: send_request → peer {peer} req_id={id:?}");
+        tracing::debug!("WebSyncClient: send_request → peer {peer} req_id={id:?}");
     }
     new_db_version
 }
@@ -2164,8 +2164,8 @@ async fn handle_event(
                 // the request_response substream open path can wake a
                 // task whose poll re-enters `Inner::run` while we still
                 // hold the outer borrow from `swarm.select_next_some()`.
-                log::info!("WebSyncClient: connected to relay {peer_id}, queuing announce");
-                log::debug!(
+                tracing::info!("WebSyncClient: connected to relay {peer_id}, queuing announce");
+                tracing::debug!(
                     "WebSyncClient: relay connection endpoint = {} ({})",
                     if endpoint.is_dialer() {
                         "dialer"
@@ -2178,11 +2178,11 @@ async fn handle_event(
                 pending_announces.push(peer_id);
             } else {
                 connected.insert(peer_id);
-                log::info!(
+                tracing::info!(
                     "WebSyncClient: connected to peer {peer_id} (connected count={})",
                     connected.len()
                 );
-                log::debug!(
+                tracing::debug!(
                     "WebSyncClient: peer connection endpoint = {} ({})",
                     if endpoint.is_dialer() {
                         "dialer"
@@ -2203,7 +2203,7 @@ async fn handle_event(
                             .record_peer_address_success(&peer_str, &addr_str)
                             .await
                         {
-                            log::debug!("WebSyncClient: peer_addrs record_success failed: {e}");
+                            tracing::debug!("WebSyncClient: peer_addrs record_success failed: {e}");
                         }
                     });
                 }
@@ -2219,11 +2219,13 @@ async fn handle_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             if Some(peer_id) == state.relay_peer_id {
-                log::info!("WebSyncClient: disconnected from relay {peer_id} (cause={cause:?})");
+                tracing::info!(
+                    "WebSyncClient: disconnected from relay {peer_id} (cause={cause:?})"
+                );
                 *relay_connected = false;
             } else {
                 connected.remove(&peer_id);
-                log::info!(
+                tracing::info!(
                     "WebSyncClient: disconnected from peer {peer_id} (connected count={}, cause={cause:?})",
                     connected.len()
                 );
@@ -2231,7 +2233,7 @@ async fn handle_event(
             push_status(state, connected, *relay_connected);
         }
         SwarmEvent::OutgoingConnectionError { error, peer_id, .. } => {
-            log::warn!("WebSyncClient: dial failure ({peer_id:?}): {error}");
+            tracing::warn!("WebSyncClient: dial failure ({peer_id:?}): {error}");
             // Bump fail_count on every cached address for this peer
             // when libp2p tells us the dial didn't land. We can't tell
             // *which* multiaddr was attempted from this event, so
@@ -2245,7 +2247,7 @@ async fn handle_event(
                 let peer_str = pid.to_string();
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) = store.record_peer_address_failure_for_peer(&peer_str).await {
-                        log::debug!("WebSyncClient: peer_addrs record_failure failed: {e}");
+                        tracing::debug!("WebSyncClient: peer_addrs record_failure failed: {e}");
                     }
                 });
             }
@@ -2291,7 +2293,9 @@ fn handle_push_event(
         } => match request {
             PushRequest::PeerJoined { topic, peer_addrs } => {
                 if Some(peer) != state.relay_peer_id {
-                    log::debug!("WebSyncClient: dropping PeerJoined from non-relay peer {peer}");
+                    tracing::debug!(
+                        "WebSyncClient: dropping PeerJoined from non-relay peer {peer}"
+                    );
                     let _ = swarm.behaviour_mut().push.send_response(
                         channel,
                         PushResponse::Error {
@@ -2301,7 +2305,7 @@ fn handle_push_event(
                     return;
                 }
                 if topic != state.topic {
-                    log::debug!(
+                    tracing::debug!(
                         "WebSyncClient: dropping PeerJoined — topic mismatch ({topic} vs {})",
                         state.topic
                     );
@@ -2311,7 +2315,7 @@ fn handle_push_event(
                         .send_response(channel, PushResponse::Ok);
                     return;
                 }
-                log::info!(
+                tracing::info!(
                     "WebSyncClient: relay introduced new peer with {} addrs",
                     peer_addrs.len()
                 );
@@ -2319,12 +2323,12 @@ fn handle_push_event(
                     match addr_str.parse::<Multiaddr>() {
                         Ok(addr) => {
                             if let Err(e) = swarm.dial(addr.clone()) {
-                                log::debug!(
+                                tracing::debug!(
                                     "WebSyncClient: dial of introduced peer {addr} failed: {e}"
                                 );
                             }
                         }
-                        Err(e) => log::debug!(
+                        Err(e) => tracing::debug!(
                             "WebSyncClient: invalid PeerJoined multiaddr {addr_str:?}: {e}"
                         ),
                     }
@@ -2350,7 +2354,7 @@ fn handle_push_event(
             ..
         } => match response {
             PushResponse::PeerList { peers } => {
-                log::info!(
+                tracing::info!(
                     "WebSyncClient: relay {peer} returned {} known peers",
                     peers.len()
                 );
@@ -2407,7 +2411,7 @@ fn handle_push_event(
                     let addr: Multiaddr = match addr_str.parse() {
                         Ok(a) => a,
                         Err(e) => {
-                            log::debug!(
+                            tracing::debug!(
                                 "WebSyncClient: invalid PeerList multiaddr {addr_str:?}: {e}"
                             );
                             continue;
@@ -2434,24 +2438,24 @@ fn handle_push_event(
                 }
 
                 for (target, addr) in &best_per_peer {
-                    log::debug!("WebSyncClient: dial(PeerList) → {addr} (peer {target})");
+                    tracing::debug!("WebSyncClient: dial(PeerList) → {addr} (peer {target})");
                     if let Err(e) = swarm.dial(addr.clone()) {
-                        log::warn!(
+                        tracing::warn!(
                             "WebSyncClient: dial(PeerList) of {addr} returned Err synchronously: {e}"
                         );
                     }
                 }
             }
             PushResponse::Error { message } => {
-                log::warn!("WebSyncClient: push error from {peer}: {message}");
+                tracing::warn!("WebSyncClient: push error from {peer}: {message}");
             }
             PushResponse::Ok => {}
         },
         Event::OutboundFailure { peer, error, .. } => {
-            log::warn!("WebSyncClient: push outbound to {peer} failed: {error}");
+            tracing::warn!("WebSyncClient: push outbound to {peer} failed: {error}");
         }
         Event::InboundFailure { peer, error, .. } => {
-            log::warn!("WebSyncClient: push inbound from {peer} failed: {error}");
+            tracing::warn!("WebSyncClient: push inbound from {peer} failed: {error}");
         }
         Event::ResponseSent { .. } => {}
     }
@@ -2504,7 +2508,7 @@ async fn handle_snapshot_event(
                 hmac,
             } => {
                 if topic != state.topic {
-                    log::debug!("WebSyncClient: dropping Push from {peer} — topic mismatch");
+                    tracing::debug!("WebSyncClient: dropping Push from {peer} — topic mismatch");
                     return;
                 }
                 if let Some(gk) = &state.group_key {
@@ -2520,12 +2524,14 @@ async fn handle_snapshot_event(
                     let tag = match hmac {
                         Some(t) => t,
                         None => {
-                            log::debug!("WebSyncClient: dropping Push from {peer} — missing HMAC");
+                            tracing::debug!(
+                                "WebSyncClient: dropping Push from {peer} — missing HMAC"
+                            );
                             return;
                         }
                     };
                     if !gk.verify(&bytes, &tag) {
-                        log::debug!("WebSyncClient: dropping Push from {peer} — bad HMAC");
+                        tracing::debug!("WebSyncClient: dropping Push from {peer} — bad HMAC");
                         return;
                     }
                 }
@@ -2552,7 +2558,7 @@ async fn handle_snapshot_event(
                 hmac,
             } => {
                 if req_topic != state.topic {
-                    log::debug!(
+                    tracing::debug!(
                         "WebSyncClient: dropping VersionVector from {peer} — topic mismatch"
                     );
                     return;
@@ -2572,14 +2578,16 @@ async fn handle_snapshot_event(
                     let tag = match hmac {
                         Some(t) => t,
                         None => {
-                            log::debug!(
+                            tracing::debug!(
                                 "WebSyncClient: dropping VersionVector from {peer} — missing HMAC"
                             );
                             return;
                         }
                     };
                     if !gk.verify(&bytes, &tag) {
-                        log::debug!("WebSyncClient: dropping VersionVector from {peer} — bad HMAC");
+                        tracing::debug!(
+                            "WebSyncClient: dropping VersionVector from {peer} — bad HMAC"
+                        );
                         return;
                     }
                 }
@@ -2597,7 +2605,7 @@ async fn handle_snapshot_event(
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            log::warn!("WebSyncClient: catch-up scan failed: {e}");
+                            tracing::warn!("WebSyncClient: catch-up scan failed: {e}");
                             Vec::new()
                         }
                     },
@@ -2658,7 +2666,7 @@ async fn handle_snapshot_event(
                 // marks this client reconcile-capable and stops both the
                 // periodic digest chatter and the redundant version-vector.
                 if req_topic != state.topic {
-                    log::debug!(
+                    tracing::debug!(
                         "WebSyncClient: dropping ReconcileDigest from {peer} — topic mismatch"
                     );
                     return;
@@ -2676,14 +2684,14 @@ async fn handle_snapshot_event(
                     let tag = match hmac {
                         Some(t) => t,
                         None => {
-                            log::debug!(
+                            tracing::debug!(
                                 "WebSyncClient: dropping ReconcileDigest from {peer} — missing HMAC"
                             );
                             return;
                         }
                     };
                     if !gk.verify(&bytes, &tag) {
-                        log::debug!(
+                        tracing::debug!(
                             "WebSyncClient: dropping ReconcileDigest from {peer} — bad HMAC"
                         );
                         return;
@@ -2701,7 +2709,7 @@ async fn handle_snapshot_event(
                         {
                             Ok(d) => d,
                             Err(e) => {
-                                log::warn!("WebSyncClient: digest computation failed: {e}");
+                                tracing::warn!("WebSyncClient: digest computation failed: {e}");
                                 return;
                             }
                         }
@@ -2715,7 +2723,9 @@ async fn handle_snapshot_event(
                     .unwrap_or([0u8; 32]),
                 };
                 let converged = local_digest == remote_digest;
-                log::debug!("WebSyncClient: ReconcileDigest from {peer} → converged={converged}");
+                tracing::debug!(
+                    "WebSyncClient: ReconcileDigest from {peer} → converged={converged}"
+                );
                 let mut resp = SyncResponse::ReconcileResult {
                     converged,
                     digest: local_digest,
@@ -2742,7 +2752,7 @@ async fn handle_snapshot_event(
                 // ranges, split/itemize mismatching ones, apply cells the
                 // peer transferred — all via the shared `reconcile` core.
                 if req_topic != state.topic {
-                    log::debug!(
+                    tracing::debug!(
                         "WebSyncClient: dropping ReconcileRange from {peer} — topic mismatch"
                     );
                     return;
@@ -2761,14 +2771,14 @@ async fn handle_snapshot_event(
                     let tag = match hmac {
                         Some(t) => t,
                         None => {
-                            log::debug!(
+                            tracing::debug!(
                                 "WebSyncClient: dropping ReconcileRange from {peer} — missing HMAC"
                             );
                             return;
                         }
                     };
                     if !gk.verify(&bytes, &tag) {
-                        log::debug!(
+                        tracing::debug!(
                             "WebSyncClient: dropping ReconcileRange from {peer} — bad HMAC"
                         );
                         return;
@@ -2798,7 +2808,7 @@ async fn handle_snapshot_event(
                 let (reply, to_apply) = match step {
                     Ok(r) => r,
                     Err(e) => {
-                        log::warn!("WebSyncClient: reconcile range step failed: {e}");
+                        tracing::warn!("WebSyncClient: reconcile range step failed: {e}");
                         return;
                     }
                 };
@@ -2857,7 +2867,7 @@ async fn handle_snapshot_event(
                 hmac,
             } => {
                 if peer_topic != state.topic {
-                    log::debug!(
+                    tracing::debug!(
                         "WebSyncClient: dropping ChangesetResponse from {peer} — topic mismatch"
                     );
                     return;
@@ -2878,20 +2888,20 @@ async fn handle_snapshot_event(
                     let tag = match hmac {
                         Some(t) => t,
                         None => {
-                            log::debug!(
+                            tracing::debug!(
                                 "WebSyncClient: dropping ChangesetResponse from {peer} — missing HMAC"
                             );
                             return;
                         }
                     };
                     if !gk.verify(&bytes, &tag) {
-                        log::debug!(
+                        tracing::debug!(
                             "WebSyncClient: dropping ChangesetResponse from {peer} — bad HMAC"
                         );
                         return;
                     }
                 }
-                log::info!(
+                tracing::info!(
                     "WebSyncClient: received ChangesetResponse from {peer} with {} changes (their db_version={my_db_version})",
                     changes.len()
                 );
@@ -2916,10 +2926,10 @@ async fn handle_snapshot_event(
             }
         },
         Event::OutboundFailure { peer, error, .. } => {
-            log::warn!("WebSyncClient: outbound to {peer} failed: {error}");
+            tracing::warn!("WebSyncClient: outbound to {peer} failed: {error}");
         }
         Event::InboundFailure { peer, error, .. } => {
-            log::warn!("WebSyncClient: inbound from {peer} failed: {error}");
+            tracing::warn!("WebSyncClient: inbound from {peer} failed: {error}");
         }
         Event::ResponseSent { .. } => {}
     }

@@ -21,7 +21,7 @@ use common::{assert_eventually, make_peer, mem_db};
 
 #[tokio::test]
 async fn test_diagnostics_counters_fire_during_two_peer_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-diag-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -93,7 +93,7 @@ async fn test_diagnostics_counters_fire_during_two_peer_sync() {
 // Node ID seeds 72-73 (see CLAUDE.md Section 6 seed range table).
 #[tokio::test]
 async fn test_diagnostics_byte_accounting_relay_vs_direct() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-diag-bytes-{}", Uuid::new_v4());
     let passphrase = "diag-bytes-secret";
     let timeout = Duration::from_secs(15);

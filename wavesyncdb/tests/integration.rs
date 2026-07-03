@@ -130,7 +130,7 @@ async fn test_wavesyncdb_change_notifications() {
 
 #[tokio::test]
 async fn test_fresh_peer_receives_snapshot() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-snapshot-{}", Uuid::new_v4());
     let db_b_url = mem_db("snap_b");
     let db_a_url = mem_db("snap_a");
@@ -212,7 +212,7 @@ async fn test_fresh_peer_receives_snapshot() {
 
 #[tokio::test]
 async fn test_offline_peer_receives_updates_on_reconnect() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-reconnect-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_b_url = mem_db("recon_b");
@@ -326,7 +326,7 @@ async fn test_offline_peer_receives_updates_on_reconnect() {
 
 #[tokio::test]
 async fn test_registry_ready_fires_before_discovery() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-registry-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_b_url = mem_db("reg_b");
@@ -395,7 +395,7 @@ async fn test_registry_ready_fires_before_discovery() {
 
 #[tokio::test]
 async fn test_sync_with_matching_passphrase() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-auth-match-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_b_url = mem_db("auth_match_b");
@@ -467,7 +467,7 @@ async fn test_sync_with_matching_passphrase() {
 
 #[tokio::test]
 async fn test_sync_with_mismatched_passphrase() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-auth-mismatch-{}", Uuid::new_v4());
     let db_b_url = mem_db("auth_mis_b");
     let db_a_url = mem_db("auth_mis_a");
@@ -533,7 +533,7 @@ async fn test_sync_with_mismatched_passphrase() {
 
 #[tokio::test]
 async fn test_sync_one_passphrase_one_not() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-auth-mixed-{}", Uuid::new_v4());
     let db_b_url = mem_db("auth_mixed_b");
     let db_a_url = mem_db("auth_mixed_a");
@@ -598,7 +598,7 @@ async fn test_sync_one_passphrase_one_not() {
 
 #[tokio::test]
 async fn test_same_db_reconnection_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-samedb-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_mobile_url = mem_db("samedb_mobile");
@@ -740,7 +740,7 @@ async fn test_same_db_reconnection_sync() {
 
 #[tokio::test]
 async fn test_resume_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-resume-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("resume_a");
@@ -845,7 +845,7 @@ async fn test_resume_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_empty_table_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-empty-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -899,7 +899,7 @@ async fn test_empty_table_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_unicode_sync_p2p() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-unicode-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -939,7 +939,7 @@ async fn test_unicode_sync_p2p() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_peer_joins_after_many_writes() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-latejoin-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(30);
 
@@ -982,7 +982,7 @@ async fn test_peer_joins_after_many_writes() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_schema_registration_order_independence() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-regorder-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1076,7 +1076,7 @@ async fn test_schema_registration_order_independence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_four_peer_mesh_convergence() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-4mesh-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(30);
 
@@ -1125,7 +1125,7 @@ async fn test_four_peer_mesh_convergence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_disconnect_reconnect_cycle() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-disrecon-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1245,7 +1245,7 @@ async fn test_disconnect_reconnect_cycle() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_rolling_restart() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-rolling-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -1363,7 +1363,7 @@ async fn test_rolling_restart() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_slow_peer_catches_up() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-slow-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(30);
 

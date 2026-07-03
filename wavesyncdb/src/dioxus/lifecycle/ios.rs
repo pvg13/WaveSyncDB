@@ -43,5 +43,5 @@ unsafe fn register_observers(tx: watch::Sender<bool>) {
     std::mem::forget(resume_observer);
     std::mem::forget(pause_observer);
 
-    log::info!("iOS lifecycle observers registered");
+    tracing::info!("iOS lifecycle observers registered");
 }

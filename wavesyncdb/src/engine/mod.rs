@@ -307,10 +307,10 @@ pub(crate) fn start_engine(
         .await;
 
         match result {
-            Ok(Ok(())) => log::info!("Engine shut down cleanly"),
+            Ok(Ok(())) => tracing::info!("Engine shut down cleanly"),
             Ok(Err(e)) => {
                 let reason = format!("{e}");
-                log::error!("Engine error: {reason}");
+                tracing::error!("Engine error: {reason}");
                 let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed { reason });
             }
             Err(panic) => {
@@ -319,7 +319,7 @@ pub(crate) fn start_engine(
                     .map(|s| s.as_str())
                     .or_else(|| panic.downcast_ref::<&str>().copied())
                     .unwrap_or("unknown panic");
-                log::error!("Engine panicked: {msg}");
+                tracing::error!("Engine panicked: {msg}");
                 let _ = event_tx.send(crate::network_status::NetworkEvent::EngineFailed {
                     reason: format!("panic: {msg}"),
                 });
@@ -377,7 +377,7 @@ fn routable_listen_ips(ipv6: bool) -> Vec<std::net::IpAddr> {
     let ifaces = match if_addrs::get_if_addrs() {
         Ok(i) => i,
         Err(e) => {
-            log::warn!("getifaddrs failed; cannot enumerate interfaces for QUIC bind: {e}");
+            tracing::warn!("getifaddrs failed; cannot enumerate interfaces for QUIC bind: {e}");
             return Vec::new();
         }
     };
@@ -597,7 +597,7 @@ fn build_swarm(
                 .build())
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "System DNS resolver failed (expected on Android): {e}. \
                  Falling back to Google public DNS."
             );
@@ -656,7 +656,7 @@ fn build_swarm_with_tcp(
                 .build())
         }
         Err(e) => {
-            log::warn!(
+            tracing::warn!(
                 "System DNS resolver failed (expected on Android): {e}. \
                  Falling back to Google public DNS."
             );
@@ -720,7 +720,7 @@ async fn run_engine(
     )?;
 
     let local_peer_id = keypair.public().to_peer_id();
-    log::info!("Local libp2p PeerId (persistent): {local_peer_id}");
+    tracing::info!("Local libp2p PeerId (persistent): {local_peer_id}");
 
     // Load current db_version
     let local_db_version = shadow::get_db_version(&db).await?;
@@ -738,7 +738,7 @@ async fn run_engine(
         match peer_tracker::get_all_peer_versions(&db).await {
             Ok(rows) => peer_tracker::parse_peer_versions(rows),
             Err(e) => {
-                log::warn!("Failed to hydrate peer versions from disk: {e}");
+                tracing::warn!("Failed to hydrate peer versions from disk: {e}");
                 HashMap::new()
             }
         };
@@ -1267,19 +1267,19 @@ impl EngineRunner {
         // Drop listeners for interfaces that have gone away.
         for ip in known.difference(&current).copied().collect::<Vec<_>>() {
             if let Some(id) = self.quic_listeners.remove(&ip) {
-                log::info!("Network interface {ip} departed; removing QUIC listener {id:?}");
+                tracing::info!("Network interface {ip} departed; removing QUIC listener {id:?}");
                 self.swarm.remove_listener(id);
             }
         }
         // Bind listeners for interfaces that have just appeared.
         for ip in current.difference(&known).copied().collect::<Vec<_>>() {
             let addr = quic_listen_multiaddr(ip);
-            log::info!("Network interface {ip} appeared; binding QUIC listener {addr}");
+            tracing::info!("Network interface {ip} appeared; binding QUIC listener {addr}");
             match self.swarm.listen_on(addr.clone()) {
                 Ok(id) => {
                     self.quic_listeners.insert(ip, id);
                 }
-                Err(e) => log::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
+                Err(e) => tracing::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
             }
         }
     }
@@ -1403,11 +1403,13 @@ impl EngineRunner {
             return;
         };
         if self.circuit_listen_pending {
-            log::debug!("Skipping listen_on(circuit): a reservation request is already in flight");
+            tracing::debug!(
+                "Skipping listen_on(circuit): a reservation request is already in flight"
+            );
             return;
         }
         if !force_renewal && matches!(self.relay_state, RelayState::Listening { .. }) {
-            log::debug!(
+            tracing::debug!(
                 "Skipping listen_on(circuit): already in Listening state (set force_renewal to refresh the reservation)"
             );
             return;
@@ -1421,13 +1423,13 @@ impl EngineRunner {
                 self.diagnostics
                     .circuit_reservation_attempts
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                log::info!(
+                tracing::info!(
                     "Listening on relay circuit ({}): {circuit_addr}",
                     if force_renewal { "renewal" } else { "initial" }
                 );
             }
             Err(e) => {
-                log::warn!("listen_on(circuit) failed: {e}");
+                tracing::warn!("listen_on(circuit) failed: {e}");
             }
         }
     }
@@ -1450,20 +1452,20 @@ impl EngineRunner {
             self.relay_state,
             RelayState::Connected { .. } | RelayState::Listening { .. }
         ) {
-            log::debug!("Skipping relay dial: already connected/listening");
+            tracing::debug!("Skipping relay dial: already connected/listening");
             return;
         }
         if self.relay_dial_pending {
-            log::debug!("Skipping relay dial: a previous dial is still in flight");
+            tracing::debug!("Skipping relay dial: a previous dial is still in flight");
             return;
         }
         match self.swarm.dial(relay_addr.clone()) {
             Ok(_) => {
                 self.relay_dial_pending = true;
-                log::info!("Dialing relay server: {relay_addr}");
+                tracing::info!("Dialing relay server: {relay_addr}");
             }
             Err(e) => {
-                log::warn!("Relay dial failed: {e}");
+                tracing::warn!("Relay dial failed: {e}");
             }
         }
     }
@@ -1492,7 +1494,7 @@ impl EngineRunner {
                 rendezvous_addr.iter().last()
             && peer_id == rv_peer_id
         {
-            log::info!("Connected to rendezvous server {peer_id}");
+            tracing::info!("Connected to rendezvous server {peer_id}");
             self.infrastructure_peers.insert(peer_id);
             self.rendezvous_discover();
         }
@@ -1569,13 +1571,13 @@ impl EngineRunner {
             _ => false,
         };
         if already_attached {
-            log::debug!(
+            tracing::debug!(
                 "ConnectionEstablished for relay {peer_id} ignored — state={:?} already attached, keeping existing reservation",
                 self.relay_state
             );
             return;
         }
-        log::info!("Connected to relay server {peer_id}");
+        tracing::info!("Connected to relay server {peer_id}");
         self.infrastructure_peers.insert(peer_id);
         self.circuit_retry_count = 0;
         self.relay_state = RelayState::Connected {
@@ -1599,7 +1601,7 @@ impl EngineRunner {
             .with(libp2p::multiaddr::Protocol::P2pCircuit)
             .with(libp2p::multiaddr::Protocol::P2p(self.local_peer_id));
         self.swarm.add_external_address(my_circuit_addr.clone());
-        log::info!("Added circuit address as external: {my_circuit_addr}");
+        tracing::info!("Added circuit address as external: {my_circuit_addr}");
 
         // Register with rendezvous immediately
         if let Some(ref rv_addr) = self.config.rendezvous_server
@@ -1752,14 +1754,14 @@ impl EngineRunner {
                     self.diagnostics
                         .relay_connections_demoted
                         .fetch_add(closed, std::sync::atomic::Ordering::Relaxed);
-                    log::info!(
+                    tracing::info!(
                         "Relay demotion: closed {closed} relay connection(s) to {peer} after dwell (direct path held)"
                     );
                 }
             } else {
                 // Direct path didn't hold — keep the relay as the active path and
                 // restore tracking so a future direct path can demote it again.
-                log::info!(
+                tracing::info!(
                     "Relay demotion cancelled for {peer}: direct path did not hold during dwell; keeping relay"
                 );
                 self.relayed_conn_ids.entry(peer).or_default().extend(ids);
@@ -1811,7 +1813,7 @@ impl EngineRunner {
             && !matches!(&self.relay_state, RelayState::Connecting { .. })
             && self.default_group().rendezvous_registered
         {
-            log::warn!("Lost connection to rendezvous server {peer_id}");
+            tracing::warn!("Lost connection to rendezvous server {peer_id}");
             self.default_group_mut().rendezvous_registered = false;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
@@ -1826,7 +1828,7 @@ impl EngineRunner {
                 .values()
                 .any(|g| g.peer_db_versions.contains_key(&peer_id))
         {
-            log::info!(
+            tracing::info!(
                 "Peer {peer_id} disconnected with sync history, triggering rendezvous discover"
             );
             self.rendezvous_discover();
@@ -1835,7 +1837,7 @@ impl EngineRunner {
 
     /// Reset relay state, push registration, and attempt reconnection.
     fn handle_relay_peer_disconnected(&mut self, peer_id: libp2p::PeerId) {
-        log::warn!("Lost connection to relay server {peer_id}");
+        tracing::warn!("Lost connection to relay server {peer_id}");
         self.relay_state = RelayState::Connecting { retry_count: 0 };
         self.circuit_accepted_at = None;
         self.push_registered_topics.clear();
@@ -1855,7 +1857,7 @@ impl EngineRunner {
             && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) = rv_addr.iter().last()
             && peer_id == rv_peer_id
         {
-            log::warn!("Rendezvous server also disconnected (same as relay)");
+            tracing::warn!("Rendezvous server also disconnected (same as relay)");
             self.default_group_mut().rendezvous_registered = false;
             self.emit_network_event(
                 crate::network_status::NetworkEvent::RendezvousStatusChanged { registered: false },
@@ -1865,7 +1867,7 @@ impl EngineRunner {
 
         // Attempt immediate reconnection (idempotent — won't pile dials on
         // top of one another).
-        log::info!("Attempting immediate relay reconnection");
+        tracing::info!("Attempting immediate relay reconnection");
         self.try_dial_relay();
     }
 
@@ -1873,7 +1875,7 @@ impl EngineRunner {
         &mut self,
         sync_rx: &mut mpsc::Receiver<TaggedChangeset>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log::info!(
+        tracing::info!(
             "DIAG run() entered: relay_server={:?} rendezvous_server={:?} ipv6={} os={}",
             self.config.relay_server,
             self.config.rendezvous_server,
@@ -1899,21 +1901,21 @@ impl EngineRunner {
         {
             let ips = routable_listen_ips(self.config.ipv6);
             if ips.is_empty() {
-                log::warn!(
+                tracing::warn!(
                     "No routable network interface at startup; QUIC listen deferred \
                      to the interface watch (will bind once an interface appears)"
                 );
             }
             for ip in ips {
                 let addr = quic_listen_multiaddr(ip);
-                log::info!("DIAG calling listen_on(QUIC)={addr}");
+                tracing::info!("DIAG calling listen_on(QUIC)={addr}");
                 let t1 = std::time::Instant::now();
                 match self.swarm.listen_on(addr.clone()) {
                     Ok(id) => {
                         self.quic_listeners.insert(ip, id);
-                        log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+                        tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
                     }
-                    Err(e) => log::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
+                    Err(e) => tracing::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
                 }
             }
         }
@@ -1921,15 +1923,15 @@ impl EngineRunner {
         {
             let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
 
-            log::info!("DIAG calling listen_on(QUIC)={v4_quic}");
+            tracing::info!("DIAG calling listen_on(QUIC)={v4_quic}");
             let t1 = std::time::Instant::now();
             self.swarm.listen_on(v4_quic.parse().unwrap())?;
-            log::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+            tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
 
             if self.config.ipv6
                 && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
             {
-                log::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
+                tracing::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
             }
         }
 
@@ -1961,15 +1963,15 @@ impl EngineRunner {
             });
 
             if already_dialing {
-                log::info!("Rendezvous server is same peer as relay — skipping duplicate dial");
+                tracing::info!("Rendezvous server is same peer as relay — skipping duplicate dial");
             } else if let Err(e) = self.swarm.dial(rendezvous_addr.clone()) {
-                log::warn!(
+                tracing::warn!(
                     "Failed to dial rendezvous server {}: {}",
                     rendezvous_addr,
                     e
                 );
             } else {
-                log::info!("Dialing rendezvous server: {}", rendezvous_addr);
+                tracing::info!("Dialing rendezvous server: {}", rendezvous_addr);
             }
         }
 
@@ -1988,7 +1990,7 @@ impl EngineRunner {
             self.bootstrap_peers.insert(*peer_id);
         }
         for (peer_id, addrs) in grouped {
-            log::info!(
+            tracing::info!(
                 "Dialing bootstrap peer {peer_id} with {} address(es): {addrs:?}",
                 addrs.len()
             );
@@ -1996,13 +1998,13 @@ impl EngineRunner {
                 .addresses(addrs)
                 .build();
             if let Err(e) = self.swarm.dial(dial_opts) {
-                log::warn!("Failed to dial bootstrap peer {peer_id}: {e}");
+                tracing::warn!("Failed to dial bootstrap peer {peer_id}: {e}");
             }
         }
         for addr in suffixless {
-            log::info!("Dialing bootstrap peer: {addr}");
+            tracing::info!("Dialing bootstrap peer: {addr}");
             if let Err(e) = self.swarm.dial(addr.clone()) {
-                log::warn!("Failed to dial bootstrap peer {addr}: {e}");
+                tracing::warn!("Failed to dial bootstrap peer {addr}: {e}");
             }
         }
 
@@ -2106,7 +2108,7 @@ impl EngineRunner {
                 },
                 Some((channel, response)) = self.snapshot_resp_rx.recv() => {
                     if let Err(resp) = self.swarm.behaviour_mut().snapshot.send_response(channel, response) {
-                        log::error!("Failed to send sync response: {:?}", resp);
+                        tracing::error!("Failed to send sync response: {:?}", resp);
                     }
                 },
                 Some((peer, req)) = self.reconcile_req_rx.recv() => {
@@ -2119,7 +2121,7 @@ impl EngineRunner {
                     // the await so the group borrow ends (the swarm is not held
                     // here, but we must not keep a `groups` borrow across it).
                     let Some(g) = self.groups.get(&rc.effective_topic) else {
-                        log::debug!("remote changeset for unknown group {}; dropping", rc.effective_topic);
+                        tracing::debug!("remote changeset for unknown group {}; dropping", rc.effective_topic);
                         continue;
                     };
                     let db = g.db.clone();
@@ -2165,18 +2167,18 @@ impl EngineRunner {
                         if let Err(e) =
                             peer_tracker::upsert_peer_version(&db, &peer_str, &rc.peer_site, version).await
                         {
-                            log::warn!("Failed to persist peer version for {peer_str}: {e}");
+                            tracing::warn!("Failed to persist peer version for {peer_str}: {e}");
                         }
                     }
                 },
                 _ = registry_ready.notified(), if !self.default_group().registry_is_ready => {
                     self.default_group_mut().registry_is_ready = true;
                     self.update_network_status();
-                    log::info!("Registry ready, syncing all known peers");
+                    tracing::info!("Registry ready, syncing all known peers");
                     self.sync_all_known_peers().await;
                 },
                 _ = &mut registry_deadline, if !self.default_group().registry_is_ready => {
-                    log::error!("Schema registry not ready after 30s — proceeding without sync tables");
+                    tracing::error!("Schema registry not ready after 30s — proceeding without sync tables");
                     self.default_group_mut().registry_is_ready = true;
                     self.update_network_status();
                 },
@@ -2186,7 +2188,7 @@ impl EngineRunner {
                         None => std::future::pending().await,
                     }
                 }, if self.resume_sync_deadline.is_some() => {
-                    log::info!("Post-resume sync retry");
+                    tracing::info!("Post-resume sync retry");
                     self.resume_sync_deadline = None;
                     for g in self.groups.values_mut() {
                         g.pending_sync_peers.clear();
@@ -2205,7 +2207,7 @@ impl EngineRunner {
                     if self.nat_status == NatStatus::Unknown
                         && matches!(self.relay_state, RelayState::Connected { .. } | RelayState::Listening { .. })
                     {
-                        log::info!("AutoNAT timeout — relay connected, assuming Private NAT");
+                        tracing::info!("AutoNAT timeout — relay connected, assuming Private NAT");
                         self.nat_status = NatStatus::Private;
                         self.emit_network_event(
                             crate::network_status::NetworkEvent::NatStatusChanged(
@@ -2225,7 +2227,7 @@ impl EngineRunner {
                     }
                 }, if self.circuit_accepted_at.is_some()
                     && matches!(self.relay_state, RelayState::Listening { .. }) => {
-                    log::info!("Proactively renewing relay circuit (80% of max duration)");
+                    tracing::info!("Proactively renewing relay circuit (80% of max duration)");
                     self.circuit_accepted_at = None;
                     self.try_listen_on_circuit(true);
                 },
@@ -2254,7 +2256,7 @@ impl EngineRunner {
         let (topic_name, group_key) = match self.groups.get(&effective_topic) {
             Some(g) => (g.topic_name.clone(), g.group_key.clone()),
             None => {
-                log::debug!("local changeset for unknown group {effective_topic}; dropping");
+                tracing::debug!("local changeset for unknown group {effective_topic}; dropping");
                 return;
             }
         };
@@ -2276,7 +2278,7 @@ impl EngineRunner {
             while g.pending_pushes.len() > MAX_PENDING_PUSHES {
                 if let Some(oldest) = g.pending_pushes.keys().next().copied() {
                     g.pending_pushes.remove(&oldest);
-                    log::debug!(
+                    tracing::debug!(
                         "pending_pushes overflow for group {effective_topic}; \
                          evicting db_version={oldest} to the reconcile backstop"
                     );
@@ -2309,7 +2311,7 @@ impl EngineRunner {
             .collect();
 
         if peer_ids.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "No directly-connected peers; relying on relay push to wake sleeping peers"
             );
         } else {
@@ -2345,7 +2347,7 @@ impl EngineRunner {
                     .insert(request_id, (effective_topic.clone(), changeset.db_version));
             }
 
-            log::info!(
+            tracing::info!(
                 "Pushed changeset (db_version={}) to {} peers",
                 changeset.db_version,
                 peer_ids.len()
@@ -2518,7 +2520,7 @@ impl EngineRunner {
             self.diagnostics
                 .pending_pushes_redelivered
                 .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-            log::debug!("Redelivered {total} pending push(es) to un-acked peers");
+            tracing::debug!("Redelivered {total} pending push(es) to un-acked peers");
         }
     }
 
@@ -2557,7 +2559,7 @@ impl EngineRunner {
         if drained == 0 {
             return;
         }
-        log::info!(
+        tracing::info!(
             "Shutdown: drained {drained} pending changeset(s); flushing outbound (\u{2264}{FLUSH_GRACE:?})"
         );
 
@@ -2577,7 +2579,7 @@ impl EngineRunner {
     async fn handle_swarm_event(&mut self, event: SwarmEvent<WaveSyncBehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                log::info!("Listening on {address:?}");
+                tracing::info!("Listening on {address:?}");
                 // If this is a relay circuit address, add it as external so
                 // rendezvous and identify advertise it to remote peers
                 if address
@@ -2585,7 +2587,7 @@ impl EngineRunner {
                     .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
                 {
                     self.swarm.add_external_address(address.clone());
-                    log::info!("Added relay circuit as external address: {address}");
+                    tracing::info!("Added relay circuit as external address: {address}");
                     // Re-register with rendezvous so the new circuit address is advertised
                     if let Some(ref rv_addr) = self.config.rendezvous_server
                         && let Some(libp2p::multiaddr::Protocol::P2p(rv_peer_id)) =
@@ -2600,7 +2602,7 @@ impl EngineRunner {
                     // pattern of 3 QUIC bind events firing back-to-back during
                     // startup no longer produces 3 parallel relay connections.
                     if matches!(self.relay_state, RelayState::Connecting { .. }) {
-                        log::debug!(
+                        tracing::debug!(
                             "New listen address detected, redial relay if not already in flight"
                         );
                         self.try_dial_relay();
@@ -2611,12 +2613,12 @@ impl EngineRunner {
                 peer_id,
                 ..
             })) => {
-                log::info!("Sent identify info to {peer_id:?}");
+                tracing::info!("Sent identify info to {peer_id:?}");
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
             )) => {
-                log::info!("Received identify info: {:?}", info.protocol_version);
+                tracing::info!("Received identify info: {:?}", info.protocol_version);
                 // Version-negotiation diagnostic: if a peer we'd otherwise try to
                 // sync with advertises none of our sync-protocol ladder rungs, its
                 // version-vector requests will silently fail. Surface that as a
@@ -2629,7 +2631,7 @@ impl EngineRunner {
                     )
                     .is_none()
                 {
-                    log::warn!(
+                    tracing::warn!(
                         "Peer {peer_id} advertises no compatible wavesync sync protocol \
                          (rungs: {:?}) — version-vector sync unavailable with it; likely a \
                          version past its transition window or a different application",
@@ -2643,7 +2645,7 @@ impl EngineRunner {
                 result,
             })) => {
                 if let Err(ref e) = result {
-                    log::warn!("Ping failed for {peer:?} over {connection:?}: {e}");
+                    tracing::warn!("Ping failed for {peer:?} over {connection:?}: {e}");
                     // If relay ping fails, log prominently — libp2p will close the
                     // connection, triggering ConnectionClosed → reconnect.
                     if matches!(
@@ -2652,10 +2654,10 @@ impl EngineRunner {
                         | RelayState::Listening { relay_peer_id }
                         if peer == *relay_peer_id
                     ) {
-                        log::warn!("Ping to relay server failed — connection will be closed");
+                        tracing::warn!("Ping to relay server failed — connection will be closed");
                     }
                 } else {
-                    log::debug!("Ping event with {peer:?} over {connection:?}: {result:?}");
+                    tracing::debug!("Ping event with {peer:?} over {connection:?}: {result:?}");
                 }
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mdns(event)) => {
@@ -2694,19 +2696,19 @@ impl EngineRunner {
                 use libp2p::upnp::Event as UpnpEvent;
                 match event {
                     UpnpEvent::NewExternalAddr(addr) => {
-                        log::info!("UPnP: gateway mapped external address {addr}");
+                        tracing::info!("UPnP: gateway mapped external address {addr}");
                     }
                     UpnpEvent::ExpiredExternalAddr(addr) => {
-                        log::info!("UPnP: gateway expired external address {addr}");
+                        tracing::info!("UPnP: gateway expired external address {addr}");
                     }
                     UpnpEvent::GatewayNotFound => {
-                        log::debug!(
+                        tracing::debug!(
                             "UPnP: no IGD-capable gateway on this network \
                              (expected on cellular/CGNAT/enterprise)"
                         );
                     }
                     UpnpEvent::NonRoutableGateway => {
-                        log::debug!(
+                        tracing::debug!(
                             "UPnP: gateway is itself behind NAT (CGNAT or \
                              double-NAT); port mapping wouldn't help"
                         );
@@ -2719,7 +2721,7 @@ impl EngineRunner {
                 connection_id,
                 ..
             } => {
-                log::info!("Connection established with {peer_id}");
+                tracing::info!("Connection established with {peer_id}");
                 // Clear any pending DCUtR retry for this peer: a direct
                 // connection just succeeded, so the hole-punch problem is
                 // resolved (even if this connection happens to be via
@@ -2758,7 +2760,7 @@ impl EngineRunner {
                                         .relay_connections_demoted
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                log::info!(
+                                tracing::info!(
                                     "Relay demotion: dropped redundant relay connection to {peer_id} (direct already up)"
                                 );
                             } else {
@@ -2769,7 +2771,7 @@ impl EngineRunner {
                                     .entry(peer_id)
                                     .or_default()
                                     .insert(connection_id);
-                                log::debug!(
+                                tracing::debug!(
                                     "Relay demotion deferred to lower-PeerId peer for {peer_id} (direct already up)"
                                 );
                             }
@@ -2811,7 +2813,7 @@ impl EngineRunner {
                         {
                             let deadline = tokio::time::Instant::now() + DEMOTION_DWELL;
                             self.pending_demotions.insert(peer_id, (deadline, ids));
-                            log::debug!(
+                            tracing::debug!(
                                 "Relay demotion scheduled for {peer_id} in ~{}s (direct path just came up)",
                                 DEMOTION_DWELL.as_secs()
                             );
@@ -2828,7 +2830,7 @@ impl EngineRunner {
                         if let Err(e) =
                             crate::peer_addrs::record_success(&db, &peer_str, &addr_str).await
                         {
-                            log::debug!("peer_addrs::record_success failed: {e}");
+                            tracing::debug!("peer_addrs::record_success failed: {e}");
                         }
                     });
                 }
@@ -2846,11 +2848,11 @@ impl EngineRunner {
                 // Logged at info for infrastructure peers (relay/rendezvous), whose
                 // churn breaks circuit reservations, and at debug otherwise.
                 if self.infrastructure_peers.contains(&peer_id) {
-                    log::info!(
+                    tracing::info!(
                         "Connection closed with infra peer {peer_id} ({num_established} remaining); cause: {cause:?}"
                     );
                 } else {
-                    log::debug!(
+                    tracing::debug!(
                         "Connection closed with {peer_id} ({num_established} remaining); cause: {cause:?}"
                     );
                 }
@@ -2875,18 +2877,18 @@ impl EngineRunner {
                 if let Err(ref e) = reason {
                     let err_str = format!("{e:?}");
                     if err_str.contains("NoAddressesInReservation") {
-                        log::error!(
+                        tracing::error!(
                             "Relay circuit failed: NoAddressesInReservation. \
                              The relay server needs --external-address configured. \
                              Peers can still discover via rendezvous fallback."
                         );
                     } else {
-                        log::warn!("Listener closed with error: {e}");
+                        tracing::warn!("Listener closed with error: {e}");
                     }
                 }
                 // If relay was in Listening state, reset to Connected and re-request circuit
                 if let RelayState::Listening { relay_peer_id } = self.relay_state {
-                    log::warn!("Relay listener closed, re-requesting circuit reservation");
+                    tracing::warn!("Relay listener closed, re-requesting circuit reservation");
                     self.circuit_retry_count = 0;
                     self.relay_state = RelayState::Connected {
                         relay_peer_id,
@@ -2906,10 +2908,10 @@ impl EngineRunner {
                 }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
-                log::warn!("Listen address expired: {address}");
+                tracing::warn!("Listen address expired: {address}");
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                log::warn!("Outgoing connection error to {peer_id:?}: {error}");
+                tracing::warn!("Outgoing connection error to {peer_id:?}: {error}");
                 // If the failed dial was the relay, clear the in-flight guard
                 // so the next reconnect-tick (or NewListenAddr trigger) can
                 // re-arm. Without this, a single failed dial would lock out
@@ -2944,7 +2946,7 @@ impl EngineRunner {
                         if let Err(e) =
                             crate::peer_addrs::record_failure_for_peer(&db, &peer_str).await
                         {
-                            log::debug!("peer_addrs::record_failure_for_peer failed: {e}");
+                            tracing::debug!("peer_addrs::record_failure_for_peer failed: {e}");
                         }
                     });
                 }
@@ -2996,21 +2998,23 @@ impl EngineRunner {
                     if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
                         self.push_registered_topics.insert(topic.clone());
                         self.update_network_status();
-                        log::info!("Push token registration confirmed for topic {topic} by {peer}");
+                        tracing::info!(
+                            "Push token registration confirmed for topic {topic} by {peer}"
+                        );
                     } else {
-                        log::debug!("Push request acknowledged by {peer}");
+                        tracing::debug!("Push request acknowledged by {peer}");
                     }
                 }
                 push_protocol::PushResponse::Error { message } => {
                     // A rejected RegisterToken must not count as registered —
                     // drop it from the in-flight set so the reconcile retries.
                     if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
-                        log::warn!(
+                        tracing::warn!(
                             "Push token registration for topic {topic} rejected by {peer}: \
                              {message} — will retry"
                         );
                     } else {
-                        log::warn!("Push request error from {peer}: {message}");
+                        tracing::warn!("Push request error from {peer}: {message}");
                     }
                 }
                 push_protocol::PushResponse::PeerList { peers } => {
@@ -3047,7 +3051,7 @@ impl EngineRunner {
                             by_peer.entry(pid).or_default().push(addr_str.clone());
                         }
                     }
-                    log::info!(
+                    tracing::info!(
                         "Relay {peer} introduced {} peer(s) on our topic",
                         by_peer.len()
                     );
@@ -3078,7 +3082,7 @@ impl EngineRunner {
                                 if relay_peer_id == peer
                         );
                         if !from_relay {
-                            log::warn!("Ignoring PeerJoined from non-relay peer {peer}");
+                            tracing::warn!("Ignoring PeerJoined from non-relay peer {peer}");
                             let _ = self.swarm.behaviour_mut().push.send_response(
                                 channel,
                                 push_protocol::PushResponse::Error {
@@ -3088,7 +3092,7 @@ impl EngineRunner {
                             return;
                         }
                         if *topic != self.default_group().topic_name {
-                            log::debug!(
+                            tracing::debug!(
                                 "Ignoring PeerJoined for foreign topic (ours vs theirs hash mismatch)"
                             );
                             let _ = self
@@ -3098,7 +3102,7 @@ impl EngineRunner {
                                 .send_response(channel, push_protocol::PushResponse::Ok);
                             return;
                         }
-                        log::info!(
+                        tracing::info!(
                             "Relay announced new peer on topic with {} address(es)",
                             peer_addrs.len()
                         );
@@ -3137,12 +3141,12 @@ impl EngineRunner {
                 // marked in-flight, or the reconcile would skip it forever.
                 // Dropping it here lets the 5s reconcile resend (issue #65).
                 if let Some(topic) = self.push_pending_registrations.remove(&request_id) {
-                    log::warn!(
+                    tracing::warn!(
                         "Push token registration for topic {topic} to {peer} failed: \
                          {error} — will retry"
                     );
                 } else {
-                    log::warn!("Push request to {peer} failed: {error}");
+                    tracing::warn!("Push request to {peer} failed: {error}");
                 }
             }
             _ => {}
@@ -3165,7 +3169,7 @@ impl EngineRunner {
             let api_key = match &self.api_key {
                 Some(k) => k.clone(),
                 None => {
-                    log::warn!("Received auth challenge from {peer} but no API key configured");
+                    tracing::warn!("Received auth challenge from {peer} but no API key configured");
                     return;
                 }
             };
@@ -3173,7 +3177,7 @@ impl EngineRunner {
             let nonce_sig = match self.keypair.sign(&request.nonce) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    log::error!("Failed to sign auth nonce: {e}");
+                    tracing::error!("Failed to sign auth nonce: {e}");
                     return;
                 }
             };
@@ -3185,9 +3189,9 @@ impl EngineRunner {
                 .auth
                 .send_response(channel, response)
             {
-                log::error!("Failed to send auth response to relay {peer}: {e:?}");
+                tracing::error!("Failed to send auth response to relay {peer}: {e:?}");
             } else {
-                log::info!("Auth response sent to relay {peer}");
+                tracing::info!("Auth response sent to relay {peer}");
             }
         }
     }
@@ -3213,13 +3217,13 @@ impl EngineRunner {
                 .send_response(channel, ());
 
             if request.accepted {
-                log::info!("Relay {peer} accepted auth — managed relay active");
+                tracing::info!("Relay {peer} accepted auth — managed relay active");
                 self.emit_network_event(crate::network_status::NetworkEvent::RelayStatusChanged(
                     crate::network_status::RelayStatus::Connected,
                 ));
             } else {
                 let reason = request.reason.as_deref().unwrap_or("invalid API key");
-                log::warn!("Relay {peer} rejected auth: {reason}");
+                tracing::warn!("Relay {peer} rejected auth: {reason}");
                 self.emit_network_event(crate::network_status::NetworkEvent::EngineFailed {
                     reason: format!("Relay auth rejected: {reason}"),
                 });

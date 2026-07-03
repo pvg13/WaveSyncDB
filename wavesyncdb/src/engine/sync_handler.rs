@@ -12,7 +12,7 @@ impl EngineRunner {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    log::info!("Received sync request from peer {peer}: {request:?}");
+                    tracing::info!("Received sync request from peer {peer}: {request:?}");
 
                     match request {
                         SyncRequest::VersionVector {
@@ -90,7 +90,7 @@ impl EngineRunner {
                             cleared_sync_starts.insert(topic.clone(), sent_at);
                         }
                     }
-                    log::info!("Received sync response from peer {peer}");
+                    tracing::info!("Received sync response from peer {peer}");
 
                     match response {
                         crate::protocol::SyncResponse::ChangesetResponse {
@@ -119,7 +119,7 @@ impl EngineRunner {
                                 // group we don't have may still share another group
                                 // with us; rejecting it here would poison those
                                 // shared groups too (Rule 2.8, multi-group).
-                                log::debug!(
+                                tracing::debug!(
                                     "Ignoring sync response from {peer} for unknown topic {effective}"
                                 );
                                 return;
@@ -129,7 +129,7 @@ impl EngineRunner {
                                 let tag = match resp_hmac {
                                     Some(t) => t,
                                     None => {
-                                        log::debug!(
+                                        tracing::debug!(
                                             "Rejecting unauthenticated sync response from peer {peer}"
                                         );
                                         return;
@@ -149,7 +149,7 @@ impl EngineRunner {
                                     // bytes were spent on the wire either way.
                                     self.record_wire_bytes(&peer, bytes.len() as u64, true);
                                     if !gk.verify(&bytes, &tag) {
-                                        log::debug!(
+                                        tracing::debug!(
                                             "Rejecting sync response with invalid HMAC from peer {peer}"
                                         );
                                         return;
@@ -197,7 +197,7 @@ impl EngineRunner {
                             }
 
                             if changes.is_empty() {
-                                log::info!(
+                                tracing::info!(
                                     "Version vector sync with peer {peer}: already up to date"
                                 );
                                 // Nothing to apply, so it is safe to record the
@@ -228,7 +228,7 @@ impl EngineRunner {
                                     .await;
                                 });
                             } else {
-                                log::info!(
+                                tracing::info!(
                                     "Received {} changes from peer {peer} (their db_version: {})",
                                     changes.len(),
                                     my_db_version,
@@ -270,20 +270,20 @@ impl EngineRunner {
                                     effective_topic: effective.clone(),
                                     changes,
                                 }) {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "Remote changeset queue full, dropping sync response: {e}"
                                     );
                                 }
                             }
                         }
                         crate::protocol::SyncResponse::PushAck => {
-                            log::debug!("Received PushAck from peer {peer}");
+                            tracing::debug!("Received PushAck from peer {peer}");
                             // Confirmed delivery — drop this changeset from the
                             // group's pending-push retry set for this peer (#81).
                             self.note_push_ack(request_id, peer);
                         }
                         crate::protocol::SyncResponse::IdentityAck => {
-                            log::debug!("Received IdentityAck from peer {peer}");
+                            tracing::debug!("Received IdentityAck from peer {peer}");
                         }
                         crate::protocol::SyncResponse::ReconcileResult {
                             converged,
@@ -336,7 +336,7 @@ impl EngineRunner {
                     // and the periodic sync would otherwise re-trigger this forever.
                     self.note_protocol_mismatch(peer);
                 } else {
-                    log::warn!("Sync request to {peer} failed: {error}");
+                    tracing::warn!("Sync request to {peer} failed: {error}");
                     // Connection might be dead — re-dial if we know the peer's
                     // address. Storm guards (#84 regression): (1) never re-dial a
                     // circuit address for a peer we already reach directly — the
@@ -352,7 +352,7 @@ impl EngineRunner {
                         && self.dial_backoff_ok(&peer)
                         && !(addr_is_relayed(&addr) && self.suppress_relay_dial(&peer))
                     {
-                        log::info!("Re-dialing {peer} after outbound failure");
+                        tracing::info!("Re-dialing {peer} after outbound failure");
                         let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
                             .addresses(vec![addr])
                             .build();
@@ -369,7 +369,7 @@ impl EngineRunner {
                 ) {
                     self.note_protocol_mismatch(peer);
                 } else {
-                    log::warn!("Sync inbound from {peer} failed: {error}");
+                    tracing::warn!("Sync inbound from {peer} failed: {error}");
                 }
             }
             _ => {}
@@ -389,7 +389,7 @@ impl EngineRunner {
         let our_protocol = super::snapshot_protocol::SNAPSHOT_PROTOCOL
             .as_ref()
             .to_string();
-        log::warn!(
+        tracing::warn!(
             "Peer {peer} does not speak our sync protocol {our_protocol} — it is running an \
              incompatible WaveSyncDB version; no data will sync with it until the versions match"
         );
@@ -424,7 +424,7 @@ impl EngineRunner {
             // all groups and may still share another group with us (e.g. a
             // household), so rejecting it would also kill that shared group's
             // sync. Reject only on per-group HMAC failure (Rule 2.8, multi-group).
-            log::debug!(
+            tracing::debug!(
                 "Ignoring version-vector request from {peer} for unknown topic {effective}"
             );
             return;
@@ -437,7 +437,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated sync request from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated sync request from peer {peer}");
                     return;
                 }
             };
@@ -541,7 +541,7 @@ impl EngineRunner {
                 match shadow::get_changes_since(&db, &registry, your_last_db_version).await {
                     Ok(c) => c,
                     Err(e) => {
-                        log::error!(
+                        tracing::error!(
                             "Failed to get changes since {}: {}",
                             your_last_db_version,
                             e
@@ -582,7 +582,7 @@ impl EngineRunner {
             }
 
             if let Err(e) = resp_tx.send((channel, resp)).await {
-                log::error!("Failed to queue sync response: {}", e);
+                tracing::error!("Failed to queue sync response: {}", e);
             }
 
             // Also persist peer version
@@ -627,7 +627,7 @@ impl EngineRunner {
             // and does not reject the peer, so Rules 2.7/2.8 are preserved. It
             // carries no HMAC (unit variant), identical to the success path, so
             // the sender accepts it regardless of which group key it holds.
-            log::debug!(
+            tracing::debug!(
                 "Ignoring push from {peer} for unknown topic {effective} (acking so the sender stops redelivering)"
             );
             let resp_tx = self.snapshot_resp_tx.clone();
@@ -636,7 +636,7 @@ impl EngineRunner {
                     .send((channel, crate::protocol::SyncResponse::PushAck))
                     .await
                 {
-                    log::error!("Failed to send PushAck for unknown topic: {e}");
+                    tracing::error!("Failed to send PushAck for unknown topic: {e}");
                 }
             });
             return;
@@ -647,7 +647,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated push from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated push from peer {peer}");
                     return;
                 }
             };
@@ -698,7 +698,7 @@ impl EngineRunner {
             *reported = (*reported).max(changeset.db_version);
         }
 
-        log::info!(
+        tracing::info!(
             "Received push from peer {peer} with {} changes at db_version {}",
             changeset.changes.len(),
             changeset.db_version,
@@ -711,7 +711,7 @@ impl EngineRunner {
                 .send((channel, crate::protocol::SyncResponse::PushAck))
                 .await
             {
-                log::error!("Failed to send PushAck: {e}");
+                tracing::error!("Failed to send PushAck: {e}");
             }
         });
 
@@ -725,7 +725,7 @@ impl EngineRunner {
             effective_topic: effective.clone(),
             changes: changeset.changes,
         }) {
-            log::warn!("Remote changeset queue full, dropping push: {e}");
+            tracing::warn!("Remote changeset queue full, dropping push: {e}");
         }
     }
 
@@ -743,7 +743,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated identity announce from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated identity announce from peer {peer}");
                     return;
                 }
             };
@@ -756,7 +756,9 @@ impl EngineRunner {
                 // on the wire either way.
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
-                    log::debug!("Rejecting identity announce with invalid HMAC from peer {peer}");
+                    tracing::debug!(
+                        "Rejecting identity announce with invalid HMAC from peer {peer}"
+                    );
                     return;
                 }
             }
@@ -768,7 +770,7 @@ impl EngineRunner {
             .values()
             .any(|g| g.verified_peers.contains(&peer));
         if !verified_somewhere {
-            log::debug!("Ignoring identity announce from unverified peer {peer}");
+            tracing::debug!("Ignoring identity announce from unverified peer {peer}");
             return;
         }
 
@@ -815,7 +817,7 @@ impl EngineRunner {
             None
         };
         if let Some((attempts, dur)) = backoff {
-            log::warn!(
+            tracing::warn!(
                 "Rejecting peer {peer} for group {effective_topic} (HMAC failure, attempt \
                  {attempts}); backing off for {dur:?}"
             );
@@ -915,7 +917,7 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            log::debug!("Ignoring reconcile digest from {peer} for unknown topic {effective}");
+            tracing::debug!("Ignoring reconcile digest from {peer} for unknown topic {effective}");
             return;
         };
         let group_key = g.group_key.clone();
@@ -924,7 +926,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated reconcile digest from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated reconcile digest from peer {peer}");
                     return;
                 }
             };
@@ -982,7 +984,7 @@ impl EngineRunner {
                 );
             }
             if let Err(e) = resp_tx.send((channel, resp)).await {
-                log::error!("Failed to queue reconcile result: {e}");
+                tracing::error!("Failed to queue reconcile result: {e}");
             }
         });
     }
@@ -1004,14 +1006,14 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            log::debug!("Ignoring reconcile result from {peer} for unknown topic {effective}");
+            tracing::debug!("Ignoring reconcile result from {peer} for unknown topic {effective}");
             return;
         };
         if let Some(ref gk) = g.group_key {
             let tag = match resp_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated reconcile result from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated reconcile result from peer {peer}");
                     return;
                 }
             };
@@ -1026,7 +1028,9 @@ impl EngineRunner {
                 // spent on the wire either way.
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
-                    log::debug!("Rejecting reconcile result with invalid HMAC from peer {peer}");
+                    tracing::debug!(
+                        "Rejecting reconcile result with invalid HMAC from peer {peer}"
+                    );
                     return;
                 }
             }
@@ -1043,7 +1047,7 @@ impl EngineRunner {
             self.diagnostics
                 .reconcile_converged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            log::debug!("Reconcile: proven converged with peer {peer} for group {effective}");
+            tracing::debug!("Reconcile: proven converged with peer {peer} for group {effective}");
             // The peer holds all our data for this group — clear it from the
             // pending-push retry set so we stop re-pushing to it (#81).
             self.note_peer_converged_pushes(&effective, peer);
@@ -1057,7 +1061,7 @@ impl EngineRunner {
             self.diagnostics
                 .reconcile_diverged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            log::debug!(
+            tracing::debug!(
                 "Reconcile: diverged with peer {peer} for group {effective}; \
                  starting recursive range reconciliation"
             );
@@ -1127,7 +1131,7 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            log::debug!("Ignoring reconcile range from {peer} for unknown topic {effective}");
+            tracing::debug!("Ignoring reconcile range from {peer} for unknown topic {effective}");
             return;
         };
         let group_key = g.group_key.clone();
@@ -1136,7 +1140,7 @@ impl EngineRunner {
             let tag = match req_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated reconcile range from peer {peer}");
+                    tracing::debug!("Rejecting unauthenticated reconcile range from peer {peer}");
                     return;
                 }
             };
@@ -1212,7 +1216,7 @@ impl EngineRunner {
                 );
             }
             if let Err(e) = resp_tx.send((channel, resp)).await {
-                log::error!("Failed to queue reconcile range result: {e}");
+                tracing::error!("Failed to queue reconcile range result: {e}");
             }
         });
     }
@@ -1234,7 +1238,7 @@ impl EngineRunner {
             peer_topic.clone()
         };
         let Some(g) = self.groups.get(&effective) else {
-            log::debug!(
+            tracing::debug!(
                 "Ignoring reconcile range result from {peer} for unknown topic {effective}"
             );
             return;
@@ -1243,7 +1247,7 @@ impl EngineRunner {
             let tag = match resp_hmac {
                 Some(t) => t,
                 None => {
-                    log::debug!("Rejecting unauthenticated reconcile range result from {peer}");
+                    tracing::debug!("Rejecting unauthenticated reconcile range result from {peer}");
                     return;
                 }
             };
@@ -1258,7 +1262,9 @@ impl EngineRunner {
                 // spent on the wire either way.
                 self.record_wire_bytes(&peer, bytes.len() as u64, true);
                 if !gk.verify(&bytes, &tag) {
-                    log::debug!("Rejecting reconcile range result with invalid HMAC from {peer}");
+                    tracing::debug!(
+                        "Rejecting reconcile range result with invalid HMAC from {peer}"
+                    );
                     return;
                 }
             }
@@ -1460,7 +1466,7 @@ async fn apply_changeset_chunk<'a>(
     let txn = match db.begin().await {
         Ok(t) => t,
         Err(e) => {
-            log::error!("Failed to begin transaction for remote changeset: {e}");
+            tracing::error!("Failed to begin transaction for remote changeset: {e}");
             return false;
         }
     };
@@ -1473,7 +1479,7 @@ async fn apply_changeset_chunk<'a>(
     // single-writer locking means no concurrent local write can observe it.
     // Fail closed: applying without suppression must never happen.
     if let Err(e) = crate::capture::set_capture_suppressed(&txn, true).await {
-        log::error!("Failed to suppress change capture for remote apply: {e}");
+        tracing::error!("Failed to suppress change capture for remote apply: {e}");
         let _ = txn.rollback().await;
         return false;
     }
@@ -1481,7 +1487,7 @@ async fn apply_changeset_chunk<'a>(
     let local_db_version = match shadow::increment_db_version(&txn).await {
         Ok(v) => v,
         Err(e) => {
-            log::error!("Failed to increment db_version: {e}");
+            tracing::error!("Failed to increment db_version: {e}");
             let _ = txn.rollback().await;
             return false;
         }
@@ -1493,7 +1499,7 @@ async fn apply_changeset_chunk<'a>(
         let meta = match registry.get(table) {
             Some(m) => m,
             None => {
-                log::warn!("Rejecting remote changes for unregistered table: {}", table);
+                tracing::warn!("Rejecting remote changes for unregistered table: {}", table);
                 continue;
             }
         };
@@ -1518,7 +1524,7 @@ async fn apply_changeset_chunk<'a>(
                     // the entire chunk rather than commit a partially-applied row
                     // whose clock state would diverge silently. The changeset is
                     // idempotent and will be re-delivered / re-reconciled.
-                    log::error!("Remote delete {table}/{pk} failed, rolling back chunk: {e}");
+                    tracing::error!("Remote delete {table}/{pk} failed, rolling back chunk: {e}");
                     let _ = txn.rollback().await;
                     return false;
                 }
@@ -1535,7 +1541,9 @@ async fn apply_changeset_chunk<'a>(
                     }
                 }
                 Err(e) => {
-                    log::error!("Remote column apply {table}/{pk} failed, rolling back chunk: {e}");
+                    tracing::error!(
+                        "Remote column apply {table}/{pk} failed, rolling back chunk: {e}"
+                    );
                     let _ = txn.rollback().await;
                     return false;
                 }
@@ -1613,13 +1621,13 @@ async fn apply_changeset_chunk<'a>(
     // can never leak past it — committed applies and rolled-back applies
     // both leave the guard at 0.
     if let Err(e) = crate::capture::set_capture_suppressed(&txn, false).await {
-        log::error!("Failed to restore change capture after remote apply: {e}");
+        tracing::error!("Failed to restore change capture after remote apply: {e}");
         let _ = txn.rollback().await;
         return false;
     }
 
     if let Err(e) = txn.commit().await {
-        log::error!("Failed to commit remote changeset transaction: {e}");
+        tracing::error!("Failed to commit remote changeset transaction: {e}");
         return false;
     }
 
@@ -1640,7 +1648,7 @@ async fn apply_changeset_chunk<'a>(
             if ctx.registry.has(&n.table.0) {
                 match ctx.registry.dispatch(&n) {
                     Some(user_notif) => {
-                        log::info!(
+                        tracing::info!(
                             "notification: generated for table {} kind={:?} pk={} ({} receiver(s) subscribed)",
                             n.table.0,
                             n.kind,
@@ -1650,7 +1658,7 @@ async fn apply_changeset_chunk<'a>(
                         let _ = ctx.tx.send(user_notif);
                     }
                     None => {
-                        log::info!(
+                        tracing::info!(
                             "notification: policy DECLINED table {} kind={:?} pk={} cols={:?} (on_sync returned None)",
                             n.table.0,
                             n.kind,
@@ -1692,7 +1700,7 @@ async fn apply_remote_delete(
         && let Ok(Some(cutoff)) = shadow::tombstone_cutoff(db).await
         && ts < cutoff
     {
-        log::debug!("Skipping aged incoming tombstone for {table}/{pk}");
+        tracing::debug!("Skipping aged incoming tombstone for {table}/{pk}");
         return Ok(false);
     }
 
@@ -1806,7 +1814,7 @@ async fn apply_remote_column_changes(
         // corrupt convergence state without producing any user-table
         // write (the original WSDB-PoC-1).
         if !meta.columns.iter().any(|c| c == &change.cid.0) {
-            log::warn!(
+            tracing::warn!(
                 "Rejecting remote change for unregistered column: {}/{}/{}",
                 table,
                 pk,
@@ -1815,7 +1823,7 @@ async fn apply_remote_column_changes(
             continue;
         }
         if change.cid.0 == meta.primary_key_column {
-            log::warn!(
+            tracing::warn!(
                 "Rejecting remote change targeting the primary-key column: {}/{}",
                 table,
                 pk
@@ -1938,7 +1946,7 @@ async fn apply_remote_column_changes(
         flush_shadow_updates(db, table, pk, &pending_shadow_updates, local_db_version).await?;
         Ok((true, exists, changed_columns))
     } else {
-        log::debug!(
+        tracing::debug!(
             "Row {}/{} not created (likely missing NOT NULL columns from \
              out-of-order delivery), deferring shadow updates",
             table,

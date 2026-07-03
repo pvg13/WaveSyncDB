@@ -86,7 +86,7 @@ fn read_token_from_file(database_url: &str, filename: &str, platform_name: &str)
             if token.is_empty() {
                 None
             } else {
-                log::info!(
+                tracing::info!(
                     "{platform_name} token read from {}: {}...",
                     token_path.display(),
                     &token[..token.len().min(10)]
@@ -95,7 +95,7 @@ fn read_token_from_file(database_url: &str, filename: &str, platform_name: &str)
             }
         }
         Err(_) => {
-            log::debug!(
+            tracing::debug!(
                 "No {platform_name} token file at {} (expected on first launch)",
                 token_path.display()
             );
@@ -257,12 +257,12 @@ pub(crate) fn load_ios_push_framework() {
             } else {
                 CStr::from_ptr(err_ptr).to_string_lossy()
             };
-            log::warn!(
+            tracing::warn!(
                 "Failed to load WaveSyncPush framework: {err}. \
                  APNs integration will be unavailable this launch."
             );
         } else {
-            log::info!("Loaded WaveSyncPush framework (dlopen); +load handlers active");
+            tracing::info!("Loaded WaveSyncPush framework (dlopen); +load handlers active");
         }
     }
 }

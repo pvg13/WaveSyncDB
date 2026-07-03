@@ -13,7 +13,7 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
     let vm = match unsafe { JavaVM::from_raw(ctx.vm().cast()) } {
         Ok(vm) => vm,
         Err(e) => {
-            log::error!("Failed to get JavaVM for lifecycle detection: {e}");
+            tracing::error!("Failed to get JavaVM for lifecycle detection: {e}");
             return;
         }
     };
@@ -22,7 +22,7 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
     let env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(e) => {
-            log::error!("Failed to attach JNI thread: {e}");
+            tracing::error!("Failed to attach JNI thread: {e}");
             return;
         }
     };
@@ -30,14 +30,14 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
     let activity_global = match env.new_global_ref(&activity) {
         Ok(g) => g,
         Err(e) => {
-            log::error!("Failed to create global ref for activity: {e}");
+            tracing::error!("Failed to create global ref for activity: {e}");
             return;
         }
     };
 
     drop(env);
 
-    log::info!("Android lifecycle polling started");
+    tracing::info!("Android lifecycle polling started");
 
     let mut was_foreground = true;
 
@@ -54,7 +54,7 @@ pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
             .unwrap_or(was_foreground);
 
         if focused != was_foreground {
-            log::debug!("Android lifecycle: foreground={focused}");
+            tracing::debug!("Android lifecycle: foreground={focused}");
             let _ = tx.send(focused);
             was_foreground = focused;
         }

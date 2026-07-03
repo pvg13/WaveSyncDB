@@ -243,7 +243,7 @@ pub async fn get_or_create_libp2p_keypair(
         match libp2p::identity::Keypair::from_protobuf_encoding(&row.value) {
             Ok(kp) => return Ok(kp),
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "stored libp2p keypair is unparseable ({e}); regenerating. \
                      PeerId will change once."
                 );
@@ -930,7 +930,7 @@ pub async fn heal_lost_tombstones(
     }
 
     if healed > 0 {
-        log::info!("Healed {healed} row(s) stuck with a defeated tombstone (N8 repair)");
+        tracing::info!("Healed {healed} row(s) stuck with a defeated tombstone (N8 repair)");
     }
     Ok(healed)
 }

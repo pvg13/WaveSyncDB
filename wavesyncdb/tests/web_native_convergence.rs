@@ -204,7 +204,7 @@ fn unique_topic(name: &str) -> String {
 
 #[tokio::test]
 async fn inserts_and_updates_converge_bidirectionally() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_a"), &unique_topic("ins"), 80).await;
     let mut web = WebPeer::new(81, DeletePolicy::DeleteWins);
 
@@ -245,7 +245,7 @@ async fn inserts_and_updates_converge_bidirectionally() {
 
 #[tokio::test]
 async fn native_delete_propagates_to_web() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_b"), &unique_topic("ndel"), 82).await;
     let mut web = WebPeer::new(83, DeletePolicy::DeleteWins);
 
@@ -276,7 +276,7 @@ async fn native_delete_propagates_to_web() {
 
 #[tokio::test]
 async fn web_delete_propagates_to_native() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_c"), &unique_topic("wdel"), 84).await;
     let mut web = WebPeer::new(85, DeletePolicy::DeleteWins);
 
@@ -305,7 +305,7 @@ async fn web_delete_propagates_to_native() {
 
 #[tokio::test]
 async fn concurrent_edit_vs_delete_tie_delete_wins() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_d"), &unique_topic("tie-dw"), 86).await;
     let mut web = WebPeer::new(87, DeletePolicy::DeleteWins);
 
@@ -347,7 +347,7 @@ async fn concurrent_edit_vs_delete_tie_delete_wins() {
 
 #[tokio::test]
 async fn concurrent_edit_vs_delete_tie_add_wins_keeps_row_on_both() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_e"), &unique_topic("tie-aw"), 88).await;
     // Flip the native registry to AddWins for this scenario (upsert) and
     // configure web identically — mismatched policies are themselves a
@@ -417,7 +417,7 @@ async fn dominant_delete_is_not_resurrected_by_stale_edit() {
     // The N8 gate must not over-correct: a delete that provably DOMINATES an
     // incoming edit (its causal length exceeds the edit's col_version) keeps the
     // row deleted — the stale edit must not resurrect it.
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_dom"), &unique_topic("dom"), 86).await;
     let mut web = WebPeer::new(87, DeletePolicy::AddWins);
     native.registry().register(TableMeta {
@@ -477,7 +477,7 @@ async fn reinsert_after_won_delete_converges_deletewins() {
     // node must revive above its own tombstone, or a DeleteWins peer that still
     // holds the tombstone rejects the re-insert (equal cl → delete wins the tie)
     // and the two replicas diverge permanently.
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_res"), &unique_topic("res"), 84).await;
     let mut web = WebPeer::new(85, DeletePolicy::DeleteWins);
 
@@ -519,7 +519,7 @@ async fn reinsert_after_won_delete_converges_deletewins() {
 
 #[tokio::test]
 async fn interleaved_batches_converge() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_f"), &unique_topic("mix"), 80).await;
     let mut web = WebPeer::new(81, DeletePolicy::DeleteWins);
 
@@ -573,7 +573,7 @@ async fn interleaved_batches_converge() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn aged_tombstones_stay_convergent_across_gc_timing() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let native = make_peer(&mem_db("conv_ret"), &unique_topic("ret"), 178).await;
     let mut web = WebPeer::new(179, DeletePolicy::DeleteWins);
 

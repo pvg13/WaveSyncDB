@@ -128,51 +128,67 @@ pub use registry::{TableMeta, TableRegistry};
 pub use synced_model::{SyncedModel, lenient_from_value};
 pub use synced_table::SyncedTableEntity;
 
-/// Returns recommended log module filter tuples for silencing noisy dependencies.
+/// Returns a recommended `EnvFilter`/`RUST_LOG` directive string for silencing
+/// noisy dependencies.
 ///
-/// Usage with `env_logger`:
+/// The string is a comma-separated list of `target=level` directives (the
+/// same syntax `RUST_LOG` and [`tracing_subscriber::EnvFilter`] both parse)
+/// and is meant to be layered under an application-chosen default level.
+///
+/// Usage with `tracing-subscriber`:
 /// ```rust,no_run
+/// let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+///     tracing_subscriber::EnvFilter::new(format!(
+///         "info,{}",
+///         wavesyncdb::recommended_log_filters()
+///     ))
+/// });
+/// tracing_subscriber::fmt().with_env_filter(filter).init();
+/// ```
+///
+/// `env_logger`-based setups can use the same string directly:
+/// ```rust,ignore
 /// let mut builder = env_logger::Builder::from_env(
-///     env_logger::Env::default().default_filter_or("info")
+///     env_logger::Env::default().default_filter_or(format!(
+///         "info,{}",
+///         wavesyncdb::recommended_log_filters()
+///     )),
 /// );
-/// for (module, level) in wavesyncdb::recommended_log_filters() {
-///     builder.filter_module(module, level);
-/// }
 /// builder.init();
 /// ```
-pub fn recommended_log_filters() -> Vec<(&'static str, log::LevelFilter)> {
-    vec![
-        ("hickory_resolver", log::LevelFilter::Warn),
-        ("hickory_proto", log::LevelFilter::Warn),
-        ("libp2p_autonat", log::LevelFilter::Warn),
-        ("libp2p_dcutr", log::LevelFilter::Info),
-        ("libp2p_mdns", log::LevelFilter::Warn),
-        ("libp2p_swarm", log::LevelFilter::Warn),
-        ("libp2p_dns", log::LevelFilter::Warn),
-        ("libp2p_tcp", log::LevelFilter::Warn),
+pub fn recommended_log_filters() -> &'static str {
+    concat!(
+        "hickory_resolver=warn,",
+        "hickory_proto=warn,",
+        "libp2p_autonat=warn,",
+        "libp2p_dcutr=info,",
+        "libp2p_mdns=warn,",
+        "libp2p_swarm=warn,",
+        "libp2p_dns=warn,",
+        "libp2p_tcp=warn,",
         // libp2p_core emits long type-name debug stack traces ("Failed to
         // listen/dial using libp2p_core::transport::map::Map<...>"). The full
         // generic type name fills tens of lines per failed dial attempt and
         // adds nothing actionable. Drop to warn.
-        ("libp2p_core", log::LevelFilter::Warn),
-        ("libp2p_noise", log::LevelFilter::Warn),
-        ("libp2p_quic", log::LevelFilter::Warn),
-        ("libp2p_relay", log::LevelFilter::Warn),
-        ("libp2p_identify", log::LevelFilter::Warn),
-        ("libp2p_yamux", log::LevelFilter::Warn),
-        ("libp2p_ping", log::LevelFilter::Warn),
-        ("libp2p_request_response", log::LevelFilter::Warn),
-        ("multistream_select", log::LevelFilter::Warn),
-        ("netlink_proto", log::LevelFilter::Warn),
+        "libp2p_core=warn,",
+        "libp2p_noise=warn,",
+        "libp2p_quic=warn,",
+        "libp2p_relay=warn,",
+        "libp2p_identify=warn,",
+        "libp2p_yamux=warn,",
+        "libp2p_ping=warn,",
+        "libp2p_request_response=warn,",
+        "multistream_select=warn,",
+        "netlink_proto=warn,",
         // sqlx logs every query at INFO by default. We also set
         // SeaORM's `ConnectOptions::sqlx_logging_level(Debug)` in
         // `connection.rs` so the events themselves are emitted at debug —
         // this filter is the second line of defence in case anything routes
         // through the `log` crate at info regardless. Set
         // RUST_LOG=sqlx::query=info to re-enable when debugging slow queries.
-        ("sqlx::query", log::LevelFilter::Warn),
-        ("sqlx_core::logger", log::LevelFilter::Warn),
-    ]
+        "sqlx::query=warn,",
+        "sqlx_core::logger=warn"
+    )
 }
 
 /// The crate's semver version string (from `CARGO_PKG_VERSION`).

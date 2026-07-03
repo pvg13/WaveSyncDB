@@ -86,7 +86,7 @@ async fn test_h3_multi_row_insert_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_seaorm_insert_many_syncs_all_rows() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-insert-many-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -470,7 +470,7 @@ async fn test_h4_unparseable_sql_succeeds_locally() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_r1_peer_starts_unverified() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r1a-{}", Uuid::new_v4());
     let passphrase = "test-secret";
 
@@ -512,7 +512,7 @@ async fn test_r1_peer_starts_unverified() {
 
 #[tokio::test]
 async fn test_r1_peer_verified_after_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r1b-{}", Uuid::new_v4());
     let passphrase = "test-secret-r1b";
     let timeout = Duration::from_secs(15);
@@ -563,7 +563,7 @@ async fn test_r1_peer_verified_after_sync() {
 
 #[tokio::test]
 async fn test_r1_no_passphrase_never_verified() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r1c-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(10);
 
@@ -630,7 +630,7 @@ async fn test_r1_no_passphrase_never_verified() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_r5_identity_announced_after_verification() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r5a-{}", Uuid::new_v4());
     let passphrase = "test-secret-r5a";
     let timeout = Duration::from_secs(15);
@@ -683,7 +683,7 @@ async fn test_r5_identity_announced_after_verification() {
 
 #[tokio::test]
 async fn test_r5_identity_cleared_on_disconnect() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r5b-{}", Uuid::new_v4());
     let passphrase = "test-secret-r5b";
     let timeout = Duration::from_secs(15);
@@ -736,7 +736,7 @@ async fn test_r5_identity_cleared_on_disconnect() {
 
 #[tokio::test]
 async fn test_r5_identity_not_sent_without_passphrase() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-r5c-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(10);
 
@@ -807,7 +807,7 @@ async fn test_r5_identity_not_sent_without_passphrase() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_out_of_order_insert_update_convergence() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-ooo-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -867,7 +867,7 @@ async fn test_out_of_order_insert_update_convergence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_peer_version_hydration_no_missed_changes_across_restart() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-hydrate-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -940,7 +940,7 @@ async fn test_peer_version_hydration_no_missed_changes_across_restart() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_h6_graceful_shutdown_flushes_pending_writes() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-h6-shutdown-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1081,7 +1081,7 @@ async fn test_n2_shadow_failure_fails_closed_on_delete() {
 async fn test_84_relay_cost_telemetry_classifies_direct() {
     use sea_orm::EntityTrait;
 
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-relaycost-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1148,7 +1148,7 @@ async fn test_84_relay_cost_telemetry_classifies_direct() {
 async fn test_82_reconcile_proves_convergence() {
     use sea_orm::EntityTrait;
 
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-reconcile-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(25);
 
@@ -1207,7 +1207,7 @@ async fn test_82_reconcile_proves_convergence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_82_rbsr_repairs_divergence_without_version_vector() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-rbsr-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(30);
 
@@ -1324,7 +1324,7 @@ async fn test_81_pending_push_redelivers_to_late_peer() {
         peer
     }
 
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-redeliver-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -1443,7 +1443,7 @@ async fn make_typed_peer(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::Wav
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_trigger_capture_type_matrix_and_expression_update() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cap-t1-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1521,7 +1521,7 @@ async fn test_trigger_capture_type_matrix_and_expression_update() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_trigger_capture_blob_column_syncs_as_hex() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cap-t2-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1563,7 +1563,7 @@ async fn test_trigger_capture_blob_column_syncs_as_hex() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_trigger_capture_no_echo_loop() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cap-t3-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1638,7 +1638,7 @@ async fn test_trigger_capture_no_echo_loop() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_trigger_capture_bypass_write_reaches_peer() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cap-t4-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1679,7 +1679,7 @@ async fn test_trigger_capture_bypass_write_reaches_peer() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_trigger_capture_insert_or_replace_syncs() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-cap-t5-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 

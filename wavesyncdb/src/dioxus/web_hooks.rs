@@ -75,7 +75,9 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                             .map(|r| E::from_columns(&r.pk, &r.columns))
                             .collect(),
                         Err(e) => {
-                            log::warn!("use_synced_table({table}): list_table_rows failed: {e}");
+                            tracing::warn!(
+                                "use_synced_table({table}): list_table_rows failed: {e}"
+                            );
                             Vec::new()
                         }
                     }
@@ -94,7 +96,9 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                     let first = match rx.recv().await {
                         Ok(change) => change,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            log::warn!("use_synced_table({table}): lagged {n}, re-materializing");
+                            tracing::warn!(
+                                "use_synced_table({table}): lagged {n}, re-materializing"
+                            );
                             if let Some(store) = c.store() {
                                 if let Ok(stored) = store.list_table_rows(&table).await {
                                     rows = stored
@@ -112,7 +116,7 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            log::info!("use_synced_table({table}): client dropped");
+                            tracing::info!("use_synced_table({table}): client dropped");
                             return;
                         }
                     };
@@ -123,7 +127,7 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                         match rx.try_recv() {
                             Ok(n) => batch.push(n),
                             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                                log::warn!(
+                                tracing::warn!(
                                     "use_synced_table({table}): lagged {n}, re-materializing"
                                 );
                                 batch.clear();

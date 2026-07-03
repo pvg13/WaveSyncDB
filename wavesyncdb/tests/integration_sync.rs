@@ -14,7 +14,7 @@ use common::{assert_eventually, make_node_id, make_peer, mem_db, note, task};
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_update_propagation() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-update-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("upd_a");
@@ -85,7 +85,7 @@ async fn test_update_propagation() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_delete_propagation() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-delete-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("del_a");
@@ -157,7 +157,7 @@ async fn test_delete_propagation() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_concurrent_same_column_higher_version_wins() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-conflict-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("conf_a");
@@ -237,7 +237,7 @@ async fn test_concurrent_same_column_higher_version_wins() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_concurrent_different_columns_both_survive() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-diffcol-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("diffcol_a");
@@ -330,7 +330,7 @@ async fn test_concurrent_different_columns_both_survive() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_bidirectional_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-bidi-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("bidi_a");
@@ -408,7 +408,7 @@ async fn test_bidirectional_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_three_peer_convergence() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-3peer-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -463,7 +463,7 @@ async fn test_three_peer_convergence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_delete_then_reinsert_same_pk() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-reinsert-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
     let db_a_url = mem_db("reinsert_a");
@@ -562,7 +562,7 @@ async fn test_delete_then_reinsert_same_pk() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_three_peer_same_column_deterministic_winner() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-3col-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -654,7 +654,7 @@ async fn test_three_peer_same_column_deterministic_winner() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_three_peer_different_columns_all_survive() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-3diffcol-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 
@@ -751,7 +751,7 @@ async fn test_three_peer_different_columns_all_survive() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_burst_inserts_all_propagate() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-burst-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(30);
 
@@ -794,7 +794,7 @@ async fn test_burst_inserts_all_propagate() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_large_payload_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-large-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -835,7 +835,7 @@ async fn test_large_payload_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_add_wins_policy_integration() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-addwins-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1002,7 +1002,7 @@ async fn test_add_wins_policy_integration() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_concurrent_delete_vs_update() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-delvupd-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1074,7 +1074,7 @@ async fn test_concurrent_delete_vs_update() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_remote_delete_then_reinsert() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-bothdelreins-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1159,7 +1159,7 @@ async fn test_remote_delete_then_reinsert() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multi_table_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-multitable-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1278,7 +1278,7 @@ async fn test_multi_table_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_network_partition_merge() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let timeout = Duration::from_secs(20);
 
     // Group X: peers A+B on topic-X
@@ -1409,7 +1409,7 @@ async fn test_network_partition_merge() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multiple_updates_before_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-multiupd-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1462,7 +1462,7 @@ async fn test_multiple_updates_before_sync() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_insert_delete_before_sync() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-insdelbs-{}", Uuid::new_v4());
 
     let url_a = mem_db("insdelbs_a");
@@ -1513,7 +1513,7 @@ async fn test_insert_delete_before_sync() {
 /// tombstones back and forth).
 #[tokio::test]
 async fn test_retention_aging_no_reconcile_churn() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-retention-churn-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 
@@ -1594,7 +1594,7 @@ async fn test_retention_aging_no_reconcile_churn() {
 /// live row arrives intact. No silent gap, no error.
 #[tokio::test]
 async fn test_fresh_peer_after_physical_gc_converges() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-retention-fresh-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(15);
 

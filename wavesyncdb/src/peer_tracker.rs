@@ -105,7 +105,7 @@ pub fn parse_peer_versions(raw: HashMap<String, u64>) -> HashMap<libp2p::PeerId,
             |(peer_id, version)| match peer_id.parse::<libp2p::PeerId>() {
                 Ok(pid) => Some((pid, version)),
                 Err(e) => {
-                    log::debug!(
+                    tracing::debug!(
                         "Skipping unparseable peer_id '{peer_id}' during version hydration: {e}"
                     );
                     None

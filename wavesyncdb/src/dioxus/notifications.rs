@@ -85,7 +85,7 @@ fn show_os_notification(n: &Notification) {
             .body(&n.body)
             .show()
         {
-            log::warn!("Failed to show desktop notification: {e}");
+            tracing::warn!("Failed to show desktop notification: {e}");
         }
     }
 
@@ -108,7 +108,7 @@ fn show_os_notification(n: &Notification) {
         all(target_os = "ios", feature = "push-sync"),
     )))]
     {
-        log::info!(
+        tracing::info!(
             "sync notification (no native display on this target — enable `push-sync` on mobile): {} — {}",
             n.title,
             n.body
@@ -144,18 +144,18 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
     let vm = match unsafe { JavaVM::from_raw(ctx.vm().cast()) } {
         Ok(vm) => vm,
         Err(e) => {
-            log::warn!("notification: JavaVM unavailable: {e}");
+            tracing::warn!("notification: JavaVM unavailable: {e}");
             return;
         }
     };
     let mut env = match vm.attach_current_thread() {
         Ok(env) => env,
         Err(e) => {
-            log::warn!("notification: JNI attach failed: {e}");
+            tracing::warn!("notification: JNI attach failed: {e}");
             return;
         }
     };
-    log::info!(
+    tracing::info!(
         "notification: posting Android notification via NotificationHelper.show (group={group})"
     );
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
@@ -172,7 +172,9 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
     let helper = match resolve_app_class(&mut env, &context, "dev.dioxus.main.NotificationHelper") {
         Some(c) => c,
         None => {
-            log::warn!("notification: could not resolve NotificationHelper via app classloader");
+            tracing::warn!(
+                "notification: could not resolve NotificationHelper via app classloader"
+            );
             describe_and_clear(&mut env);
             return;
         }
@@ -183,7 +185,7 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
         env.new_string(body),
         env.new_string(group),
     ) else {
-        log::warn!("notification: failed to build JNI strings");
+        tracing::warn!("notification: failed to build JNI strings");
         return;
     };
     match env.call_static_method(
@@ -197,9 +199,9 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
             JValue::Object(&group_j),
         ],
     ) {
-        Ok(_) => log::debug!("notification: NotificationHelper.show returned ok"),
+        Ok(_) => tracing::debug!("notification: NotificationHelper.show returned ok"),
         Err(e) => {
-            log::warn!("notification: NotificationHelper.show failed: {e}");
+            tracing::warn!("notification: NotificationHelper.show failed: {e}");
             // Surface the underlying Java stack trace, then clear so the pending
             // exception can't leak into later JNI calls on this thread.
             describe_and_clear(&mut env);
@@ -274,7 +276,7 @@ fn show_ios_notification(title: &str, body: &str, group: &str) {
     unsafe {
         let sym = dlsym(RTLD_DEFAULT, c"wavesync_show_notification".as_ptr());
         if sym.is_null() {
-            log::warn!(
+            tracing::warn!(
                 "notification: wavesync_show_notification not found \
                  (WaveSyncPush framework not loaded?)"
             );

@@ -12,6 +12,21 @@ use std::sync::Mutex;
 use wavesyncdb::messages::{ColumnChange, ColumnName, NodeId, PrimaryKey, TableName};
 use wavesyncdb::web_sync_core::{ShadowRow, ShadowStore, StoreError, WriteBatch};
 
+/// Idempotent tracing init for tests: honors RUST_LOG, captures per-test output.
+///
+/// Each test binary compiles this module independently; binaries that init
+/// tracing via `common::init_test_tracing()` instead leave this one unused.
+#[allow(dead_code)]
+pub fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 #[derive(Default)]
 struct Inner {
     db_version: u64,

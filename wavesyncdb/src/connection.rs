@@ -670,7 +670,7 @@ impl WaveSyncDb {
         // process sharing this DB file (iOS background sync). Best-effort —
         // rows persist for the next drain if this one fails.
         if let Err(e) = self.drain_and_dispatch().await {
-            log::warn!("Startup capture drain failed (will retry on next write): {e}");
+            tracing::warn!("Startup capture drain failed (will retry on next write): {e}");
         }
 
         Ok(())
@@ -759,7 +759,7 @@ impl WaveSyncDb {
                                 // wrong tombstone col_version. Roll back rather
                                 // than publish a delete the local shadow can't
                                 // back.
-                                log::error!("Failed to read clock entries for delete: {e}");
+                                tracing::error!("Failed to read clock entries for delete: {e}");
                                 *ver -= 1;
                                 self.inner.db_version_cache.store(*ver, Ordering::Release);
                                 let _ = txn.rollback().await;
@@ -784,7 +784,7 @@ impl WaveSyncDb {
                     )
                     .await
                     {
-                        log::error!("Failed to insert tombstone: {e}");
+                        tracing::error!("Failed to insert tombstone: {e}");
                         *ver -= 1;
                         self.inner.db_version_cache.store(*ver, Ordering::Release);
                         let _ = txn.rollback().await;
@@ -816,7 +816,7 @@ impl WaveSyncDb {
                         Ok(Some(cl)) => cl + 1,
                         Ok(None) => 0,
                         Err(e) => {
-                            log::error!("Failed to read tombstone for resurrection floor: {e}");
+                            tracing::error!("Failed to read tombstone for resurrection floor: {e}");
                             *ver -= 1;
                             self.inner.db_version_cache.store(*ver, Ordering::Release);
                             let _ = txn.rollback().await;
@@ -831,7 +831,7 @@ impl WaveSyncDb {
                         // Fail-closed: a stale tombstone left behind could let a
                         // delete win over this resurrection on a peer. Roll back
                         // instead of committing inconsistent shadow state.
-                        log::error!("Failed to clear tombstone: {e}");
+                        tracing::error!("Failed to clear tombstone: {e}");
                         *ver -= 1;
                         self.inner.db_version_cache.store(*ver, Ordering::Release);
                         let _ = txn.rollback().await;
@@ -859,7 +859,7 @@ impl WaveSyncDb {
                     {
                         Ok(map) => map,
                         Err(e) => {
-                            log::error!("Failed to batch-upsert clock entries: {e}");
+                            tracing::error!("Failed to batch-upsert clock entries: {e}");
                             *ver -= 1;
                             self.inner.db_version_cache.store(*ver, Ordering::Release);
                             let _ = txn.rollback().await;
@@ -1131,7 +1131,7 @@ impl<'a> SchemaBuilder<'a> {
         // pre-sync() writes recorded by triggers from a previous run.
         // Best-effort — rows persist for the next drain if this one fails.
         if let Err(e) = self.db.drain_and_dispatch().await {
-            log::warn!("Startup capture drain failed (will retry on next write): {e}");
+            tracing::warn!("Startup capture drain failed (will retry on next write): {e}");
         }
         // Persist the crate name so background sync can reconstruct the registry
         if let Some(crate_name) = &self.crate_name
@@ -1151,7 +1151,7 @@ impl<'a> SchemaBuilder<'a> {
         if let Err(e) =
             crate::shadow::heal_lost_tombstones(&self.db.inner.inner, self.db.registry()).await
         {
-            log::warn!("N8 tombstone heal sweep failed (non-fatal): {e}");
+            tracing::warn!("N8 tombstone heal sweep failed (non-fatal): {e}");
         }
 
         // Physically collect aged tombstones off the startup path. Exclusion
@@ -1163,8 +1163,8 @@ impl<'a> SchemaBuilder<'a> {
         tokio::spawn(async move {
             match crate::shadow::gc_aged_tombstones(&gc_db, &gc_registry).await {
                 Ok(0) => {}
-                Ok(n) => log::info!("Tombstone GC collected {n} aged tombstones"),
-                Err(e) => log::warn!("Tombstone GC sweep failed (non-fatal): {e}"),
+                Ok(n) => tracing::info!("Tombstone GC collected {n} aged tombstones"),
+                Err(e) => tracing::warn!("Tombstone GC sweep failed (non-fatal): {e}"),
             }
         });
 
@@ -1252,7 +1252,7 @@ async fn parse_and_resolve_multiaddr(addr_str: &str) -> Result<libp2p::Multiaddr
                         resolved_once = true;
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "DNS resolution failed for '{host_str}' in '{addr_str}': {e}; \
                              passing multiaddr through to libp2p unchanged"
                         );
@@ -1273,7 +1273,7 @@ async fn parse_and_resolve_multiaddr(addr_str: &str) -> Result<libp2p::Multiaddr
                         resolved_once = true;
                     }
                     Err(e) => {
-                        log::warn!(
+                        tracing::warn!(
                             "DNS resolution failed for '{host_str}' in '{addr_str}': {e}; \
                              passing multiaddr through to libp2p unchanged"
                         );
@@ -1435,7 +1435,7 @@ fn restrict_file_permissions(path: &std::path::Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            log::warn!("Could not restrict permissions on {}: {e}", path.display());
+            tracing::warn!("Could not restrict permissions on {}: {e}", path.display());
         }
     }
     #[cfg(not(unix))]
@@ -1711,7 +1711,7 @@ impl WaveSyncDbBuilder {
                 self.fcm_credentials = Some(creds);
             }
             Err(e) => {
-                log::error!("Failed to parse google-services.json: {e}");
+                tracing::error!("Failed to parse google-services.json: {e}");
             }
         }
         self
@@ -1779,7 +1779,7 @@ impl WaveSyncDbBuilder {
                 }
             }
             if self.push_token.is_none() {
-                log::info!("No FCM token file found — push will be registered on next launch");
+                tracing::info!("No FCM token file found — push will be registered on next launch");
             }
         }
 
@@ -1812,7 +1812,9 @@ impl WaveSyncDbBuilder {
                     }
                 }
                 if self.push_token.is_none() {
-                    log::info!("No APNs token file found — push will be registered on next launch");
+                    tracing::info!(
+                        "No APNs token file found — push will be registered on next launch"
+                    );
                 }
             }
         }
@@ -1866,7 +1868,7 @@ impl WaveSyncDbBuilder {
         // notification will ever fire regardless of sync working. A populated
         // list but no "notification: generated" logs means `on_sync` returned
         // None for the changes that arrived.
-        log::info!(
+        tracing::info!(
             "SyncNotify: {} notification polic{} registered: [{}]",
             notify_tables.len(),
             if notify_tables.len() == 1 { "y" } else { "ies" },
@@ -1914,7 +1916,7 @@ impl WaveSyncDbBuilder {
         for s in &self.relay_fallbacks {
             match parse_and_resolve_multiaddr(s).await {
                 Ok(addr) => relay_fallbacks.push(addr),
-                Err(e) => log::warn!("Skipping invalid relay fallback address '{s}': {e}"),
+                Err(e) => tracing::warn!("Skipping invalid relay fallback address '{s}': {e}"),
             }
         }
 
@@ -1930,7 +1932,7 @@ impl WaveSyncDbBuilder {
         for s in &self.bootstrap_peers {
             match parse_and_resolve_multiaddr(s).await {
                 Ok(addr) => bootstrap_peers.push(addr),
-                Err(e) => log::warn!("Skipping invalid bootstrap peer address '{s}': {e}"),
+                Err(e) => tracing::warn!("Skipping invalid bootstrap peer address '{s}': {e}"),
             }
         }
 
@@ -1973,7 +1975,7 @@ impl WaveSyncDbBuilder {
             groups: preserved_groups,
         };
         if let Err(e) = sync_config.save() {
-            log::warn!("Failed to save sync config for background services: {e}");
+            tracing::warn!("Failed to save sync config for background services: {e}");
         }
 
         let engine_config = crate::engine::EngineConfig {
@@ -2159,7 +2161,7 @@ impl WaveSyncNode {
             notify_tables.push(table_name.clone());
             notification_registry.register(table_name, dispatch);
         }
-        log::info!(
+        tracing::info!(
             "SyncNotify (group): {} notification polic{} registered: [{}]",
             notify_tables.len(),
             if notify_tables.len() == 1 { "y" } else { "ies" },
@@ -2172,7 +2174,7 @@ impl WaveSyncNode {
         let peer_db_versions = match crate::peer_tracker::get_all_peer_versions(&db).await {
             Ok(rows) => crate::peer_tracker::parse_peer_versions(rows),
             Err(e) => {
-                log::warn!("Failed to hydrate peer versions for joined group: {e}");
+                tracing::warn!("Failed to hydrate peer versions for joined group: {e}");
                 HashMap::new()
             }
         };
@@ -2239,7 +2241,7 @@ impl WaveSyncNode {
                 kind: kind.map(|k| k.to_string()),
             },
         ) {
-            log::debug!("Could not persist joined group '{user_topic}' to config: {e}");
+            tracing::debug!("Could not persist joined group '{user_topic}' to config: {e}");
         }
 
         Ok(db_handle)
@@ -2278,7 +2280,7 @@ impl WaveSyncNode {
             if let Err(e) =
                 SyncConfig::persist_group_left(&self.inner.base_database_url, &user_topic)
             {
-                log::debug!("Could not remove left group '{user_topic}' from config: {e}");
+                tracing::debug!("Could not remove left group '{user_topic}' from config: {e}");
             }
         }
     }

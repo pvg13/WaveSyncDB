@@ -5,6 +5,17 @@ use uuid::Uuid;
 use wavesyncdb::WaveSyncDb;
 use wavesyncdb::WaveSyncDbBuilder;
 
+/// Idempotent tracing init for tests: honors RUST_LOG, captures per-test output.
+pub fn init_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 /// Generate a unique temp file SQLite URI.
 pub fn mem_db(name: &str) -> String {
     let unique = Uuid::new_v4().simple().to_string();

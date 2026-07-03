@@ -15,11 +15,18 @@ use std::time::Duration;
 
 use crate::background_sync::{self, BackgroundSyncResult};
 
-/// On Android, route `log::*` output through the system logger so background-
-/// sync engine messages show up in `adb logcat` (filterable by tag
-/// `wavesync`). Without this, the FirebaseMessagingService JNI thread has no
-/// log destination — env_logger writes to stderr, and Android discards stderr
-/// from native code — so "no peers found" failures are uninvestigable.
+/// On Android, route engine output (tracing events, bridged via `tracing`'s
+/// `log` feature) through the system logger so background-sync messages show
+/// up in `adb logcat` (filterable by tag `wavesync`). Without this, the
+/// FirebaseMessagingService JNI thread has no log destination — a plain
+/// stderr-based setup is discarded by Android from native code — so "no
+/// peers found" failures are uninvestigable.
+///
+/// `android_logger`'s `Config` is a `log`-crate API (it predates `tracing`
+/// and has no tracing-native equivalent), so this function still reaches for
+/// `log::LevelFilter` directly — the crate keeps a narrow `log` dependency
+/// scoped to native targets for exactly this and SeaORM's equivalent
+/// `sqlx_logging_level` API (see `Cargo.toml`).
 ///
 /// Idempotent: `android_logger::init_once` is documented to be a no-op on
 /// subsequent calls. Safe to call from every JNI entry point.
@@ -27,10 +34,7 @@ use crate::background_sync::{self, BackgroundSyncResult};
 fn ensure_android_logger() {
     use android_logger::{Config, FilterBuilder};
     let mut filter = FilterBuilder::new();
-    filter.parse("info");
-    for (module, level) in crate::recommended_log_filters() {
-        filter.filter_module(module, level);
-    }
+    filter.parse(&format!("info,{}", crate::recommended_log_filters()));
     android_logger::init_once(
         Config::default()
             .with_tag("wavesync")
@@ -147,11 +151,11 @@ pub extern "C" fn wavesync_background_sync_with_peers(
             Ok(json) => serde_json::from_str(json).unwrap_or_else(|e| {
                 // Malformed payload peer hints: log rather than silently degrade
                 // to discovery-only, which slows the cold-start wake on cellular.
-                log::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
+                tracing::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
                 Vec::new()
             }),
             Err(e) => {
-                log::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
+                tracing::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
                 Vec::new()
             }
         }
@@ -195,11 +199,11 @@ pub extern "C" fn wavesync_background_sync_targeted(
             Ok(json) => serde_json::from_str(json).unwrap_or_else(|e| {
                 // Malformed payload peer hints: log rather than silently degrade
                 // to discovery-only, which slows the cold-start wake on cellular.
-                log::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
+                tracing::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
                 Vec::new()
             }),
             Err(e) => {
-                log::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
+                tracing::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
                 Vec::new()
             }
         }
@@ -239,7 +243,7 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
     // Capture the JavaVM so the background-sync notification pump can call back
     // into Kotlin (this process has no ndk_context).
     crate::notify_display::store_java_vm(&mut env);
-    log::info!(
+    tracing::info!(
         "JNI backgroundSync invoked (timeout={}s, peer_addrs payload present={})",
         timeout_secs,
         !peer_addrs_json.is_null()
@@ -262,7 +266,7 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
         }
     };
 
-    log::info!(
+    tracing::info!(
         "background_sync starting: db={url}, {} bootstrap peer(s) from FCM payload",
         peer_addrs.len()
     );
@@ -320,7 +324,7 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSyncTarget
         }
     };
 
-    log::info!(
+    tracing::info!(
         "JNI backgroundSyncTargeted invoked (timeout={}s, peer_addrs present={}, topic present={})",
         timeout_secs,
         !peer_addrs_json.is_null(),

@@ -72,7 +72,7 @@ async fn has_task(db: &WaveSyncDb, id: &str) -> bool {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multigroup_isolation() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let suffix = Uuid::new_v4().simple().to_string();
     let topic_alpha = format!("alpha-{suffix}");
     let topic_beta = format!("beta-{suffix}");
@@ -152,7 +152,7 @@ async fn test_multigroup_isolation() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multigroup_leave_and_rejoin() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let suffix = Uuid::new_v4().simple().to_string();
     let topic_alpha = format!("alpha-{suffix}");
     let topic_beta = format!("beta-{suffix}");
@@ -237,7 +237,7 @@ async fn test_multigroup_leave_and_rejoin() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multigroup_config_persistence() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let suffix = Uuid::new_v4().simple().to_string();
     let url = isolated_db_url("mg_cfg");
     let topic_alpha = format!("alpha-{suffix}");
@@ -294,7 +294,7 @@ async fn test_multigroup_config_persistence() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_multigroup_config_survives_rebuild() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let suffix = Uuid::new_v4().simple().to_string();
     let url = isolated_db_url("mg_rebuild");
     let topic_alpha = format!("alpha-{suffix}");
@@ -407,7 +407,7 @@ async fn table_exists(db: &WaveSyncDb, table: &str) -> bool {
 
 #[tokio::test]
 async fn test_scope_controls_table_registration() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let suffix = Uuid::new_v4().simple().to_string();
     let url = isolated_db_url("scope");
     let topic_house = format!("household-{suffix}");

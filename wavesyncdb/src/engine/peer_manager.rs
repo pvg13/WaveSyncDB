@@ -69,7 +69,7 @@ impl EngineRunner {
             )
         };
 
-        log::info!(
+        tracing::info!(
             "Requesting version vector sync from peer {peer_id} for topic {topic} (their last known version: {their_last_db_version})"
         );
 
@@ -140,7 +140,7 @@ impl EngineRunner {
                         }
                         continue;
                     }
-                    log::info!("Discovered peer {peer_id} at {multiaddr}");
+                    tracing::info!("Discovered peer {peer_id} at {multiaddr}");
                     // A peer announced on the LAN via mDNS is reachable directly;
                     // mark it so we suppress relay-circuit dials to it (prefer the
                     // closer, more reliable LAN path — and avoid a circuit during
@@ -164,7 +164,7 @@ impl EngineRunner {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(e) => {
-                                log::warn!("Failed to dial peer {peer_id}: {e}");
+                                tracing::warn!("Failed to dial peer {peer_id}: {e}");
                             }
                         }
                     }
@@ -216,7 +216,7 @@ impl EngineRunner {
             }
             mdns::Event::Expired(list) => {
                 for (peer_id, multiaddr) in list {
-                    log::debug!("Expired peer {peer_id} at {multiaddr}");
+                    tracing::debug!("Expired peer {peer_id} at {multiaddr}");
                     self.peers.remove(&peer_id);
                     // No longer seen on the LAN — drop the LAN-preference marker
                     // so the relay path becomes available again if needed.
@@ -267,23 +267,23 @@ impl EngineRunner {
         // Opportunistic GC. Cheap and only runs once per engine lifetime,
         // so we don't bother throttling it.
         if let Err(e) = crate::peer_addrs::gc(&db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
-            log::debug!("peer_addrs::gc failed: {e}");
+            tracing::debug!("peer_addrs::gc failed: {e}");
         }
 
         let cached = match crate::peer_addrs::load_recent(&db, MAX_AGE_SECS, MAX_FAIL_COUNT).await {
             Ok(v) => v,
             Err(e) => {
-                log::debug!("peer_addrs::load_recent failed: {e}");
+                tracing::debug!("peer_addrs::load_recent failed: {e}");
                 return;
             }
         };
 
         if cached.is_empty() {
-            log::debug!("peer_addrs cache empty — no cold-start pre-dials");
+            tracing::debug!("peer_addrs cache empty — no cold-start pre-dials");
             return;
         }
 
-        log::info!(
+        tracing::info!(
             "Pre-dialing {} cached peer address(es) from previous session",
             cached.len()
         );
@@ -301,7 +301,7 @@ impl EngineRunner {
             let addr: libp2p::Multiaddr = match entry.multiaddr.parse() {
                 Ok(a) => a,
                 Err(e) => {
-                    log::debug!(
+                    tracing::debug!(
                         "skipping un-parseable cached multiaddr {}: {e}",
                         entry.multiaddr
                     );
@@ -317,23 +317,23 @@ impl EngineRunner {
                         .peer_dial_attempts
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                Err(e) => log::debug!("cached pre-dial of {addr} failed: {e}"),
+                Err(e) => tracing::debug!("cached pre-dial of {addr} failed: {e}"),
             }
         }
     }
 
     pub(super) fn trigger_rediscovery(&mut self) {
         if !self.mdns_enabled {
-            log::debug!("mDNS rediscovery skipped: mDNS disabled at runtime");
+            tracing::debug!("mDNS rediscovery skipped: mDNS disabled at runtime");
             return;
         }
-        log::info!("Triggering mDNS rediscovery");
+        tracing::info!("Triggering mDNS rediscovery");
         match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
             Ok(new_mdns) => {
                 self.swarm.behaviour_mut().mdns =
                     libp2p::swarm::behaviour::toggle::Toggle::from(Some(new_mdns));
             }
-            Err(e) => log::warn!("mDNS unavailable during rediscovery: {e}"),
+            Err(e) => tracing::warn!("mDNS unavailable during rediscovery: {e}"),
         }
     }
 
@@ -355,16 +355,16 @@ impl EngineRunner {
         }
         self.mdns_enabled = enabled;
         if enabled {
-            log::info!("mDNS enabled at runtime — starting LAN announcements");
+            tracing::info!("mDNS enabled at runtime — starting LAN announcements");
             match mdns::tokio::Behaviour::new(self.config.mdns_config(), self.local_peer_id) {
                 Ok(new_mdns) => {
                     self.swarm.behaviour_mut().mdns =
                         libp2p::swarm::behaviour::toggle::Toggle::from(Some(new_mdns));
                 }
-                Err(e) => log::warn!("mDNS unavailable on enable: {e}"),
+                Err(e) => tracing::warn!("mDNS unavailable on enable: {e}"),
             }
         } else {
-            log::info!("mDNS disabled at runtime — stopping LAN announcements");
+            tracing::info!("mDNS disabled at runtime — stopping LAN announcements");
             self.swarm.behaviour_mut().mdns = libp2p::swarm::behaviour::toggle::Toggle::from(None);
         }
     }

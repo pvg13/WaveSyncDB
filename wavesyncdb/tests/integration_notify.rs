@@ -80,7 +80,7 @@ fn drain(rx: &mut tokio::sync::broadcast::Receiver<Notification>) -> Vec<Notific
 
 #[tokio::test]
 async fn test_remote_insert_notifies_local_does_not_and_update_is_silent() {
-    let _ = env_logger::try_init();
+    common::init_test_tracing();
     let topic = format!("test-notify-{}", Uuid::new_v4());
     let timeout = Duration::from_secs(20);
 

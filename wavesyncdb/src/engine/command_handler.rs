@@ -16,13 +16,13 @@ impl EngineRunner {
             EngineCommand::NetworkTransition => {
                 // Drain duplicate NetworkTransition commands
                 while let Ok(EngineCommand::NetworkTransition) = self.cmd_rx.try_recv() {}
-                log::info!("Network transition detected — force-disconnecting all peers");
+                tracing::info!("Network transition detected — force-disconnecting all peers");
                 // Network changed: old sockets are dead, force a clean reconnect.
                 self.handle_resume(true).await;
                 false
             }
             EngineCommand::RequestFullSync => {
-                log::info!("Full sync requested by user");
+                tracing::info!("Full sync requested by user");
                 // Reset peer versions to trigger full re-sync (every group)
                 for g in self.groups.values_mut() {
                     g.peer_db_versions.clear();
@@ -44,7 +44,7 @@ impl EngineRunner {
                 false
             }
             EngineCommand::RegisterPushToken { platform, token } => {
-                log::info!("Registering push token (platform: {platform})");
+                tracing::info!("Registering push token (platform: {platform})");
                 self.push_token = Some((platform, token));
                 // Token rotated — every topic must be re-registered with the
                 // new token, so clear the per-topic registration set and any
@@ -71,7 +71,7 @@ impl EngineRunner {
                 false
             }
             EngineCommand::Shutdown => {
-                log::info!("Engine shutdown requested");
+                tracing::info!("Engine shutdown requested");
                 true
             }
             EngineCommand::JoinGroup(init) => {
@@ -87,7 +87,7 @@ impl EngineRunner {
                     && !g.registry_is_ready
                 {
                     g.registry_is_ready = true;
-                    log::info!(
+                    tracing::info!(
                         "Group {effective_topic} schema registered — now eligible for \
                          connect-time sync initiation"
                     );
@@ -113,7 +113,7 @@ impl EngineRunner {
     fn handle_join_group(&mut self, init: GroupInit) {
         let effective_topic = init.effective_topic.clone();
         if self.groups.contains_key(&effective_topic) {
-            log::debug!("JoinGroup for already-joined topic {effective_topic}; ignoring");
+            tracing::debug!("JoinGroup for already-joined topic {effective_topic}; ignoring");
             return;
         }
 
@@ -158,7 +158,7 @@ impl EngineRunner {
             pending_pushes: std::collections::BTreeMap::new(),
         };
         self.groups.insert(effective_topic.clone(), group);
-        log::info!("Joined sync group (effective topic {effective_topic})");
+        tracing::info!("Joined sync group (effective topic {effective_topic})");
 
         // Register the new namespace + re-announce presence if the
         // rendezvous / relay infrastructure is already connected. Both helpers
@@ -191,11 +191,11 @@ impl EngineRunner {
     /// for the default group, or for a topic we don't serve, is ignored.
     fn handle_leave_group(&mut self, effective_topic: String) {
         if effective_topic == self.default_effective_topic {
-            log::warn!("Refusing to leave the default group {effective_topic}");
+            tracing::warn!("Refusing to leave the default group {effective_topic}");
             return;
         }
         if let Some(group) = self.groups.remove(&effective_topic) {
-            log::info!("Left sync group (effective topic {effective_topic})");
+            tracing::info!("Left sync group (effective topic {effective_topic})");
             // Stop the relay from waking this device for the left group's
             // topic. Skip if another remaining group shares the same topic name.
             if let RelayState::Connected { relay_peer_id, .. }
@@ -209,7 +209,7 @@ impl EngineRunner {
             }
             self.update_network_status();
         } else {
-            log::debug!("LeaveGroup for unknown topic {effective_topic}; ignoring");
+            tracing::debug!("LeaveGroup for unknown topic {effective_topic}; ignoring");
         }
     }
 
@@ -223,7 +223,7 @@ impl EngineRunner {
     ///   interface and are dead, so force-disconnect the relay and all peers to
     ///   re-establish on the new interface.
     pub(super) async fn handle_resume(&mut self, force_relay_reset: bool) {
-        log::info!("App resumed — triggering rediscovery and sync");
+        tracing::info!("App resumed — triggering rediscovery and sync");
 
         // Clear version maps so the next sync requests all changes since the
         // last *persisted* peer version, not stale in-memory values that may
@@ -265,7 +265,7 @@ impl EngineRunner {
             if let RelayState::Connected { relay_peer_id, .. }
             | RelayState::Listening { relay_peer_id } = self.relay_state
             {
-                log::info!(
+                tracing::info!(
                     "Network transition: disconnecting relay {relay_peer_id} for clean reconnection"
                 );
                 let _ = self.swarm.disconnect_peer_id(relay_peer_id);

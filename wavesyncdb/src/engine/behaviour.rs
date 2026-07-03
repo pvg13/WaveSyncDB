@@ -70,7 +70,7 @@ impl WaveSyncBehaviour {
             Some(cfg) => match mdns::tokio::Behaviour::new(cfg, peer_id) {
                 Ok(mdns) => Toggle::from(Some(mdns)),
                 Err(e) => {
-                    log::warn!("mDNS unavailable: {e}");
+                    tracing::warn!("mDNS unavailable: {e}");
                     Toggle::from(None)
                 }
             },

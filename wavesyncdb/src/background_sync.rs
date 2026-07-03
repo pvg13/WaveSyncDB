@@ -13,9 +13,9 @@
 //!
 //! let result = background_sync("sqlite:///data/data/com.app/app.db?mode=rwc", Duration::from_secs(30)).await?;
 //! match result {
-//!     BackgroundSyncResult::Synced { peers_synced } => log::info!("Synced with {peers_synced} peers"),
-//!     BackgroundSyncResult::TimedOut { peers_synced } => log::warn!("Timeout, synced with {peers_synced}"),
-//!     BackgroundSyncResult::NoPeers => log::warn!("No peers found"),
+//!     BackgroundSyncResult::Synced { peers_synced } => tracing::info!("Synced with {peers_synced} peers"),
+//!     BackgroundSyncResult::TimedOut { peers_synced } => tracing::warn!("Timeout, synced with {peers_synced}"),
+//!     BackgroundSyncResult::NoPeers => tracing::warn!("No peers found"),
 //! }
 //! ```
 
@@ -133,7 +133,7 @@ pub async fn background_sync_with_peers_for_topic(
     // Each is at info so they're visible without a debug RUST_LOG override.
     let t_start = std::time::Instant::now();
     let log_stage = |stage: &str| {
-        log::info!(
+        tracing::info!(
             "bg_sync stage={stage} elapsed_ms={}",
             t_start.elapsed().as_millis()
         );
@@ -239,7 +239,7 @@ pub async fn background_sync_with_peers_for_topic(
     let default_effective = derive_effective_topic(&config.topic, config.passphrase.as_deref());
     let selected = groups_to_rejoin(target_effective_topic, &default_effective, &extra_groups);
     if let Some(target) = target_effective_topic {
-        log::info!(
+        tracing::info!(
             "bg_sync: targeted wake for topic {target} → rejoining {} of {} extra group(s)",
             selected.len(),
             extra_groups.len()
@@ -256,7 +256,7 @@ pub async fn background_sync_with_peers_for_topic(
             Ok(group_db) => {
                 if let Some(ref cn) = crate_name {
                     if let Err(e) = group_db.get_schema_registry(cn).sync().await {
-                        log::warn!(
+                        tracing::warn!(
                             "bg_sync: schema sync failed for group '{}': {e}",
                             group.user_topic
                         );
@@ -267,7 +267,7 @@ pub async fn background_sync_with_peers_for_topic(
                 _group_handles.push(group_db);
             }
             Err(e) => {
-                log::warn!(
+                tracing::warn!(
                     "bg_sync: failed to rejoin group '{}': {e}",
                     group.user_topic
                 );
@@ -414,7 +414,7 @@ pub async fn background_sync_with_peers_for_topic(
     } else {
         BackgroundSyncResult::NoPeers
     };
-    log::info!(
+    tracing::info!(
         "bg_sync stage=done elapsed_ms={} result={result:?}",
         t_start.elapsed().as_millis()
     );

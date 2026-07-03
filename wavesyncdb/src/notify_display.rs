@@ -51,7 +51,7 @@ mod imp {
                 Ok(vm) => {
                     let _ = JAVA_VM.set(vm);
                 }
-                Err(e) => log::warn!("notify_display: could not capture JavaVM: {e}"),
+                Err(e) => tracing::warn!("notify_display: could not capture JavaVM: {e}"),
             }
         }
         // Cache the class from this (JVM-created, app-classloader) thread.
@@ -64,7 +64,7 @@ mod imp {
                     let _ = HELPER_CLASS.set(g);
                 }
                 Err(e) => {
-                    log::warn!("notify_display: could not cache NotificationHelper class: {e}");
+                    tracing::warn!("notify_display: could not cache NotificationHelper class: {e}");
                     let _ = env.exception_clear();
                 }
             }
@@ -75,7 +75,7 @@ mod imp {
         use jni::objects::{JClass, JValue};
 
         let Some(vm) = JAVA_VM.get() else {
-            log::warn!(
+            tracing::warn!(
                 "notify_display: no JavaVM captured — background notification skipped \
                  (background sync not entered via JNI?)"
             );
@@ -84,7 +84,7 @@ mod imp {
         let mut env = match vm.attach_current_thread() {
             Ok(env) => env,
             Err(e) => {
-                log::warn!("notify_display: JNI attach failed: {e}");
+                tracing::warn!("notify_display: JNI attach failed: {e}");
                 return;
             }
         };
@@ -93,7 +93,7 @@ mod imp {
             env.new_string(body),
             env.new_string(group),
         ) else {
-            log::warn!("notify_display: failed to build JNI strings");
+            tracing::warn!("notify_display: failed to build JNI strings");
             return;
         };
         let args = [JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)];
@@ -118,9 +118,9 @@ mod imp {
             ),
         };
         match result {
-            Ok(_) => log::debug!("notify_display: NotificationHelper.showFromNative ok"),
+            Ok(_) => tracing::debug!("notify_display: NotificationHelper.showFromNative ok"),
             Err(e) => {
-                log::warn!("notify_display: showFromNative failed: {e}");
+                tracing::warn!("notify_display: showFromNative failed: {e}");
                 let _ = env.exception_clear();
             }
         }
@@ -146,7 +146,7 @@ mod imp {
         unsafe {
             let sym = dlsym(RTLD_DEFAULT, c"wavesync_show_notification".as_ptr());
             if sym.is_null() {
-                log::warn!("notify_display: wavesync_show_notification not found");
+                tracing::warn!("notify_display: wavesync_show_notification not found");
                 return;
             }
             let show: ShowFn = std::mem::transmute(sym);
