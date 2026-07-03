@@ -268,6 +268,8 @@ const PEER_IMAGE: &str = "wavesync-test-peer:e2e";
 
 /// libp2p QUIC port the relay listens on inside its container.
 const RELAY_QUIC_PORT: u16 = 4001;
+/// Prometheus metrics port the relay exposes inside its container.
+const RELAY_METRICS_PORT: u16 = 9464;
 /// HTTP port the test-peer listens on inside its container.
 const PEER_HTTP_PORT: u16 = 8080;
 
@@ -572,10 +574,12 @@ impl WaveSyncE2eHarness {
             RELAY_IMAGE.split(':').nth(1).unwrap(),
         )
         .with_exposed_port(RELAY_QUIC_PORT.udp())
+        .with_exposed_port(RELAY_METRICS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Listening on"))
         .with_env_var("IDENTITY_KEYPAIR", &relay_identity_b64)
         .with_env_var("EXTERNAL_ADDRESS", &relay_external)
         .with_env_var("RUST_LOG", "info")
+        .with_env_var("METRICS_ADDR", "0.0.0.0:9464")
         .with_network(&net_name)
         .with_container_name(&relay_host)
         .start()
@@ -852,6 +856,16 @@ impl RunningHarness {
             .position(|p| p.name == name)
             .unwrap_or_else(|| panic!("no peer named {name} in harness"));
         &mut self.peers[idx]
+    }
+
+    /// Get the relay's Prometheus metrics endpoint URL.
+    pub async fn relay_metrics_url(&self) -> Result<String> {
+        let host_port = self
+            .relay
+            .get_host_port_ipv4(RELAY_METRICS_PORT)
+            .await
+            .context("resolve relay metrics host port")?;
+        Ok(format!("http://127.0.0.1:{host_port}"))
     }
 }
 

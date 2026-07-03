@@ -50,4 +50,18 @@ async fn two_peer_wan_sync_via_relay() {
     let bob_view = bob.get_task("task-1").await.unwrap().unwrap();
     assert_eq!(alice_view, bob_view, "peers diverged");
     assert!(alice_view.completed);
+
+    // Relay observability smoke: the endpoint answers and core families exist.
+    let metrics_url = harness.relay_metrics_url().await.expect("metrics url");
+    let body = reqwest::get(metrics_url + "/metrics")
+        .await
+        .expect("metrics reachable")
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("relay_connections_total"));
+    assert!(
+        body.contains("libp2p_bandwidth"),
+        "bandwidth families registered"
+    );
 }

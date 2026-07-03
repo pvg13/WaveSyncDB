@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- **Relay Prometheus `/metrics` endpoint.** The relay exposes an OpenMetrics HTTP endpoint
+  on `METRICS_ADDR` (default loopback `127.0.0.1:9464`, configurable to `0.0.0.0:9464` for
+  remote scrape). Metrics include: circuit reservation time per topic (billing meter for
+  relay-mediated sync sessions; per-circuit bytes unavailable from libp2p — global
+  per-transport bytes exposed instead), reservation / rendezvous / push notification counters,
+  and libp2p bandwidth families (aggregate + per-protocol/direction).
 - **Tombstone retention (#41).** Deleted rows' tombstones are now aged out
   after a retention window (default 7 days;
   `WaveSyncDbBuilder::with_tombstone_retention` / `without_tombstone_gc`),

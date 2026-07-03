@@ -62,6 +62,11 @@ services:
         published: ${RELAY_UDP_PORT:-4001}
         protocol: udp
         mode: host
+      # Uncomment to expose Prometheus metrics (expose to your Prometheus network only)
+      # - target: 9464
+      #   published: 9464
+      #   protocol: tcp
+      #   mode: host
     volumes:
       # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data
@@ -112,6 +117,10 @@ services:
       # MAX_CIRCUIT_DURATION_SECS: 3600
       # MAX_CIRCUIT_BYTES: 0
       # IDLE_CONNECTION_TIMEOUT_SECS: 300
+
+      # ---------- Observability ----------
+      # Prometheus metrics listener (default loopback; expose to your Prometheus network only)
+      METRICS_ADDR: "0.0.0.0:9464"
 
       # ---------- Logging ----------
       RUST_LOG: "${RUST_LOG:-info}"
