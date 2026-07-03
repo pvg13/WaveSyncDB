@@ -22,7 +22,9 @@ pub fn Page() -> Element {
 
         ul {
             li {
-                "A GroupKey --- 32-byte BLAKE3 key used for HMAC signing and verification"
+                "A GroupKey --- 32 bytes derived with Argon2id (memory-hard, salted with "
+                "the user topic), used for HMAC signing and verification. The slow "
+                "derivation prices out offline dictionary attacks against the passphrase."
             }
             li {
                 "A derived topic --- BLAKE3 hash of (user_topic + group_key), used as "
@@ -49,7 +51,9 @@ pub fn Page() -> Element {
             li {
                 "The derived topic does not leak the passphrase. The relay server sees "
                 "the topic string (for rendezvous routing) but cannot reverse it to "
-                "recover the passphrase."
+                "recover the passphrase --- and because the key behind it is derived "
+                "with Argon2id (~100 ms and 19 MiB per guess), even a dictionary attack "
+                "against the topic hash is economically impractical."
             }
         }
 
@@ -92,8 +96,8 @@ pub fn Page() -> Element {
         H2 { id: "peer-rejection", text: "Peer Rejection" }
 
         p {
-            "When a peer sends a message with a mismatched topic or invalid HMAC, it is "
-            "added to the rejected_peers set permanently for the engine's lifetime. "
+            "When a peer fails HMAC verification for a topic this node holds, it is "
+            "rejected for that group with exponential backoff (30s doubling up to 1h). "
             "This is intentional:"
         }
 
@@ -101,12 +105,15 @@ pub fn Page() -> Element {
             li {
                 "mDNS rediscovers peers every few seconds. A per-connection rejection "
                 "would cause rejected peers to be retried on every mDNS cycle, creating "
-                "a storm of failed authentication attempts."
+                "a storm of failed authentication attempts. The growing backoff decays "
+                "re-evaluation to at most once per hour."
             }
             li {
-                "The permanent rejection prevents cross-application interference on "
-                "shared networks (e.g., two apps running on the same WiFi with different "
-                "passphrases)."
+                "Rejection is not permanent: a later successful verification re-admits "
+                "the peer, so a transiently misconfigured device recovers without an "
+                "engine restart. Messages for topics this node does not hold at all are "
+                "silently ignored, never rejected --- the sender may simply belong to a "
+                "different group on the same network."
             }
         }
 
@@ -186,17 +193,17 @@ pub fn Page() -> Element {
     }
 }
 
-const CODE_DERIVATION: &str = r##"<span class="cmt">// Step 1: Passphrase → GroupKey (32 bytes)</span>
-<span class="kw">let</span> key = blake3::<span class="fn">derive_key</span>(
-    <span class="str">"wavesyncdb-group-key-v1"</span>,
-    passphrase.<span class="fn">as_bytes</span>(),
-);
+const CODE_DERIVATION: &str = r##"<span class="cmt">// Step 1: Passphrase → GroupKey (32 bytes), Argon2id, salt = user topic.</span>
+<span class="cmt">// Memory-hard (19 MiB, 2 passes): ~100 ms per guess, once at startup.</span>
+<span class="kw">let</span> salt = &amp;blake3::<span class="fn">hash</span>(user_topic.<span class="fn">as_bytes</span>()).<span class="fn">as_bytes</span>()[..<span class="num">16</span>];
+<span class="kw">let</span> <span class="kw">mut</span> key = [<span class="num">0u8</span>; <span class="num">32</span>];
+argon2id.<span class="fn">hash_password_into</span>(passphrase.<span class="fn">as_bytes</span>(), salt, &amp;<span class="kw">mut</span> key);
 
 <span class="cmt">// Step 2: (user_topic + GroupKey) → derived topic string</span>
 <span class="kw">let</span> <span class="kw">mut</span> hasher = blake3::Hasher::<span class="fn">new_derive_key</span>(<span class="str">"wavesyncdb-topic-v1"</span>);
 hasher.<span class="fn">update</span>(user_topic.<span class="fn">as_bytes</span>());
 hasher.<span class="fn">update</span>(&amp;group_key);
-<span class="kw">let</span> topic = <span class="fn">format!</span>(<span class="str">"wavesync-{}"</span>, hasher.<span class="fn">finalize</span>().<span class="fn">to_hex</span>());
+<span class="kw">let</span> topic = <span class="fn">format!</span>(<span class="str">"wavesync2-{}"</span>, hasher.<span class="fn">finalize</span>().<span class="fn">to_hex</span>());
 
 <span class="cmt">// The derived topic is used as:</span>
 <span class="cmt">// - The libp2p pub/sub topic</span>
@@ -205,10 +212,10 @@ hasher.<span class="fn">update</span>(&amp;group_key);
 
 const CODE_TOPIC: &str = r##"<span class="cmt">// Same user topic, different passphrases → different derived topics</span>
 GroupKey(<span class="str">"password-A"</span>).<span class="fn">derive_topic</span>(<span class="str">"my-app"</span>)
-  → <span class="str">"wavesync-a1b2c3d4e5f6..."</span>
+  → <span class="str">"wavesync2-a1b2c3d4e5f6..."</span>
 
 GroupKey(<span class="str">"password-B"</span>).<span class="fn">derive_topic</span>(<span class="str">"my-app"</span>)
-  → <span class="str">"wavesync-f7e8d9c0b1a2..."</span>
+  → <span class="str">"wavesync2-f7e8d9c0b1a2..."</span>
 
 <span class="cmt">// These two groups are completely isolated:</span>
 <span class="cmt">// - Different topics → peers never discover each other via rendezvous</span>

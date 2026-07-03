@@ -427,7 +427,7 @@ pub async fn background_sync_with_peers_for_topic(
 /// `engine::run_engine`'s `effective_topic` computation.
 fn derive_effective_topic(user_topic: &str, passphrase: Option<&str>) -> String {
     match passphrase {
-        Some(p) => crate::auth::GroupKey::from_passphrase(p).derive_topic(user_topic),
+        Some(p) => crate::auth::GroupKey::from_passphrase(p, user_topic).derive_topic(user_topic),
         None => user_topic.to_string(),
     }
 }
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(derive_effective_topic("plain", None), "plain");
         // With passphrase → derived hash, stable and != the raw topic.
         let eff = derive_effective_topic("plain", Some("secret"));
-        assert!(eff.starts_with("wavesync-"));
+        assert!(eff.starts_with("wavesync2-"));
         assert_ne!(eff, "plain");
         // Same inputs → same output; different passphrase → different topic.
         assert_eq!(eff, derive_effective_topic("plain", Some("secret")));

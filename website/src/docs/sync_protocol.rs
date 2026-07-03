@@ -303,7 +303,7 @@ const CODE_PUSH: &str = r##"<span class="cmt">// SyncRequest::Push — sent for 
         }
       ]
     },
-    <span class="str">"topic"</span>: <span class="str">"wavesync-a1b2c3..."</span>,
+    <span class="str">"topic"</span>: <span class="str">"wavesync2-a1b2c3..."</span>,
     <span class="str">"hmac"</span>: [<span class="num">171</span>, <span class="num">205</span>, ...]
   }
 }"##;
@@ -313,7 +313,7 @@ A → B: SyncRequest::VersionVector {
     my_db_version: <span class="num">42</span>,         <span class="cmt">// A's current version</span>
     your_last_db_version: <span class="num">37</span>,  <span class="cmt">// Last version A got from B</span>
     site_id: [<span class="num">1</span>,<span class="num">1</span>,<span class="num">1</span>,...],
-    topic: <span class="str">"wavesync-a1b2c3..."</span>,
+    topic: <span class="str">"wavesync2-a1b2c3..."</span>,
     hmac: Some([...])
 }
 
@@ -323,7 +323,7 @@ B → A: SyncResponse::ChangesetResponse {
     my_db_version: <span class="num">50</span>,         <span class="cmt">// B's current version</span>
     your_last_db_version: <span class="num">42</span>,  <span class="cmt">// Echoed back so A can update</span>
     site_id: [<span class="num">2</span>,<span class="num">2</span>,<span class="num">2</span>,...],
-    topic: <span class="str">"wavesync-a1b2c3..."</span>,
+    topic: <span class="str">"wavesync2-a1b2c3..."</span>,
     hmac: Some([...])
 }
 

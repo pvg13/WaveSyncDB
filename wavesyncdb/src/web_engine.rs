@@ -756,7 +756,7 @@ impl WebSyncClient {
         // completes.
         cached_peer_addrs: Vec<crate::web_store::CachedPeerAddr>,
     ) -> Result<Self, WebSyncError> {
-        let group_key = passphrase.map(GroupKey::from_passphrase);
+        let group_key = passphrase.map(|p| GroupKey::from_passphrase(p, user_topic));
         let effective_topic = group_key
             .as_ref()
             .map(|gk| gk.derive_topic(user_topic))
@@ -1109,7 +1109,7 @@ impl WebSyncClient {
             .await
             .map_err(|e| WebSyncError::Store(e.to_string()))?;
 
-        let group_key = passphrase.map(GroupKey::from_passphrase);
+        let group_key = passphrase.map(|p| GroupKey::from_passphrase(p, user_topic));
         let effective_topic = group_key
             .as_ref()
             .map(|gk| gk.derive_topic(user_topic))

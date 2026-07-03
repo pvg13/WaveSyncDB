@@ -1607,7 +1607,12 @@ impl WaveSyncDbBuilder {
     }
 
     pub fn with_passphrase(mut self, passphrase: &str) -> Self {
-        self.group_key = Some(crate::auth::GroupKey::from_passphrase(passphrase));
+        // Argon2id derivation, salted with the user topic (fixed at
+        // `WaveSyncDbBuilder::new`) — intentionally slow, runs once here.
+        self.group_key = Some(crate::auth::GroupKey::from_passphrase(
+            passphrase,
+            &self.topic,
+        ));
         self.passphrase = Some(passphrase.to_string());
         self
     }
@@ -2044,11 +2049,11 @@ impl WaveSyncNode {
             return Ok(WaveSyncDb { inner });
         }
 
-        let group_key = GroupKey::from_passphrase(passphrase);
+        let group_key = GroupKey::from_passphrase(passphrase, user_topic);
         let effective_topic = group_key.derive_topic(user_topic);
 
         // Per-group DB file derived from the node's base URL. The effective
-        // topic is already `wavesync-<hex>`, so it is filesystem-safe.
+        // topic is already `wavesync2-<hex>`, so it is filesystem-safe.
         let group_url = derive_group_database_url(&self.inner.base_database_url, &effective_topic);
 
         let mut opts = ConnectOptions::new(&group_url);

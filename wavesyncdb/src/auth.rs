@@ -6,24 +6,24 @@
 //! 2. **HMAC on all messages** — request-response messages carry a BLAKE3-keyed MAC.
 //!    Peers without the PSK cannot forge or inject valid messages.
 //!
-//! ## Key derivation and the v2 migration
+//! ## Key derivation
 //!
 //! The group key is the entire security boundary: anyone who recovers it can forge
-//! valid MACs and inject arbitrary writes. The v1 scheme derived it with a *fast*,
-//! unsalted function (`blake3::derive_key`), so an observer who saw a group's topic
-//! hash (notably the relay, which sees every topic in cleartext) could mount an
-//! offline dictionary attack — two hashes per passphrase guess, no salt, so one
-//! precomputed table covered every deployment sharing a user topic.
+//! valid MACs and inject arbitrary writes. It is derived from the passphrase with
+//! **Argon2id**, salted with the user topic. The memory-hard cost (~19 MiB, 2
+//! passes) prices each offline guess at ~100 ms of CPU plus real RAM instead of
+//! nanoseconds — an observer who sees a group's derived topic in cleartext (notably
+//! the relay, which sees every topic) can no longer run a cheap dictionary attack
+//! against it, and GPUs gain little because of the memory requirement. The salt
+//! keeps derivation deterministic across peers (no coordination needed) while
+//! binding the key to the deployment: the same passphrase under a different user
+//! topic yields an unrelated key, so no precomputed table transfers between
+//! deployments.
 //!
-//! The v2 scheme derives the key with **Argon2id**, salted with the user topic so it
-//! stays deterministic across peers (no coordination needed) while making each guess
-//! ~six orders of magnitude more expensive and defeating cross-deployment precomputation.
-//!
-//! Because the derived key — and therefore the derived topic — differs between v1 and
-//! v2, a node cannot simply switch: it would stop syncing with un-upgraded peers. During
-//! the transition window a node holds **both** keys, listens on **both** topics, verifies
-//! an inbound MAC against **either** key, and signs an outbound message with the key that
-//! matches the topic it is sent on. A later release drops the v1 rung.
+//! Every peer of a passphrase group must run the same derivation — there is no
+//! multi-version negotiation. The derived-topic prefix (`wavesync2-`) namespaces
+//! this scheme's topics so any peer running an older derivation lands on a
+//! different topic string and is silently ignored (never rejected).
 //!
 //! ## Trust model — known limitations (by design)
 //!
@@ -47,11 +47,12 @@
 //!   group's derived topic in cleartext and can enumerate the peers announcing on it.
 //!   Topic isolation hides message *content* and blocks *injection* (no key ⇒ no valid
 //!   MAC), but it does not hide *who* is in a group from infrastructure that knows the
-//!   topic string.
+//!   topic string. What the Argon2id derivation adds: knowing the topic string no
+//!   longer lets that infrastructure cheaply recover the passphrase behind it.
 
 use subtle::ConstantTimeEq;
 
-/// Argon2id cost parameters for v2 group-key derivation.
+/// Argon2id cost parameters for group-key derivation.
 ///
 /// Derivation happens rarely (engine build / config load), so these can be well
 /// above interactive-login budgets. Values meet the OWASP Argon2id minimum
@@ -61,48 +62,24 @@ const ARGON2_M_COST_KIB: u32 = 19_456;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;
 
-/// Which key-derivation scheme produced a [`GroupKey`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KdfVersion {
-    /// Legacy fast, unsalted `blake3::derive_key`. Retained for interop with
-    /// un-upgraded peers during the migration window; do not use for new material.
-    V1Blake3,
-    /// Salted Argon2id over `(passphrase, salt = user_topic)`.
-    V2Argon2id,
-}
-
-/// A single group authentication key plus the scheme that derived it.
+/// A group authentication key.
 ///
-/// All peers sharing the same passphrase (and, for v2, the same user topic) derive
-/// the same `GroupKey`, enabling them to join the same sync topic and verify each
-/// other's messages. Prefer [`GroupKeySet`] at call sites that must interoperate
-/// across the v1→v2 migration; a bare `GroupKey` signs and verifies with one scheme.
+/// All peers sharing the same `(passphrase, user_topic)` pair derive the same
+/// `GroupKey`, enabling them to join the same sync topic and verify each other's
+/// messages.
 #[derive(Clone)]
 pub struct GroupKey {
     key: [u8; 32],
-    version: KdfVersion,
 }
 
 impl GroupKey {
-    /// Derive a **v1** group key from a passphrase using BLAKE3 key derivation.
-    ///
-    /// Legacy scheme — fast and unsalted. Retained only for migration interop; new
-    /// deployments should rely on the v2 key carried by [`GroupKeySet`].
-    pub fn from_passphrase(passphrase: &str) -> Self {
-        let key = blake3::derive_key("wavesyncdb-group-key-v1", passphrase.as_bytes());
-        Self {
-            key,
-            version: KdfVersion::V1Blake3,
-        }
-    }
-
-    /// Derive a **v2** group key with Argon2id over `(passphrase, salt = user_topic)`.
+    /// Derive a group key with Argon2id over `(passphrase, salt = user_topic)`.
     ///
     /// The salt is the BLAKE3 hash of the user topic, giving a deterministic 16-byte
     /// salt every peer computes identically while still binding the key to the
     /// deployment (no cross-deployment rainbow tables). Derivation is intentionally
-    /// slow; call it once and cache the result.
-    pub fn from_passphrase_v2(passphrase: &str, user_topic: &str) -> Self {
+    /// slow (~100 ms native, seconds on wasm); call it once and cache the result.
+    pub fn from_passphrase(passphrase: &str, user_topic: &str) -> Self {
         use argon2::{Algorithm, Argon2, Params, Version};
 
         // Deterministic per-deployment salt. Argon2 requires >= 8 bytes; use 16.
@@ -117,34 +94,24 @@ impl GroupKey {
         argon2
             .hash_password_into(passphrase.as_bytes(), salt, &mut key)
             .expect("Argon2id derivation with static params cannot fail");
-        Self {
-            key,
-            version: KdfVersion::V2Argon2id,
-        }
-    }
-
-    /// The derivation scheme behind this key.
-    pub fn version(&self) -> KdfVersion {
-        self.version
+        Self { key }
     }
 
     /// Derive a sync topic name from the user topic and this group key.
     ///
-    /// Different passphrases (and, for v2, different user topics) produce different
-    /// topic names, providing topic-level isolation so peers in different groups
-    /// never see each other's messages. The scheme is folded into the topic prefix
-    /// (`wavesync-` for v1, `wavesync2-` for v2) so the two never collide and a peer
-    /// can tell which key a topic expects.
+    /// Different passphrases and different user topics produce different topic
+    /// names, providing topic-level isolation so peers in different groups never
+    /// see each other's messages. The `wavesync2-` prefix namespaces this
+    /// derivation scheme: a peer running an older scheme derives a different
+    /// prefix and lands in the silent-ignore path instead of colliding on a
+    /// same-name topic with mismatched keys (which would trigger HMAC-failure
+    /// rejection and backoff churn).
     pub fn derive_topic(&self, user_topic: &str) -> String {
         let mut hasher = blake3::Hasher::new_derive_key("wavesyncdb-topic-v1");
         hasher.update(user_topic.as_bytes());
         hasher.update(&self.key);
         let hash = hasher.finalize();
-        let prefix = match self.version {
-            KdfVersion::V1Blake3 => "wavesync-",
-            KdfVersion::V2Argon2id => "wavesync2-",
-        };
-        format!("{}{}", prefix, hash.to_hex())
+        format!("wavesync2-{}", hash.to_hex())
     }
 
     /// Derive a rendezvous namespace from the effective topic name.
@@ -173,88 +140,7 @@ impl GroupKey {
 
 impl std::fmt::Debug for GroupKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GroupKey")
-            .field("version", &self.version)
-            .finish_non_exhaustive()
-    }
-}
-
-/// The set of group keys a node holds for one `(passphrase, user_topic)` pair.
-///
-/// During the v1→v2 migration a node carries the v2 (primary) key and, unless
-/// migration is disabled, the v1 (legacy) key as well. It listens on both derived
-/// topics, verifies an inbound MAC against whichever key matches the message's
-/// topic, and signs an outbound message with the key for the topic it targets.
-/// New material is always signed and published under v2; v1 exists only so
-/// un-upgraded peers keep syncing until the window closes.
-#[derive(Clone, Debug)]
-pub struct GroupKeySet {
-    primary: GroupKey,
-    legacy: Option<GroupKey>,
-    user_topic: String,
-}
-
-impl GroupKeySet {
-    /// Build the migration key set for a passphrase and user topic: v2 primary plus
-    /// the v1 legacy key for transition interop.
-    pub fn new(passphrase: &str, user_topic: &str) -> Self {
-        Self {
-            primary: GroupKey::from_passphrase_v2(passphrase, user_topic),
-            legacy: Some(GroupKey::from_passphrase(passphrase)),
-            user_topic: user_topic.to_string(),
-        }
-    }
-
-    /// Build a v2-only key set (no legacy interop). Use once the migration window
-    /// has closed to stop announcing and honoring the weak v1 topic.
-    pub fn new_v2_only(passphrase: &str, user_topic: &str) -> Self {
-        Self {
-            primary: GroupKey::from_passphrase_v2(passphrase, user_topic),
-            legacy: None,
-            user_topic: user_topic.to_string(),
-        }
-    }
-
-    /// The primary (v2) key — used to sign all newly published messages.
-    pub fn primary(&self) -> &GroupKey {
-        &self.primary
-    }
-
-    /// The primary (v2) topic this node publishes under.
-    pub fn primary_topic(&self) -> String {
-        self.primary.derive_topic(&self.user_topic)
-    }
-
-    /// Every topic this node accepts messages on (primary first, then legacy).
-    /// The engine subscribes to and gates inbound messages against all of these.
-    pub fn all_topics(&self) -> Vec<String> {
-        let mut topics = vec![self.primary.derive_topic(&self.user_topic)];
-        if let Some(legacy) = &self.legacy {
-            topics.push(legacy.derive_topic(&self.user_topic));
-        }
-        topics
-    }
-
-    /// Return the key that signs/verifies messages for `topic`, if this set owns it.
-    pub fn key_for_topic(&self, topic: &str) -> Option<&GroupKey> {
-        if topic == self.primary.derive_topic(&self.user_topic) {
-            return Some(&self.primary);
-        }
-        if let Some(legacy) = &self.legacy
-            && topic == legacy.derive_topic(&self.user_topic)
-        {
-            return Some(legacy);
-        }
-        None
-    }
-
-    /// Verify a MAC against whichever held key matches `topic`. Messages on an
-    /// unknown topic are not ours to verify and return `false`.
-    pub fn verify_for_topic(&self, topic: &str, data: &[u8], tag: &[u8; 32]) -> bool {
-        match self.key_for_topic(topic) {
-            Some(key) => key.verify(data, tag),
-            None => false,
-        }
+        f.debug_struct("GroupKey").finish_non_exhaustive()
     }
 }
 
@@ -263,125 +149,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deterministic_derivation() {
-        let k1 = GroupKey::from_passphrase("my-secret");
-        let k2 = GroupKey::from_passphrase("my-secret");
-        assert_eq!(k1.key, k2.key);
+    fn test_deterministic_and_salted() {
+        // Same (passphrase, user_topic) → same key, across independent derivations.
+        let a = GroupKey::from_passphrase("my-secret", "my-app");
+        let b = GroupKey::from_passphrase("my-secret", "my-app");
+        assert_eq!(a.key, b.key);
+
+        // Salt = user_topic: the same passphrase under a different user topic yields a
+        // different key, defeating cross-deployment precomputation.
+        let c = GroupKey::from_passphrase("my-secret", "other-app");
+        assert_ne!(a.key, c.key);
     }
 
     #[test]
     fn test_different_passphrases_different_keys() {
-        let k1 = GroupKey::from_passphrase("alpha");
-        let k2 = GroupKey::from_passphrase("beta");
+        let k1 = GroupKey::from_passphrase("alpha", "app");
+        let k2 = GroupKey::from_passphrase("beta", "app");
         assert_ne!(k1.key, k2.key);
     }
 
     #[test]
-    fn test_v2_deterministic_and_salted() {
-        // Same (passphrase, user_topic) → same key, across independent derivations.
-        let a = GroupKey::from_passphrase_v2("my-secret", "my-app");
-        let b = GroupKey::from_passphrase_v2("my-secret", "my-app");
-        assert_eq!(a.key, b.key);
-        assert_eq!(a.version(), KdfVersion::V2Argon2id);
-
-        // Salt = user_topic: the same passphrase under a different user topic yields a
-        // different key, defeating cross-deployment precomputation.
-        let c = GroupKey::from_passphrase_v2("my-secret", "other-app");
-        assert_ne!(a.key, c.key);
-
-        // v2 differs from v1 for the same passphrase (distinct scheme → distinct topic).
-        let v1 = GroupKey::from_passphrase("my-secret");
-        assert_ne!(a.key, v1.key);
-    }
-
-    #[test]
-    fn test_topic_prefixes_distinguish_schemes() {
-        let v1 = GroupKey::from_passphrase("pw");
-        let v2 = GroupKey::from_passphrase_v2("pw", "app");
-        assert!(v1.derive_topic("app").starts_with("wavesync-"));
-        assert!(v2.derive_topic("app").starts_with("wavesync2-"));
-        assert_ne!(v1.derive_topic("app"), v2.derive_topic("app"));
-    }
-
-    #[test]
-    fn test_key_set_dual_topic_and_verify() {
-        let set = GroupKeySet::new("pw", "app");
-        let topics = set.all_topics();
-        assert_eq!(topics.len(), 2, "migration set holds primary + legacy");
-        assert_eq!(topics[0], set.primary_topic());
-        assert!(topics[0].starts_with("wavesync2-"));
-        assert!(topics[1].starts_with("wavesync-"));
-
-        // A message signed under either topic's key verifies via the set.
-        let data = b"changeset";
-        let v2_topic = &topics[0];
-        let v1_topic = &topics[1];
-        let v2_tag = set.key_for_topic(v2_topic).unwrap().mac(data);
-        let v1_tag = set.key_for_topic(v1_topic).unwrap().mac(data);
-        assert!(set.verify_for_topic(v2_topic, data, &v2_tag));
-        assert!(set.verify_for_topic(v1_topic, data, &v1_tag));
-        // Cross-topic tag must not verify.
-        assert!(!set.verify_for_topic(v2_topic, data, &v1_tag));
-        // Unknown topic is not ours.
-        assert!(!set.verify_for_topic("wavesync-deadbeef", data, &v2_tag));
-    }
-
-    #[test]
-    fn test_key_set_v2_only_drops_legacy() {
-        let set = GroupKeySet::new_v2_only("pw", "app");
-        assert_eq!(set.all_topics().len(), 1);
-        assert!(set.primary_topic().starts_with("wavesync2-"));
-    }
-
-    #[test]
-    fn test_v2_peers_agree_on_topic() {
-        // Two independent nodes with the same passphrase+user_topic land on the same
-        // primary topic — the property the whole migration relies on.
-        let a = GroupKeySet::new("shared-pw", "roommates");
-        let b = GroupKeySet::new("shared-pw", "roommates");
-        assert_eq!(a.primary_topic(), b.primary_topic());
-        assert_eq!(a.all_topics(), b.all_topics());
+    fn test_peers_agree_on_topic() {
+        // Two independent nodes with the same passphrase+user_topic land on the
+        // same derived topic — the property group formation relies on.
+        let a = GroupKey::from_passphrase("shared-pw", "roommates");
+        let b = GroupKey::from_passphrase("shared-pw", "roommates");
+        assert_eq!(a.derive_topic("roommates"), b.derive_topic("roommates"));
     }
 
     #[test]
     fn test_different_passphrases_different_topics() {
-        let k1 = GroupKey::from_passphrase("alpha");
-        let k2 = GroupKey::from_passphrase("beta");
+        let k1 = GroupKey::from_passphrase("alpha", "my-app");
+        let k2 = GroupKey::from_passphrase("beta", "my-app");
         let t1 = k1.derive_topic("my-app");
         let t2 = k2.derive_topic("my-app");
         assert_ne!(t1, t2);
-        assert!(t1.starts_with("wavesync-"));
-        assert!(t2.starts_with("wavesync-"));
+        assert!(t1.starts_with("wavesync2-"));
+        assert!(t2.starts_with("wavesync2-"));
     }
 
     #[test]
     fn test_topic_derivation_deterministic() {
-        let k = GroupKey::from_passphrase("test");
+        let k = GroupKey::from_passphrase("test", "app");
         let t1 = k.derive_topic("app");
         let t2 = k.derive_topic("app");
         assert_eq!(t1, t2);
     }
 
     #[test]
-    fn test_mac_roundtrip() {
-        let k = GroupKey::from_passphrase("secret");
+    fn test_mac_roundtrip_and_tamper() {
+        let k = GroupKey::from_passphrase("secret", "app");
         let data = b"hello world";
         let tag = k.mac(data);
         assert!(k.verify(data, &tag));
-    }
-
-    #[test]
-    fn test_mac_tamper_detection() {
-        let k = GroupKey::from_passphrase("secret");
-        let data = b"hello world";
-        let tag = k.mac(data);
         assert!(!k.verify(b"tampered", &tag));
     }
 
     #[test]
     fn test_mac_wrong_key() {
-        let k1 = GroupKey::from_passphrase("key1");
-        let k2 = GroupKey::from_passphrase("key2");
+        let k1 = GroupKey::from_passphrase("key1", "app");
+        let k2 = GroupKey::from_passphrase("key2", "app");
         let data = b"hello world";
         let tag = k1.mac(data);
         assert!(!k2.verify(data, &tag));
