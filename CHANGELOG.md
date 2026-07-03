@@ -81,8 +81,36 @@
   per-group `ChangeNotification` broadcast channel capacity (default 1024,
   floor 16) for bursty writers whose subscribers need to keep per-row deltas
   instead of falling back to a debounced full-table reload.
+- **Per-peer sync health on `PeerInfo`.** Each connected peer's entry gains
+  `bytes_in`/`bytes_out` (relay + direct combined), `last_synced_at_ms`,
+  `last_converged_at_ms`, and `sync_rtt_ms`. Timestamps are Unix epoch
+  milliseconds sampled at the point a peer's data was applied or its
+  reconcile digest matched ours; RTT is the last catch-up (version-vector)
+  round trip. Never used as input to conflict resolution — display/health
+  only. All fields are `#[serde(default)]`, so older serialized snapshots
+  keep deserializing.
+- **Client relay-traffic gauge (#84, client half).** `diagnostics::Snapshot`
+  gains `relay_bytes_in`/`relay_bytes_out` and
+  `direct_bytes_in`/`direct_bytes_out` totals, plus
+  `Snapshot::relay_traffic_ratio()` (`None` until any traffic has moved,
+  otherwise relay-bytes / total-bytes). Also adds a 14-bucket sync-RTT
+  histogram (`sync_rtt_histogram`; bucket upper bounds
+  `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` ms plus an
+  implicit `+Inf` bucket). Byte counting rides the wire bytes already
+  computed at the existing HMAC sign/verify sites — no new serialization,
+  no new wire traffic.
+- `wavesyncdb::diagnostics` is now `#[cfg(not(target_arch = "wasm32"))]`.
+  It had no wasm consumer and was compiled there as dead code; wasm builds
+  no longer pull it in.
 
 ### Fixed
+- **Peer version cursor no longer advances on an uncommitted apply.** A
+  remote changeset that rolled back mid-apply (e.g. a transaction error)
+  used to still persist the sender's `db_version` cursor, which told future
+  catch-ups the range had already been applied — silently losing it forever.
+  The cursor is now only recorded once the apply transaction actually
+  commits; an uncommitted apply leaves it untouched so the peer re-sends the
+  same range next time.
 - **Engine-swap zombie/leak in Dioxus hooks.** After `InitDb::reset()` +
   re-init, a mounted `use_synced_table`/`use_synced_row` used to keep the old
   engine's `WaveSyncDb` clone alive in its driver task, pinning the dead
