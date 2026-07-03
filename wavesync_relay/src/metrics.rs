@@ -170,11 +170,10 @@ impl RelayMetrics {
         self.connections_total
             .get_or_create(&DirectionLabel { direction })
             .inc();
-        self.connected_peers.inc();
     }
 
-    pub fn connection_closed(&self) {
-        self.connected_peers.dec();
+    pub fn set_connected_peers(&self, n: i64) {
+        self.connected_peers.set(n);
     }
 
     pub fn reservation(&self, outcome: ReservationOutcome) {
@@ -592,6 +591,7 @@ mod tests {
         let mut reg = prometheus_client::registry::Registry::default();
         let m = RelayMetrics::new(&mut reg);
         m.connection_established(true);
+        m.set_connected_peers(1);
         m.reservation(ReservationOutcome::Accepted);
         m.rendezvous_registered("wavesync2-abcdef123456");
         m.push_notify("wavesync2-abcdef123456");

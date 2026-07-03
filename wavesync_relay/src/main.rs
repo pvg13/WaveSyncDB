@@ -768,6 +768,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     addrs.push(addr);
                 }
                 cap_peer_addresses(addrs);
+                // gauge = distinct peers (map size), not connection count
+                relay_metrics.set_connected_peers(peer_addresses.len() as i64);
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -775,7 +777,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } => {
                 log::info!("Peer disconnected: {peer_id}");
-                relay_metrics.connection_closed();
                 if num_established == 0 {
                     peer_addresses.remove(&peer_id);
                     // Drop from every topic set; leave empty sets so the
@@ -786,6 +787,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     rendezvous_topics.remove(&peer_id);
                 }
+                // gauge = distinct peers (map size), not connection count
+                relay_metrics.set_connected_peers(peer_addresses.len() as i64);
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(event)) => {
                 use libp2p::relay::Event as RelayEvent;
