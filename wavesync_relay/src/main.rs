@@ -192,23 +192,23 @@ fn read_optional_secret(kind: &str, path: &str) -> Option<String> {
         Ok(meta) if meta.is_file() => match std::fs::read_to_string(path) {
             Ok(s) if !s.trim().is_empty() => Some(s),
             Ok(_) => {
-                log::warn!("{kind} file at {path:?} is empty; skipping");
+                tracing::warn!("{kind} file at {path:?} is empty; skipping");
                 None
             }
             Err(e) => {
-                log::warn!("{kind} file at {path:?} not readable ({e}); skipping");
+                tracing::warn!("{kind} file at {path:?} not readable ({e}); skipping");
                 None
             }
         },
         Ok(_) => {
-            log::warn!(
+            tracing::warn!(
                 "{kind} path {path:?} exists but is not a regular file \
                  (empty bind mount?); skipping"
             );
             None
         }
         Err(e) => {
-            log::warn!("{kind} file at {path:?} not available ({e}); skipping");
+            tracing::warn!("{kind} file at {path:?} not available ({e}); skipping");
             None
         }
     }
@@ -243,7 +243,7 @@ fn resolve_secret_source(
     }
     match std::fs::metadata(default_path) {
         Ok(meta) if meta.is_file() => {
-            log::info!("auto-discovered {kind} at {default_path}");
+            tracing::info!("auto-discovered {kind} at {default_path}");
             Some(default_path.to_string())
         }
         _ => None,
@@ -332,7 +332,7 @@ fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(path, bytes).expect("Failed to write identity file");
-        log::info!("Generated new identity at {}", path.display());
+        tracing::info!("Generated new identity at {}", path.display());
         keypair
     }
 }
@@ -341,14 +341,18 @@ fn load_or_generate_keypair(path: &PathBuf) -> identity::Keypair {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The autonat v2 server logs a WARN every time a dial-back times out, which
     // is the normal mechanism for classifying NAT'd peers — we expect dozens per
-    // hour and they are not actionable. Pin that one module to error-only so it
-    // doesn't drown out real warnings. RUST_LOG can still override.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .filter_module(
-            "libp2p_autonat::v2::server::handler::dial_request",
-            log::LevelFilter::Error,
-        )
-        .init();
+    // hour and they are not actionable. Pin that one module to error-only, on
+    // top of whatever RUST_LOG (or the "info" default) sets globally — a
+    // target-specific directive always wins over a broader one, so this stays
+    // pinned even if RUST_LOG raises the global level.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        .add_directive(
+            "libp2p_autonat::v2::server::handler::dial_request=error"
+                .parse()
+                .expect("valid filter directive"),
+        );
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Compose interpolation (`${FOO:-}`) leaves unset vars as empty strings in
     // the process env. For string flags that becomes `Some("")` and panics
@@ -396,8 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (the relay's private keypair, FCM/APNs credentials); echoing even a short
         // prefix of a private key to the logs is needless exposure.
         match std::env::var(var) {
-            Ok(v) => log::info!("env {var}: set (len={})", v.len()),
-            Err(_) => log::info!("env {var}: <unset>"),
+            Ok(v) => tracing::info!("env {var}: set (len={})", v.len()),
+            Err(_) => tracing::info!("env {var}: <unset>"),
         }
     }
 
@@ -443,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match try_decode(from_file.trim()) {
             Some(kp) => Some(kp),
             None => {
-                log::warn!(
+                tracing::warn!(
                     "IDENTITY_KEYPAIR file at {value:?} did not contain a valid base64-encoded protobuf keypair; falling back"
                 );
                 None
@@ -455,7 +459,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(identity::Keypair::generate_ed25519);
 
     let peer_id = keypair.public().to_peer_id();
-    log::info!("Relay server PeerId: {peer_id}");
+    tracing::info!("Relay server PeerId: {peer_id}");
 
     let relay_config = relay::Config {
         max_circuits: cli.max_circuits,
@@ -470,7 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Log the effective limits so a running instance can be verified against the
     // intended config (e.g. confirm max_circuits_per_peer is no longer the
     // stock default of 4 after a redeploy).
-    log::info!(
+    tracing::info!(
         "Relay limits: max_circuits={} max_circuits_per_peer={} max_circuit_duration={}s \
          max_circuit_bytes={} max_reservations={} max_reservations_per_peer={} reservation_duration={}s",
         cli.max_circuits,
@@ -518,12 +522,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         service_account_json: json,
                     }),
                     None => {
-                        log::warn!("FCM credentials missing project_id; skipping FCM");
+                        tracing::warn!("FCM credentials missing project_id; skipping FCM");
                         None
                     }
                 },
                 Err(e) => {
-                    log::warn!("FCM credentials JSON invalid ({e}); skipping FCM");
+                    tracing::warn!("FCM credentials JSON invalid ({e}); skipping FCM");
                     None
                 }
             }
@@ -558,7 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if fcm_config.is_none() && apns_config.is_none() {
-            log::warn!("Push DB configured but no FCM or APNs credentials provided");
+            tracing::warn!("Push DB configured but no FCM or APNs credentials provided");
         }
 
         let sender = Arc::new(PushSender::new(fcm_config, apns_config));
@@ -577,10 +581,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // momentarily-wrong 0.
         match store.count_tokens().await {
             Ok(n) => relay_metrics.set_registered_tokens(n),
-            Err(e) => log::warn!("Failed to read initial registered token count: {e}"),
+            Err(e) => tracing::warn!("Failed to read initial registered token count: {e}"),
         }
 
-        log::info!("Push notifications enabled (db: {push_db_path})");
+        tracing::info!("Push notifications enabled (db: {push_db_path})");
         Some((store, notifier))
     } else {
         None
@@ -658,7 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     if cli.external_address.is_empty() {
-        log::warn!(
+        tracing::warn!(
             "No --external-address configured! Relay circuit reservations will respond \
              with NoAddressesInReservation for clients behind NAT. \
              Set --external-address /ip4/<public-ip>/tcp/4001"
@@ -667,18 +671,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for ext_addr_str in &cli.external_address {
         let ext_addr: Multiaddr = ext_addr_str.parse()?;
         swarm.add_external_address(ext_addr.clone());
-        log::info!("Advertising external address: {ext_addr}");
+        tracing::info!("Advertising external address: {ext_addr}");
     }
 
     let listen_addr: Multiaddr = cli.listen_addr.parse()?;
     swarm.listen_on(listen_addr.clone())?;
-    log::info!("Listening on {listen_addr}");
+    tracing::info!("Listening on {listen_addr}");
 
     // Also listen on QUIC on same port if TCP was specified
     if let Some(port) = extract_tcp_port(&listen_addr) {
         let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?;
         swarm.listen_on(quic_addr.clone())?;
-        log::info!("Also listening on {quic_addr}");
+        tracing::info!("Also listening on {quic_addr}");
     }
 
     // Optional WebSocket listener for browser peers. Plain `/ws` is
@@ -691,7 +695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.ws_listen_addr.is_empty() {
         let ws_addr: Multiaddr = cli.ws_listen_addr.parse()?;
         swarm.listen_on(ws_addr.clone())?;
-        log::info!("Also listening on WebSocket {ws_addr} (browser peers)");
+        tracing::info!("Also listening on WebSocket {ws_addr} (browser peers)");
     }
 
     // libp2p's own aggregate Swarm/protocol metrics (connection counts,
@@ -708,12 +712,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let registry = metrics_registry.clone();
                 tokio::spawn(async move {
                     if let Err(e) = metrics::serve_metrics(addr, registry).await {
-                        log::error!("Metrics endpoint failed: {e}");
+                        tracing::error!("Metrics endpoint failed: {e}");
                     }
                 });
             }
             Err(e) => {
-                log::error!(
+                tracing::error!(
                     "Invalid METRICS_ADDR '{}': {e}; metrics endpoint disabled",
                     cli.metrics_addr
                 );
@@ -767,19 +771,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event = swarm.select_next_some() => event,
             _ = sweep_interval.tick() => {
                 circuit_ledger.sweep(Instant::now(), sweep_max_age);
-                log::debug!("CircuitLedger: {} circuit(s) currently tracked as active", circuit_ledger.active_count());
+                tracing::debug!("CircuitLedger: {} circuit(s) currently tracked as active", circuit_ledger.active_count());
                 continue;
             }
         };
         libp2p_metrics.record(&event);
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                log::info!("Listening on {address}/p2p/{peer_id}");
+                tracing::info!("Listening on {address}/p2p/{peer_id}");
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                log::info!("Peer connected: {peer_id}");
+                tracing::info!("Peer connected: {peer_id}");
                 relay_metrics.connection_established(matches!(
                     endpoint,
                     libp2p::core::ConnectedPoint::Listener { .. }
@@ -798,7 +802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 num_established,
                 ..
             } => {
-                log::info!("Peer disconnected: {peer_id}");
+                tracing::info!("Peer disconnected: {peer_id}");
                 if num_established == 0 {
                     peer_addresses.remove(&peer_id);
                     // Drop from every topic set; leave empty sets so the
@@ -823,10 +827,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Renewals are frequent (every reservation refresh); only
                         // the first acceptance is interesting at info level.
                         if renewed {
-                            log::debug!("Relay: reservation renewed for {src_peer_id}");
+                            tracing::debug!(peer = %src_peer_id, outcome = "renewed", "Relay: reservation renewed");
                             relay_metrics.reservation(ReservationOutcome::Renewed);
                         } else {
-                            log::info!("Relay: reservation accepted for {src_peer_id}");
+                            tracing::info!(peer = %src_peer_id, outcome = "accepted", "Relay: reservation accepted");
                             relay_metrics.reservation(ReservationOutcome::Accepted);
                         }
                     }
@@ -834,13 +838,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         src_peer_id,
                         status,
                     } => {
-                        log::warn!(
-                            "Relay: reservation denied for {src_peer_id} (status {status:?})"
+                        tracing::warn!(
+                            peer = %src_peer_id,
+                            outcome = "denied",
+                            status = ?status,
+                            "Relay: reservation denied"
                         );
                         relay_metrics.reservation(ReservationOutcome::Denied);
                     }
                     RelayEvent::ReservationClosed { src_peer_id } => {
-                        log::debug!("Relay: reservation closed for {src_peer_id}");
+                        tracing::debug!(peer = %src_peer_id, outcome = "closed", "Relay: reservation closed");
                         // `ReservationClosed`/`ReservationTimedOut` each fire exactly
                         // once per reservation (libp2p never emits both for the same
                         // one), so this decrement is balanced by the single earlier
@@ -849,7 +856,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         relay_metrics.reservation_ended();
                     }
                     RelayEvent::ReservationTimedOut { src_peer_id } => {
-                        log::debug!("Relay: reservation timed out for {src_peer_id}");
+                        tracing::debug!(peer = %src_peer_id, outcome = "timed_out", "Relay: reservation timed out");
                         // See the comment on the `ReservationClosed` arm above.
                         relay_metrics.reservation_ended();
                     }
@@ -857,7 +864,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         src_peer_id,
                         dst_peer_id,
                     } => {
-                        log::info!("Relay: circuit {src_peer_id} → {dst_peer_id}");
+                        // Attributed independently of the ledger's own bookkeeping
+                        // below — pure lookup over current topic membership, safe
+                        // to compute twice (once for the log line, once inside
+                        // `open` for billing) since it carries no ledger state.
+                        let topic = metrics::attribute_topic(&src_peer_id, &dst_peer_id, &|p| {
+                            topics_for_peer(&topic_peers, &rendezvous_topics, p)
+                        });
+                        tracing::info!(
+                            src = %src_peer_id,
+                            dst = %dst_peer_id,
+                            topic = %topic,
+                            "Relay: circuit accepted"
+                        );
                         circuit_ledger.open(src_peer_id, dst_peer_id, Instant::now(), &|p| {
                             topics_for_peer(&topic_peers, &rendezvous_topics, p)
                         });
@@ -867,8 +886,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dst_peer_id,
                         status,
                     } => {
-                        log::warn!(
-                            "Relay: circuit denied {src_peer_id} → {dst_peer_id} (status {status:?})"
+                        let topic = metrics::attribute_topic(&src_peer_id, &dst_peer_id, &|p| {
+                            topics_for_peer(&topic_peers, &rendezvous_topics, p)
+                        });
+                        tracing::warn!(
+                            src = %src_peer_id,
+                            dst = %dst_peer_id,
+                            topic = %topic,
+                            status = ?status,
+                            "Relay: circuit denied"
                         );
                         circuit_ledger.denied();
                     }
@@ -877,6 +903,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dst_peer_id,
                         error,
                     } => {
+                        let topic = metrics::attribute_topic(&src_peer_id, &dst_peer_id, &|p| {
+                            topics_for_peer(&topic_peers, &rendezvous_topics, p)
+                        });
                         circuit_ledger.close(
                             src_peer_id,
                             dst_peer_id,
@@ -884,17 +913,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             error.is_none(),
                         );
                         match error {
-                            Some(e) => log::debug!(
-                                "Relay: circuit closed {src_peer_id} → {dst_peer_id}: {e}"
+                            Some(e) => tracing::debug!(
+                                src = %src_peer_id,
+                                dst = %dst_peer_id,
+                                topic = %topic,
+                                error = %e,
+                                "Relay: circuit closed"
                             ),
-                            None => {
-                                log::debug!("Relay: circuit closed {src_peer_id} → {dst_peer_id}")
-                            }
+                            None => tracing::debug!(
+                                src = %src_peer_id,
+                                dst = %dst_peer_id,
+                                topic = %topic,
+                                "Relay: circuit closed"
+                            ),
                         }
                     }
                     // Deprecated *Failed variants and any future additions:
                     // keep them off the steady-state log but available at debug.
-                    other => log::debug!("Relay: {other:?}"),
+                    other => tracing::debug!("Relay: {other:?}"),
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Ping(event)) => {
@@ -909,7 +945,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // dumped the full SignedEnvelope (hundreds of bytes/line).
                     RzEvent::PeerRegistered { peer, registration } => {
                         let namespace = registration.namespace.to_string();
-                        log::debug!(
+                        tracing::debug!(
                             "Rendezvous: {peer} registered ns={} ttl={}s",
                             short_topic(&namespace),
                             registration.ttl,
@@ -921,7 +957,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         enquirer,
                         registrations,
                     } => {
-                        log::debug!(
+                        tracing::debug!(
                             "Rendezvous: served discover to {enquirer} ({} registration(s))",
                             registrations.len(),
                         );
@@ -930,10 +966,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     RzEvent::DiscoverNotServed { enquirer, error } => {
                         // Mostly the benign first-page / expired-cookie case the
                         // client immediately re-issues; not actionable.
-                        log::debug!("Rendezvous: discover for {enquirer} not served ({error:?})");
+                        tracing::debug!(
+                            "Rendezvous: discover for {enquirer} not served ({error:?})"
+                        );
                     }
                     RzEvent::RegistrationExpired(registration) => {
-                        log::debug!(
+                        tracing::debug!(
                             "Rendezvous: registration expired for {} ns={}",
                             registration.record.peer_id(),
                             short_topic(&registration.namespace.to_string()),
@@ -941,7 +979,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Notable, low-frequency: surface at info/warn.
                     RzEvent::PeerUnregistered { peer, namespace } => {
-                        log::info!(
+                        tracing::info!(
                             "Rendezvous: {peer} unregistered ns={}",
                             short_topic(&namespace.to_string()),
                         );
@@ -951,7 +989,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         namespace,
                         error,
                     } => {
-                        log::warn!(
+                        tracing::warn!(
                             "Rendezvous: declined registration from {peer} ns={} ({error:?})",
                             short_topic(&namespace.to_string()),
                         );
@@ -961,7 +999,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Identify(event)) => {
                 libp2p_metrics.record(&event);
                 if let identify::Event::Received { info, peer_id, .. } = event {
-                    log::info!(
+                    tracing::info!(
                         "Identify from {peer_id}: {} listen addr(s) ({})",
                         info.listen_addrs.len(),
                         info.protocol_version,
@@ -1033,7 +1071,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Register the newcomer for this topic
                         topic_peers.entry(topic.clone()).or_default().insert(peer);
-                        log::info!(
+                        tracing::info!(
                             "Presence announced: topic={topic} peer={peer} ({} existing)",
                             existing.len()
                         );
@@ -1073,7 +1111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Err(resp) = swarm.behaviour_mut().push.send_response(channel, response) {
-                    log::error!("Failed to send push response: {:?}", resp);
+                    tracing::error!("Failed to send push response: {:?}", resp);
                 }
             }
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
@@ -1087,7 +1125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SwarmEvent::Behaviour(RelayServerBehaviourEvent::Push(
                 request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
-                log::debug!("PeerJoined delivery to {peer} failed: {error}");
+                tracing::debug!("PeerJoined delivery to {peer} failed: {error}");
             }
             SwarmEvent::IncomingConnectionError {
                 local_addr,
@@ -1095,7 +1133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 error,
                 ..
             } => {
-                log::warn!(
+                tracing::warn!(
                     "Incoming connection error from {send_back_addr} on {local_addr}: {error}"
                 );
             }
@@ -1103,17 +1141,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Almost always an autonat dial-back that timed out because the
                 // probed peer is behind NAT — that is how autonat decides "this
                 // peer is private". Not actionable for the relay; keep at debug.
-                log::debug!("Outgoing connection error to {peer_id:?}: {error}");
+                tracing::debug!("Outgoing connection error to {peer_id:?}: {error}");
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                log::error!("Listener {listener_id:?} error: {error}");
+                tracing::error!("Listener {listener_id:?} error: {error}");
             }
             SwarmEvent::ListenerClosed {
                 listener_id,
                 reason,
                 ..
             } => {
-                log::error!("Listener {listener_id:?} closed: {reason:?}");
+                tracing::error!("Listener {listener_id:?} closed: {reason:?}");
             }
             _ => {}
         }
@@ -1190,7 +1228,7 @@ async fn handle_push_request(
                 .await
             {
                 Ok(()) => {
-                    log::info!(
+                    tracing::info!(
                         "Registered {platform_str} push token for topic {topic} from {peer_id}"
                     );
                     relay_metrics.set_registered_tokens(store.count_tokens().await.unwrap_or(-1));
@@ -1204,7 +1242,7 @@ async fn handle_push_request(
         PushRequest::UnregisterToken { topic, token } => {
             match store.unregister_token(topic, token).await {
                 Ok(()) => {
-                    log::info!("Unregistered push token for topic {topic} from {peer_id}");
+                    tracing::info!("Unregistered push token for topic {topic} from {peer_id}");
                     relay_metrics.set_registered_tokens(store.count_tokens().await.unwrap_or(-1));
                     PushResponse::Ok
                 }
@@ -1225,24 +1263,35 @@ async fn handle_push_request(
             match store.peer_registered_on_topic(topic, peer_id).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    log::warn!(
-                        "Rejecting NotifyTopic from unregistered peer {peer_id} for {}",
-                        short_topic(topic),
+                    tracing::warn!(
+                        topic = %short_topic(topic),
+                        peer = %peer_id,
+                        outcome = "rejected_unregistered",
+                        "Rejecting NotifyTopic from unregistered peer"
                     );
                     return PushResponse::Error {
                         message: "sender is not registered for this topic".to_string(),
                     };
                 }
                 Err(e) => {
-                    log::error!("NotifyTopic registration check failed for {peer_id}: {e}");
+                    tracing::error!(
+                        topic = %short_topic(topic),
+                        peer = %peer_id,
+                        outcome = "error",
+                        error = %e,
+                        "NotifyTopic registration check failed"
+                    );
                     return PushResponse::Error {
                         message: "registration check failed".to_string(),
                     };
                 }
             }
-            log::info!(
-                "NotifyTopic from {peer_id} (site {sender_site_id}) for {}",
-                short_topic(topic),
+            tracing::info!(
+                topic = %short_topic(topic),
+                peer = %peer_id,
+                site = %sender_site_id,
+                outcome = "accepted",
+                "NotifyTopic"
             );
             relay_metrics.push_notify(topic);
             // Pass the sender's peer id so the fan-out skips the writer's own

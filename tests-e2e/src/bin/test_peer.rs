@@ -74,9 +74,11 @@ impl From<task::Model> for Task {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .parse_env("RUST_LOG")
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let bind: SocketAddr = std::env::var("BIND_ADDR")

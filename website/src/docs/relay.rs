@@ -129,10 +129,27 @@ pub fn Page() -> Element {
 
         p {
             "The relay logs connection events, circuit reservations, rendezvous "
-            "registrations, and push notifications. Control verbosity with RUST_LOG:"
+            "registrations, and push notifications through "
+            code { "tracing" }
+            " with "
+            code { "tracing-subscriber" }
+            "'s "
+            code { "EnvFilter" }
+            ", so verbosity is controlled the same way it always has been — "
+            "with RUST_LOG:"
         }
 
         CodeBlock { html: CODE_LOGGING }
+
+        p { class: "note",
+            "If you're scraping relay output with an "
+            code { "env_logger" }
+            "-based tool, nothing changes on your end: every "
+            code { "tracing" }
+            " event the relay emits is also published as a "
+            code { "log" }
+            " record, so existing log-based tailing/parsing keeps working unmodified."
+        }
 
         p {
             "Key events to monitor:"

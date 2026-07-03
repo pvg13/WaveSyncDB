@@ -233,7 +233,7 @@ async fn fire_notifications(
     {
         Ok(t) => t,
         Err(e) => {
-            log::error!("Failed to get push tokens for topic {topic}: {e}");
+            tracing::error!("Failed to get push tokens for topic {topic}: {e}");
             return;
         }
     };
@@ -246,13 +246,13 @@ async fn fire_notifications(
         // failure. Kept at debug so it doesn't read as an alarm on every write;
         // a genuinely-unregistered peer shows up as a missing RegisterToken on
         // the relay's INFO log, not here.
-        log::debug!(
+        tracing::debug!(
             "No other registered devices to wake for {topic_short} (writer {notifying_peer} excluded)"
         );
         return;
     }
 
-    log::info!(
+    tracing::info!(
         "Waking {} device(s) for {topic_short} (writer {notifying_peer} excluded; {} peer addr(s))",
         tokens.len(),
         peer_addrs.len(),
@@ -271,15 +271,23 @@ async fn fire_notifications(
             Ok(true) => {}
             Ok(false) => {
                 let short = token_entry.token.chars().take(20).collect::<String>();
-                log::warn!(
-                    "Daily push budget exhausted for token={short}... ({}); skipping wake for {topic_short}",
-                    token_entry.platform
+                tracing::warn!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "budget_denied",
+                    "Daily push budget exhausted for token={short}...; skipping wake"
                 );
                 metrics.push_sent(&token_entry.platform, "budget_denied");
                 continue;
             }
             Err(e) => {
-                log::error!("Daily budget check failed for {topic_short}: {e}");
+                tracing::error!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "budget_check_error",
+                    error = %e,
+                    "Daily budget check failed"
+                );
                 // Fail closed on the budget check: skip rather than risk unbounded sends.
                 metrics.push_sent(&token_entry.platform, "budget_check_error");
                 continue;
@@ -294,7 +302,7 @@ async fn fire_notifications(
                     .await
             }
             other => {
-                log::warn!("Unknown push platform: {other}");
+                tracing::warn!("Unknown push platform: {other}");
                 continue;
             }
         };
@@ -302,29 +310,37 @@ async fn fire_notifications(
         let short = token_entry.token.chars().take(20).collect::<String>();
         match result {
             PushResult::Sent => {
-                log::info!("Push sent ({}) to token={}...", token_entry.platform, short);
+                tracing::info!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "ok",
+                    "Push sent to token={short}..."
+                );
                 metrics.push_sent(&token_entry.platform, "ok");
                 // A fresh send succeeded — clear any stale retry row
                 // that had been queued from an earlier failure for the
                 // same (topic, token). Latest peer_addrs already won
                 // via the debouncer; this just sweeps the stale row.
                 if let Err(e) = store.remove_retry(topic, &token_entry.token).await {
-                    log::debug!("remove_retry after Sent failed for {short}...: {e}");
+                    tracing::debug!("remove_retry after Sent failed for {short}...: {e}");
                 }
             }
             PushResult::TokenInvalid { reason } => {
-                log::info!(
-                    "Pruning invalid push token {short}... ({}): {reason:?}",
-                    token_entry.platform
+                tracing::info!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "token_invalid",
+                    reason = ?reason,
+                    "Pruning invalid push token {short}..."
                 );
                 metrics.push_sent(&token_entry.platform, "token_invalid");
                 if let Err(e) = store.remove_token(&token_entry.token).await {
-                    log::error!("Failed to remove invalid token: {e}");
+                    tracing::error!("Failed to remove invalid token: {e}");
                 }
                 // Token is dead; corresponding retry rows are now
                 // orphans that would never succeed. Sweep them.
                 if let Err(e) = store.purge_retries_for_token(&token_entry.token).await {
-                    log::error!("Failed to purge retries for invalidated token: {e}");
+                    tracing::error!("Failed to purge retries for invalidated token: {e}");
                 }
             }
             PushResult::Transient(err) => {
@@ -337,11 +353,12 @@ async fn fire_notifications(
                 };
                 let next_attempt_at = now + next_delay.as_secs() as i64;
 
-                log::warn!(
-                    "Push transient failure for {short}... ({}); \
-                     queueing retry #1/7 in ~{:?}: {err:?}",
-                    token_entry.platform,
-                    next_delay,
+                tracing::warn!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "transient",
+                    error = ?err,
+                    "Push transient failure for {short}...; queueing retry #1/7 in ~{next_delay:?}"
                 );
                 metrics.push_sent(&token_entry.platform, "transient");
                 if let Err(e) = store
@@ -359,16 +376,18 @@ async fn fire_notifications(
                     )
                     .await
                 {
-                    log::error!("Failed to enqueue retry: {e}");
+                    tracing::error!("Failed to enqueue retry: {e}");
                     continue;
                 }
                 let _ = nudge_tx.try_send(RetryNudge);
             }
             PushResult::Permanent(err) => {
-                log::error!(
-                    "Push permanent failure for {short}... ({}): {err:?} \
-                     (dropping; misconfiguration won't resolve itself)",
-                    token_entry.platform
+                tracing::error!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    outcome = "permanent",
+                    error = ?err,
+                    "Push permanent failure for {short}...; dropping (misconfiguration won't resolve itself)"
                 );
                 metrics.push_sent(&token_entry.platform, "permanent");
                 // Clear any retry row that might be in flight for this
@@ -432,20 +451,20 @@ async fn retry_worker_loop(
         .reschedule_overdue_retries(now, RESTART_GRACE_SECS, RESTART_JITTER_SECS)
         .await
     {
-        Ok(n) if n > 0 => log::info!(
+        Ok(n) if n > 0 => tracing::info!(
             "Retry worker: smeared {n} overdue rows into +{}..{}s after startup",
             RESTART_GRACE_SECS,
             RESTART_GRACE_SECS + RESTART_JITTER_SECS
         ),
         Ok(_) => {}
-        Err(e) => log::warn!("reschedule_overdue_retries failed at startup: {e}"),
+        Err(e) => tracing::warn!("reschedule_overdue_retries failed at startup: {e}"),
     }
     match store.purge_stale_retries(now, MAX_AGE_SECS).await {
         Ok(n) if n > 0 => {
-            log::info!("Retry worker: purged {n} rows older than {MAX_AGE_SECS}s")
+            tracing::info!("Retry worker: purged {n} rows older than {MAX_AGE_SECS}s")
         }
         Ok(_) => {}
-        Err(e) => log::warn!("purge_stale_retries failed at startup: {e}"),
+        Err(e) => tracing::warn!("purge_stale_retries failed at startup: {e}"),
     }
 
     loop {
@@ -454,7 +473,7 @@ async fn retry_worker_loop(
         let due = match store.fetch_due_retries(now, RETRY_BATCH_SIZE).await {
             Ok(rows) => rows,
             Err(e) => {
-                log::error!("fetch_due_retries failed: {e}");
+                tracing::error!("fetch_due_retries failed: {e}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -496,6 +515,7 @@ async fn process_retry(
     // at attempts=N+1 if it fails again.
     let short = row.token.chars().take(20).collect::<String>();
     let platform_label = row.platform.clone();
+    let topic_short = crate::short_topic(&row.topic);
 
     let result = match row.platform.as_str() {
         "Fcm" => {
@@ -509,7 +529,7 @@ async fn process_retry(
                 .await
         }
         other => {
-            log::warn!("Retry worker: unknown push platform {other}; dropping row");
+            tracing::warn!("Retry worker: unknown push platform {other}; dropping row");
             let _ = store.remove_retry(&row.topic, &row.token).await;
             return;
         }
@@ -517,27 +537,35 @@ async fn process_retry(
 
     match result {
         PushResult::Sent => {
-            log::info!(
-                "Push retry succeeded ({platform_label}) to token={short}... \
-                 (attempt {})",
+            tracing::info!(
+                topic = %topic_short,
+                platform = %platform_label,
+                outcome = "ok",
+                "Push retry succeeded to token={short}... (attempt {})",
                 row.attempts
             );
             metrics.push_sent(&platform_label, "ok");
             let _ = store.remove_retry(&row.topic, &row.token).await;
         }
         PushResult::TokenInvalid { reason } => {
-            log::info!(
-                "Push retry hit TokenInvalid for {short}... ({platform_label}): {reason:?}; \
-                 pruning token + retries"
+            tracing::info!(
+                topic = %topic_short,
+                platform = %platform_label,
+                outcome = "token_invalid",
+                reason = ?reason,
+                "Push retry hit TokenInvalid for {short}...; pruning token + retries"
             );
             metrics.push_sent(&platform_label, "token_invalid");
             let _ = store.remove_token(&row.token).await;
             let _ = store.purge_retries_for_token(&row.token).await;
         }
         PushResult::Permanent(err) => {
-            log::error!(
-                "Push retry hit Permanent for {short}... ({platform_label}): {err:?}; \
-                 dropping"
+            tracing::error!(
+                topic = %topic_short,
+                platform = %platform_label,
+                outcome = "permanent",
+                error = ?err,
+                "Push retry hit Permanent for {short}...; dropping"
             );
             metrics.push_sent(&platform_label, "permanent");
             let _ = store.remove_retry(&row.topic, &row.token).await;
@@ -545,9 +573,11 @@ async fn process_retry(
         PushResult::Transient(err) => {
             let now = now_unix();
             if push_retry::age_exceeded(row.first_failed_at, now) {
-                log::info!(
-                    "Push retry: dropping {short}... ({platform_label}) — \
-                     age exceeded ({}s old)",
+                tracing::info!(
+                    topic = %topic_short,
+                    platform = %platform_label,
+                    outcome = "age_exceeded",
+                    "Push retry: dropping {short}... — age exceeded ({}s old)",
                     now - row.first_failed_at
                 );
                 metrics.push_sent(&platform_label, "age_exceeded");
@@ -560,9 +590,11 @@ async fn process_retry(
             match compute_delay(next_attempts, retry_after) {
                 Some(delay) => {
                     let next_attempt_at = now + delay.as_secs() as i64;
-                    log::info!(
-                        "Push retry attempt {} failed for {short}... ({platform_label}); \
-                         scheduling attempt {} in ~{:?}",
+                    tracing::info!(
+                        topic = %topic_short,
+                        platform = %platform_label,
+                        outcome = "transient",
+                        "Push retry attempt {} failed for {short}...; scheduling attempt {} in ~{:?}",
                         row.attempts,
                         next_attempts,
                         delay
@@ -592,9 +624,11 @@ async fn process_retry(
                         .await;
                 }
                 None => {
-                    log::info!(
-                        "Push retry budget exhausted for {short}... ({platform_label}) \
-                         after {} attempts; dropping",
+                    tracing::info!(
+                        topic = %topic_short,
+                        platform = %platform_label,
+                        outcome = "retry_budget_exhausted",
+                        "Push retry budget exhausted for {short}... after {} attempts; dropping",
                         row.attempts
                     );
                     metrics.push_sent(&platform_label, "retry_budget_exhausted");

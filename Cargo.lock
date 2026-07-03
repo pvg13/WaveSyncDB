@@ -8178,7 +8178,6 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
  "clap",
- "env_logger 0.11.10",
  "futures",
  "jsonwebtoken",
  "libp2p",
@@ -8191,6 +8190,8 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -8259,15 +8260,14 @@ dependencies = [
  "axum 0.7.9",
  "base64 0.22.1",
  "bollard",
- "env_logger 0.11.10",
  "libp2p",
- "log",
  "reqwest",
  "sea-orm",
  "serde",
  "serde_json",
  "testcontainers",
  "tokio",
+ "tracing-subscriber",
  "uuid",
  "wavesyncdb",
  "wavesyncdb_derive",

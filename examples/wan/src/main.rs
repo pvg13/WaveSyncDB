@@ -90,12 +90,11 @@ fn menu() {
 
 #[tokio::main]
 pub async fn main() {
-    let mut log_builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    for (module, level) in wavesyncdb::recommended_log_filters() {
-        log_builder.filter_module(module, level);
-    }
-    log_builder.init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or(format!("info,{}", wavesyncdb::recommended_log_filters())),
+    )
+    .init();
 
     let cli = Cli::parse();
 

@@ -137,17 +137,13 @@ pub fn run() {
     // Quiet libp2p / sqlx with the recommended log filters so the
     // example output is readable.
     if std::env::var_os("RUST_LOG").is_none() {
-        let directives: Vec<String> = std::iter::once("info".to_string())
-            .chain(
-                wavesyncdb::recommended_log_filters()
-                    .into_iter()
-                    .map(|(m, lvl)| format!("{m}={}", lvl.as_str().to_lowercase())),
-            )
-            .collect();
         // SAFETY: setting an env var before threads start is sound;
         // this runs on the main thread before tokio spawns anything.
         unsafe {
-            std::env::set_var("RUST_LOG", directives.join(","));
+            std::env::set_var(
+                "RUST_LOG",
+                format!("info,{}", wavesyncdb::recommended_log_filters()),
+            );
         }
     }
 
@@ -219,13 +215,10 @@ fn init_logger() {
     {
         use android_logger::{Config, FilterBuilder};
         let mut filter = FilterBuilder::new();
-        filter.filter_level(log::LevelFilter::Info);
         // Same noise reduction the env_logger path applies — keep
         // the libp2p / sqlx output below `info` so logcat is
         // readable while debugging the demo.
-        for (module, level) in wavesyncdb::recommended_log_filters() {
-            filter.filter_module(module, level);
-        }
+        filter.parse(&format!("info,{}", wavesyncdb::recommended_log_filters()));
         android_logger::init_once(
             Config::default()
                 .with_max_level(log::LevelFilter::Trace)
@@ -235,11 +228,10 @@ fn init_logger() {
     }
     #[cfg(not(target_os = "android"))]
     {
-        let mut log_builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-        for (module, level) in wavesyncdb::recommended_log_filters() {
-            log_builder.filter_module(module, level);
-        }
+        let mut log_builder = env_logger::Builder::from_env(
+            env_logger::Env::default()
+                .default_filter_or(format!("info,{}", wavesyncdb::recommended_log_filters())),
+        );
         let _ = log_builder.try_init();
     }
 }

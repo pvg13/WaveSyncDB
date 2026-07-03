@@ -250,7 +250,7 @@ impl RelayMetrics {
 /// single topic both peers have in common. Zero or more than one shared
 /// topic is ambiguous (or the pair has no relationship we can attribute a
 /// cost to) and is reported as `"unknown"` rather than guessed.
-fn attribute_topic(
+pub(crate) fn attribute_topic(
     src: &PeerId,
     dst: &PeerId,
     topics_of: &dyn Fn(&PeerId) -> Vec<String>,
@@ -439,7 +439,7 @@ impl CircuitLedger {
         });
         if pruned > 0 {
             self.active_circuits.dec_by(pruned as i64);
-            log::warn!(
+            tracing::warn!(
                 "CircuitLedger: swept {pruned} leaked circuit entries older than {max_age:?} (billed elapsed seconds before removal)"
             );
         }
@@ -494,7 +494,7 @@ pub async fn serve_metrics(
         .route("/healthz", get(|| async { "ok" }));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("Metrics endpoint on http://{addr}/metrics");
+    tracing::info!("Metrics endpoint on http://{addr}/metrics");
     axum::serve(listener, app).await
 }
 

@@ -149,12 +149,34 @@ pub fn Page() -> Element {
             }
             li {
                 code { "RUST_LOG=info" }
-                " — controls log verbosity. Use "
+                " — controls log verbosity. The relay emits its events through "
+                code { "tracing" }
+                " (configured with "
+                code { "tracing-subscriber" }
+                "'s "
+                code { "EnvFilter" }
+                "), and "
+                code { "EnvFilter" }
+                " parses the same "
+                code { "RUST_LOG" }
+                " directive syntax "
+                code { "env_logger" }
+                " does, so this setting works exactly as before. Use "
                 code { "debug" }
                 " or "
                 code { "trace" }
                 " for troubleshooting connection issues."
             }
+        }
+
+        p { class: "note",
+            "Already tailing relay output with an "
+            code { "env_logger" }
+            "-based setup? No changes needed — every "
+            code { "tracing" }
+            " event is also emitted as a "
+            code { "log" }
+            " record, so existing log-based tooling keeps receiving relay events unmodified."
         }
 
         p {

@@ -17,8 +17,17 @@ path = "src/main.rs"
 libp2p = { version = "0.56.0", features = ["relay", "rendezvous", "identify", "ping", "autonat", "request-response", "tokio", "noise", "yamux", "tcp", "quic", "websocket", "dns", "metrics"] }
 libp2p-swarm-derive = "0.35.1"
 tokio = { version = "1.47", features = ["full"] }
+# `features = ["log"]` is the compat bridge: every tracing event is also
+# emitted as a `log` record when no tracing `Subscriber` is installed, so
+# existing env_logger/RUST_LOG-based deployments keep working with zero
+# changes.
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# The crate's own logging is tracing-native (see `tracing` above). This `log`
+# dependency is NOT used for that — it exists only because sqlx's
+# `SqliteConnectOptions::log_statements` (push_store.rs) is typed directly
+# against `log::LevelFilter` with no tracing equivalent.
 log = "0.4"
-env_logger = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }

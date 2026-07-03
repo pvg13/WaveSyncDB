@@ -115,14 +115,16 @@ Limitations compared to native:
 
 ## Verify
 
-After adding the dependency and building, run the tiniest possible smoke test:
+After adding the dependency and building, run the tiniest possible smoke test. This needs `tracing-subscriber` (`cargo add tracing-subscriber -F env-filter,fmt`) to see the engine's log output:
 
 ```rust
 use wavesyncdb::WaveSyncDbBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = env_logger::try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let _db = WaveSyncDbBuilder::new("sqlite::memory:", "smoketest")
         .build()
         .await?;
@@ -130,6 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+WaveSyncDB emits its events through `tracing`; set `RUST_LOG=info` (or `debug` for more detail) when running the smoke test to see them. If your app already sets up logging with `env_logger`, you don't need to change anything — WaveSyncDB's `tracing` events are also published as `log` records via `tracing`'s `log` compatibility feature, so an existing `env_logger`-based setup keeps receiving them.
 
 You should see libp2p log lines indicating the engine has started and is listening for peers. If you instead see compile errors complaining about missing features, double-check the `features = [...]` list above.
 

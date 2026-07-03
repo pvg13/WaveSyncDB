@@ -50,7 +50,7 @@ Walk through the layers in order:
 2. **Did the engine emit a `SyncChangeset`?** Subscribe to the change broadcast: `db.change_rx().recv().await`. If you don't see a notification, the SQL parser didn't recognize the statement (e.g., a raw `execute()` of a multi-statement script). Check your write pattern.
 3. **Are the peers connected?** Check `db.network_status().connected_peers`. Empty list means peer discovery hasn't completed.
 4. **Same topic + passphrase?** A topic mismatch silently rejects all messages — check both sides.
-5. **HMAC failing?** Enable `RUST_LOG=wavesyncdb=debug` and look for "HMAC verification failed". Almost always a passphrase typo.
+5. **HMAC failing?** Enable `RUST_LOG=wavesyncdb=debug` and look for "HMAC verification failed". Almost always a passphrase typo. WaveSyncDB's events go through `tracing`, but `RUST_LOG` still works the same way it always has (`tracing-subscriber`'s `EnvFilter` parses the same directive syntax `env_logger` does) — and if your app initializes logging with `env_logger`, you'll still see these events with no changes on your end.
 6. **Schema registered on both sides?** A peer that hasn't called `.sync()` yet rejects inbound changes for unknown tables.
 
 ## Why is sync slow on cellular?

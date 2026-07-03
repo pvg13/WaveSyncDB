@@ -20,6 +20,8 @@ APNS_BUNDLE_ID=com.example.myapp
 RUST_LOG=info
 ```
 
+The relay logs through `tracing` (via `tracing-subscriber`'s `EnvFilter`), which parses the exact same `RUST_LOG` directive syntax as `env_logger` — this variable works the same as it always has, no compose changes needed on upgrade.
+
 Place your secrets next to it under `secrets/`:
 
 ```
@@ -68,7 +70,7 @@ The `docker-compose.yml` is already structured for Dokploy:
 | `MAX_RESERVATIONS` | no | Default `1024`. Bump if you have many phones. |
 | `MAX_RESERVATIONS_PER_PEER` | no | Default `32`. |
 | `RESERVATION_DURATION_SECS` | no | Default `600`. |
-| `RUST_LOG` | no | Standard log filter. `info` is recommended in production. |
+| `RUST_LOG` | no | Standard `tracing`/`EnvFilter` directive syntax (same as `env_logger`'s). `info` is recommended in production. |
 
 ## Pointing clients at it
 
@@ -95,3 +97,4 @@ let db = WaveSyncDbBuilder::new("sqlite:./app.db?mode=rwc", "my-topic")
 - The relay is stateless except for `/data/identity.key` (peer id continuity) and `/data/push_tokens.db` (registered phones). Mount a volume on `/data` so reservations and tokens survive restarts.
 - Health: check the logs for periodic `Reservation accepted` and `Push sent` lines. If you see `ReservationReqDenied { ResourceLimitExceeded }`, raise `MAX_RESERVATIONS_PER_PEER`.
 - The relay can be public; without your shared passphrase, anonymous peers can't decrypt or sign anything they receive.
+- If you have existing tooling built around `env_logger`-style log scraping, no changes are needed — every `tracing` event the relay emits is also published as a `log` record via `tracing`'s `log` compatibility feature.

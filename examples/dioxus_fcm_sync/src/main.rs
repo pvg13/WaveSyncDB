@@ -101,8 +101,10 @@ static DB: OnceLock<WaveSyncDb> = OnceLock::new();
 fn main() {
     // Two logging systems flow through this app:
     //
-    // 1. The `log` crate (env_logger) — used by wavesyncdb's own `log::info!`
-    //    macros. Configured below with the recommended module filters.
+    // 1. The `log` crate (env_logger) — wavesyncdb's own events are
+    //    `tracing`-native now, but its `log` compat feature also emits them
+    //    as `log` records, so env_logger still shows them. Configured below
+    //    with the recommended module filters.
     //
     // 2. The `tracing` crate (tracing-subscriber, set up by dioxus-logger
     //    inside `dioxus::launch`) — used by libp2p transports, sqlx, hickory,
@@ -114,27 +116,22 @@ fn main() {
     // Set RUST_LOG once with the equivalent module filters so BOTH systems
     // honor them. If the user has already set RUST_LOG, defer to that.
     if std::env::var_os("RUST_LOG").is_none() {
-        let directives: Vec<String> = std::iter::once("info".to_string())
-            .chain(
-                wavesyncdb::recommended_log_filters()
-                    .into_iter()
-                    .map(|(m, lvl)| format!("{m}={}", lvl.as_str().to_lowercase())),
-            )
-            .collect();
         // Safety: setting an env var before any threads are spawned is sound.
         // This must run before `dioxus::launch` (which initializes
         // tracing-subscriber via dioxus-logger).
         unsafe {
-            std::env::set_var("RUST_LOG", directives.join(","));
+            std::env::set_var(
+                "RUST_LOG",
+                format!("info,{}", wavesyncdb::recommended_log_filters()),
+            );
         }
     }
 
     // Set up the `log` crate side (env_logger). dioxus-logger handles tracing.
-    let mut log_builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    for (module, level) in wavesyncdb::recommended_log_filters() {
-        log_builder.filter_module(module, level);
-    }
+    let mut log_builder = env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or(format!("info,{}", wavesyncdb::recommended_log_filters())),
+    );
     log_builder.init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
