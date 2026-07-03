@@ -19,6 +19,10 @@ impl EngineRunner {
             if let SyncRequest::IdentityAnnounce { ref mut hmac, .. } = req {
                 *hmac = Some(tag);
             }
+            // Unsigned (no-passphrase) mode never reaches this branch, so its
+            // byte metrics are approximate — acceptable since production
+            // groups run passphrases.
+            self.record_wire_bytes(&peer_id, bytes.len() as u64, false);
         }
 
         self.swarm

@@ -137,13 +137,16 @@ impl EngineRunner {
                                         topic: peer_topic.clone(),
                                         hmac: None,
                                     };
-                                if let Ok(bytes) = serde_json::to_vec(&verify_resp)
-                                    && !gk.verify(&bytes, &tag)
-                                {
-                                    log::debug!(
-                                        "Rejecting sync response with invalid HMAC from peer {peer}"
-                                    );
-                                    return;
+                                if let Ok(bytes) = serde_json::to_vec(&verify_resp) {
+                                    // Counted regardless of verify outcome — the
+                                    // bytes were spent on the wire either way.
+                                    self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                                    if !gk.verify(&bytes, &tag) {
+                                        log::debug!(
+                                            "Rejecting sync response with invalid HMAC from peer {peer}"
+                                        );
+                                        return;
+                                    }
                                 }
                             }
 
@@ -424,13 +427,16 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_req)
-                && !gk.verify(&bytes, &tag)
-            {
-                // Per-group HMAC failure for a topic we hold → time-boxed
-                // rejection with backoff (Rule 2.8 / N6).
-                self.reject_peer_for_group(&effective, peer);
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_req) {
+                // Counted regardless of verify outcome — the bytes were spent
+                // on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    // Per-group HMAC failure for a topic we hold → time-boxed
+                    // rejection with backoff (Rule 2.8 / N6).
+                    self.reject_peer_for_group(&effective, peer);
+                    return;
+                }
             }
             // HMAC verified — mark peer as a member of THIS group, and clear any
             // prior rejection backoff (it just proved the right key — recovery).
@@ -495,6 +501,11 @@ impl EngineRunner {
         let local_site_id = g.site_id;
         let change_tx = g.change_tx.clone();
         let topic_name = g.topic_name.clone();
+        // No `&mut self` inside the spawned task below, so the relay
+        // classification and the shared counters are captured here.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             // Note on long-offline cursors: shadow tables are upsert-in-place,
@@ -535,6 +546,17 @@ impl EngineRunner {
                 {
                     *hmac = Some(tag);
                 }
+                // Unsigned mode never reaches this branch, so its byte
+                // metrics are approximate — acceptable since production
+                // groups run passphrases.
+                account_wire_bytes(
+                    &diagnostics,
+                    &peer_health,
+                    &peer,
+                    relayed,
+                    bytes.len() as u64,
+                    false,
+                );
             }
 
             if let Err(e) = resp_tx.send((channel, resp)).await {
@@ -612,13 +634,16 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_req)
-                && !gk.verify(&bytes, &tag)
-            {
-                // Per-group HMAC failure for a topic we hold → time-boxed
-                // rejection with backoff (Rule 2.8 / N6).
-                self.reject_peer_for_group(&effective, peer);
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_req) {
+                // Counted regardless of verify outcome — the bytes were spent
+                // on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    // Per-group HMAC failure for a topic we hold → time-boxed
+                    // rejection with backoff (Rule 2.8 / N6).
+                    self.reject_peer_for_group(&effective, peer);
+                    return;
+                }
             }
             // HMAC verified — mark peer as a member of THIS group, and clear any
             // prior rejection backoff (it just proved the right key — recovery).
@@ -704,11 +729,14 @@ impl EngineRunner {
                 app_id: app_id.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_req)
-                && !gk.verify(&bytes, &tag)
-            {
-                log::debug!("Rejecting identity announce with invalid HMAC from peer {peer}");
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_req) {
+                // Counted regardless of verify outcome — the bytes were spent
+                // on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    log::debug!("Rejecting identity announce with invalid HMAC from peer {peer}");
+                    return;
+                }
             }
         }
 
@@ -816,6 +844,10 @@ impl EngineRunner {
         let topic_name = g.topic_name.clone();
         let group_key = g.group_key.clone();
         let req_tx = self.reconcile_req_tx.clone();
+        // No `&mut self` inside the spawned task below.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             let digest = reconcile::compute_group_digest(&db, &registry).await;
@@ -831,6 +863,14 @@ impl EngineRunner {
                 if let SyncRequest::ReconcileDigest { ref mut hmac, .. } = req {
                     *hmac = Some(tag);
                 }
+                account_wire_bytes(
+                    &diagnostics,
+                    &peer_health,
+                    &peer,
+                    relayed,
+                    bytes.len() as u64,
+                    false,
+                );
             }
             let _ = req_tx.send((peer, req)).await;
         });
@@ -871,11 +911,14 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_req)
-                && !gk.verify(&bytes, &tag)
-            {
-                self.reject_peer_for_group(&effective, peer);
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_req) {
+                // Counted regardless of verify outcome — the bytes were
+                // spent on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    self.reject_peer_for_group(&effective, peer);
+                    return;
+                }
             }
         }
 
@@ -886,6 +929,10 @@ impl EngineRunner {
         let registry = g.registry.clone();
         let topic_name = g.topic_name.clone();
         let resp_tx = self.snapshot_resp_tx.clone();
+        // No `&mut self` inside the spawned task below.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             let local_digest = reconcile::compute_group_digest(&db, &registry).await;
@@ -903,6 +950,14 @@ impl EngineRunner {
                 if let crate::protocol::SyncResponse::ReconcileResult { ref mut hmac, .. } = resp {
                     *hmac = Some(tag);
                 }
+                account_wire_bytes(
+                    &diagnostics,
+                    &peer_health,
+                    &peer,
+                    relayed,
+                    bytes.len() as u64,
+                    false,
+                );
             }
             if let Err(e) = resp_tx.send((channel, resp)).await {
                 log::error!("Failed to queue reconcile result: {e}");
@@ -944,11 +999,14 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_resp)
-                && !gk.verify(&bytes, &tag)
-            {
-                log::debug!("Rejecting reconcile result with invalid HMAC from peer {peer}");
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_resp) {
+                // Counted regardless of verify outcome — the bytes were
+                // spent on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    log::debug!("Rejecting reconcile result with invalid HMAC from peer {peer}");
+                    return;
+                }
             }
         }
 
@@ -1005,11 +1063,24 @@ impl EngineRunner {
         let group_key = g.group_key.clone();
         let site_id = g.site_id;
         let req_tx = self.reconcile_req_tx.clone();
+        // No `&mut self` inside the spawned task below.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             let cells = reconcile::enumerate_sorted_cells(&db, &registry).await;
             let entries = reconcile::initial_entries(&cells);
-            let req = build_reconcile_range(entries, site_id, topic_name, group_key.as_ref());
+            let req = build_reconcile_range(
+                entries,
+                site_id,
+                topic_name,
+                group_key.as_ref(),
+                &diagnostics,
+                &peer_health,
+                &peer,
+                relayed,
+            );
             let _ = req_tx.send((peer, req)).await;
         });
     }
@@ -1051,11 +1122,14 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_req)
-                && !gk.verify(&bytes, &tag)
-            {
-                self.reject_peer_for_group(&effective, peer);
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_req) {
+                // Counted regardless of verify outcome — the bytes were
+                // spent on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    self.reject_peer_for_group(&effective, peer);
+                    return;
+                }
             }
         }
 
@@ -1069,6 +1143,10 @@ impl EngineRunner {
         let resp_tx = self.snapshot_resp_tx.clone();
         let changeset_tx = self.remote_changeset_tx.clone();
         let effective_for_apply = effective.clone();
+        // No `&mut self` inside the spawned task below.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             let cells = reconcile::enumerate_sorted_cells(&db, &registry).await;
@@ -1100,6 +1178,14 @@ impl EngineRunner {
                 {
                     *hmac = Some(tag);
                 }
+                account_wire_bytes(
+                    &diagnostics,
+                    &peer_health,
+                    &peer,
+                    relayed,
+                    bytes.len() as u64,
+                    false,
+                );
             }
             if let Err(e) = resp_tx.send((channel, resp)).await {
                 log::error!("Failed to queue reconcile range result: {e}");
@@ -1143,11 +1229,14 @@ impl EngineRunner {
                 topic: peer_topic.clone(),
                 hmac: None,
             };
-            if let Ok(bytes) = serde_json::to_vec(&verify_resp)
-                && !gk.verify(&bytes, &tag)
-            {
-                log::debug!("Rejecting reconcile range result with invalid HMAC from {peer}");
-                return;
+            if let Ok(bytes) = serde_json::to_vec(&verify_resp) {
+                // Counted regardless of verify outcome — the bytes were
+                // spent on the wire either way.
+                self.record_wire_bytes(&peer, bytes.len() as u64, true);
+                if !gk.verify(&bytes, &tag) {
+                    log::debug!("Rejecting reconcile range result with invalid HMAC from {peer}");
+                    return;
+                }
             }
         }
 
@@ -1169,6 +1258,10 @@ impl EngineRunner {
         let changeset_tx = self.remote_changeset_tx.clone();
         let req_tx = self.reconcile_req_tx.clone();
         let effective_for_apply = effective.clone();
+        // No `&mut self` inside the spawned task below.
+        let relayed = self.peer_via_relay.get(&peer).copied().unwrap_or(false);
+        let diagnostics = self.diagnostics.clone();
+        let peer_health = self.peer_health.clone();
 
         tokio::spawn(async move {
             let cells = reconcile::enumerate_sorted_cells(&db, &registry).await;
@@ -1185,7 +1278,16 @@ impl EngineRunner {
                     .await;
             }
             if !next.is_empty() {
-                let req = build_reconcile_range(next, site_id, topic_name, group_key.as_ref());
+                let req = build_reconcile_range(
+                    next,
+                    site_id,
+                    topic_name,
+                    group_key.as_ref(),
+                    &diagnostics,
+                    &peer_health,
+                    &peer,
+                    relayed,
+                );
                 let _ = req_tx.send((peer, req)).await;
             }
         });
@@ -1193,11 +1295,16 @@ impl EngineRunner {
 }
 
 /// Build a `ReconcileRange` request, signed when a group key is configured (Rule 2.7).
+#[allow(clippy::too_many_arguments)]
 fn build_reconcile_range(
     entries: Vec<crate::protocol::RangeEntry>,
     site_id: NodeId,
     topic: String,
     group_key: Option<&GroupKey>,
+    diagnostics: &crate::diagnostics::Counters,
+    peer_health: &crate::diagnostics::PeerHealthStore,
+    peer: &libp2p::PeerId,
+    relayed: bool,
 ) -> SyncRequest {
     let mut req = SyncRequest::ReconcileRange {
         entries,
@@ -1212,6 +1319,14 @@ fn build_reconcile_range(
         if let SyncRequest::ReconcileRange { ref mut hmac, .. } = req {
             *hmac = Some(tag);
         }
+        account_wire_bytes(
+            diagnostics,
+            peer_health,
+            peer,
+            relayed,
+            bytes.len() as u64,
+            false,
+        );
     }
     req
 }

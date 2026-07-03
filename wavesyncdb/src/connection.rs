@@ -56,6 +56,12 @@ pub(crate) struct WaveSyncNodeInner {
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    /// Per-peer byte/health bookkeeping, threaded alongside `diagnostics` so a
+    /// future `WaveSyncDb`-level accessor can read it. Not read anywhere yet —
+    /// the engine already writes to it directly via its own clone; the
+    /// `PeerInfo` mirror lands in a later change.
+    #[allow(dead_code)]
+    peer_health: Arc<crate::diagnostics::PeerHealthStore>,
     /// Node-level user-notification channel, shared by **every** group on this
     /// node. Each group's engine-side `GroupState.notification_tx` is a clone of
     /// this one sender, so `WaveSyncDb::notification_rx()` on any handle yields
@@ -1990,6 +1996,10 @@ impl WaveSyncDbBuilder {
         // engine clones the Arc, increments through atomic operations, and
         // never blocks on it.
         let diagnostics = Arc::new(crate::diagnostics::Counters::default());
+        // Per-peer byte/health bookkeeping, threaded the same way as
+        // `diagnostics` above so a future `WaveSyncDb`-level accessor has it
+        // ready — see `crate::diagnostics::PeerHealthStore`.
+        let peer_health = Arc::new(crate::diagnostics::PeerHealthStore::new());
 
         let db_version_cache = Arc::new(AtomicU64::new(db_version));
 
@@ -2018,6 +2028,7 @@ impl WaveSyncDbBuilder {
             network_status.clone(),
             network_event_tx.clone(),
             diagnostics.clone(),
+            peer_health.clone(),
             db_version_cache.clone(),
             notification_tx.clone(),
             notification_registry,
@@ -2034,6 +2045,7 @@ impl WaveSyncDbBuilder {
             network_status,
             network_event_tx,
             diagnostics,
+            peer_health,
             // The default group's channel is the node-level channel; joined
             // groups clone this same sender so all notifications merge here.
             notification_tx: notification_tx.clone(),

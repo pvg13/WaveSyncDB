@@ -34,9 +34,10 @@
 //! * Not retained across engine restarts; the snapshot reflects the
 //!   current process's lifetime.
 //! * [`PeerHealthStore`] tracks the per-peer substrate (bytes, sync/converge
-//!   timestamps, catch-up RTT), but nothing here writes to it yet — the
-//!   engine plumbing that feeds it and mirrors it onto
-//!   [`crate::network_status::PeerInfo`] lands in a later change.
+//!   timestamps, catch-up RTT). Byte accounting (`record_bytes`) is wired at
+//!   every HMAC sign/verify site in the engine; the sync/converge timestamps,
+//!   RTT, and the mirror onto [`crate::network_status::PeerInfo`] land in a
+//!   later change.
 //!
 //! [issue #27]: https://github.com/pvg13/WaveSyncDB/issues/27
 
@@ -317,7 +318,8 @@ impl Snapshot {
 /// Mirrors the fields the engine attaches to
 /// [`crate::network_status::PeerInfo`] in a later change.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-// Wired by the engine in the next change: constructed only in tests today.
+// bytes_in/bytes_out are written by the engine's sign/verify sites now;
+// still read only in tests until the PeerInfo mirror lands in a later change.
 #[allow(dead_code)]
 pub(crate) struct PeerHealth {
     pub bytes_in: u64,
@@ -338,12 +340,8 @@ pub(crate) struct PeerHealth {
 /// `.await` inside it, so the lock is held for a bounded, tiny amount of
 /// time and never across a suspension point.
 #[derive(Debug, Default)]
-// Wired by the engine in the next change: no producer/consumer call sites yet.
-#[allow(dead_code)]
 pub(crate) struct PeerHealthStore(Mutex<HashMap<PeerId, PeerHealth>>);
 
-// Wired by the engine in the next change: no producer/consumer call sites yet.
-#[allow(dead_code)]
 impl PeerHealthStore {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -359,12 +357,16 @@ impl PeerHealthStore {
 
     /// Read-only snapshot for one peer; `None` if nothing has been
     /// recorded for it yet (e.g. discovered but never synced).
+    // Read by a later change (PeerInfo mirroring in update_network_status).
+    #[allow(dead_code)]
     pub(crate) fn snapshot_for(&self, peer: &PeerId) -> Option<PeerHealth> {
         self.guard().get(peer).copied()
     }
 
     /// Record wire bytes transferred with `peer`. `inbound = true` adds to
-    /// `bytes_in`, `false` to `bytes_out`.
+    /// `bytes_in`, `false` to `bytes_out`. Called from every HMAC sign/verify
+    /// site in the engine, alongside the matching `Counters` relay/direct
+    /// bucket increment.
     pub(crate) fn record_bytes(&self, peer: &PeerId, n: u64, inbound: bool) {
         let mut guard = self.guard();
         let entry = guard.entry(*peer).or_default();
@@ -377,6 +379,8 @@ impl PeerHealthStore {
 
     /// Stamp `peer` as synced right now — applied a `ChangesetResponse`,
     /// applied an inbound `Push`, or received a `PushAck` from it.
+    // Wired by the engine in a later change: no call site yet.
+    #[allow(dead_code)]
     pub(crate) fn stamp_synced(&self, peer: &PeerId) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().last_synced_at_ms = Some(unix_now_ms());
@@ -384,12 +388,16 @@ impl PeerHealthStore {
 
     /// Stamp `peer` as converged right now (its reconcile digest matched
     /// ours — see `Counters::reconcile_converged`).
+    // Wired by the engine in a later change: no call site yet.
+    #[allow(dead_code)]
     pub(crate) fn stamp_converged(&self, peer: &PeerId) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().last_converged_at_ms = Some(unix_now_ms());
     }
 
     /// Record the latest catch-up round-trip time observed for `peer`.
+    // Wired by the engine in a later change: no call site yet.
+    #[allow(dead_code)]
     pub(crate) fn record_rtt(&self, peer: &PeerId, rtt_ms: u64) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().sync_rtt_ms = Some(rtt_ms);

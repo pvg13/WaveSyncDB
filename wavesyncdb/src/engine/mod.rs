@@ -269,6 +269,7 @@ pub(crate) fn start_engine(
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    peer_health: Arc<crate::diagnostics::PeerHealthStore>,
     db_version_cache: Arc<std::sync::atomic::AtomicU64>,
     notification_tx: broadcast::Sender<crate::notify::Notification>,
     notification_registry: Arc<crate::registry::NotificationRegistry>,
@@ -289,6 +290,7 @@ pub(crate) fn start_engine(
             network_status,
             network_event_tx,
             diagnostics,
+            peer_health,
             db_version_cache,
             notification_tx,
             notification_registry,
@@ -440,6 +442,38 @@ fn quic_listen_multiaddr(ip: std::net::IpAddr) -> libp2p::Multiaddr {
 fn addr_is_relayed(addr: &libp2p::Multiaddr) -> bool {
     addr.iter()
         .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// Attribute `n` wire bytes exchanged with `peer` to the relay/direct bucket
+/// in `Counters`, and mirror the same total into `PeerHealthStore`. Every
+/// HMAC sign/verify site already runs `serde_json::to_vec` to build/check the
+/// MAC, so `n` (`bytes.len()`) is free — no extra serialization is added to
+/// count it. Counted on successful (de)serialization regardless of whether an
+/// inbound HMAC later verifies: the bytes were spent on the wire either way,
+/// and rejection is a separate, orthogonal decision (Rule 2.7).
+///
+/// A free function (not an `EngineRunner` method) because several sign sites
+/// — the version-vector / reconcile responders — run inside `tokio::spawn`
+/// with no `&mut self` available. Callers there clone the two `Arc`s and
+/// capture `relayed` from `peer_via_relay` before spawning; see
+/// [`EngineRunner::record_wire_bytes`] for the non-spawned call sites.
+fn account_wire_bytes(
+    diagnostics: &crate::diagnostics::Counters,
+    peer_health: &crate::diagnostics::PeerHealthStore,
+    peer: &libp2p::PeerId,
+    relayed: bool,
+    n: u64,
+    inbound: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counter = match (relayed, inbound) {
+        (true, true) => &diagnostics.relay_bytes_in,
+        (true, false) => &diagnostics.relay_bytes_out,
+        (false, true) => &diagnostics.direct_bytes_in,
+        (false, false) => &diagnostics.direct_bytes_out,
+    };
+    counter.fetch_add(n, Relaxed);
+    peer_health.record_bytes(peer, n, inbound);
 }
 
 /// Given a peer's introduced address set, drop circuit-relay addresses when a
@@ -654,6 +688,7 @@ async fn run_engine(
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
+    peer_health: Arc<crate::diagnostics::PeerHealthStore>,
     db_version_cache: Arc<std::sync::atomic::AtomicU64>,
     notification_tx: broadcast::Sender<crate::notify::Notification>,
     notification_registry: Arc<crate::registry::NotificationRegistry>,
@@ -809,6 +844,7 @@ async fn run_engine(
         lan_peers: std::collections::HashSet::new(),
         pending_demotions: HashMap::new(),
         diagnostics,
+        peer_health,
         protocol_mismatch_peers: std::collections::HashSet::new(),
         peer_via_relay: std::collections::HashMap::new(),
         reconcile_capable: std::collections::HashSet::new(),
@@ -1142,6 +1178,10 @@ struct EngineRunner {
     /// (UI / debug panel / test assertions) snapshot via
     /// [`WaveSyncDb::diagnostics`]. See [`crate::diagnostics`].
     pub(crate) diagnostics: Arc<crate::diagnostics::Counters>,
+    /// Per-peer byte/health bookkeeping, shared with spawned responder tasks
+    /// that sign/verify HMACs without `&mut self` available. See
+    /// [`EngineRunner::record_wire_bytes`] and [`crate::diagnostics`].
+    pub(crate) peer_health: Arc<crate::diagnostics::PeerHealthStore>,
     /// Peers that rejected our sync request-response protocol id
     /// (`OutboundFailure::UnsupportedProtocols`) — i.e. they are connected at
     /// the transport level but run an incompatible WaveSyncDB version. Tracked
@@ -1306,6 +1346,22 @@ impl EngineRunner {
     /// Emit a network event on the broadcast channel, ignoring no-receiver errors.
     fn emit_network_event(&self, event: crate::network_status::NetworkEvent) {
         let _ = self.network_event_tx.send(event);
+    }
+
+    /// Record `n` wire bytes exchanged with `peer` (see [`account_wire_bytes`]).
+    /// For call sites that hold `&self`/`&mut self` directly — i.e. everywhere
+    /// except the `tokio::spawn`'d HMAC responders, which call
+    /// `account_wire_bytes` directly with pre-captured state.
+    fn record_wire_bytes(&self, peer: &libp2p::PeerId, n: u64, inbound: bool) {
+        let relayed = self.peer_via_relay.get(peer).copied().unwrap_or(false);
+        account_wire_bytes(
+            &self.diagnostics,
+            &self.peer_health,
+            peer,
+            relayed,
+            n,
+            inbound,
+        );
     }
 
     /// Idempotently issue `swarm.listen_on(<relay>/p2p-circuit)` against the
@@ -1717,6 +1773,7 @@ impl EngineRunner {
         self.relayed_conn_ids.remove(&peer_id);
         self.lan_peers.remove(&peer_id);
         self.pending_demotions.remove(&peer_id);
+        self.peer_health.prune(&peer_id);
 
         // Handle relay server disconnect
         if let RelayState::Connected { relay_peer_id, .. } | RelayState::Listening { relay_peer_id } =
@@ -2234,6 +2291,10 @@ impl EngineRunner {
                             unreachable!()
                         };
                         *hmac = Some(tag);
+                        // Unsigned (no-passphrase) mode never reaches this branch, so
+                        // its byte metrics are approximate — acceptable since
+                        // production groups run passphrases.
+                        self.record_wire_bytes(peer_id, bytes.len() as u64, false);
                     }
                 }
 
@@ -2398,6 +2459,9 @@ impl EngineRunner {
                         unreachable!()
                     };
                     *hmac = Some(tag);
+                    // Unsigned mode never reaches this branch — see the fan-out
+                    // sign site above.
+                    self.record_wire_bytes(peer_id, bytes.len() as u64, false);
                 }
                 let request_id = self
                     .swarm

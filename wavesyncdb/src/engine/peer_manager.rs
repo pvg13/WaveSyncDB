@@ -88,6 +88,9 @@ impl EngineRunner {
                 if let SyncRequest::VersionVector { ref mut hmac, .. } = req {
                     *hmac = Some(tag);
                 }
+                // Unsigned mode never reaches this branch — see the
+                // identity-announce sign site for the same caveat.
+                self.record_wire_bytes(&peer_id, bytes.len() as u64, false);
             }
         }
 
