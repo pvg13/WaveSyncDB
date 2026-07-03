@@ -2182,6 +2182,10 @@ impl WaveSyncDbBuilder {
 
         // Create meta table and get/generate persistent site_id
         crate::shadow::create_meta_table(&inner).await?;
+        // Capture + guard tables must exist before any registered table's
+        // triggers can fire — a trigger referencing a missing table fails
+        // the user's write outright.
+        crate::capture::ensure_capture_tables(&inner).await?;
         let site_id = crate::shadow::get_site_id(&inner).await?;
 
         let node_id = self.node_id.unwrap_or(site_id);
@@ -2471,6 +2475,7 @@ impl WaveSyncNode {
 
         // Same per-DB setup that `build()` performs for the default group.
         crate::shadow::create_meta_table(&db).await?;
+        crate::capture::ensure_capture_tables(&db).await?;
         let site_id = crate::shadow::get_site_id(&db).await?;
         let db_version = crate::shadow::get_db_version(&db).await?;
         let db_version_cache = Arc::new(AtomicU64::new(db_version));

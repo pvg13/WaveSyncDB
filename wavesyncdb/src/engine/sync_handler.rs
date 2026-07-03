@@ -1305,6 +1305,19 @@ async fn apply_changeset_chunk<'a>(
         }
     };
 
+    // Suppress change capture for the duration of this transaction: the
+    // user-table writes below are REMOTE state, and re-capturing them would
+    // re-broadcast every applied changeset — two peers would echo the same
+    // changes back and forth forever. The flag is row state inside this
+    // transaction, so a rollback (or crash) restores it, and SQLite's
+    // single-writer locking means no concurrent local write can observe it.
+    // Fail closed: applying without suppression must never happen.
+    if let Err(e) = crate::capture::set_capture_suppressed(&txn, true).await {
+        log::error!("Failed to suppress change capture for remote apply: {e}");
+        let _ = txn.rollback().await;
+        return;
+    }
+
     let local_db_version = match shadow::increment_db_version(&txn).await {
         Ok(v) => v,
         Err(e) => {
@@ -1434,6 +1447,15 @@ async fn apply_changeset_chunk<'a>(
                 column_values,
             });
         }
+    }
+
+    // Lift the capture suppression inside the same transaction so the flag
+    // can never leak past it — committed applies and rolled-back applies
+    // both leave the guard at 0.
+    if let Err(e) = crate::capture::set_capture_suppressed(&txn, false).await {
+        log::error!("Failed to restore change capture after remote apply: {e}");
+        let _ = txn.rollback().await;
+        return;
     }
 
     if let Err(e) = txn.commit().await {
@@ -1919,6 +1941,7 @@ mod tests {
     async fn setup_engine_test_db() -> (sea_orm::DatabaseConnection, Arc<TableRegistry>) {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::shadow::create_meta_table(&db).await.unwrap();
+        crate::capture::ensure_capture_tables(&db).await.unwrap();
         crate::peer_tracker::create_peer_versions_table(&db)
             .await
             .unwrap();
@@ -2474,6 +2497,66 @@ mod tests {
             .expect("Row should exist");
         let title: String = result.try_get_by_index(0).unwrap();
         assert_eq!(title, "Test Task");
+    }
+
+    /// A remote apply must not be re-captured by the change triggers —
+    /// re-capturing would re-broadcast the changeset and two peers would
+    /// echo it back and forth forever. A local write afterwards must still
+    /// capture normally (the suppression is scoped to the apply tx).
+    #[tokio::test]
+    async fn test_remote_apply_is_not_recaptured() {
+        let (db, registry) = setup_engine_test_db().await;
+        let meta = registry.get("tasks").unwrap();
+        crate::capture::ensure_triggers(&db, &meta).await.unwrap();
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        let changes = vec![ColumnChange {
+            table: "tasks".into(),
+            pk: "remote-1".into(),
+            cid: "title".into(),
+            val: Some(serde_json::json!("from peer")),
+            site_id: NodeId([2u8; 16]),
+            col_version: 1,
+            cl: 1,
+            seq: 0,
+            db_version: 0,
+        }];
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Remote {
+                peer_site: NodeId([2u8; 16]),
+            },
+            None,
+        )
+        .await;
+
+        // The remote row landed...
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'remote-1'".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(row.is_some(), "remote row should have been applied");
+        // ...but nothing was captured.
+        let captured = crate::capture::fetch_capture_rows(&db).await.unwrap();
+        assert!(
+            captured.is_empty(),
+            "remote apply must not enter the capture table, got {captured:?}"
+        );
+
+        // A local (unsuppressed) write still captures.
+        db.execute_unprepared("INSERT INTO tasks (id, title) VALUES ('local-1', 'mine')")
+            .await
+            .unwrap();
+        let captured = crate::capture::fetch_capture_rows(&db).await.unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].pk, "local-1");
     }
 
     #[tokio::test]
@@ -3306,6 +3389,7 @@ mod tests {
     {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         crate::shadow::create_meta_table(&db).await.unwrap();
+        crate::capture::ensure_capture_tables(&db).await.unwrap();
         crate::peer_tracker::create_peer_versions_table(&db)
             .await
             .unwrap();
