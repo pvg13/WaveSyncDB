@@ -336,7 +336,16 @@ async fn test_m12_update_with_unicode_column_values() {
 }
 
 // ---------------------------------------------------------------------------
-// N4 regression: db_version persist failure must return error and roll back
+// N4 regression: db_version durability under bookkeeping failure.
+//
+// The write path no longer touches `_wavesync_meta` per write — each clock
+// upsert carries the new db_version inside the same transaction as the rest
+// of the bookkeeping, and `get_db_version` recovers via
+// MAX(meta, MAX over shadow tables). Two guarantees to hold:
+//   1. Version recovery survives a missing `_wavesync_meta` (shadow MAX wins).
+//   2. A bookkeeping failure (shadow table unavailable) fails the write and
+//      rolls back the in-memory counter — no changeset is published with a
+//      db_version the shadow state can't back.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_n4_db_version_persist_failure_returns_error() {
@@ -368,13 +377,25 @@ async fn test_n4_db_version_persist_failure_returns_error() {
         "db_version should be 1 after first insert"
     );
 
-    // Step 2: Drop _wavesync_meta to make set_db_version fail
-    db.inner()
-        .execute_unprepared("DROP TABLE \"_wavesync_meta\"")
+    // Step 2: Rewind _wavesync_meta to 0 — the write path never updates it,
+    // so recovery must report 1 via the shadow-table MAX (guarantee 1).
+    wavesyncdb::shadow::set_db_version(db.inner(), 0)
         .await
         .unwrap();
+    let recovered = wavesyncdb::shadow::get_db_version(db.inner())
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered, 1,
+        "N4: db_version must recover from shadow tables when _wavesync_meta is stale"
+    );
 
-    // Step 3: Attempt insert — should return Err because db_version persist fails
+    // Step 3: Drop the shadow clock table — the next write's bookkeeping
+    // cannot commit, so the write must return Err (guarantee 2).
+    db.inner()
+        .execute_unprepared("DROP TABLE \"_wavesync_tasks_clock\"")
+        .await
+        .unwrap();
     let result = task::ActiveModel {
         id: Set("t2".to_string()),
         title: Set("second".into()),
@@ -383,17 +404,13 @@ async fn test_n4_db_version_persist_failure_returns_error() {
     }
     .insert(&db)
     .await;
-
     assert!(
         result.is_err(),
-        "N4: Insert should fail when db_version persist fails"
+        "N4: Insert should fail when shadow bookkeeping cannot be persisted"
     );
 
-    // Step 4: Restore _wavesync_meta and set db_version back to 1
-    wavesyncdb::shadow::create_meta_table(db.inner())
-        .await
-        .unwrap();
-    wavesyncdb::shadow::set_db_version(db.inner(), 1)
+    // Step 4: Restore the shadow table.
+    wavesyncdb::shadow::create_shadow_table(db.inner(), "tasks")
         .await
         .unwrap();
 
