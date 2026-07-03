@@ -366,8 +366,22 @@ impl PeerHealthStore {
         }
     }
 
-    /// Stamp `peer` as synced right now — applied a `ChangesetResponse`,
-    /// applied an inbound `Push`, or received a `PushAck` from it.
+    /// Stamp `peer` as synced right now. Called from four triggers: a
+    /// `ChangesetResponse` was applied (including the empty "already up to
+    /// date" case), an inbound `Push` was applied, a reconcile-range (RBSR)
+    /// apply completed, or a `PushAck` was received from this peer. The first
+    /// three route through the shared remote-changeset consumer and are only
+    /// stamped once the apply transaction actually commits — a rolled-back
+    /// apply must never read as a successful sync.
+    ///
+    /// Catch-up RTT sampling (a separate measurement, see `record_rtt`) is
+    /// peer-keyed rather than (peer, group)-keyed: when a `Response` arrives
+    /// from a peer, every group's `pending_sync_peers` entry for that peer is
+    /// drained, not just the responding group's. If the same peer had a
+    /// catch-up request in flight in more than one group at once, the other
+    /// group(s) lose their own RTT sample when their real response later
+    /// arrives (nothing left to diff against) — a missed sample, not a
+    /// double-counted one.
     pub(crate) fn stamp_synced(&self, peer: &PeerId) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().last_synced_at_ms = Some(unix_now_ms());

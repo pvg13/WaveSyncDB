@@ -2127,13 +2127,19 @@ impl EngineRunner {
                         registry: &notif_registry,
                         tx: &notif_tx,
                     };
-                    apply_remote_changeset(&db, &change_tx, &registry, &rc.changes, Some(&cache), change_source, Some(notify_ctx)).await;
-                    // Applied successfully — covers both a ChangesetResponse
-                    // with changes and an inbound Push (peer_db_version is
-                    // Some only for the former; both funnel through this one
-                    // apply site).
-                    self.peer_health.stamp_synced(&rc.peer);
-                    self.update_network_status();
+                    let committed = apply_remote_changeset(&db, &change_tx, &registry, &rc.changes, Some(&cache), change_source, Some(notify_ctx)).await;
+                    // Only stamp "synced" if the apply actually committed —
+                    // `apply_remote_changeset` rolls back and logs on failure
+                    // internally, so without this check a rolled-back apply
+                    // (e.g. a mid-transaction DB error) would still report a
+                    // successful sync. Covers both a ChangesetResponse with
+                    // changes and an inbound Push (peer_db_version is Some
+                    // only for the former; both funnel through this one apply
+                    // site).
+                    if committed {
+                        self.peer_health.stamp_synced(&rc.peer);
+                        self.update_network_status();
+                    }
                     // Record our knowledge of the sender's db_version only now,
                     // after the changes are durably committed — never at receive
                     // time. This guarantees the persisted peer version is always

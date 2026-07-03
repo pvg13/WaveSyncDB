@@ -56,10 +56,14 @@ pub(crate) struct WaveSyncNodeInner {
     network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     diagnostics: Arc<crate::diagnostics::Counters>,
-    /// Per-peer byte/health bookkeeping, threaded alongside `diagnostics` so a
-    /// future `WaveSyncDb`-level accessor can read it. Not read anywhere yet —
-    /// the engine already writes to it directly via its own clone; the
-    /// `PeerInfo` mirror lands in a later change.
+    /// Engine-shared per-peer health store (byte counters, last-synced /
+    /// last-converged timestamps, catch-up RTT). This node holds one clone of
+    /// the `Arc` and the engine holds another; the engine's clone is what
+    /// actually feeds `PeerInfo`'s health fields today, via
+    /// `update_network_status` reading `PeerHealthStore::snapshot_for`. This
+    /// field's own clone isn't read anywhere yet — it exists so a future
+    /// `WaveSyncDb`-level accessor can reach the store directly without going
+    /// through `NetworkStatus`.
     #[allow(dead_code)]
     peer_health: Arc<crate::diagnostics::PeerHealthStore>,
     /// Node-level user-notification channel, shared by **every** group on this

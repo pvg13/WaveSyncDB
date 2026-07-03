@@ -1379,6 +1379,11 @@ pub struct NotifyCtx<'a> {
 // `pub` (reachable only through the hidden `engine::convergence` re-export)
 // so the cross-implementation convergence test suite can push changesets
 // through the real native apply path.
+/// Returns `true` only if every chunk's transaction committed. A caller that
+/// wants to know whether the apply is durable (e.g. before recording the sync
+/// as successful) must check this — the function itself already rolls back
+/// and logs on failure, so this return value is purely for the caller's own
+/// bookkeeping and never changes what got applied or rolled back.
 pub async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
@@ -1387,7 +1392,7 @@ pub async fn apply_remote_changeset(
     db_version_cache: Option<&std::sync::atomic::AtomicU64>,
     source: crate::messages::ChangeSource,
     notify: Option<NotifyCtx<'_>>,
-) {
+) -> bool {
     // Group changes by (table, pk) so a single row is never split across chunks.
     let mut grouped: Vec<((&str, &str), Vec<&ColumnChange>)> = {
         let mut map: HashMap<(&str, &str), Vec<&ColumnChange>> = HashMap::new();
@@ -1401,7 +1406,7 @@ pub async fn apply_remote_changeset(
 
     // Small changesets: single transaction (no chunking overhead).
     if grouped.len() <= CHANGESET_CHUNK_SIZE {
-        apply_changeset_chunk(
+        return apply_changeset_chunk(
             db,
             change_tx,
             registry,
@@ -1411,14 +1416,16 @@ pub async fn apply_remote_changeset(
             notify,
         )
         .await;
-        return;
     }
 
-    // Large changesets: split into chunks.
+    // Large changesets: split into chunks. A chunk that fails is logged and
+    // rolled back by `apply_changeset_chunk` itself; subsequent chunks still
+    // run (unchanged behavior) but the overall result reflects the failure.
+    let mut all_committed = true;
     while !grouped.is_empty() {
         let chunk_end = grouped.len().min(CHANGESET_CHUNK_SIZE);
         let chunk: Vec<_> = grouped.drain(..chunk_end).collect();
-        apply_changeset_chunk(
+        let committed = apply_changeset_chunk(
             db,
             change_tx,
             registry,
@@ -1428,9 +1435,16 @@ pub async fn apply_remote_changeset(
             notify,
         )
         .await;
+        all_committed &= committed;
     }
+    all_committed
 }
 
+/// Returns `true` if this chunk's transaction committed, `false` if it was
+/// rolled back (or never began) due to an error along the way. Every failure
+/// branch below already logs and rolls back on its own — the return value
+/// only lets the caller distinguish "applied" from "rolled back" without
+/// re-deriving it from log output.
 async fn apply_changeset_chunk<'a>(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,
@@ -1439,14 +1453,14 @@ async fn apply_changeset_chunk<'a>(
     db_version_cache: Option<&std::sync::atomic::AtomicU64>,
     source: crate::messages::ChangeSource,
     notify: Option<NotifyCtx<'_>>,
-) {
+) -> bool {
     use sea_orm::TransactionTrait;
 
     let txn = match db.begin().await {
         Ok(t) => t,
         Err(e) => {
             log::error!("Failed to begin transaction for remote changeset: {e}");
-            return;
+            return false;
         }
     };
 
@@ -1460,7 +1474,7 @@ async fn apply_changeset_chunk<'a>(
     if let Err(e) = crate::capture::set_capture_suppressed(&txn, true).await {
         log::error!("Failed to suppress change capture for remote apply: {e}");
         let _ = txn.rollback().await;
-        return;
+        return false;
     }
 
     let local_db_version = match shadow::increment_db_version(&txn).await {
@@ -1468,7 +1482,7 @@ async fn apply_changeset_chunk<'a>(
         Err(e) => {
             log::error!("Failed to increment db_version: {e}");
             let _ = txn.rollback().await;
-            return;
+            return false;
         }
     };
 
@@ -1505,7 +1519,7 @@ async fn apply_changeset_chunk<'a>(
                     // idempotent and will be re-delivered / re-reconciled.
                     log::error!("Remote delete {table}/{pk} failed, rolling back chunk: {e}");
                     let _ = txn.rollback().await;
-                    return;
+                    return false;
                 }
             }
         } else {
@@ -1522,7 +1536,7 @@ async fn apply_changeset_chunk<'a>(
                 Err(e) => {
                     log::error!("Remote column apply {table}/{pk} failed, rolling back chunk: {e}");
                     let _ = txn.rollback().await;
-                    return;
+                    return false;
                 }
             }
         }
@@ -1600,12 +1614,12 @@ async fn apply_changeset_chunk<'a>(
     if let Err(e) = crate::capture::set_capture_suppressed(&txn, false).await {
         log::error!("Failed to restore change capture after remote apply: {e}");
         let _ = txn.rollback().await;
-        return;
+        return false;
     }
 
     if let Err(e) = txn.commit().await {
         log::error!("Failed to commit remote changeset transaction: {e}");
-        return;
+        return false;
     }
 
     if let Some(cache) = db_version_cache {
@@ -1650,6 +1664,8 @@ async fn apply_changeset_chunk<'a>(
         }
         let _ = change_tx.send(n);
     }
+
+    true
 }
 
 /// Apply a remote delete: check conflict resolution, delete row, update shadow.
