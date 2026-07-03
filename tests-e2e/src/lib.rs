@@ -1053,27 +1053,56 @@ struct PeersResponse {
 }
 
 /// Diagnostics counter snapshot returned by `GET /diagnostics`. Field
-/// names mirror `wavesyncdb::diagnostics::Snapshot` exactly so the
-/// JSON returned by the test-peer is wire-compatible. We don't import
-/// `wavesyncdb` here directly — keeping the harness type-only so the
-/// e2e crate doesn't pull the full engine surface.
+/// names mirror `wavesyncdb::diagnostics::Snapshot` exactly (22 fields,
+/// kept in lockstep with the source struct) so the JSON returned by the
+/// test-peer is wire-compatible. We don't import `wavesyncdb` here
+/// directly — keeping the harness type-only so the e2e crate doesn't
+/// pull the full engine surface. Every field is `#[serde(default)]` so a
+/// snapshot from an older/newer test-peer binary still deserializes.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct DiagnosticsSnapshot {
+    #[serde(default)]
     pub circuit_reservation_attempts: u64,
+    #[serde(default)]
     pub circuit_reservations_accepted: u64,
+    #[serde(default)]
     pub peer_dial_attempts: u64,
+    #[serde(default)]
     pub peer_dial_successes: u64,
+    #[serde(default)]
     pub peer_dial_failures: u64,
+    #[serde(default)]
     pub mdns_discoveries: u64,
+    #[serde(default)]
     pub peerlist_introductions: u64,
+    #[serde(default)]
     pub peerjoined_introductions: u64,
+    #[serde(default)]
     pub cached_addr_dials: u64,
+    #[serde(default)]
     pub dcutr_upgrades_attempted: u64,
+    #[serde(default)]
     pub dcutr_upgrades_succeeded: u64,
     #[serde(default)]
     pub relayed_connections_established: u64,
     #[serde(default)]
     pub direct_connections_established: u64,
     #[serde(default)]
+    pub reconcile_converged: u64,
+    #[serde(default)]
+    pub reconcile_diverged: u64,
+    #[serde(default)]
+    pub pending_pushes_redelivered: u64,
+    #[serde(default)]
     pub relay_connections_demoted: u64,
+    #[serde(default)]
+    pub relay_bytes_out: u64,
+    #[serde(default)]
+    pub relay_bytes_in: u64,
+    #[serde(default)]
+    pub direct_bytes_out: u64,
+    #[serde(default)]
+    pub direct_bytes_in: u64,
+    #[serde(default)]
+    pub sync_rtt_histogram: Vec<(u64, u64)>,
 }

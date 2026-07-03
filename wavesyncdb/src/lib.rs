@@ -41,7 +41,6 @@
 // shared with browser builds.
 pub mod auth;
 pub mod conflict;
-pub mod diagnostics;
 pub mod messages;
 pub mod network_status;
 pub mod protocol;
@@ -68,6 +67,10 @@ pub mod background_sync;
 pub(crate) mod capture;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod connection;
+// Uses libp2p::PeerId (per-peer health store) and is only ever read from
+// WaveSyncDb::diagnostics, itself native-only — no browser build consumes it.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]
