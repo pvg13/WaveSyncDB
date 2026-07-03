@@ -1307,6 +1307,9 @@ impl EngineRunner {
                     .groups
                     .values()
                     .any(|g| g.verified_peers.contains(peer_id));
+                // Health defaults to all-zero/None when nothing has been
+                // recorded for this peer yet (e.g. connected but not synced).
+                let health = self.peer_health.snapshot_for(peer_id).unwrap_or_default();
                 ns::PeerInfo {
                     peer_id: ns::PeerId(peer_id.to_string()),
                     address: addr.to_string(),
@@ -1315,6 +1318,11 @@ impl EngineRunner {
                     is_group_member,
                     app_id: self.peer_identities.get(peer_id).cloned(),
                     via_relay: self.peer_via_relay.get(peer_id).copied().unwrap_or(false),
+                    bytes_in: health.bytes_in,
+                    bytes_out: health.bytes_out,
+                    last_synced_at_ms: health.last_synced_at_ms,
+                    last_converged_at_ms: health.last_converged_at_ms,
+                    sync_rtt_ms: health.sync_rtt_ms,
                 }
             })
             .collect();
@@ -1624,6 +1632,11 @@ impl EngineRunner {
                 is_group_member: false,
                 app_id: None,
                 via_relay: self.peer_via_relay.get(&peer_id).copied().unwrap_or(false),
+                bytes_in: 0,
+                bytes_out: 0,
+                last_synced_at_ms: None,
+                last_converged_at_ms: None,
+                sync_rtt_ms: None,
             },
         ));
         self.update_network_status();
@@ -2115,6 +2128,12 @@ impl EngineRunner {
                         tx: &notif_tx,
                     };
                     apply_remote_changeset(&db, &change_tx, &registry, &rc.changes, Some(&cache), change_source, Some(notify_ctx)).await;
+                    // Applied successfully — covers both a ChangesetResponse
+                    // with changes and an inbound Push (peer_db_version is
+                    // Some only for the former; both funnel through this one
+                    // apply site).
+                    self.peer_health.stamp_synced(&rc.peer);
+                    self.update_network_status();
                     // Record our knowledge of the sender's db_version only now,
                     // after the changes are durably committed — never at receive
                     // time. This guarantees the persisted peer version is always
@@ -2364,6 +2383,10 @@ impl EngineRunner {
         request_id: request_response::OutboundRequestId,
         peer: libp2p::PeerId,
     ) {
+        // The ack was received either way, even if we no longer track this
+        // request (e.g. a redelivery raced the original and both got acked).
+        self.peer_health.stamp_synced(&peer);
+        self.update_network_status();
         let Some((effective_topic, db_version)) = self.pending_push_reqs.remove(&request_id) else {
             return;
         };

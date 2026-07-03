@@ -183,6 +183,11 @@ impl EngineRunner {
                             is_group_member: false,
                             app_id: None,
                             via_relay: self.peer_via_relay.get(&peer_id).copied().unwrap_or(false),
+                            bytes_in: 0,
+                            bytes_out: 0,
+                            last_synced_at_ms: None,
+                            last_converged_at_ms: None,
+                            sync_rtt_ms: None,
                         },
                     ));
                     self.update_network_status();

@@ -39,6 +39,27 @@ pub struct PeerInfo {
     /// `false` means a direct path is in use. Flips to `false` once a DCUtR
     /// hole-punch upgrades the connection to direct.
     pub via_relay: bool,
+    /// Wire bytes received from this peer over its lifetime in the engine's
+    /// per-peer health store (relay + direct combined). `#[serde(default)]` so
+    /// a snapshot captured before this field existed still deserializes.
+    #[serde(default)]
+    pub bytes_in: u64,
+    /// Wire bytes sent to this peer over its lifetime in the health store.
+    #[serde(default)]
+    pub bytes_out: u64,
+    /// Most recent time this peer's data was applied: a `ChangesetResponse`
+    /// with changes, an inbound `Push`, or a `PushAck` received from it.
+    /// `None` if nothing has synced with this peer yet.
+    #[serde(default)]
+    pub last_synced_at_ms: Option<u64>,
+    /// Most recent time a reconcile digest (#82) proved this peer's database
+    /// byte-identical to ours. `None` if never proven convergent.
+    #[serde(default)]
+    pub last_converged_at_ms: Option<u64>,
+    /// Round-trip time (milliseconds) of the last catch-up (version-vector)
+    /// exchange with this peer. `None` if no round trip has completed yet.
+    #[serde(default)]
+    pub sync_rtt_ms: Option<u64>,
 }
 
 /// Relay connection status.
@@ -226,6 +247,11 @@ mod tests {
                     is_group_member: true,
                     app_id: None,
                     via_relay: false,
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    last_synced_at_ms: None,
+                    last_converged_at_ms: None,
+                    sync_rtt_ms: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("b".into()),
@@ -235,6 +261,11 @@ mod tests {
                     is_group_member: false,
                     app_id: None,
                     via_relay: false,
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    last_synced_at_ms: None,
+                    last_converged_at_ms: None,
+                    sync_rtt_ms: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("c".into()),
@@ -244,6 +275,11 @@ mod tests {
                     is_group_member: true,
                     app_id: None,
                     via_relay: false,
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    last_synced_at_ms: None,
+                    last_converged_at_ms: None,
+                    sync_rtt_ms: None,
                 },
             ],
             ..Default::default()
@@ -276,6 +312,11 @@ mod tests {
                 is_group_member: true,
                 app_id: None,
                 via_relay: false,
+                bytes_in: 0,
+                bytes_out: 0,
+                last_synced_at_ms: None,
+                last_converged_at_ms: None,
+                sync_rtt_ms: None,
             }],
             topic: "my-topic".into(),
             relay_status: RelayStatus::Connected,

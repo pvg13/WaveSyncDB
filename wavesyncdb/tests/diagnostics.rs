@@ -165,4 +165,57 @@ async fn test_diagnostics_byte_accounting_relay_vs_direct() {
 
     assert_eq!(alice_after.relay_traffic_ratio(), Some(0.0));
     assert_eq!(bob_after.relay_traffic_ratio(), Some(0.0));
+
+    // Per-peer health (Task 3): the same version-vector round trip that moved
+    // the byte counters above also stamps `last_synced_at_ms` and records a
+    // catch-up RTT sample on both sides.
+    assert_eventually(
+        "alice's PeerInfo for bob shows a sync timestamp + outbound bytes",
+        timeout,
+        || async {
+            let status = alice.network_status();
+            status
+                .group_peers()
+                .iter()
+                .any(|p| p.last_synced_at_ms.is_some() && p.bytes_out > 0)
+        },
+    )
+    .await;
+
+    assert_eventually(
+        "bob's PeerInfo for alice shows a sync timestamp + outbound bytes",
+        timeout,
+        || async {
+            let status = bob.network_status();
+            status
+                .group_peers()
+                .iter()
+                .any(|p| p.last_synced_at_ms.is_some() && p.bytes_out > 0)
+        },
+    )
+    .await;
+
+    let sum_rtt_counts = |snap: &wavesyncdb::diagnostics::Snapshot| -> u64 {
+        snap.sync_rtt_histogram.iter().map(|(_, count)| count).sum()
+    };
+    assert!(
+        sum_rtt_counts(&alice.diagnostics()) >= 1,
+        "expected at least one sync-RTT histogram observation on alice"
+    );
+
+    // Convergence (#82): the periodic reconcile-digest exchange on the same
+    // sync_interval tick proves both empty-table peers byte-identical, which
+    // stamps `last_converged_at_ms`.
+    assert_eventually(
+        "alice's PeerInfo for bob shows a converged timestamp",
+        timeout,
+        || async {
+            let status = alice.network_status();
+            status
+                .group_peers()
+                .iter()
+                .any(|p| p.last_converged_at_ms.is_some())
+        },
+    )
+    .await;
 }

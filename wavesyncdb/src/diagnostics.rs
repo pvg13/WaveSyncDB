@@ -34,10 +34,9 @@
 //! * Not retained across engine restarts; the snapshot reflects the
 //!   current process's lifetime.
 //! * [`PeerHealthStore`] tracks the per-peer substrate (bytes, sync/converge
-//!   timestamps, catch-up RTT). Byte accounting (`record_bytes`) is wired at
-//!   every HMAC sign/verify site in the engine; the sync/converge timestamps,
-//!   RTT, and the mirror onto [`crate::network_status::PeerInfo`] land in a
-//!   later change.
+//!   timestamps, catch-up RTT), wired at every HMAC sign/verify site plus the
+//!   sync-applied / converged / PushAck call sites in the engine, and mirrored
+//!   onto [`crate::network_status::PeerInfo`] in `update_network_status`.
 //!
 //! [issue #27]: https://github.com/pvg13/WaveSyncDB/issues/27
 
@@ -61,8 +60,6 @@ const RTT_BUCKET_COUNT: usize = RTT_BUCKETS_MS.len() + 1;
 /// Current unix-epoch time in milliseconds. Display/diagnostics only —
 /// never an input to conflict resolution, which stays fully deterministic
 /// on `(col_version, value_bytes, site_id)`.
-// Wired by the engine in the next change: no call site outside tests yet.
-#[allow(dead_code)]
 pub(crate) fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -191,8 +188,6 @@ impl Counters {
     /// histogram. Linear scan over the 13 thresholds — cheap at this
     /// message rate and keeps the bucket boundaries readable as a flat
     /// array literal rather than a binary-search table.
-    // Wired by the engine in the next change: no call site exists yet.
-    #[allow(dead_code)]
     pub(crate) fn observe_sync_rtt(&self, ms: u64) {
         let idx = RTT_BUCKETS_MS
             .iter()
@@ -315,12 +310,8 @@ impl Snapshot {
 }
 
 /// Per-peer health snapshot returned by [`PeerHealthStore::snapshot_for`].
-/// Mirrors the fields the engine attaches to
-/// [`crate::network_status::PeerInfo`] in a later change.
+/// Mirrored onto [`crate::network_status::PeerInfo`] in `update_network_status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-// bytes_in/bytes_out are written by the engine's sign/verify sites now;
-// still read only in tests until the PeerInfo mirror lands in a later change.
-#[allow(dead_code)]
 pub(crate) struct PeerHealth {
     pub bytes_in: u64,
     pub bytes_out: u64,
@@ -357,8 +348,6 @@ impl PeerHealthStore {
 
     /// Read-only snapshot for one peer; `None` if nothing has been
     /// recorded for it yet (e.g. discovered but never synced).
-    // Read by a later change (PeerInfo mirroring in update_network_status).
-    #[allow(dead_code)]
     pub(crate) fn snapshot_for(&self, peer: &PeerId) -> Option<PeerHealth> {
         self.guard().get(peer).copied()
     }
@@ -379,8 +368,6 @@ impl PeerHealthStore {
 
     /// Stamp `peer` as synced right now — applied a `ChangesetResponse`,
     /// applied an inbound `Push`, or received a `PushAck` from it.
-    // Wired by the engine in a later change: no call site yet.
-    #[allow(dead_code)]
     pub(crate) fn stamp_synced(&self, peer: &PeerId) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().last_synced_at_ms = Some(unix_now_ms());
@@ -388,16 +375,12 @@ impl PeerHealthStore {
 
     /// Stamp `peer` as converged right now (its reconcile digest matched
     /// ours — see `Counters::reconcile_converged`).
-    // Wired by the engine in a later change: no call site yet.
-    #[allow(dead_code)]
     pub(crate) fn stamp_converged(&self, peer: &PeerId) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().last_converged_at_ms = Some(unix_now_ms());
     }
 
     /// Record the latest catch-up round-trip time observed for `peer`.
-    // Wired by the engine in a later change: no call site yet.
-    #[allow(dead_code)]
     pub(crate) fn record_rtt(&self, peer: &PeerId, rtt_ms: u64) {
         let mut guard = self.guard();
         guard.entry(*peer).or_default().sync_rtt_ms = Some(rtt_ms);

@@ -79,9 +79,16 @@ impl EngineRunner {
                     ..
                 } => {
                     // Response received — this peer no longer has an in-flight
-                    // request in any group.
-                    for g in self.groups.values_mut() {
-                        g.pending_sync_peers.remove(&peer);
+                    // request in any group. Keep the removed send-time Instants
+                    // so a ChangesetResponse below can compute its catch-up RTT
+                    // without re-stamping (the request's send time is the only
+                    // record of when the round trip started).
+                    let mut cleared_sync_starts: HashMap<String, tokio::time::Instant> =
+                        HashMap::new();
+                    for (topic, g) in self.groups.iter_mut() {
+                        if let Some(sent_at) = g.pending_sync_peers.remove(&peer) {
+                            cleared_sync_starts.insert(topic.clone(), sent_at);
+                        }
                     }
                     log::info!("Received sync response from peer {peer}");
 
@@ -150,6 +157,17 @@ impl EngineRunner {
                                 }
                             }
 
+                            // Catch-up round-trip time: reuse the request's
+                            // send-time Instant captured above (do not
+                            // re-stamp). If multiple groups had a request in
+                            // flight to this peer, sample whichever group's
+                            // response this is.
+                            if let Some(sent_at) = cleared_sync_starts.get(&effective) {
+                                let rtt_ms = sent_at.elapsed().as_millis() as u64;
+                                self.diagnostics.observe_sync_rtt(rtt_ms);
+                                self.peer_health.record_rtt(&peer, rtt_ms);
+                            }
+
                             // Arcs for the spawned persistence task.
                             let db = g.db.clone();
                             let cache = g.db_version_cache.clone();
@@ -187,6 +205,10 @@ impl EngineRunner {
                                 if let Some(g) = self.groups.get_mut(&effective) {
                                     g.peer_db_versions.insert(peer, my_db_version);
                                 }
+                                // Round trip completed successfully even with
+                                // nothing to apply — still a sync.
+                                self.peer_health.stamp_synced(&peer);
+                                self.update_network_status();
                                 let peer_str = peer.to_string();
                                 tokio::spawn(async move {
                                     if lamport_bump
@@ -1025,10 +1047,12 @@ impl EngineRunner {
             // The peer holds all our data for this group — clear it from the
             // pending-push retry set so we stop re-pushing to it (#81).
             self.note_peer_converged_pushes(&effective, peer);
+            self.peer_health.stamp_converged(&peer);
             self.emit_network_event(crate::network_status::NetworkEvent::PeerConverged {
                 peer_id: crate::network_status::PeerId(peer.to_string()),
                 topic: effective,
             });
+            self.update_network_status();
         } else {
             self.diagnostics
                 .reconcile_diverged
