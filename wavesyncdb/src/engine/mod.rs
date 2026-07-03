@@ -61,12 +61,20 @@ use crate::shadow;
 
 /// A remote changeset queued for sequential application in the main event loop.
 ///
+/// Produced by three call sites: a `ChangesetResponse` from a version-vector
+/// catch-up, an inbound real-time `Push`, and a reconcile-range (RBSR) apply.
+/// All three funnel through the same consumer (`remote_changeset_rx` in the
+/// engine loop) so the commit-gating rule below applies uniformly regardless
+/// of which path produced the changeset.
+///
 /// Carries the context needed to record our knowledge of the sender's
-/// `db_version` *after* the changes durably commit — never before. Persisting
-/// the peer version ahead of the commit risks claiming a version whose changes
-/// we never actually applied (e.g. the process is torn down between queueing
-/// and applying). On the next launch that peer would be told to send only
-/// changes *above* the claimed version, silently skipping the dropped range.
+/// `db_version` *after* the changes durably commit — never before, and never
+/// at all if the apply rolls back. Persisting the peer version for an apply
+/// that never landed risks claiming a version whose changes we never actually
+/// applied (e.g. a mid-transaction DB error, or the process torn down between
+/// queueing and applying). On the next launch — or the next catch-up — that
+/// peer would be told to send only changes *above* the claimed version,
+/// silently skipping the dropped range forever.
 pub(crate) struct RemoteChangeset {
     pub peer: libp2p::PeerId,
     pub peer_site: NodeId,
@@ -2142,10 +2150,14 @@ impl EngineRunner {
                     }
                     // Record our knowledge of the sender's db_version only now,
                     // after the changes are durably committed — never at receive
-                    // time. This guarantees the persisted peer version is always
-                    // <= what we have actually applied, so a restart can hydrate
-                    // it without risking a silently-skipped change range.
-                    if let Some(version) = rc.peer_db_version {
+                    // time, and never at all if the apply rolled back. Gating on
+                    // `committed` is load-bearing: advancing (and persisting) the
+                    // cursor for an apply that never landed would make the next
+                    // catch-up believe we already have that range, silently
+                    // skipping it forever. Leaving the cursor untouched instead
+                    // means the peer just re-sends the same range next time,
+                    // which is idempotent.
+                    if committed && let Some(version) = rc.peer_db_version {
                         if let Some(g) = self.groups.get_mut(&rc.effective_topic) {
                             g.peer_db_versions.insert(rc.peer, version);
                         }

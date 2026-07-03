@@ -47,9 +47,10 @@ pub struct PeerInfo {
     /// Wire bytes sent to this peer over its lifetime in the health store.
     #[serde(default)]
     pub bytes_out: u64,
-    /// Most recent time this peer's data was applied: a `ChangesetResponse`
-    /// with changes, an inbound `Push`, or a `PushAck` received from it.
-    /// `None` if nothing has synced with this peer yet.
+    /// Most recent time this peer's data was applied. See
+    /// [`crate::diagnostics::PeerHealthStore::stamp_synced`] for the
+    /// authoritative list of triggers — do not duplicate it here, it has
+    /// drifted before. `None` if nothing has synced with this peer yet.
     #[serde(default)]
     pub last_synced_at_ms: Option<u64>,
     /// Most recent time a reconcile digest (#82) proved this peer's database

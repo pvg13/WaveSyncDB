@@ -29,11 +29,13 @@ async fn test_diagnostics_counters_fire_during_two_peer_sync() {
     let alice = make_peer(&mem_db("diag_alice"), &topic, 240).await;
     let bob = make_peer(&mem_db("diag_bob"), &topic, 241).await;
 
-    // Both engines come up with all counters at zero.
+    // Baseline snapshot right after both peers are up. This is deliberately
+    // NOT asserted to be zero: mDNS discovery + the connect-triggered dial
+    // can complete within the wall time `make_peer` itself takes to bring up
+    // the second peer, so an initial-zero assertion here is racy by
+    // construction (process-wide mDNS, Rule 2.13) — it has flaked in CI.
+    // Instead we only assert forward progress from this baseline below.
     let initial = alice.diagnostics();
-    assert_eq!(initial.mdns_discoveries, 0);
-    assert_eq!(initial.peer_dial_attempts, 0);
-    assert_eq!(initial.peer_dial_successes, 0);
 
     // Wait until both sides have seen each other end-to-end. The earliest
     // signal is mDNS discovery; success happens after the dial completes.
@@ -49,6 +51,14 @@ async fn test_diagnostics_counters_fire_during_two_peer_sync() {
 
     let alice_after = alice.diagnostics();
     let bob_after = bob.diagnostics();
+
+    // Forward progress only: these counters must never regress from the
+    // baseline captured above (still catches the increment site being
+    // deleted — a deleted increment would leave `alice_after` == `initial`
+    // rather than showing the growth asserted below).
+    assert!(alice_after.mdns_discoveries >= initial.mdns_discoveries);
+    assert!(alice_after.peer_dial_attempts >= initial.peer_dial_attempts);
+    assert!(alice_after.peer_dial_successes >= initial.peer_dial_successes);
 
     // Sanity: mDNS produced at least one peer-id arrival on Alice (the
     // helper dedups by peer-id within a single Discovered event, so this
