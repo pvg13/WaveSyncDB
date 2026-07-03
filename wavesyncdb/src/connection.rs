@@ -91,6 +91,10 @@ pub(crate) struct WaveSyncNodeInner {
     /// carried from the builder so runtime-joined groups match the
     /// default group's setting.
     change_channel_capacity: usize,
+    /// Tombstone retention override from the builder, applied to every
+    /// group DB this node opens (None = builder untouched; the DB's
+    /// persisted value or the 7-day default governs).
+    tombstone_retention: Option<Option<std::time::Duration>>,
 }
 
 impl Drop for WaveSyncNodeInner {
@@ -1135,6 +1139,20 @@ impl<'a> SchemaBuilder<'a> {
             log::warn!("N8 tombstone heal sweep failed (non-fatal): {e}");
         }
 
+        // Physically collect aged tombstones off the startup path. Exclusion
+        // already hides them from every sync/reconcile/conflict surface, so
+        // this sweep only reclaims storage — its timing is a purely local
+        // concern and a failure costs nothing but disk.
+        let gc_db = self.db.inner.inner.clone();
+        let gc_registry = self.db.registry().clone();
+        tokio::spawn(async move {
+            match crate::shadow::gc_aged_tombstones(&gc_db, &gc_registry).await {
+                Ok(0) => {}
+                Ok(n) => log::info!("Tombstone GC collected {n} aged tombstones"),
+                Err(e) => log::warn!("Tombstone GC sweep failed (non-fatal): {e}"),
+            }
+        });
+
         // Signal the engine that tables are registered and sync can begin. Via
         // `registry_ready()` so runtime-joined groups also notify the engine
         // (GroupRegistryReady), not just the default group's Notify.
@@ -1435,6 +1453,7 @@ pub struct WaveSyncDbBuilder {
     circuit_max_duration: std::time::Duration,
     tcp_enabled: bool,
     change_channel_capacity: usize,
+    tombstone_retention: Option<Option<std::time::Duration>>,
 }
 
 impl WaveSyncDbBuilder {
@@ -1465,6 +1484,7 @@ impl WaveSyncDbBuilder {
             circuit_max_duration: defaults.circuit_max_duration,
             tcp_enabled: defaults.tcp_enabled,
             change_channel_capacity: 1024,
+            tombstone_retention: None,
         }
     }
 
@@ -1585,6 +1605,24 @@ impl WaveSyncDbBuilder {
     /// many notifications behind sees `Lagged` and the reactive hooks fall
     /// back to a debounced full-table reload — raise this for bursty
     /// writers whose subscribers must keep per-row deltas.
+    /// Tombstone retention window (default 7 days). Deleted rows'
+    /// tombstones older than this are excluded from sync/reconciliation and
+    /// eventually garbage-collected. Tradeoff: a peer offline LONGER than
+    /// this window can resurrect rows deleted in its absence. Persisted in
+    /// the database so a background-sync process ages tombstones by the
+    /// same rule.
+    pub fn with_tombstone_retention(mut self, retention: std::time::Duration) -> Self {
+        self.tombstone_retention = Some(Some(retention));
+        self
+    }
+
+    /// Disable tombstone garbage collection entirely: tombstones are kept
+    /// (and synced) forever. Storage grows with all-time deletes.
+    pub fn without_tombstone_gc(mut self) -> Self {
+        self.tombstone_retention = Some(None);
+        self
+    }
+
     pub fn with_change_channel_capacity(mut self, capacity: usize) -> Self {
         self.change_channel_capacity = capacity.max(16);
         self
@@ -1778,6 +1816,12 @@ impl WaveSyncDbBuilder {
         // triggers can fire — a trigger referencing a missing table fails
         // the user's write outright.
         crate::capture::ensure_capture_tables(&inner).await?;
+        // Persist the retention window in the DB so every process sharing
+        // this file (foreground + background sync) ages tombstones by the
+        // same rule. Absent key = the 7-day default.
+        if let Some(retention) = self.tombstone_retention {
+            crate::shadow::set_tombstone_retention(&inner, retention).await?;
+        }
         let site_id = crate::shadow::get_site_id(&inner).await?;
 
         let node_id = self.node_id.unwrap_or(site_id);
@@ -1992,6 +2036,7 @@ impl WaveSyncDbBuilder {
             groups: std::sync::Mutex::new(HashMap::new()),
             base_database_url: self.database_url.clone(),
             change_channel_capacity: self.change_channel_capacity,
+            tombstone_retention: self.tombstone_retention,
         });
 
         let db = WaveSyncDb {
@@ -2069,6 +2114,9 @@ impl WaveSyncNode {
         // Same per-DB setup that `build()` performs for the default group.
         crate::shadow::create_meta_table(&db).await?;
         crate::capture::ensure_capture_tables(&db).await?;
+        if let Some(retention) = self.inner.tombstone_retention {
+            crate::shadow::set_tombstone_retention(&db, retention).await?;
+        }
         let site_id = crate::shadow::get_site_id(&db).await?;
         let db_version = crate::shadow::get_db_version(&db).await?;
         let db_version_cache = Arc::new(AtomicU64::new(db_version));

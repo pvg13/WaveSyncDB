@@ -497,19 +497,35 @@ impl EngineRunner {
         let topic_name = g.topic_name.clone();
 
         tokio::spawn(async move {
+            // A cursor below the GC floor cannot be served incrementally —
+            // tombstones from that range were physically collected, so the
+            // incremental slice would LOOK complete while silently omitting
+            // deletes. Widen to a full snapshot instead (idempotent apply
+            // makes the re-send harmless; the peer's cursor then jumps past
+            // the floor).
+            let floor = shadow::get_gc_floor(&db).await.unwrap_or(0);
+            let effective_since = if your_last_db_version < floor {
+                log::info!(
+                    "Peer cursor {} predates GC floor {}; widening to full state",
+                    your_last_db_version,
+                    floor
+                );
+                0
+            } else {
+                your_last_db_version
+            };
             // Get changes since the peer's last known version of us
-            let changes =
-                match shadow::get_changes_since(&db, &registry, your_last_db_version).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to get changes since {}: {}",
-                            your_last_db_version,
-                            e
-                        );
-                        Vec::new()
-                    }
-                };
+            let changes = match shadow::get_changes_since(&db, &registry, effective_since).await {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!(
+                        "Failed to get changes since {}: {}",
+                        your_last_db_version,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
 
             let mut resp = crate::protocol::SyncResponse::ChangesetResponse {
                 changes,
@@ -1522,6 +1538,18 @@ async fn apply_remote_delete(
     meta: &crate::registry::TableMeta,
     local_db_version: u64,
 ) -> Result<bool, sea_orm::DbErr> {
+    // An incoming tombstone already past the retention cutoff is
+    // semantically nonexistent — applying it would re-introduce a delete
+    // that peers with a physically-collected copy no longer hold, and the
+    // pair would never re-converge.
+    if let Some(ts) = change.deleted_ts
+        && let Ok(Some(cutoff)) = shadow::tombstone_cutoff(db).await
+        && ts < cutoff
+    {
+        log::debug!("Skipping aged incoming tombstone for {table}/{pk}");
+        return Ok(false);
+    }
+
     let local_entries = shadow::get_clock_entries_for_row(db, table, pk)
         .await
         .unwrap_or_default();

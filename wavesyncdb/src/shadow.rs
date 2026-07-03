@@ -523,10 +523,15 @@ pub async fn get_clock_entries_for_row(
         seq: i32,
     }
 
+    let cutoff = tombstone_cutoff(db).await?;
     let shadow_name = format!("_wavesync_{}_clock", table);
+    // Aged tombstones must not contribute to a row's max col_version (a new
+    // local delete's tombstone_cv would otherwise differ between a peer that
+    // physically GC'd and one that hasn't).
     let sql = format!(
-        "SELECT pk, cid, col_version, db_version, site_id, seq FROM \"{}\" WHERE pk = $1",
-        shadow_name
+        "SELECT pk, cid, col_version, db_version, site_id, seq FROM \"{}\" WHERE pk = $1{}",
+        shadow_name,
+        aged_tombstone_predicate(cutoff, "")
     );
 
     let rows = ClockRow::find_by_statement(Statement::from_sql_and_values(
@@ -567,6 +572,7 @@ pub async fn get_changes_since(
     since_db_version: u64,
 ) -> Result<Vec<ColumnChange>, DbErr> {
     let mut all_changes = Vec::new();
+    let cutoff = tombstone_cutoff(db).await?;
 
     for meta in registry.all_tables() {
         let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
@@ -584,14 +590,18 @@ pub async fn get_changes_since(
             .collect::<Vec<_>>()
             .join(", ");
 
+        // Aged tombstones never travel: excluded here, they vanish from
+        // catch-up responses, reconcile digests, and RBSR enumeration all
+        // at once (every one of those surfaces reads through this query).
         let sql = format!(
             "SELECT s.pk, s.cid, s.col_version, s.db_version, s.seq, s.site_id, s.deleted_ts, \
              json_object({json_cols}) as row_json \
              FROM \"{shadow_name}\" s \
              LEFT JOIN \"{table}\" t ON t.\"{pk_col}\" = s.pk \
-             WHERE s.db_version > $1 \
+             WHERE s.db_version > $1{aged} \
              ORDER BY s.db_version, s.seq",
             table = meta.table_name,
+            aged = aged_tombstone_predicate(cutoff, "s."),
         );
 
         let stmt = Statement::from_sql_and_values(
@@ -693,6 +703,121 @@ pub(crate) fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Default tombstone retention when none was ever configured: 7 days.
+pub const DEFAULT_TOMBSTONE_RETENTION_SECS: u64 = 7 * 24 * 3600;
+
+/// Persist the tombstone retention window (seconds; 0 = GC disabled) in
+/// `_wavesync_meta`. Stored IN the database rather than passed through the
+/// engine so every reader — including a background-sync process that opens
+/// the same file — ages tombstones by the same rule. An aged tombstone must
+/// be invisible on every surface of every process or replicas diverge.
+pub async fn set_tombstone_retention(
+    db: &impl ConnectionTrait,
+    retention: Option<std::time::Duration>,
+) -> Result<(), DbErr> {
+    let secs: u64 = retention.map(|d| d.as_secs().max(1)).unwrap_or(0);
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        [
+            "tombstone_retention".into(),
+            secs.to_le_bytes().to_vec().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The exclusion cutoff: tombstones with `deleted_ts < cutoff` are treated
+/// as nonexistent EVERYWHERE (wire, digests, RBSR, conflict gates). `None`
+/// disables retention. Absent key = the 7-day default.
+pub(crate) async fn tombstone_cutoff(db: &impl ConnectionTrait) -> Result<Option<u64>, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct MetaRow {
+        value: Vec<u8>,
+    }
+    let row = MetaRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT value FROM _wavesync_meta WHERE key = $1",
+        ["tombstone_retention".into()],
+    ))
+    .one(db)
+    .await?;
+    let secs = row
+        .and_then(|r| r.value.try_into().ok().map(u64::from_le_bytes))
+        .unwrap_or(DEFAULT_TOMBSTONE_RETENTION_SECS);
+    if secs == 0 {
+        return Ok(None);
+    }
+    Ok(Some(unix_now_secs().saturating_sub(secs)))
+}
+
+/// SQL predicate excluding aged tombstones from a shadow scan aliased `s`.
+/// Aged means absent EVERYWHERE — this predicate (or its equivalent) must
+/// guard every reader of `__deleted` cells, or peers that physically GC at
+/// different times resolve conflicts differently and diverge.
+fn aged_tombstone_predicate(cutoff: Option<u64>, alias: &str) -> String {
+    match cutoff {
+        Some(c) => format!(
+            " AND NOT ({a}cid = '__deleted' AND {a}deleted_ts IS NOT NULL AND {a}deleted_ts < {c})",
+            a = alias,
+        ),
+        None => String::new(),
+    }
+}
+
+/// Physically delete aged tombstones from every registered table's shadow,
+/// recording the GC floor FIRST (the floor must be durable before history
+/// disappears — it is what protects below-floor catch-up cursors from
+/// silently incomplete responses). Returns the number of rows collected.
+/// Exclusion already hides these rows from every surface, so when this
+/// sweep runs is a purely local concern.
+pub async fn gc_aged_tombstones(
+    db: &impl ConnectionTrait,
+    registry: &TableRegistry,
+) -> Result<u64, DbErr> {
+    let Some(cutoff) = tombstone_cutoff(db).await? else {
+        return Ok(0);
+    };
+
+    #[derive(Debug, FromQueryResult)]
+    struct MaxRow {
+        m: Option<i64>,
+    }
+    let mut doomed_floor: u64 = 0;
+    for meta in registry.all_tables() {
+        let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
+        let sql = format!(
+            "SELECT MAX(db_version) AS m FROM \"{shadow_name}\" \
+             WHERE cid = '__deleted' AND deleted_ts IS NOT NULL AND deleted_ts < {cutoff}"
+        );
+        let row = MaxRow::find_by_statement(Statement::from_string(DatabaseBackend::Sqlite, sql))
+            .one(db)
+            .await?;
+        if let Some(m) = row.and_then(|r| r.m) {
+            doomed_floor = doomed_floor.max(m as u64);
+        }
+    }
+    if doomed_floor == 0 {
+        return Ok(0);
+    }
+
+    let floor = get_gc_floor(db).await?.max(doomed_floor);
+    set_gc_floor(db, floor).await?;
+
+    let mut collected = 0u64;
+    for meta in registry.all_tables() {
+        let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
+        let sql = format!(
+            "DELETE FROM \"{shadow_name}\" \
+             WHERE cid = '__deleted' AND deleted_ts IS NOT NULL AND deleted_ts < {cutoff}"
+        );
+        let res = db.execute_unprepared(&sql).await?;
+        collected += res.rows_affected();
+    }
+    Ok(collected)
+}
+
 /// Read the GC floor: the highest `db_version` among tombstones that have
 /// been physically garbage-collected. A catch-up cursor below this floor
 /// cannot be served incrementally (the response would silently omit the
@@ -739,10 +864,16 @@ pub async fn get_tombstone_cl(
     struct Cl {
         col_version: i64,
     }
+    let cutoff = tombstone_cutoff(db).await?;
     let shadow_name = format!("_wavesync_{}_clock", table);
+    // Aged tombstones are absent everywhere: if this gate still honored an
+    // expired tombstone, a peer that already physically collected it would
+    // resolve the same incoming change differently and the replicas would
+    // permanently diverge.
     let sql = format!(
-        "SELECT col_version FROM \"{}\" WHERE pk = $1 AND cid = '__deleted'",
-        shadow_name
+        "SELECT col_version FROM \"{}\" WHERE pk = $1 AND cid = '__deleted'{}",
+        shadow_name,
+        aged_tombstone_predicate(cutoff, "")
     );
     let row = Cl::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
@@ -812,6 +943,7 @@ pub async fn heal_lost_tombstones(
     registry: &TableRegistry,
 ) -> Result<usize, DbErr> {
     let mut healed = 0usize;
+    let cutoff = tombstone_cutoff(db).await?;
 
     for meta in registry.all_tables() {
         if !shadow_table_exists(db, &meta.table_name).await? {
@@ -822,15 +954,18 @@ pub async fn heal_lost_tombstones(
 
         // Tombstones whose user row still exists, with the row's max non-tombstone
         // col_version alongside (NULL → 0 when the row has no column entries).
+        // Aged tombstones are skipped — they are pending physical GC, not
+        // anomalies to heal.
         let sql = format!(
             "SELECT s.pk AS pk, s.col_version AS cl, \
                     (SELECT MAX(s2.col_version) FROM \"{shadow}\" s2 \
                      WHERE s2.pk = s.pk AND s2.cid != '__deleted') AS max_cv \
              FROM \"{shadow}\" s \
              JOIN \"{table}\" t ON t.\"{pk_col}\" = s.pk \
-             WHERE s.cid = '__deleted'",
+             WHERE s.cid = '__deleted'{aged}",
             shadow = shadow_name,
             table = meta.table_name,
+            aged = aged_tombstone_predicate(cutoff, "s."),
         );
         let rows = db
             .query_all_raw(Statement::from_sql_and_values(
@@ -1021,7 +1156,7 @@ mod tests {
         let db = setup_with_shadow().await;
         let site_id = NodeId([1u8; 16]);
 
-        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, 1_000_000)
+        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, unix_now_secs())
             .await
             .unwrap();
 
@@ -1037,7 +1172,8 @@ mod tests {
     async fn test_insert_tombstone_persists_deleted_ts_on_wire() {
         let db = setup_with_shadow().await;
         let site_id = NodeId([1u8; 16]);
-        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, 1234)
+        let stamp = unix_now_secs();
+        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, stamp)
             .await
             .unwrap();
 
@@ -1052,7 +1188,7 @@ mod tests {
         let tomb = changes.iter().find(|c| c.cid == "__deleted").unwrap();
         // The stored stamp rides the wire so every replica ages this
         // tombstone from the same instant.
-        assert_eq!(tomb.deleted_ts, Some(1234));
+        assert_eq!(tomb.deleted_ts, Some(stamp));
     }
 
     #[tokio::test]
@@ -1111,6 +1247,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_aged_tombstone_excluded_everywhere() {
+        let db = setup_with_shadow().await;
+        let site_id = NodeId([1u8; 16]);
+        // Retention 100s; one fresh and one aged tombstone.
+        set_tombstone_retention(&db, Some(std::time::Duration::from_secs(100)))
+            .await
+            .unwrap();
+        let now = unix_now_secs();
+        insert_tombstone(&db, "tasks", "fresh", 1, 1, &site_id, now)
+            .await
+            .unwrap();
+        insert_tombstone(&db, "tasks", "aged", 1, 2, &site_id, now - 1000)
+            .await
+            .unwrap();
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+
+        // Wire/digest surface: the aged tombstone never travels.
+        let changes = get_changes_since(&db, &registry, 0).await.unwrap();
+        assert!(changes.iter().any(|c| c.pk == "fresh"));
+        assert!(
+            !changes.iter().any(|c| c.pk == "aged"),
+            "aged tombstone must be excluded from every wire surface"
+        );
+
+        // Conflict surface: the aged tombstone no longer defends.
+        assert!(
+            get_tombstone_cl(&db, "tasks", "fresh")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            get_tombstone_cl(&db, "tasks", "aged")
+                .await
+                .unwrap()
+                .is_none(),
+            "aged means absent for conflict resolution too"
+        );
+        assert!(
+            get_clock_entries_for_row(&db, "tasks", "aged")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gc_sweep_sets_floor_before_deleting() {
+        let db = setup_with_shadow().await;
+        let site_id = NodeId([1u8; 16]);
+        set_tombstone_retention(&db, Some(std::time::Duration::from_secs(100)))
+            .await
+            .unwrap();
+        let now = unix_now_secs();
+        insert_tombstone(&db, "tasks", "aged1", 1, 5, &site_id, now - 1000)
+            .await
+            .unwrap();
+        insert_tombstone(&db, "tasks", "aged2", 1, 9, &site_id, now - 1000)
+            .await
+            .unwrap();
+        insert_tombstone(&db, "tasks", "fresh", 1, 12, &site_id, now)
+            .await
+            .unwrap();
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+
+        let collected = gc_aged_tombstones(&db, &registry).await.unwrap();
+        assert_eq!(collected, 2, "both aged tombstones collected");
+        // Floor = the highest db_version among the collected rows.
+        assert_eq!(get_gc_floor(&db).await.unwrap(), 9);
+        // Fresh tombstone survives physically.
+        assert!(
+            get_tombstone_cl(&db, "tasks", "fresh")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Idempotent: nothing left to collect, floor unchanged.
+        assert_eq!(gc_aged_tombstones(&db, &registry).await.unwrap(), 0);
+        assert_eq!(get_gc_floor(&db).await.unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_retention_disabled_keeps_everything() {
+        let db = setup_with_shadow().await;
+        let site_id = NodeId([1u8; 16]);
+        set_tombstone_retention(&db, None).await.unwrap();
+        insert_tombstone(&db, "tasks", "ancient", 1, 1, &site_id, 1)
+            .await
+            .unwrap();
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+
+        assert!(
+            get_tombstone_cl(&db, "tasks", "ancient")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let changes = get_changes_since(&db, &registry, 0).await.unwrap();
+        assert!(changes.iter().any(|c| c.pk == "ancient"));
+        assert_eq!(gc_aged_tombstones(&db, &registry).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn test_gc_floor_roundtrip() {
         let db = setup_db().await;
         assert_eq!(get_gc_floor(&db).await.unwrap(), 0, "absent floor reads 0");
@@ -1154,7 +1414,7 @@ mod tests {
             .unwrap();
 
         // Add a tombstone (simulating a DELETE)
-        insert_tombstone(&db, "tasks", "pk1", 6, 2, &site_id, 1_000_000)
+        insert_tombstone(&db, "tasks", "pk1", 6, 2, &site_id, unix_now_secs())
             .await
             .unwrap();
 
@@ -1297,13 +1557,13 @@ mod tests {
         upsert_clock_entry(&db, "tasks", "live", "title", 2, 1, &site, 0)
             .await
             .unwrap();
-        insert_tombstone(&db, "tasks", "live", 2, 1, &site, 1_000_000)
+        insert_tombstone(&db, "tasks", "live", 2, 1, &site, unix_now_secs())
             .await
             .unwrap();
 
         // Normally-deleted row "gone": tombstone present, NO user row. Must be left
         // alone (it is a correct deleted state, not the anomaly).
-        insert_tombstone(&db, "tasks", "gone", 3, 1, &site, 1_000_000)
+        insert_tombstone(&db, "tasks", "gone", 3, 1, &site, unix_now_secs())
             .await
             .unwrap();
 
