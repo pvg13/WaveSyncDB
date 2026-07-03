@@ -413,7 +413,12 @@ fn build_synced_model_body(meta: &FieldMeta) -> proc_macro2::TokenStream {
             match column {
                 #(
                     #field_lits => {
-                        if let Ok(__v) = ::wavesyncdb::serde_json::from_value::<#field_types>(value.clone()) {
+                        // Lenient: values read through SQLite json_object()
+                        // spell booleans as 0/1; strict serde would silently
+                        // keep the stale field value.
+                        if let ::std::option::Option::Some(__v) =
+                            ::wavesyncdb::lenient_from_value::<#field_types>(value)
+                        {
                             self.#field_idents = __v;
                         }
                     }
@@ -435,7 +440,7 @@ fn build_synced_model_body(meta: &FieldMeta) -> proc_macro2::TokenStream {
                 match __c.as_str() {
                     #(
                         #field_lits => {
-                            #local_idents = ::wavesyncdb::serde_json::from_value::<#field_types>(__v.clone()).ok();
+                            #local_idents = ::wavesyncdb::lenient_from_value::<#field_types>(__v);
                         }
                     )*
                     _ => {}
@@ -517,7 +522,7 @@ fn build_browser_entity_body(meta: &FieldMeta) -> proc_macro2::TokenStream {
                 #(
                     #non_pk_idents: cols
                         .get(#non_pk_lits)
-                        .and_then(|__v| ::wavesyncdb::serde_json::from_value::<#non_pk_types>(__v.clone()).ok())
+                        .and_then(|__v| ::wavesyncdb::lenient_from_value::<#non_pk_types>(__v))
                         .unwrap_or_default(),
                 )*
             }

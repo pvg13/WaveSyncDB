@@ -122,7 +122,7 @@ pub use registry::EntityScope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use registry::SyncEntityInfo;
 pub use registry::{TableMeta, TableRegistry};
-pub use synced_model::SyncedModel;
+pub use synced_model::{SyncedModel, lenient_from_value};
 pub use synced_table::SyncedTableEntity;
 
 /// Returns recommended log module filter tuples for silencing noisy dependencies.
