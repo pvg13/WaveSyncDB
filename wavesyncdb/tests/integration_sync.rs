@@ -876,16 +876,19 @@ async fn test_add_wins_policy_integration() {
         )
         .await
         .unwrap();
-    peer_a.register_table(TableMeta {
-        table_name: "tasks".to_string(),
-        primary_key_column: "id".to_string(),
-        columns: vec![
-            "id".to_string(),
-            "title".to_string(),
-            "completed".to_string(),
-        ],
-        delete_policy: DeletePolicy::AddWins,
-    });
+    peer_a
+        .register_table(TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "title".to_string(),
+                "completed".to_string(),
+            ],
+            delete_policy: DeletePolicy::AddWins,
+        })
+        .await
+        .unwrap();
 
     let peer_b = WaveSyncDbBuilder::new(&url_b, &topic)
         .with_node_id(make_node_id(131))
@@ -920,16 +923,19 @@ async fn test_add_wins_policy_integration() {
         )
         .await
         .unwrap();
-    peer_b.register_table(TableMeta {
-        table_name: "tasks".to_string(),
-        primary_key_column: "id".to_string(),
-        columns: vec![
-            "id".to_string(),
-            "title".to_string(),
-            "completed".to_string(),
-        ],
-        delete_policy: DeletePolicy::AddWins,
-    });
+    peer_b
+        .register_table(TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec![
+                "id".to_string(),
+                "title".to_string(),
+                "completed".to_string(),
+            ],
+            delete_policy: DeletePolicy::AddWins,
+        })
+        .await
+        .unwrap();
 
     // Signal registry ready on both peers
     peer_a.registry_ready();

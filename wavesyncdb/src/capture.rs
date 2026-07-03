@@ -29,11 +29,6 @@
 //! blobs); a blob column therefore round-trips as TEXT on remote peers — a
 //! documented limitation until typed blob sync exists.
 
-// The drain (connection.rs) and the remote-apply suppression bracket
-// (engine/sync_handler.rs) land in follow-up commits on this branch; until
-// they do, nothing outside the tests consumes these items.
-#![allow(dead_code)]
-
 use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 
 use crate::registry::{TableMeta, TableRegistry};
