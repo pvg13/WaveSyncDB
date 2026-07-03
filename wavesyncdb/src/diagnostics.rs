@@ -49,9 +49,9 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
 /// Upper bounds (inclusive, milliseconds) for the sync-RTT histogram
-/// buckets — Prometheus-style "le" (less-or-equal) semantics. A round trip
-/// slower than the last threshold falls into the implicit `+Inf` overflow
-/// bucket (see [`RTT_BUCKET_COUNT`]).
+/// buckets. Each observation increments exactly ONE bucket — the smallest
+/// threshold it is <= (overflow → the `+Inf` bucket, encoded as `u64::MAX`).
+/// To get Prometheus-style cumulative 'le' counts, sum buckets 0..=i.
 const RTT_BUCKETS_MS: [u64; 13] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
 /// `RTT_BUCKETS_MS` buckets plus one implicit `+Inf` overflow bucket.
@@ -179,10 +179,9 @@ pub(crate) struct Counters {
     pub direct_bytes_in: AtomicU64,
 
     /// Per-bucket counts for catch-up (version-vector) round-trip latency.
-    /// Index `i` for `i < RTT_BUCKETS_MS.len()` counts round trips with
-    /// `rtt_ms <= RTT_BUCKETS_MS[i]`; the last index is the `+Inf` overflow
-    /// bucket for anything slower than the highest threshold. See
-    /// [`Counters::observe_sync_rtt`].
+    /// Each observation increments exactly ONE bucket — the smallest threshold
+    /// it is <=. To get Prometheus-style cumulative 'le' counts, sum buckets 0..=i.
+    /// See [`Counters::observe_sync_rtt`] and [`RTT_BUCKETS_MS`].
     pub sync_rtt_buckets: [AtomicU64; RTT_BUCKET_COUNT],
 }
 
@@ -290,8 +289,9 @@ pub struct Snapshot {
     #[serde(default)]
     pub direct_bytes_in: u64,
     /// Catch-up round-trip-time histogram as `(le_ms, count)` pairs,
-    /// `u64::MAX` marking the `+Inf` overflow bucket. See
-    /// [`Counters::observe_sync_rtt`] for bucket boundaries.
+    /// `u64::MAX` marking the `+Inf` overflow bucket. Each count is the number
+    /// of observations in that bucket. To get Prometheus-style cumulative 'le'
+    /// counts, sum the counts from index 0..=i. See [`RTT_BUCKETS_MS`].
     #[serde(default)]
     pub sync_rtt_histogram: Vec<(u64, u64)>,
 }
@@ -349,21 +349,25 @@ impl PeerHealthStore {
         Self::default()
     }
 
+    /// Acquire the lock, recovering from poison if needed. This structure
+    /// holds diagnostics only; a poisoned lock still contains structurally
+    /// valid counters. Health reporting must degrade rather than panic
+    /// the engine.
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PeerHealth>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Read-only snapshot for one peer; `None` if nothing has been
     /// recorded for it yet (e.g. discovered but never synced).
     pub(crate) fn snapshot_for(&self, peer: &PeerId) -> Option<PeerHealth> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(peer)
-            .copied()
+        self.guard().get(peer).copied()
     }
 
     /// Record wire bytes transferred with `peer`. `inbound = true` adds to
     /// `bytes_in`, `false` to `bytes_out`.
-    pub(crate) fn record_bytes(&self, peer: PeerId, n: u64, inbound: bool) {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(peer).or_default();
+    pub(crate) fn record_bytes(&self, peer: &PeerId, n: u64, inbound: bool) {
+        let mut guard = self.guard();
+        let entry = guard.entry(*peer).or_default();
         if inbound {
             entry.bytes_in += n;
         } else {
@@ -373,32 +377,29 @@ impl PeerHealthStore {
 
     /// Stamp `peer` as synced right now — applied a `ChangesetResponse`,
     /// applied an inbound `Push`, or received a `PushAck` from it.
-    pub(crate) fn stamp_synced(&self, peer: PeerId) {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.entry(peer).or_default().last_synced_at_ms = Some(unix_now_ms());
+    pub(crate) fn stamp_synced(&self, peer: &PeerId) {
+        let mut guard = self.guard();
+        guard.entry(*peer).or_default().last_synced_at_ms = Some(unix_now_ms());
     }
 
     /// Stamp `peer` as converged right now (its reconcile digest matched
     /// ours — see `Counters::reconcile_converged`).
-    pub(crate) fn stamp_converged(&self, peer: PeerId) {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.entry(peer).or_default().last_converged_at_ms = Some(unix_now_ms());
+    pub(crate) fn stamp_converged(&self, peer: &PeerId) {
+        let mut guard = self.guard();
+        guard.entry(*peer).or_default().last_converged_at_ms = Some(unix_now_ms());
     }
 
     /// Record the latest catch-up round-trip time observed for `peer`.
-    pub(crate) fn record_rtt(&self, peer: PeerId, rtt_ms: u64) {
-        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        guard.entry(peer).or_default().sync_rtt_ms = Some(rtt_ms);
+    pub(crate) fn record_rtt(&self, peer: &PeerId, rtt_ms: u64) {
+        let mut guard = self.guard();
+        guard.entry(*peer).or_default().sync_rtt_ms = Some(rtt_ms);
     }
 
     /// Drop all bookkeeping for `peer`. Call on the final
     /// `PeerDisconnected` (not a transient reconnect) so the map doesn't
     /// grow unboundedly across a long-lived engine's peer churn.
     pub(crate) fn prune(&self, peer: &PeerId) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(peer);
+        self.guard().remove(peer);
     }
 }
 
@@ -494,11 +495,11 @@ mod tests {
         let peer = PeerId::random();
         assert_eq!(store.snapshot_for(&peer), None);
 
-        store.record_bytes(peer, 100, true);
-        store.record_bytes(peer, 50, false);
-        store.stamp_synced(peer);
-        store.stamp_converged(peer);
-        store.record_rtt(peer, 42);
+        store.record_bytes(&peer, 100, true);
+        store.record_bytes(&peer, 50, false);
+        store.stamp_synced(&peer);
+        store.stamp_converged(&peer);
+        store.record_rtt(&peer, 42);
 
         let health = store.snapshot_for(&peer).expect("peer was recorded");
         assert_eq!(health.bytes_in, 100);
