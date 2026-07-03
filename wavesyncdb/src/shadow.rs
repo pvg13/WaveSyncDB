@@ -548,11 +548,13 @@ pub async fn get_changes_since(
 
         // Build json_object() with all columns so the JOIN returns all
         // values in a single round trip — O(1) queries per table vs the
-        // old O(rows) approach.
+        // old O(rows) approach. Each column goes through the shared
+        // blob-safe expression so this read, the capture triggers, and the
+        // tiebreak read all produce the same JSON spelling.
         let json_cols: String = meta
             .columns
             .iter()
-            .map(|c| format!("'{}', t.\"{}\"", c, c))
+            .map(|c| format!("'{}', {}", c, crate::capture::json_col_expr("t", c)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1071,6 +1073,36 @@ mod tests {
         // Get all changes (since 0)
         let all_changes = get_changes_since(&db, &registry, 0).await.unwrap();
         assert_eq!(all_changes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_changes_since_blob_column_as_hex() {
+        let db = setup_db().await;
+        db.execute_unprepared("CREATE TABLE files (id TEXT PRIMARY KEY, data BLOB)")
+            .await
+            .unwrap();
+        create_shadow_table(&db, "files").await.unwrap();
+        db.execute_unprepared("INSERT INTO files (id, data) VALUES ('f1', X'DEADBEEF')")
+            .await
+            .unwrap();
+        let site_id = NodeId([2u8; 16]);
+        upsert_clock_entry(&db, "files", "f1", "data", 1, 1, &site_id, 0)
+            .await
+            .unwrap();
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "files".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "data".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+
+        // BLOB cells must ship as lowercase hex strings — json_object()
+        // errors on raw blobs, which used to make the whole catch-up fail.
+        let changes = get_changes_since(&db, &registry, 0).await.unwrap();
+        let data_change = changes.iter().find(|c| c.cid == "data").unwrap();
+        assert_eq!(data_change.val, Some(serde_json::json!("deadbeef")));
     }
 
     #[tokio::test]

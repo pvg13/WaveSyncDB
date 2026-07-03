@@ -1814,9 +1814,14 @@ pub(super) async fn get_local_value_bytes(
     pk: &str,
     cid: &str,
 ) -> Vec<u8> {
+    // The blob-safe shared expression keeps these bytes identical to what a
+    // sender's capture trigger produced for the same logical value — the
+    // tiebreak compares them byte-wise, so the spellings must match.
     let sql = format!(
-        "SELECT json_object('v', \"{}\") as json_val FROM \"{}\" WHERE \"{}\" = $1",
-        cid, table, pk_col
+        "SELECT json_object('v', {}) as json_val FROM \"{}\" WHERE \"{}\" = $1",
+        crate::capture::json_col_expr("", cid),
+        table,
+        pk_col
     );
     let result = db
         .query_one_raw(sea_orm::Statement::from_sql_and_values(
@@ -1859,13 +1864,13 @@ pub(super) async fn read_row_values(
     if meta.columns.is_empty() {
         return Vec::new();
     }
-    // Build `json_object('col', "col", …)` so SQLite handles the per-type
-    // value→JSON conversion for us. Column names are schema identifiers (never
-    // user input), so they are safe to interpolate.
+    // Build `json_object('col', <blob-safe expr>, …)` so SQLite handles the
+    // per-type value→JSON conversion for us. Column names are schema
+    // identifiers (never user input), so they are safe to interpolate.
     let obj_args = meta
         .columns
         .iter()
-        .map(|c| format!("'{c}', \"{c}\""))
+        .map(|c| format!("'{c}', {}", crate::capture::json_col_expr("", c)))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
