@@ -144,8 +144,16 @@ pub extern "C" fn wavesync_background_sync_with_peers(
         Vec::new()
     } else {
         match unsafe { CStr::from_ptr(peer_addrs_json) }.to_str() {
-            Ok(json) => serde_json::from_str(json).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(json) => serde_json::from_str(json).unwrap_or_else(|e| {
+                // Malformed payload peer hints: log rather than silently degrade
+                // to discovery-only, which slows the cold-start wake on cellular.
+                log::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
+                Vec::new()
+            }),
+            Err(e) => {
+                log::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
+                Vec::new()
+            }
         }
     };
 
@@ -184,8 +192,16 @@ pub extern "C" fn wavesync_background_sync_targeted(
         Vec::new()
     } else {
         match unsafe { CStr::from_ptr(peer_addrs_json) }.to_str() {
-            Ok(json) => serde_json::from_str(json).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            Ok(json) => serde_json::from_str(json).unwrap_or_else(|e| {
+                // Malformed payload peer hints: log rather than silently degrade
+                // to discovery-only, which slows the cold-start wake on cellular.
+                log::warn!("background sync: ignoring malformed peer_addrs JSON: {e}");
+                Vec::new()
+            }),
+            Err(e) => {
+                log::warn!("background sync: peer_addrs_json is not valid UTF-8: {e}");
+                Vec::new()
+            }
         }
     };
 
