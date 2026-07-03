@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+- **Tombstone retention (#41).** Deleted rows' tombstones are now aged out
+  after a retention window (default 7 days;
+  `WaveSyncDbBuilder::with_tombstone_retention` / `without_tombstone_gc`),
+  bounding shadow-table growth, new-peer onboarding payloads, and digest
+  work by *current data* instead of all-time deletes. The deleter's
+  wall-clock stamp travels on the wire (`ColumnChange::deleted_ts`), so
+  every replica ages a tombstone from the same instant: expired tombstones
+  vanish from catch-up, digests, RBSR, and conflict resolution
+  simultaneously on all peers, keeping reconcile digests equal no matter
+  when each peer physically garbage-collects. The setting is persisted in
+  the database so background-sync processes follow the same rule; the web
+  engine mirrors it (`WebSyncConfig::tombstone_retention_secs`).
+  **Documented tradeoff:** a peer offline longer than the retention window
+  can resurrect rows deleted in its absence — tune the window to the data.
+
+### Changed
+- **Sync protocol 4.0.0.** The `deleted_ts` field is covered by message
+  HMACs, making 3.0.0 peers incompatible (pre-1.0 hard bump; all peers of
+  a group upgrade together, older peers log a protocol mismatch at
+  identify time).
+
 ### Security
 - **Argon2id passphrase derivation (breaking).** The group key is now
   derived exclusively with Argon2id (19 MiB, 2 passes, salted with the user
