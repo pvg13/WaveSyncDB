@@ -7,6 +7,7 @@ use wavesyncdb::WaveSyncDbBuilder;
 
 use common::task;
 use common::{assert_eventually, make_peer, mem_db};
+use wavesyncdb::engine::convergence::compute_group_digest;
 
 // ---------------------------------------------------------------------------
 // H3 / issue #2 regression: multi-row INSERT must produce one
@@ -1363,6 +1364,359 @@ async fn test_81_pending_push_redelivers_to_late_peer() {
     // 600s periodic tick cannot have fired in this window).
     assert_eventually("A redelivered the pending push", timeout, || async {
         a.diagnostics().pending_pushes_redelivered >= 1
+    })
+    .await;
+}
+
+// ===========================================================================
+// Trigger-capture tests (seeds 90-99). Capture happens inside SQLite via
+// per-table triggers; these tests pin the end-to-end behaviors the old
+// SQL-parsing path could not deliver, plus the echo-loop guard.
+// ===========================================================================
+
+/// Entity with a fuller type matrix than `task` (int, float, bool, optional).
+mod typed_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "typed_rows")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub name: String,
+        pub count: i64,
+        pub ratio: f64,
+        pub flag: bool,
+        pub memo: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Entity with a BLOB column (documented limitation: blob cells sync as
+/// lowercase hex strings, so receivers store TEXT).
+mod blob_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "blob_rows")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub data: Vec<u8>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+async fn make_typed_peer(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+    let peer = WaveSyncDbBuilder::new(db_url, topic)
+        .with_node_id(common::make_node_id(seed))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create peer");
+    peer.schema()
+        .register(typed_row::Entity)
+        .register(blob_row::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema");
+    peer
+}
+
+// ---------------------------------------------------------------------------
+// T1: full type matrix converges, expression UPDATE syncs the COMPUTED
+// value, pk-changing UPDATE moves the row on peers, digests match.
+// The old parser shipped `count + 1` as a literal string and corrupted
+// pk-changing updates — both now correct by construction.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_trigger_capture_type_matrix_and_expression_update() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-cap-t1-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_typed_peer(&mem_db("cap_t1_a"), &topic, 90).await;
+    let b = make_typed_peer(&mem_db("cap_t1_b"), &topic, 91).await;
+
+    let row = typed_row::ActiveModel {
+        id: Set("r1".into()),
+        name: Set("café's, «weird» 日本語".into()),
+        count: Set(42),
+        ratio: Set(2.5),
+        flag: Set(true),
+        memo: Set(None),
+    };
+    row.insert(&a).await.unwrap();
+
+    assert_eventually("B has full typed row", timeout, || async {
+        typed_row::Entity::find_by_id("r1")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| {
+                m.name == "café's, «weird» 日本語"
+                    && m.count == 42
+                    && m.ratio == 2.5
+                    && m.flag
+                    && m.memo.is_none()
+            })
+    })
+    .await;
+
+    // Expression UPDATE: the trigger captures the value SQLite computed.
+    a.execute_unprepared(
+        "UPDATE typed_rows SET count = count + 1, flag = NOT flag WHERE id = 'r1'",
+    )
+    .await
+    .unwrap();
+    assert_eventually("B has computed values", timeout, || async {
+        typed_row::Entity::find_by_id("r1")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.count == 43 && !m.flag)
+    })
+    .await;
+
+    // pk-changing UPDATE: drains as delete(old) + insert(new).
+    a.execute_unprepared("UPDATE typed_rows SET id = 'r1-moved' WHERE id = 'r1'")
+        .await
+        .unwrap();
+    assert_eventually("B moved the row to the new pk", timeout, || async {
+        let old = typed_row::Entity::find_by_id("r1").one(&b).await.unwrap();
+        let new = typed_row::Entity::find_by_id("r1-moved")
+            .one(&b)
+            .await
+            .unwrap();
+        old.is_none() && new.is_some_and(|m| m.count == 43)
+    })
+    .await;
+
+    // Cell-set equality, not just row equality: the reconcile digest is the
+    // proof both shadow states converged.
+    assert_eventually("digests match", timeout, || async {
+        let da = compute_group_digest(a.inner(), a.registry()).await;
+        let db_ = compute_group_digest(b.inner(), b.registry()).await;
+        da == db_
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// T2: BLOB columns sync as lowercase hex strings (documented limitation:
+// the receiver stores TEXT, so a blob round-trips as the hex bytes). The
+// old parser garbled blob literals entirely.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_trigger_capture_blob_column_syncs_as_hex() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-cap-t2-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_typed_peer(&mem_db("cap_t2_a"), &topic, 92).await;
+    let b = make_typed_peer(&mem_db("cap_t2_b"), &topic, 93).await;
+
+    blob_row::ActiveModel {
+        id: Set("b1".into()),
+        data: Set(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    assert_eventually("B has hex-encoded blob row", timeout, || async {
+        blob_row::Entity::find_by_id("b1")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.data == b"deadbeef".to_vec())
+    })
+    .await;
+
+    // Both sides read the cell through the same hex expression, so the
+    // digests agree even though the stored SQLite types differ.
+    assert_eventually("blob digests match", timeout, || async {
+        let da = compute_group_digest(a.inner(), a.registry()).await;
+        let db_ = compute_group_digest(b.inner(), b.registry()).await;
+        da == db_
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// T3: echo-loop regression. A remote apply must NOT be re-captured on the
+// receiver — otherwise B re-broadcasts every applied changeset and the
+// pair ping-pongs forever. Tripwires: B's capture table stays empty, and
+// A's db_version stays exactly at its own write count.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_trigger_capture_no_echo_loop() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-cap-t3-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_peer(&mem_db("cap_t3_a"), &topic, 94).await;
+    let b = make_peer(&mem_db("cap_t3_b"), &topic, 95).await;
+
+    for i in 0..3 {
+        task::ActiveModel {
+            id: Set(format!("t{i}")),
+            title: Set(format!("task {i}")),
+            completed: Set(false),
+            ..Default::default()
+        }
+        .insert(&a)
+        .await
+        .unwrap();
+    }
+
+    assert_eventually("B has all three tasks", timeout, || async {
+        task::Entity::find().all(&b).await.unwrap().len() == 3
+    })
+    .await;
+
+    // Let redelivery/catch-up ticks run — an echo would surface here.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    #[derive(FromQueryResult)]
+    struct CountRow {
+        cnt: i64,
+    }
+    async fn captured_count(db: &sea_orm::DatabaseConnection) -> i64 {
+        CountRow::find_by_statement(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) as cnt FROM _wavesync_changes".to_string(),
+        ))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+        .cnt
+    }
+    assert_eq!(
+        captured_count(b.inner()).await,
+        0,
+        "remote applies must not land in the receiver's capture table"
+    );
+
+    // db_version may legitimately advance past A's own write count — a
+    // catch-up response from B carries A's cells back and the receipt
+    // bumps the version even though the (idempotent) apply rejects them.
+    // The echo signature is UNBOUNDED growth: B re-capturing applied
+    // changes and re-pushing them keeps both counters climbing forever.
+    // So assert stability across two more redelivery/catch-up windows.
+    let ver_a_before = wavesyncdb::shadow::get_db_version(a.inner()).await.unwrap();
+    let ver_b_before = wavesyncdb::shadow::get_db_version(b.inner()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let ver_a_after = wavesyncdb::shadow::get_db_version(a.inner()).await.unwrap();
+    let ver_b_after = wavesyncdb::shadow::get_db_version(b.inner()).await.unwrap();
+    assert_eq!(
+        (ver_a_before, ver_b_before),
+        (ver_a_after, ver_b_after),
+        "db_versions must be stable at steady state — growth means changes are echoing"
+    );
+    assert_eq!(captured_count(a.inner()).await, 0);
+    assert_eq!(captured_count(b.inner()).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// T4: writes that bypass the interceptors (db.inner(), or another process
+// sharing the DB file) are still captured by the triggers and drained on
+// the next intercepted write. The old parser could never see these.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_trigger_capture_bypass_write_reaches_peer() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-cap-t4-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_peer(&mem_db("cap_t4_a"), &topic, 96).await;
+    let b = make_peer(&mem_db("cap_t4_b"), &topic, 97).await;
+
+    // Bypass write: straight to the inner connection, no interception.
+    a.inner()
+        .execute_unprepared(
+            "INSERT INTO tasks (id, title, completed) VALUES ('bypass', 'hidden write', 0)",
+        )
+        .await
+        .unwrap();
+
+    // Next intercepted write drains BOTH captured rows in one changeset.
+    task::ActiveModel {
+        id: Set("normal".into()),
+        title: Set("visible write".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    assert_eventually("B has the bypassed row too", timeout, || async {
+        let bypass = task::Entity::find_by_id("bypass").one(&b).await.unwrap();
+        let normal = task::Entity::find_by_id("normal").one(&b).await.unwrap();
+        bypass.is_some_and(|m| m.title == "hidden write") && normal.is_some()
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// T5: INSERT OR REPLACE syncs end-to-end. The old parser did not classify
+// it at all (warn-and-skip, see test_h4); the trigger fires as a plain
+// INSERT whose full column set supersedes the previous cells.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_trigger_capture_insert_or_replace_syncs() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-cap-t5-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_peer(&mem_db("cap_t5_a"), &topic, 98).await;
+    let b = make_peer(&mem_db("cap_t5_b"), &topic, 99).await;
+
+    task::ActiveModel {
+        id: Set("r1".into()),
+        title: Set("original".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    assert_eventually("B has original", timeout, || async {
+        task::Entity::find_by_id("r1")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.title == "original")
+    })
+    .await;
+
+    a.execute_unprepared(
+        "INSERT OR REPLACE INTO tasks (id, title, completed) VALUES ('r1', 'replaced', 1)",
+    )
+    .await
+    .unwrap();
+
+    assert_eventually("B has replaced row", timeout, || async {
+        task::Entity::find_by_id("r1")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.title == "replaced" && m.completed)
     })
     .await;
 }
