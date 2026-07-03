@@ -493,6 +493,70 @@ async fn table_driver_lagged_burst_converges() {
 }
 
 // ---------------------------------------------------------------------------
+// M10 at the driver layer: cancelling the old driver and starting one on a
+// fresh engine (what the generation-reactive effect does) must track the
+// new DB — and dropping the old task must release the old engine.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn driver_swap_tracks_new_engine() {
+    let db1 = WaveSyncDbBuilder::new(&mem_db("swap_1"), "test-swap-1")
+        .build()
+        .await
+        .unwrap();
+    db1.schema().register(task::Entity).sync().await.unwrap();
+
+    let (sink, publish) = collector::<Vec<task::Model>>();
+    let drv1 = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db1.clone(),
+        publish,
+    ));
+    wait_for(|| sink.lock().unwrap().len() == 1, "db1 initial publish").await;
+
+    // Engine swap: cancel the old driver FIRST (as the effect does), then
+    // shut down db1 and bring up db2.
+    drv1.abort();
+    db1.shutdown().await;
+    drop(db1);
+
+    let db2 = WaveSyncDbBuilder::new(&mem_db("swap_2"), "test-swap-2")
+        .build()
+        .await
+        .unwrap();
+    db2.schema().register(task::Entity).sync().await.unwrap();
+    task::ActiveModel {
+        id: Set("after-swap".into()),
+        title: Set("from db2".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db2)
+    .await
+    .unwrap();
+
+    let (sink2, publish2) = collector::<Vec<task::Model>>();
+    let drv2 = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db2.clone(),
+        publish2,
+    ));
+    wait_for(
+        || {
+            sink2
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|rows| rows.iter().any(|m| m.id == "after-swap"))
+        },
+        "db2 rows published",
+    )
+    .await;
+
+    // The old sink must not have received anything after the swap.
+    let count_after_swap = sink.lock().unwrap().len();
+    assert_eq!(count_after_swap, 1, "cancelled driver must not publish");
+    drv2.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Row driver: initial publish (None for a missing row = the observable
 // "loaded, absent" moment), then in-place update and delete snapshots.
 // ---------------------------------------------------------------------------

@@ -7,9 +7,12 @@
 //! `column_values` payload in place via [`SyncedModel`](crate::SyncedModel) — no
 //! per-notification SeaORM round trip on the receive path.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 
+use dioxus::dioxus_core::Task;
 use dioxus::prelude::*;
 use sea_orm::{DbErr, EntityTrait, FromQueryResult, PrimaryKeyTrait};
 use tokio::time::{Duration, Instant};
@@ -336,6 +339,37 @@ pub fn use_peer_identities(
 // Reactive table/row hooks
 // ---------------------------------------------------------------------------
 
+/// Spawn a driver task from a `use_effect`, cancelling the previous one.
+///
+/// Reads the app's generation counter (provided by
+/// [`use_wavesync_generation`]) INSIDE the effect so an `InitDb::reset()` +
+/// re-init re-runs the effect with the freshly rendered `db` and swaps the
+/// driver. Cancelling the old task drops its `WaveSyncDb` clone — without
+/// this, a mounted hook pins the dead engine's SQLite file open forever
+/// after a reset. Apps that pass a `db` without the context pattern get no
+/// generation dependency: same behavior as before, re-attach on engine swap
+/// requires the context pattern (documented on the hooks).
+///
+/// `start` must spawn via [`dioxus::prelude::spawn`] and nothing else — the
+/// `LocalPublish` wrapper the hooks pass through it is only sound because
+/// the driver future never migrates off the Dioxus thread that runs it.
+fn use_driver_task(db: WaveSyncDb, start: impl Fn(WaveSyncDb) -> Task + 'static) {
+    let generation = try_use_context::<Signal<u64>>();
+    let slot: Rc<Cell<Option<Task>>> = use_hook(|| Rc::new(Cell::new(None)));
+
+    use_effect(move || {
+        if let Some(generation) = generation {
+            // Reactive dependency: a reset/re-init bumps this and re-runs
+            // the effect with the new db captured by the latest render.
+            let _ = generation.read();
+        }
+        if let Some(prev) = slot.take() {
+            prev.cancel();
+        }
+        slot.set(Some(start(db.clone())));
+    });
+}
+
 /// Reactive signal containing all rows in a table, keyed by a SeaORM
 /// `Entity` type and operating directly on a [`WaveSyncDb`].
 ///
@@ -369,8 +403,7 @@ where
     #[cfg(not(target_arch = "wasm32"))]
     ensure_auto_resume(&db);
 
-    use_effect(move || {
-        let db = db.clone();
+    use_driver_task(db, move |db| {
         // `run_table_driver` needs its callback bound `Send` so plain-tokio
         // tests can drive it via `tokio::spawn` without a Dioxus runtime.
         // The `Signal` this hook publishes to is intentionally `!Send`
@@ -381,7 +414,7 @@ where
         let mut publish = LocalPublish(signal);
         spawn(async move {
             run_table_driver::<E>(db, move |rows| publish.publish(rows)).await;
-        });
+        })
     });
 
     signal
@@ -638,8 +671,7 @@ where
     #[cfg(not(target_arch = "wasm32"))]
     ensure_auto_resume(&db);
 
-    use_effect(move || {
-        let db = db.clone();
+    use_driver_task(db, move |db| {
         let pk = pk.clone();
         // See `use_synced_table_db`: `run_row_driver` needs its callback
         // bound `Send`, but the `Signal` this hook publishes to is
@@ -649,7 +681,7 @@ where
         let mut publish = LocalPublish(signal);
         spawn(async move {
             run_row_driver::<E>(db, pk, move |row| publish.publish(row)).await;
-        });
+        })
     });
 
     signal
