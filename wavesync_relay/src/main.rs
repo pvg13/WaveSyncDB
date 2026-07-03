@@ -1,3 +1,4 @@
+mod metrics;
 mod push_notifier;
 mod push_protocol;
 mod push_retry;

@@ -8150,6 +8150,7 @@ dependencies = [
  "libp2p",
  "libp2p-swarm-derive",
  "log",
+ "prometheus-client",
  "rand 0.8.5",
  "reqwest",
  "serde",
