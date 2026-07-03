@@ -300,6 +300,25 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
             continue;
         }
 
+        // N8: if this replica deleted the row, adjudicate the incoming column
+        // edits against the local tombstone before applying them — mirrors native
+        // apply_remote_column_changes. A delete that still dominates skips the row
+        // (no resurrection); a delete that provably lost is cleared so the pair
+        // reconverges. The web store keeps values, so a cleared tombstone makes
+        // the surviving cells visible again with no residue drop needed.
+        if let Some(tomb) = local_entries.get(DELETED_COLUMN) {
+            let incoming_max = row_changes
+                .iter()
+                .filter(|c| c.cid.0 != DELETED_COLUMN)
+                .map(|c| c.col_version)
+                .max()
+                .unwrap_or(0);
+            if conflict::should_apply_delete(tomb.cl, incoming_max, &cfg.delete_policy_for(table)) {
+                continue;
+            }
+            batch.tombstone_clears.push((table.clone(), pk.clone()));
+        }
+
         for change in row_changes {
             let remote_val = match &change.val {
                 Some(v) => serde_json::to_vec(v).unwrap_or_default(),
@@ -379,6 +398,15 @@ pub async fn submit_local_write_core<S: ShadowStore>(
     // tombstone but PRESERVE the per-column clock entries so col_versions
     // continue from their previous values — mirrors native clear_tombstone
     // (connection.rs:1039-1054).
+    // Resurrection floor: if this row is reviving after a local delete, its cells
+    // must outrank the tombstone (col_version >= cl + 1) or a DeleteWins peer that
+    // still holds the tombstone would let its equal-cl delete win the tie and the
+    // row would diverge. Mirrors the native floor in connection.rs. 0 = no
+    // tombstone = normal write.
+    let floor = local_entries
+        .get(DELETED_COLUMN)
+        .map(|t| t.cl + 1)
+        .unwrap_or(0);
     if local_entries.contains_key(DELETED_COLUMN) {
         batch
             .tombstone_clears
@@ -388,7 +416,7 @@ pub async fn submit_local_write_core<S: ShadowStore>(
 
     for (seq, (cid, val)) in columns.into_iter().enumerate() {
         let prev = local_entries.get(&cid);
-        let next_cv = prev.map(|r| r.col_version + 1).unwrap_or(1);
+        let next_cv = prev.map(|r| r.col_version + 1).unwrap_or(1).max(floor);
         let next_cl = prev.map(|r| r.cl.max(next_cv)).unwrap_or(next_cv);
 
         batch.shadow_puts.push((

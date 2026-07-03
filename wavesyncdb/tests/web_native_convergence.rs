@@ -359,20 +359,20 @@ async fn concurrent_edit_vs_delete_tie_add_wins_keeps_row_on_both() {
     c2.update(&native).await.unwrap();
     web.delete("c2").await;
 
-    // Cross-apply. AddWins: the delete loses the tie on BOTH engines.
-    apply_to_native(&native, web.state().await, web.site).await;
-    web.apply(native_state(&native).await, NodeId([0u8; 16]))
-        .await;
+    // Cross-apply and prove convergence. AddWins: the delete loses the tie on
+    // both engines, and — with the N8 fix — the losing deleter (web) clears its
+    // now-defeated tombstone when the winning edit applies, so the two replicas'
+    // cell sets become identical rather than diverging permanently.
+    exchange_and_prove(&native, &mut web, "AddWins tie").await;
 
-    // The native row survives — same outcome a native AddWins receiver
-    // produces (sync_handler's AddWins-tie test).
+    // The native row survives — same outcome a native AddWins receiver produces.
     let row = task::Entity::find_by_id("c2").one(&native).await.unwrap();
     assert_eq!(
         row.map(|r| r.title),
         Some("edited concurrently".to_string()),
         "AddWins: the concurrent edit must survive the tie on native"
     );
-    // Web applied native's winning edit through the column path.
+    // Web applied native's winning edit and cleared its tombstone.
     let title = web
         .store
         .get_shadow("tasks", "c2", "title")
@@ -381,13 +381,119 @@ async fn concurrent_edit_vs_delete_tie_add_wins_keeps_row_on_both() {
         .unwrap();
     assert_eq!(title.val, Some(serde_json::json!("edited concurrently")));
     assert_eq!(title.col_version, 2);
+    assert!(
+        web.store
+            .get_shadow("tasks", "c2", DELETED_COLUMN)
+            .await
+            .unwrap()
+            .is_none(),
+        "N8: the losing deleter must clear its defeated tombstone"
+    );
+}
 
-    // NOTE deliberately NO digest-equality assertion here: the losing
-    // deleter retains its local tombstone while the survivor never stores
-    // one — the same shadow-state asymmetry two NATIVE peers exhibit after
-    // an AddWins tie (a remote column apply never clears a tombstone;
-    // only a LOCAL write does, connection.rs clear_tombstone). Parity
-    // means matching that behavior, not improving on it unilaterally.
+#[tokio::test]
+async fn dominant_delete_is_not_resurrected_by_stale_edit() {
+    // The N8 gate must not over-correct: a delete that provably DOMINATES an
+    // incoming edit (its causal length exceeds the edit's col_version) keeps the
+    // row deleted — the stale edit must not resurrect it.
+    let _ = env_logger::try_init();
+    let native = make_peer(&mem_db("conv_dom"), &unique_topic("dom"), 86).await;
+    let mut web = WebPeer::new(87, DeletePolicy::AddWins);
+    native.registry().register(TableMeta {
+        table_name: "tasks".into(),
+        primary_key_column: "id".into(),
+        columns: vec!["id".into(), "title".into(), "completed".into()],
+        delete_policy: DeletePolicy::AddWins,
+    });
+
+    // Seed and sync a row.
+    task::ActiveModel {
+        id: Set("d1".into()),
+        title: Set("v1".into()),
+        completed: Set(false),
+    }
+    .insert(&native)
+    .await
+    .unwrap();
+    exchange_and_prove(&native, &mut web, "seed").await;
+
+    // Native advances the row's clock (two edits → title cv 3) then deletes it,
+    // so the tombstone's causal length (4) dominates any single stale edit.
+    for t in ["v2", "v3"] {
+        let mut m: task::ActiveModel = task::Entity::find_by_id("d1")
+            .one(&native)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        m.title = Set(t.into());
+        m.update(&native).await.unwrap();
+    }
+    // Web makes a single stale concurrent edit (title cv 2) before it hears the
+    // native churn, then native deletes.
+    web.write("d1", "stale-edit", 0).await;
+    task::Entity::delete_by_id("d1")
+        .exec(&native)
+        .await
+        .unwrap();
+
+    // Converge. The dominant delete wins on both sides; the stale edit never
+    // resurrects the row, and the digests match.
+    exchange_and_prove(&native, &mut web, "dominant delete").await;
+    assert!(
+        task::Entity::find_by_id("d1")
+            .one(&native)
+            .await
+            .unwrap()
+            .is_none(),
+        "a delete that dominates a stale edit must keep the row deleted"
+    );
+}
+
+#[tokio::test]
+async fn reinsert_after_won_delete_converges_deletewins() {
+    // Resurrection floor (N8 part A): a row deleted then re-inserted on the SAME
+    // node must revive above its own tombstone, or a DeleteWins peer that still
+    // holds the tombstone rejects the re-insert (equal cl → delete wins the tie)
+    // and the two replicas diverge permanently.
+    let _ = env_logger::try_init();
+    let native = make_peer(&mem_db("conv_res"), &unique_topic("res"), 84).await;
+    let mut web = WebPeer::new(85, DeletePolicy::DeleteWins);
+
+    // Seed + sync a row so the web peer holds it (and will hold the tombstone).
+    task::ActiveModel {
+        id: Set("r1".into()),
+        title: Set("orig".into()),
+        completed: Set(false),
+    }
+    .insert(&native)
+    .await
+    .unwrap();
+    exchange_and_prove(&native, &mut web, "seed").await;
+
+    // Native deletes, then immediately re-inserts the same pk locally. Without
+    // the floor the revived title lands at col_version == tombstone.cl.
+    task::Entity::delete_by_id("r1")
+        .exec(&native)
+        .await
+        .unwrap();
+    task::ActiveModel {
+        id: Set("r1".into()),
+        title: Set("revived".into()),
+        completed: Set(true),
+    }
+    .insert(&native)
+    .await
+    .unwrap();
+
+    // Converge. The revived row must survive on both sides and the digests match.
+    exchange_and_prove(&native, &mut web, "reinsert after won delete").await;
+    let row = task::Entity::find_by_id("r1").one(&native).await.unwrap();
+    assert_eq!(
+        row.map(|r| r.title),
+        Some("revived".to_string()),
+        "the re-inserted row must survive against a peer's stale tombstone"
+    );
 }
 
 #[tokio::test]

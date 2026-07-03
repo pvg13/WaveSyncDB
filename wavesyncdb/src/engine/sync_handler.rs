@@ -1362,9 +1362,7 @@ async fn apply_changeset_chunk<'a>(
                     }
                 }
                 Err(e) => {
-                    log::error!(
-                        "Remote column apply {table}/{pk} failed, rolling back chunk: {e}"
-                    );
+                    log::error!("Remote column apply {table}/{pk} failed, rolling back chunk: {e}");
                     let _ = txn.rollback().await;
                     return;
                 }
@@ -1557,6 +1555,40 @@ async fn apply_remote_column_changes(
     local_db_version: u64,
 ) -> Result<(bool, bool, Vec<(String, serde_json::Value)>), sea_orm::DbErr> {
     let exists = row_exists(db, table, &meta.primary_key_column, pk).await;
+
+    // N8: adjudicate the row against a local tombstone BEFORE applying columns.
+    // If this replica deleted the row, an incoming column edit either provably
+    // outlives the delete (clear the tombstone and let the row survive) or does
+    // not (the delete still dominates — skip the edit and do NOT resurrect). This
+    // is the same deterministic predicate as the delete path, rerun with the
+    // incoming edit's causal position, so every tombstone-holder converges on the
+    // same clear/keep decision regardless of message order (Rule 2.6 preserved).
+    if let Some(tomb_cl) = shadow::get_tombstone_cl(db, table, pk).await? {
+        let incoming_max = row_changes
+            .iter()
+            .filter(|c| {
+                meta.columns.iter().any(|col| col == &c.cid.0) && c.cid.0 != meta.primary_key_column
+            })
+            .map(|c| c.col_version)
+            .max()
+            .unwrap_or(0);
+        if conflict::should_apply_delete(tomb_cl, incoming_max, &meta.delete_policy) {
+            // Delete still dominates: don't apply the edit, don't resurrect.
+            return Ok((false, exists, Vec::new()));
+        }
+        // Delete provably lost — clear it so the pair reconverges (this heals the
+        // asymmetric-tombstone state even when no column ends up winning below).
+        if exists {
+            shadow::clear_tombstone(db, table, pk).await?;
+        } else {
+            // Resurrection: drop the stale tombstone + any residual clock entries
+            // so this replica's cell set matches a peer that saw the delete and
+            // then the re-insert (winning columns are re-inserted fresh below at
+            // their remote col_versions).
+            shadow::delete_clock_entries(db, table, pk).await?;
+        }
+    }
+
     let mut winning_columns: Vec<(String, sea_orm::Value)> = Vec::new();
     let mut pending_shadow_updates: Vec<(String, u64, crate::messages::NodeId, u32)> = Vec::new();
     let mut changed_columns: Vec<(String, serde_json::Value)> = Vec::new();

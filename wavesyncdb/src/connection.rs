@@ -1055,6 +1055,30 @@ impl WaveSyncDb {
                     });
                 }
                 WriteKind::Insert | WriteKind::Update => {
+                    // If this row is resurrecting after a local delete, its cells
+                    // must outrank the tombstone: read the tombstone's causal
+                    // length first and floor the revived col_versions at cl+1, so
+                    // a DeleteWins peer still holding that tombstone applies the
+                    // re-insert instead of letting the (equal-cl) delete win. 0 =
+                    // no tombstone = normal write.
+                    let floor = match crate::shadow::get_tombstone_cl(
+                        &txn,
+                        table_owned,
+                        &parsed.primary_key,
+                    )
+                    .await
+                    {
+                        Ok(Some(cl)) => cl + 1,
+                        Ok(None) => 0,
+                        Err(e) => {
+                            log::error!("Failed to read tombstone for resurrection floor: {e}");
+                            *ver -= 1;
+                            self.inner.db_version_cache.store(*ver, Ordering::Release);
+                            let _ = txn.rollback().await;
+                            return Err(e);
+                        }
+                    };
+
                     // Clear any tombstone for this row (it's alive again),
                     // but preserve per-column clock entries so col_versions
                     // continue from their previous values.
@@ -1088,6 +1112,7 @@ impl WaveSyncDb {
                         &batch_input,
                         new_db_version,
                         &site_id,
+                        floor,
                     )
                     .await
                     {
@@ -1524,6 +1549,16 @@ impl<'a> SchemaBuilder<'a> {
                 let _ = std::fs::write(&config_path, updated);
             }
         }
+        // One-time N8 repair: clear any defeated tombstone still sitting on a live
+        // row (from a losing delete applied before the tombstone-clear fix). This
+        // lets reconciliation reconverge such rows. Best-effort — a failure here
+        // must not block startup, only leave the (data-correct) digest mismatch.
+        if let Err(e) =
+            crate::shadow::heal_lost_tombstones(&self.db.inner.inner, self.db.registry()).await
+        {
+            log::warn!("N8 tombstone heal sweep failed (non-fatal): {e}");
+        }
+
         // Signal the engine that tables are registered and sync can begin. Via
         // `registry_ready()` so runtime-joined groups also notify the engine
         // (GroupRegistryReady), not just the default group's Notify.
