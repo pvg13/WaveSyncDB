@@ -491,3 +491,60 @@ async fn table_driver_lagged_burst_converges() {
     .await;
     drv.abort();
 }
+
+// ---------------------------------------------------------------------------
+// Row driver: initial publish (None for a missing row = the observable
+// "loaded, absent" moment), then in-place update and delete snapshots.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn row_driver_publishes_initial_and_incremental_snapshots() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_row"), "test-drv-row")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    let (sink, publish) = collector::<Option<task::Model>>();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_row_driver::<task::Entity>(
+        db.clone(),
+        "r1".to_string(),
+        publish,
+    ));
+
+    // Initial publish fires with None — the row doesn't exist yet.
+    wait_for(|| sink.lock().unwrap().len() == 1, "initial None publish").await;
+    assert!(sink.lock().unwrap()[0].is_none());
+
+    task::ActiveModel {
+        id: Set("r1".into()),
+        title: Set("row".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    wait_for(
+        || {
+            sink.lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|m| m.title == "row")
+        },
+        "insert publish",
+    )
+    .await;
+
+    db.execute_unprepared("DELETE FROM tasks WHERE id = 'r1'")
+        .await
+        .unwrap();
+    wait_for(
+        || sink.lock().unwrap().last().unwrap().is_none(),
+        "delete publish",
+    )
+    .await;
+
+    drv.abort();
+}
