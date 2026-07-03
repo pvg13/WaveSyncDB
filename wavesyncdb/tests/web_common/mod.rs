@@ -151,6 +151,22 @@ impl ShadowStore for MemoryStore {
     }
 }
 
+impl MemoryStore {
+    /// Test-only: rewrite a tombstone's deleted_ts to simulate aging
+    /// without sleeping. Mirrors the raw-SQL UPDATE used on the native
+    /// side of the convergence suite.
+    pub fn age_tombstone(&self, table: &str, pk: &str, new_ts: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(row) =
+            inner
+                .shadow
+                .get_mut(&(table.to_string(), pk.to_string(), "__deleted".to_string()))
+        {
+            row.deleted_ts = Some(new_ts);
+        }
+    }
+}
+
 /// Real wall clock for retention params in tests: native peers stamp real
 /// times, so the web side must age against the same clock. Nothing ages
 /// out under the 7-day default within a test run.

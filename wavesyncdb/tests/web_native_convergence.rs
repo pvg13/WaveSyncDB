@@ -28,7 +28,7 @@
 mod common;
 mod web_common;
 
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use uuid::Uuid;
 
 use common::{make_node_id, make_peer, mem_db, task};
@@ -561,4 +561,76 @@ async fn interleaved_batches_converge() {
     n0.update(&native).await.unwrap();
 
     exchange_and_prove(&native, &mut web, "interleaved batches").await;
+}
+
+// ---------------------------------------------------------------------------
+// Retention: aged tombstones vanish from both engines by the SAME shared
+// timestamp rule, so digests stay equal no matter when (or whether) each
+// side physically garbage-collects — the central claim of the retention
+// design. Aging is injected (never slept): both replicas hold the same
+// wire-carried deleted_ts, so rewriting it on both sides is exactly what
+// the passage of time would do.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn aged_tombstones_stay_convergent_across_gc_timing() {
+    let _ = env_logger::try_init();
+    let native = make_peer(&mem_db("conv_ret"), &unique_topic("ret"), 178).await;
+    let mut web = WebPeer::new(179, DeletePolicy::DeleteWins);
+
+    // Same retention window on both sides (100s).
+    wavesyncdb::shadow::set_tombstone_retention(
+        native.inner(),
+        Some(std::time::Duration::from_secs(100)),
+    )
+    .await
+    .unwrap();
+    web.cfg.tombstone_retention_secs = Some(100);
+
+    // A row lives on both, then web deletes it; the tombstone propagates.
+    web.write("r1", "doomed", 0).await;
+    exchange_and_prove(&native, &mut web, "retention: row propagated").await;
+    web.delete("r1").await;
+    exchange_and_prove(&native, &mut web, "retention: delete propagated").await;
+    assert!(
+        native_state(&native)
+            .await
+            .iter()
+            .any(|c| c.cid == DELETED_COLUMN && c.pk == "r1"),
+        "fresh tombstone visible on native"
+    );
+
+    // Age the SAME tombstone on both sides (simulates elapsed time).
+    let aged = web_common::test_now() - 1000;
+    native
+        .inner()
+        .execute_unprepared(&format!(
+            "UPDATE \"_wavesync_tasks_clock\" SET deleted_ts = {aged} \
+             WHERE pk = 'r1' AND cid = '__deleted'"
+        ))
+        .await
+        .unwrap();
+    web.store.age_tombstone("tasks", "r1", aged);
+
+    // Both exclude it — digests equal, tombstone gone from every surface.
+    exchange_and_prove(&native, &mut web, "retention: aged out on both").await;
+    assert!(
+        !native_state(&native)
+            .await
+            .iter()
+            .any(|c| c.cid == DELETED_COLUMN),
+        "aged tombstone must not travel from native"
+    );
+    assert!(
+        !web.state().await.iter().any(|c| c.cid.0 == DELETED_COLUMN),
+        "aged tombstone must not travel from web"
+    );
+
+    // Asymmetric physical GC: native deletes the row from disk, web only
+    // excludes. Digest equality must be unaffected — physical timing is a
+    // local concern.
+    let collected = wavesyncdb::shadow::gc_aged_tombstones(native.inner(), native.registry())
+        .await
+        .unwrap();
+    assert_eq!(collected, 1, "native physically collected the tombstone");
+    exchange_and_prove(&native, &mut web, "retention: asymmetric physical GC").await;
 }

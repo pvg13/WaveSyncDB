@@ -497,35 +497,25 @@ impl EngineRunner {
         let topic_name = g.topic_name.clone();
 
         tokio::spawn(async move {
-            // A cursor below the GC floor cannot be served incrementally —
-            // tombstones from that range were physically collected, so the
-            // incremental slice would LOOK complete while silently omitting
-            // deletes. Widen to a full snapshot instead (idempotent apply
-            // makes the re-send harmless; the peer's cursor then jumps past
-            // the floor).
-            let floor = shadow::get_gc_floor(&db).await.unwrap_or(0);
-            let effective_since = if your_last_db_version < floor {
-                log::info!(
-                    "Peer cursor {} predates GC floor {}; widening to full state",
-                    your_last_db_version,
-                    floor
-                );
-                0
-            } else {
-                your_last_db_version
-            };
+            // Note on long-offline cursors: shadow tables are upsert-in-place,
+            // so an incremental response at ANY cursor is complete for all
+            // live cells — physical tombstone GC removes only deletes older
+            // than the retention window, which are intentionally
+            // unrecoverable by any response shape (the documented
+            // resurrection window). No full-resync fallback is needed.
             // Get changes since the peer's last known version of us
-            let changes = match shadow::get_changes_since(&db, &registry, effective_since).await {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!(
-                        "Failed to get changes since {}: {}",
-                        your_last_db_version,
-                        e
-                    );
-                    Vec::new()
-                }
-            };
+            let changes =
+                match shadow::get_changes_since(&db, &registry, your_last_db_version).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to get changes since {}: {}",
+                            your_last_db_version,
+                            e
+                        );
+                        Vec::new()
+                    }
+                };
 
             let mut resp = crate::protocol::SyncResponse::ChangesetResponse {
                 changes,

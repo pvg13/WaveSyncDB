@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use uuid::Uuid;
+use wavesyncdb::engine::convergence::compute_group_digest;
 use wavesyncdb::{DeletePolicy, TableMeta, WaveSyncDbBuilder};
 
 use common::{assert_eventually, make_node_id, make_peer, mem_db, note, task};
@@ -1499,4 +1500,162 @@ async fn test_insert_delete_before_sync() {
         .map(|v| v.len())
         .unwrap_or(0);
     assert_eq!(count, 0, "B should have 0 rows after insert+delete");
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone retention (#41), seeds 115-118.
+// ---------------------------------------------------------------------------
+
+/// T-A: with a tiny retention window, a propagated delete ages out on both
+/// peers and the pair stays convergent AND quiet — digests equal, and
+/// db_versions stable across further sync/reconcile windows (the
+/// no-ping-pong tripwire: uncoordinated GC must not make RBSR re-transfer
+/// tombstones back and forth).
+#[tokio::test]
+async fn test_retention_aging_no_reconcile_churn() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-retention-churn-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let mut peers = Vec::new();
+    for seed in [115u8, 116] {
+        let peer = WaveSyncDbBuilder::new(&mem_db(&format!("ret_churn_{seed}")), &topic)
+            .with_node_id(make_node_id(seed))
+            .with_mdns_query_interval(Duration::from_millis(100))
+            .with_mdns_ttl(Duration::from_secs(5))
+            .with_sync_interval(Duration::from_secs(2))
+            .with_tombstone_retention(Duration::from_secs(1))
+            .build()
+            .await
+            .unwrap();
+        peer.schema().register(task::Entity).sync().await.unwrap();
+        peers.push(peer);
+    }
+    let (a, b) = (&peers[0], &peers[1]);
+
+    task::ActiveModel {
+        id: Set("doomed".into()),
+        title: Set("short-lived".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(a)
+    .await
+    .unwrap();
+    assert_eventually("B has the row", timeout, || async {
+        task::Entity::find_by_id("doomed")
+            .one(b)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+
+    task::Entity::delete_by_id("doomed").exec(a).await.unwrap();
+    assert_eventually("B saw the delete", timeout, || async {
+        task::Entity::find_by_id("doomed")
+            .one(b)
+            .await
+            .unwrap()
+            .is_none()
+    })
+    .await;
+
+    // Let the 1s retention window lapse on both, then require digest
+    // equality (both exclude the aged tombstone by the same shared stamp).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eventually("digests equal after aging", timeout, || async {
+        let da = compute_group_digest(a.inner(), a.registry()).await;
+        let db_ = compute_group_digest(b.inner(), b.registry()).await;
+        da == db_
+    })
+    .await;
+
+    // Stability across two more sync/reconcile windows: churn would show as
+    // climbing db_versions (RBSR re-transferring what the other side aged).
+    let before = (
+        wavesyncdb::shadow::get_db_version(a.inner()).await.unwrap(),
+        wavesyncdb::shadow::get_db_version(b.inner()).await.unwrap(),
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let after = (
+        wavesyncdb::shadow::get_db_version(a.inner()).await.unwrap(),
+        wavesyncdb::shadow::get_db_version(b.inner()).await.unwrap(),
+    );
+    assert_eq!(
+        before, after,
+        "db_versions must be stable at steady state — growth means aged tombstones are ping-ponging"
+    );
+}
+
+/// T-B: after A ages and PHYSICALLY collects a delete's tombstone, a fresh
+/// peer joining later still converges to A's live state — the deleted row
+/// stays deleted for newcomers (it simply never travels alive), and the
+/// live row arrives intact. No silent gap, no error.
+#[tokio::test]
+async fn test_fresh_peer_after_physical_gc_converges() {
+    let _ = env_logger::try_init();
+    let topic = format!("test-retention-fresh-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = WaveSyncDbBuilder::new(&mem_db("ret_fresh_a"), &topic)
+        .with_node_id(make_node_id(117))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .with_tombstone_retention(Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+    a.schema().register(task::Entity).sync().await.unwrap();
+
+    for (id, title) in [("gone", "deleted before B existed"), ("kept", "survives")] {
+        task::ActiveModel {
+            id: Set(id.into()),
+            title: Set(title.into()),
+            completed: Set(false),
+            ..Default::default()
+        }
+        .insert(&a)
+        .await
+        .unwrap();
+    }
+    task::Entity::delete_by_id("gone").exec(&a).await.unwrap();
+
+    // Age past the window and physically collect. Timestamps are
+    // second-granular and the exclusion predicate is strict (<), so sleep
+    // comfortably past retention + 1s of quantization.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let collected = wavesyncdb::shadow::gc_aged_tombstones(a.inner(), a.registry())
+        .await
+        .unwrap();
+    assert_eq!(collected, 1, "the aged tombstone was physically collected");
+
+    // A fresh peer now joins and must converge to A's live state.
+    let b = WaveSyncDbBuilder::new(&mem_db("ret_fresh_b"), &topic)
+        .with_node_id(make_node_id(118))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .with_tombstone_retention(Duration::from_secs(1))
+        .build()
+        .await
+        .unwrap();
+    b.schema().register(task::Entity).sync().await.unwrap();
+
+    assert_eventually(
+        "B has the live row and not the deleted one",
+        timeout,
+        || async {
+            let kept = task::Entity::find_by_id("kept").one(&b).await.unwrap();
+            let gone = task::Entity::find_by_id("gone").one(&b).await.unwrap();
+            kept.is_some() && gone.is_none()
+        },
+    )
+    .await;
+    assert_eventually("digests equal", timeout, || async {
+        compute_group_digest(a.inner(), a.registry()).await
+            == compute_group_digest(b.inner(), b.registry()).await
+    })
+    .await;
 }

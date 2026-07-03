@@ -765,12 +765,14 @@ fn aged_tombstone_predicate(cutoff: Option<u64>, alias: &str) -> String {
     }
 }
 
-/// Physically delete aged tombstones from every registered table's shadow,
-/// recording the GC floor FIRST (the floor must be durable before history
-/// disappears — it is what protects below-floor catch-up cursors from
-/// silently incomplete responses). Returns the number of rows collected.
-/// Exclusion already hides these rows from every surface, so when this
-/// sweep runs is a purely local concern.
+/// Physically delete aged tombstones from every registered table's shadow.
+/// Returns the number of rows collected. Exclusion already hides these
+/// rows from every surface — sync, digests, RBSR, and the conflict gates —
+/// so when this sweep runs is a purely local storage concern. Incremental
+/// catch-up stays complete at any cursor: shadow tables are
+/// upsert-in-place, so live cells always travel regardless of `since`;
+/// only deletes older than the retention window are lost, by design (the
+/// documented resurrection window) — no full-resync fallback is needed.
 pub async fn gc_aged_tombstones(
     db: &impl ConnectionTrait,
     registry: &TableRegistry,
@@ -778,31 +780,6 @@ pub async fn gc_aged_tombstones(
     let Some(cutoff) = tombstone_cutoff(db).await? else {
         return Ok(0);
     };
-
-    #[derive(Debug, FromQueryResult)]
-    struct MaxRow {
-        m: Option<i64>,
-    }
-    let mut doomed_floor: u64 = 0;
-    for meta in registry.all_tables() {
-        let shadow_name = format!("_wavesync_{}_clock", meta.table_name);
-        let sql = format!(
-            "SELECT MAX(db_version) AS m FROM \"{shadow_name}\" \
-             WHERE cid = '__deleted' AND deleted_ts IS NOT NULL AND deleted_ts < {cutoff}"
-        );
-        let row = MaxRow::find_by_statement(Statement::from_string(DatabaseBackend::Sqlite, sql))
-            .one(db)
-            .await?;
-        if let Some(m) = row.and_then(|r| r.m) {
-            doomed_floor = doomed_floor.max(m as u64);
-        }
-    }
-    if doomed_floor == 0 {
-        return Ok(0);
-    }
-
-    let floor = get_gc_floor(db).await?.max(doomed_floor);
-    set_gc_floor(db, floor).await?;
 
     let mut collected = 0u64;
     for meta in registry.all_tables() {
@@ -815,40 +792,6 @@ pub async fn gc_aged_tombstones(
         collected += res.rows_affected();
     }
     Ok(collected)
-}
-
-/// Read the GC floor: the highest `db_version` among tombstones that have
-/// been physically garbage-collected. A catch-up cursor below this floor
-/// cannot be served incrementally (the response would silently omit the
-/// GC'd deletes) — the responder widens to a full sync instead.
-pub async fn get_gc_floor(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
-    #[derive(Debug, FromQueryResult)]
-    struct MetaRow {
-        value: Vec<u8>,
-    }
-    let row = MetaRow::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "SELECT value FROM _wavesync_meta WHERE key = $1",
-        ["gc_floor".into()],
-    ))
-    .one(db)
-    .await?;
-    Ok(row
-        .and_then(|r| r.value.try_into().ok().map(u64::from_le_bytes))
-        .unwrap_or(0))
-}
-
-/// Persist the GC floor. Must be committed BEFORE the corresponding
-/// tombstone rows are physically deleted — the floor is what protects
-/// below-floor cursors from silently incomplete catch-up responses.
-pub async fn set_gc_floor(db: &impl ConnectionTrait, floor: u64) -> Result<(), DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
-        ["gc_floor".into(), floor.to_le_bytes().to_vec().into()],
-    ))
-    .await?;
-    Ok(())
 }
 
 /// Read the causal length (`col_version`) of a row's `__deleted` tombstone, if
@@ -1300,7 +1243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gc_sweep_sets_floor_before_deleting() {
+    async fn test_gc_sweep_collects_only_aged() {
         let db = setup_with_shadow().await;
         let site_id = NodeId([1u8; 16]);
         set_tombstone_retention(&db, Some(std::time::Duration::from_secs(100)))
@@ -1327,8 +1270,6 @@ mod tests {
 
         let collected = gc_aged_tombstones(&db, &registry).await.unwrap();
         assert_eq!(collected, 2, "both aged tombstones collected");
-        // Floor = the highest db_version among the collected rows.
-        assert_eq!(get_gc_floor(&db).await.unwrap(), 9);
         // Fresh tombstone survives physically.
         assert!(
             get_tombstone_cl(&db, "tasks", "fresh")
@@ -1336,9 +1277,8 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        // Idempotent: nothing left to collect, floor unchanged.
+        // Idempotent: nothing left to collect.
         assert_eq!(gc_aged_tombstones(&db, &registry).await.unwrap(), 0);
-        assert_eq!(get_gc_floor(&db).await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -1367,16 +1307,6 @@ mod tests {
         let changes = get_changes_since(&db, &registry, 0).await.unwrap();
         assert!(changes.iter().any(|c| c.pk == "ancient"));
         assert_eq!(gc_aged_tombstones(&db, &registry).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_gc_floor_roundtrip() {
-        let db = setup_db().await;
-        assert_eq!(get_gc_floor(&db).await.unwrap(), 0, "absent floor reads 0");
-        set_gc_floor(&db, 7).await.unwrap();
-        assert_eq!(get_gc_floor(&db).await.unwrap(), 7);
-        set_gc_floor(&db, 11).await.unwrap();
-        assert_eq!(get_gc_floor(&db).await.unwrap(), 11);
     }
 
     #[tokio::test]
