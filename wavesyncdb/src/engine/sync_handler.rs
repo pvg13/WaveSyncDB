@@ -1547,6 +1547,10 @@ async fn apply_remote_delete(
     .await?;
 
     shadow::delete_clock_entries(db, table, pk).await?;
+    // Store the DELETER's wire timestamp verbatim — the shared value is what
+    // makes retention aging deterministic across replicas. The fallback can
+    // only fire for a peer that somehow omitted it; local receipt time is
+    // the safest remaining approximation.
     shadow::insert_tombstone(
         db,
         table,
@@ -1554,6 +1558,7 @@ async fn apply_remote_delete(
         change.col_version,
         local_db_version,
         &change.site_id,
+        change.deleted_ts.unwrap_or_else(shadow::unix_now_secs),
     )
     .await?;
 
@@ -2064,6 +2069,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         let ctx = NotifyCtx {
@@ -2165,6 +2171,7 @@ mod tests {
                 cl: 1,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -2176,6 +2183,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
 
@@ -2237,6 +2245,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2309,6 +2318,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2371,6 +2381,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2412,6 +2423,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2446,6 +2458,7 @@ mod tests {
                 cl: 1,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -2457,6 +2470,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -2468,6 +2482,7 @@ mod tests {
                 cl: 1,
                 seq: 2,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
 
@@ -2520,6 +2535,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db,
@@ -2579,6 +2595,7 @@ mod tests {
             cl: 10,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2643,6 +2660,7 @@ mod tests {
             cl: 10,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2701,6 +2719,7 @@ mod tests {
             cl: 3,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2764,6 +2783,7 @@ mod tests {
                 cl: 5,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -2775,6 +2795,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
 
@@ -2836,6 +2857,7 @@ mod tests {
             cl: 3,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2894,6 +2916,7 @@ mod tests {
             cl: 5,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -2952,6 +2975,7 @@ mod tests {
             cl: 5,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
 
         apply_remote_changeset(
@@ -3002,6 +3026,7 @@ mod tests {
             cl: 5,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db,
@@ -3027,6 +3052,7 @@ mod tests {
                 cl: 10,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3038,6 +3064,7 @@ mod tests {
                 cl: 10,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3049,6 +3076,7 @@ mod tests {
                 cl: 10,
                 seq: 2,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
         apply_remote_changeset(
@@ -3094,6 +3122,7 @@ mod tests {
                 cl: 1,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3105,6 +3134,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3116,6 +3146,7 @@ mod tests {
                 cl: 1,
                 seq: 2,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3127,6 +3158,7 @@ mod tests {
                 cl: 1,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3138,6 +3170,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3149,6 +3182,7 @@ mod tests {
                 cl: 1,
                 seq: 2,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
 
@@ -3203,6 +3237,7 @@ mod tests {
             cl: 1,
             seq: 1,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db_a,
@@ -3244,6 +3279,7 @@ mod tests {
             cl: 1,
             seq: 1,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db_b,
@@ -3324,6 +3360,7 @@ mod tests {
             cl: 2,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db_a,
@@ -3347,6 +3384,7 @@ mod tests {
             cl: 3,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db_b,
@@ -3431,6 +3469,7 @@ mod tests {
             cl: 2,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         }];
         apply_remote_changeset(
             &db,
@@ -3473,6 +3512,7 @@ mod tests {
                 cl: 1,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3484,6 +3524,7 @@ mod tests {
                 cl: 1,
                 seq: 1,
                 db_version: 0,
+                deleted_ts: None,
             },
             ColumnChange {
                 table: "tasks".into(),
@@ -3495,6 +3536,7 @@ mod tests {
                 cl: 1,
                 seq: 2,
                 db_version: 0,
+                deleted_ts: None,
             },
         ];
         apply_remote_changeset(

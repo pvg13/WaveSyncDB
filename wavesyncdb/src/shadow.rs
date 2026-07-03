@@ -48,11 +48,37 @@ pub async fn create_shadow_table(
             db_version  INTEGER NOT NULL,
             site_id     BLOB NOT NULL,
             seq         INTEGER NOT NULL DEFAULT 0,
+            deleted_ts  INTEGER,
             PRIMARY KEY (pk, cid)
         )",
         shadow_name
     );
     db.execute_unprepared(&sql).await?;
+
+    // Migrate pre-retention shadow tables in place. CREATE IF NOT EXISTS
+    // does nothing for an existing table, so the column must be added
+    // explicitly; SQLite has no ADD COLUMN IF NOT EXISTS, so the duplicate
+    // error is the idempotence signal and is the only error swallowed.
+    let alter = format!(
+        "ALTER TABLE \"{}\" ADD COLUMN deleted_ts INTEGER",
+        shadow_name
+    );
+    if let Err(e) = db.execute_unprepared(&alter).await {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+    // Start legacy tombstones' retention clock at upgrade time: they can't
+    // be older than "now" from every peer's perspective (no shared stamp
+    // exists for them), and leaving them NULL would exempt them from GC
+    // forever. Idempotent — nothing writes NULL after this migration.
+    let backfill = format!(
+        "UPDATE \"{}\" SET deleted_ts = {} WHERE cid = '__deleted' AND deleted_ts IS NULL",
+        shadow_name,
+        unix_now_secs()
+    );
+    db.execute_unprepared(&backfill).await?;
 
     // Index on db_version for efficient get_changes_since queries
     let idx_sql = format!(
@@ -559,7 +585,7 @@ pub async fn get_changes_since(
             .join(", ");
 
         let sql = format!(
-            "SELECT s.pk, s.cid, s.col_version, s.db_version, s.seq, s.site_id, \
+            "SELECT s.pk, s.cid, s.col_version, s.db_version, s.seq, s.site_id, s.deleted_ts, \
              json_object({json_cols}) as row_json \
              FROM \"{shadow_name}\" s \
              LEFT JOIN \"{table}\" t ON t.\"{pk_col}\" = s.pk \
@@ -582,6 +608,7 @@ pub async fn get_changes_since(
             let db_version: i64 = row.try_get("", "db_version")?;
             let seq: i32 = row.try_get("", "seq")?;
             let site_id_bytes: Vec<u8> = row.try_get("", "site_id")?;
+            let deleted_ts: Option<i64> = row.try_get("", "deleted_ts").unwrap_or(None);
 
             let val = if cid == "__deleted" {
                 None
@@ -612,6 +639,7 @@ pub async fn get_changes_since(
                 cl: col_version as u64,
                 seq: seq as u32,
                 db_version: db_version as u64,
+                deleted_ts: deleted_ts.map(|t| t as u64),
             });
         }
     }
@@ -622,6 +650,10 @@ pub async fn get_changes_since(
 }
 
 /// Insert a tombstone entry in the shadow table.
+///
+/// `deleted_ts` is the DELETER's wall-clock (unix seconds), carried on the
+/// wire so every replica stores the same value — the shared basis for
+/// retention/GC eligibility. It never participates in conflict ordering.
 pub async fn insert_tombstone(
     db: &impl ConnectionTrait,
     table: &str,
@@ -629,18 +661,70 @@ pub async fn insert_tombstone(
     col_version: u64,
     db_version: u64,
     site_id: &NodeId,
+    deleted_ts: u64,
 ) -> Result<ExecResult, DbErr> {
-    upsert_clock_entry(
-        db,
-        table,
-        pk,
-        "__deleted",
-        col_version,
-        db_version,
-        site_id,
-        0,
-    )
+    let shadow_name = format!("_wavesync_{}_clock", table);
+    let sql = format!(
+        "INSERT OR REPLACE INTO \"{}\" (pk, cid, col_version, db_version, site_id, seq, deleted_ts)
+         VALUES ($1, '__deleted', $2, $3, $4, 0, $5)",
+        shadow_name
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        &sql,
+        [
+            pk.into(),
+            (col_version as i64).into(),
+            (db_version as i64).into(),
+            site_id.0.to_vec().into(),
+            (deleted_ts as i64).into(),
+        ],
+    ))
     .await
+}
+
+/// Current unix time in seconds. Used exclusively to stamp and age
+/// tombstones for retention/GC — wall-clock never participates in conflict
+/// resolution.
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read the GC floor: the highest `db_version` among tombstones that have
+/// been physically garbage-collected. A catch-up cursor below this floor
+/// cannot be served incrementally (the response would silently omit the
+/// GC'd deletes) — the responder widens to a full sync instead.
+pub async fn get_gc_floor(db: &impl ConnectionTrait) -> Result<u64, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct MetaRow {
+        value: Vec<u8>,
+    }
+    let row = MetaRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT value FROM _wavesync_meta WHERE key = $1",
+        ["gc_floor".into()],
+    ))
+    .one(db)
+    .await?;
+    Ok(row
+        .and_then(|r| r.value.try_into().ok().map(u64::from_le_bytes))
+        .unwrap_or(0))
+}
+
+/// Persist the GC floor. Must be committed BEFORE the corresponding
+/// tombstone rows are physically deleted — the floor is what protects
+/// below-floor cursors from silently incomplete catch-up responses.
+pub async fn set_gc_floor(db: &impl ConnectionTrait, floor: u64) -> Result<(), DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        ["gc_floor".into(), floor.to_le_bytes().to_vec().into()],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// Read the causal length (`col_version`) of a row's `__deleted` tombstone, if
@@ -937,7 +1021,7 @@ mod tests {
         let db = setup_with_shadow().await;
         let site_id = NodeId([1u8; 16]);
 
-        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id)
+        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, 1_000_000)
             .await
             .unwrap();
 
@@ -947,6 +1031,93 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].cid, "__deleted");
         assert_eq!(entries[0].col_version, 3);
+    }
+
+    #[tokio::test]
+    async fn test_insert_tombstone_persists_deleted_ts_on_wire() {
+        let db = setup_with_shadow().await;
+        let site_id = NodeId([1u8; 16]);
+        insert_tombstone(&db, "tasks", "pk1", 3, 5, &site_id, 1234)
+            .await
+            .unwrap();
+
+        let registry = TableRegistry::new();
+        registry.register(crate::registry::TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+        let changes = get_changes_since(&db, &registry, 0).await.unwrap();
+        let tomb = changes.iter().find(|c| c.cid == "__deleted").unwrap();
+        // The stored stamp rides the wire so every replica ages this
+        // tombstone from the same instant.
+        assert_eq!(tomb.deleted_ts, Some(1234));
+    }
+
+    #[tokio::test]
+    async fn test_shadow_migration_adds_deleted_ts_and_backfills_once() {
+        let db = setup_db().await;
+        // Simulate a pre-retention shadow table: old DDL, no deleted_ts.
+        db.execute_unprepared(
+            "CREATE TABLE \"_wavesync_legacy_clock\" (
+                pk TEXT NOT NULL, cid TEXT NOT NULL, col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL, site_id BLOB NOT NULL,
+                seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pk, cid))",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO \"_wavesync_legacy_clock\" (pk, cid, col_version, db_version, site_id)
+             VALUES ('gone', '__deleted', 1, 1, x'00')",
+        )
+        .await
+        .unwrap();
+
+        // Migration adds the column and backfills the legacy tombstone.
+        create_shadow_table(&db, "legacy").await.unwrap();
+        #[derive(FromQueryResult)]
+        struct TsRow {
+            deleted_ts: Option<i64>,
+        }
+        let ts = TsRow::find_by_statement(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT deleted_ts FROM \"_wavesync_legacy_clock\" WHERE pk = 'gone'".to_string(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .deleted_ts;
+        assert!(ts.is_some(), "legacy tombstone must be backfilled");
+
+        // Backfill is one-shot: an explicit stamp survives re-migration.
+        db.execute_unprepared(
+            "UPDATE \"_wavesync_legacy_clock\" SET deleted_ts = 42 WHERE pk = 'gone'",
+        )
+        .await
+        .unwrap();
+        create_shadow_table(&db, "legacy").await.unwrap();
+        let ts = TsRow::find_by_statement(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT deleted_ts FROM \"_wavesync_legacy_clock\" WHERE pk = 'gone'".to_string(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .deleted_ts;
+        assert_eq!(ts, Some(42), "non-NULL stamps must never be rewritten");
+    }
+
+    #[tokio::test]
+    async fn test_gc_floor_roundtrip() {
+        let db = setup_db().await;
+        assert_eq!(get_gc_floor(&db).await.unwrap(), 0, "absent floor reads 0");
+        set_gc_floor(&db, 7).await.unwrap();
+        assert_eq!(get_gc_floor(&db).await.unwrap(), 7);
+        set_gc_floor(&db, 11).await.unwrap();
+        assert_eq!(get_gc_floor(&db).await.unwrap(), 11);
     }
 
     #[tokio::test]
@@ -983,7 +1154,7 @@ mod tests {
             .unwrap();
 
         // Add a tombstone (simulating a DELETE)
-        insert_tombstone(&db, "tasks", "pk1", 6, 2, &site_id)
+        insert_tombstone(&db, "tasks", "pk1", 6, 2, &site_id, 1_000_000)
             .await
             .unwrap();
 
@@ -1126,13 +1297,13 @@ mod tests {
         upsert_clock_entry(&db, "tasks", "live", "title", 2, 1, &site, 0)
             .await
             .unwrap();
-        insert_tombstone(&db, "tasks", "live", 2, 1, &site)
+        insert_tombstone(&db, "tasks", "live", 2, 1, &site, 1_000_000)
             .await
             .unwrap();
 
         // Normally-deleted row "gone": tombstone present, NO user row. Must be left
         // alone (it is a correct deleted state, not the anomaly).
-        insert_tombstone(&db, "tasks", "gone", 3, 1, &site)
+        insert_tombstone(&db, "tasks", "gone", 3, 1, &site, 1_000_000)
             .await
             .unwrap();
 

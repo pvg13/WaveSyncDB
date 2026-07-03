@@ -41,6 +41,7 @@ fn change(
         cl: cv,
         seq: 0,
         db_version: 0,
+        deleted_ts: None,
     }
 }
 
@@ -368,6 +369,7 @@ fn delete_change(table: &str, pk: &str, site: NodeId, cl: u64) -> ColumnChange {
         cl,
         seq: 0,
         db_version: 0,
+        deleted_ts: None,
     }
 }
 

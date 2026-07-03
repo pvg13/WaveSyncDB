@@ -304,6 +304,7 @@ mod tests {
             cl: v as u64 + 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         };
         LocalCell {
             key: sort_key(&change.table.0, &change.pk.0, &change.cid.0),
@@ -462,6 +463,7 @@ mod tests {
             cl: 1,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         };
         let changes = vec![mk("tasks", "id"), mk("tasks", "title"), mk("other", "id")];
         let cells =

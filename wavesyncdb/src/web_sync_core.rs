@@ -445,6 +445,7 @@ pub async fn submit_local_write_core<S: ShadowStore>(
             cl: next_cl,
             seq: seq as u32,
             db_version: next_db_version,
+            deleted_ts: None,
         });
     }
 
@@ -505,6 +506,7 @@ pub async fn submit_local_delete_core<S: ShadowStore>(
         cl: tombstone_cv,
         seq: 0,
         db_version: next_db_version,
+        deleted_ts: None,
     }])
 }
 

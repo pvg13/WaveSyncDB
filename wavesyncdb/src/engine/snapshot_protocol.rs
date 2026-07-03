@@ -12,7 +12,7 @@ use libp2p::request_response;
 use crate::protocol::{SyncRequest, SyncResponse};
 
 /// Protocol identifier for the sync protocol (current / newest rung).
-pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/3.0.0");
+pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/4.0.0");
 
 /// The supported sync-protocol ladder, **newest first**. libp2p's request-response
 /// negotiates the newest identifier both peers advertise per stream, turning what
@@ -251,10 +251,10 @@ mod tests {
     fn test_negotiate_matches_current_rung() {
         // A peer advertising our current protocol (amongst unrelated ones)
         // negotiates the newest rung (index 0).
-        assert_eq!(SNAPSHOT_PROTOCOL.as_ref(), "/wavesync/snapshot/3.0.0");
+        assert_eq!(SNAPSHOT_PROTOCOL.as_ref(), "/wavesync/snapshot/4.0.0");
         let peer = [
             "/ipfs/id/1.0.0",
-            "/wavesync/snapshot/3.0.0",
+            "/wavesync/snapshot/4.0.0",
             "/wavesync/push/1.0.0",
         ];
         assert_eq!(negotiate_snapshot_protocol(peer), Some(0));
@@ -272,7 +272,7 @@ mod tests {
     fn test_negotiate_prefers_newest_common() {
         // Newest-first selection: with the current single rung plus a hypothetical
         // older one the peer also advertises, the newest (index 0) wins.
-        let peer = ["/wavesync/snapshot/3.0.0", "/wavesync/snapshot/2.0.0"];
+        let peer = ["/wavesync/snapshot/4.0.0", "/wavesync/snapshot/2.0.0"];
         assert_eq!(negotiate_snapshot_protocol(peer), Some(0));
     }
 }

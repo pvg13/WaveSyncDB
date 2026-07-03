@@ -114,6 +114,7 @@ impl ShadowStore for MemoryStore {
                 cl: row.cl,
                 seq: row.seq,
                 db_version: row.db_version,
+                deleted_ts: None,
             })
             .collect();
         out.sort_by_key(|c| (c.db_version, c.seq));

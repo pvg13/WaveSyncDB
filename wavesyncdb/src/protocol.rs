@@ -236,6 +236,7 @@ mod tests {
                 cl: 3,
                 seq: 0,
                 db_version: 0,
+                deleted_ts: None,
             }],
             my_db_version: 20,
             your_last_db_version: 10,

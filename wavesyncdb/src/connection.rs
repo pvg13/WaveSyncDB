@@ -750,6 +750,9 @@ impl WaveSyncDb {
 
                     let max_cv = entries.iter().map(|e| e.col_version).max().unwrap_or(0);
                     let tombstone_cv = max_cv + 1;
+                    // The deleter's clock, stamped once and carried on the
+                    // wire so every replica ages this tombstone identically.
+                    let deleted_ts = crate::shadow::unix_now_secs();
 
                     if let Err(e) = crate::shadow::insert_tombstone(
                         &txn,
@@ -758,6 +761,7 @@ impl WaveSyncDb {
                         tombstone_cv,
                         new_db_version,
                         &site_id,
+                        deleted_ts,
                     )
                     .await
                     {
@@ -778,6 +782,7 @@ impl WaveSyncDb {
                         cl: tombstone_cv,
                         seq: 0,
                         db_version: new_db_version,
+                        deleted_ts: Some(deleted_ts),
                     });
                 }
                 crate::capture::LogicalOp::Insert { table, pk, cols }
@@ -856,6 +861,7 @@ impl WaveSyncDb {
                             cl: new_cv,
                             seq: seq as u32,
                             db_version: new_db_version,
+                            deleted_ts: None,
                         });
                     }
                 }

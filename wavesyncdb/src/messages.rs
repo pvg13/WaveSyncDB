@@ -148,6 +148,15 @@ pub struct ColumnChange {
     /// Used for correct ordering in `get_changes_since`.
     #[serde(default)]
     pub db_version: u64,
+    /// Deletion wall-clock timestamp (unix seconds, the DELETER's clock),
+    /// `Some` only on `__deleted` tombstone cells. Carried on the wire so
+    /// every replica stores the SAME timestamp and "older than the retention
+    /// window" is a fact all peers agree on — that determinism is what keeps
+    /// reconcile digests equal while peers garbage-collect at different
+    /// times. Used ONLY for retention/GC eligibility, never for conflict
+    /// ordering (conflict resolution stays wall-clock-free).
+    #[serde(default)]
+    pub deleted_ts: Option<u64>,
 }
 
 /// A batch of column-level changes from a single write operation.
@@ -224,6 +233,7 @@ mod tests {
             cl: 5,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         };
         let json = serde_json::to_string(&change).unwrap();
         let deserialized: ColumnChange = serde_json::from_str(&json).unwrap();
@@ -246,6 +256,7 @@ mod tests {
                     cl: 1,
                     seq: 0,
                     db_version: 0,
+                    deleted_ts: None,
                 },
                 ColumnChange {
                     table: "tasks".into(),
@@ -257,6 +268,7 @@ mod tests {
                     cl: 1,
                     seq: 1,
                     db_version: 0,
+                    deleted_ts: None,
                 },
             ],
         };
@@ -292,6 +304,7 @@ mod tests {
             cl: 3,
             seq: 0,
             db_version: 0,
+            deleted_ts: None,
         };
         assert_eq!(change.cid, "__deleted");
         assert!(change.val.is_none());
