@@ -538,7 +538,9 @@ pub async fn run_table_driver<E>(
     // inner sender field cannot drop, so this is effectively unreachable —
     // but if it ever fires (future refactor weakens the hold), re-subscribe
     // from the handle and reload once; a second immediate Closed means the
-    // handle is truly dead and the driver exits cleanly.
+    // handle is truly dead and the driver exits cleanly. A successful receive
+    // on either the primary or refresh channel proves the driver is alive and
+    // clears this flag, preventing two unrelated Closed events from triggering exit.
     let mut closed_retry = false;
 
     loop {
@@ -551,6 +553,7 @@ pub async fn run_table_driver<E>(
             r = refresh_rx.recv() => {
                 match r {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        closed_retry = false;
                         if let Ok(r) = E::find().all(&db).await {
                             rows = r;
                             rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
@@ -866,7 +869,9 @@ pub async fn run_row_driver<E>(
     // inner sender field cannot drop, so this is effectively unreachable —
     // but if it ever fires (future refactor weakens the hold), re-subscribe
     // from the handle and reload once; a second immediate Closed means the
-    // handle is truly dead and the driver exits cleanly.
+    // handle is truly dead and the driver exits cleanly. A successful receive
+    // on either the primary or refresh channel proves the driver is alive and
+    // clears this flag, preventing two unrelated Closed events from triggering exit.
     let mut closed_retry = false;
 
     loop {
@@ -878,6 +883,7 @@ pub async fn run_row_driver<E>(
             r = refresh_rx.recv() => {
                 match r {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        closed_retry = false;
                         if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
                             current = row;
                             publish(current.clone());
