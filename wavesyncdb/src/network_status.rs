@@ -42,9 +42,13 @@ pub struct PeerInfo {
     /// Wire bytes received from this peer over its lifetime in the engine's
     /// per-peer health store (relay + direct combined). `#[serde(default)]` so
     /// a snapshot captured before this field existed still deserializes.
+    /// HMAC-covered message bodies; see [`diagnostics::Snapshot`] byte totals for
+    /// what is and isn't counted.
     #[serde(default)]
     pub bytes_in: u64,
     /// Wire bytes sent to this peer over its lifetime in the health store.
+    /// HMAC-covered message bodies; see [`diagnostics::Snapshot`] byte totals for
+    /// what is and isn't counted.
     #[serde(default)]
     pub bytes_out: u64,
     /// Most recent time this peer's data was applied. See

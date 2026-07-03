@@ -1384,6 +1384,7 @@ pub struct NotifyCtx<'a> {
 /// as successful) must check this — the function itself already rolls back
 /// and logs on failure, so this return value is purely for the caller's own
 /// bookkeeping and never changes what got applied or rolled back.
+#[must_use = "callers must gate sync bookkeeping on the commit outcome"]
 pub async fn apply_remote_changeset(
     db: &DatabaseConnection,
     change_tx: &broadcast::Sender<ChangeNotification>,

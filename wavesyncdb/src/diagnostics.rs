@@ -273,6 +273,14 @@ pub struct Snapshot {
     pub pending_pushes_redelivered: u64,
     pub relay_connections_demoted: u64,
 
+    /// Cumulative bytes in each channel (relay vs. direct, sent vs. received).
+    ///
+    /// Counts HMAC-covered message bodies measured at sign/verify time — slightly
+    /// under the actual wire size (framing and the MAC field itself are excluded),
+    /// and small unit-variant acks (PushAck/IdentityAck) are not counted. Groups
+    /// running without a passphrase sign nothing, so these stay near zero there and
+    /// [`relay_traffic_ratio()`](Snapshot::relay_traffic_ratio) returns `None`.
+    ///
     /// New fields default on deserialize so a snapshot serialized before
     /// they existed still parses (e.g. a persisted diagnostics dump, or an
     /// e2e client mid-upgrade).
