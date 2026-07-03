@@ -8,6 +8,25 @@ use wavesyncdb::{ChangeNotification, SyncedModel, WaveSyncDbBuilder, WriteKind};
 use common::mem_db;
 use common::task;
 
+use std::sync::{Arc, Mutex};
+
+/// Collects every published snapshot; the test asserts the exact sequence.
+fn collector<T: Send + 'static>() -> (Arc<Mutex<Vec<T>>>, impl FnMut(T) + Send + 'static) {
+    let sink: Arc<Mutex<Vec<T>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = sink.clone();
+    (sink, move |v: T| s2.lock().unwrap().push(v))
+}
+
+async fn wait_for<F: Fn() -> bool>(cond: F, what: &str) {
+    for _ in 0..200 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: change_rx table filter pattern (simulates hook recv loop)
 // ---------------------------------------------------------------------------
@@ -362,4 +381,113 @@ async fn change_channel_capacity_knob_is_respected() {
         got_lagged,
         "60 writes must overflow a capacity-32 channel; the knob did not reach the channel"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Driver: initial load publishes exactly once (even for an EMPTY table —
+// the observable "loaded" moment issue #1 needs), then per-change
+// snapshots arrive via in-place application.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn table_driver_publishes_initial_and_incremental_snapshots() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_tbl"), "test-drv-tbl")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    let (sink, publish) = collector::<Vec<task::Model>>();
+    let drv_db = db.clone();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        drv_db, publish,
+    ));
+
+    // 1. Initial publish fires even though the table is empty.
+    wait_for(|| sink.lock().unwrap().len() == 1, "initial empty publish").await;
+    assert!(sink.lock().unwrap()[0].is_empty());
+
+    // 2. Insert → snapshot with the row.
+    task::ActiveModel {
+        id: Set("d1".into()),
+        title: Set("one".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    wait_for(|| sink.lock().unwrap().len() >= 2, "insert publish").await;
+    assert_eq!(sink.lock().unwrap().last().unwrap()[0].title, "one");
+
+    // 3. Update → in-place snapshot.
+    db.execute_unprepared("UPDATE tasks SET title = 'two' WHERE id = 'd1'")
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            sink.lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .first()
+                .is_some_and(|m| m.title == "two")
+        },
+        "update publish",
+    )
+    .await;
+
+    // 4. Delete → empty snapshot again.
+    db.execute_unprepared("DELETE FROM tasks WHERE id = 'd1'")
+        .await
+        .unwrap();
+    wait_for(
+        || sink.lock().unwrap().last().unwrap().is_empty(),
+        "delete publish",
+    )
+    .await;
+
+    drv.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Driver under a lagged burst: with a small channel, >capacity writes force
+// Lagged; the driver's debounced full reload must still converge the
+// published snapshot to the true table.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn table_driver_lagged_burst_converges() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_lag"), "test-drv-lag")
+        .with_change_channel_capacity(32)
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    let (sink, publish) = collector::<Vec<task::Model>>();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        publish,
+    ));
+    wait_for(|| sink.lock().unwrap().len() == 1, "initial publish").await;
+
+    for i in 0..120 {
+        db.execute_unprepared(&format!(
+            "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES ('lag-{i}', 't', 0)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    // LAGGED_DEBOUNCE is 500ms; give the reload path a couple of cycles.
+    wait_for(
+        || {
+            sink.lock()
+                .unwrap()
+                .last()
+                .is_some_and(|rows| rows.len() == 120)
+        },
+        "lagged full reload converges to 120 rows",
+    )
+    .await;
+    drv.abort();
 }
