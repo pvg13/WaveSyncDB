@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Changed
+- **Trigger-driven change capture.** Write capture no longer parses SQL text.
+  Every registered table gets `AFTER INSERT/UPDATE/DELETE` triggers recording
+  row changes into a permanent `_wavesync_changes` table, drained after each
+  intercepted statement into the existing shadow bookkeeping (one
+  transaction, drained rows purged in the same transaction). What this fixes
+  by construction: expression UPDATEs (`SET count = count + 1`) sync the
+  computed value instead of the literal expression text; `REPLACE INTO`,
+  CTEs, and multi-statement scripts are captured correctly; BLOB columns
+  sync (as lowercase hex strings — receivers store TEXT, a documented
+  limitation); writes made via `db.inner()` or by a separate process sharing
+  the database file (iOS background sync) are captured and drained on the
+  next write or startup; a failed bookkeeping pass is retryable instead of
+  dropped. Remote applies suppress capture inside the apply transaction so
+  applied changesets are never re-broadcast.
+- **Unified value encoding.** Push, catch-up, and conflict-tiebreak reads now
+  all produce SQLite `json_object()` spelling (booleans as `0`/`1`), closing
+  a documented sender/receiver byte asymmetry in tie-breaking. Dioxus model
+  reconstruction decodes leniently (`0`/`1` ↔ `bool`), so in-place UI
+  updates keep working across the spelling change. Mixed-version meshes
+  interoperate; no protocol identifier bump.
+- **`register_table` is now `async` and returns `Result`** — it installs the
+  capture triggers itself, so manually registered tables (custom delete
+  policies) sync correctly. Callers add `.await?`.
+- The catch-up path no longer fails outright on tables containing BLOB
+  columns ("JSON cannot hold BLOB values").
+
 ## v0.8.0 — 03/07/2026
 
 Crate versions: `wavesyncdb` 0.8.0, `wavesyncdb_derive` 0.3.0,

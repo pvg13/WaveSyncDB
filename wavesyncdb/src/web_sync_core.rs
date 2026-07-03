@@ -29,12 +29,15 @@
 //! ## Value-byte parity caveat
 //!
 //! Reconciliation fingerprints feed `serde_json::to_vec(&val)`. Native
-//! values round-trip through SQLite (`json_object()`), so a REAL `1.0`
-//! fingerprints as `1.0`; a browser app that wrote `json!(1)` for the same
-//! logical value fingerprints as `1`. Identical *logical* numbers with
-//! different JSON spellings show up as a (self-repairing) digest mismatch.
-//! Stick to strings / integers / booleans for synced columns, or normalize
-//! numbers on the app side.
+//! values are `json_object()`-spelled on EVERY path — the capture triggers,
+//! the catch-up JOIN, and the tiebreak read all share one blob-safe
+//! expression — so a native boolean fingerprints as `0`/`1` and a REAL
+//! `1.0` as `1.0`, identically on every native peer. The only remaining
+//! mismatch source is a browser app hand-writing a different spelling for
+//! the same logical value (`json!(true)` instead of `json!(1)`, `json!(1)`
+//! for a REAL `1.0`). That shows up as a (self-repairing) digest mismatch.
+//! Match SQLite's spelling on the browser side: booleans as `0`/`1`
+//! numbers, no JSON nulls for absent values, and keep REAL columns REAL.
 
 use std::collections::HashMap;
 

@@ -145,7 +145,19 @@ async fn notification_carries_column_values_for_local_insert() {
         map.get("title").map(|v| v.as_str().unwrap()),
         Some("Buy milk")
     );
-    assert_eq!(map.get("completed").and_then(|v| v.as_bool()), Some(false));
+    // Unified SQLite json_object() spelling: booleans travel as 0/1. The
+    // lenient model decode bridges this back to `bool` for hooks.
+    assert_eq!(map.get("completed").and_then(|v| v.as_i64()), Some(0));
+    let rebuilt = <task::Model as SyncedModel>::wavesync_from_changes(
+        "id",
+        "task-7",
+        &cols
+            .iter()
+            .map(|(c, v)| (c.0.clone(), v.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .expect("lenient decode must rebuild the model from 0/1 booleans");
+    assert!(!rebuilt.completed);
 }
 
 // ---------------------------------------------------------------------------
