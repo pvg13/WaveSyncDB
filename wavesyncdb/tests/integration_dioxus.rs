@@ -324,3 +324,42 @@ async fn row_hook_filter_by_pk_pattern() {
         "Only the watched-row notification should pass the (table, pk) filter"
     );
 }
+
+// ---------------------------------------------------------------------------
+// H7 knob: broadcast capacity is configurable; a small capacity laggs a
+// slow subscriber quickly, proving the knob reaches the channel.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn change_channel_capacity_knob_is_respected() {
+    let db = WaveSyncDbBuilder::new(&mem_db("dioxus_cap"), "test-dioxus-cap")
+        .with_change_channel_capacity(32)
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    let mut rx = db.change_rx();
+    for i in 0..60 {
+        db.execute_unprepared(&format!(
+            "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES ('cap-{i}', 't', 0)"
+        ))
+        .await
+        .unwrap();
+    }
+
+    let mut got_lagged = false;
+    loop {
+        match rx.try_recv() {
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                got_lagged = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        got_lagged,
+        "60 writes must overflow a capacity-32 channel; the knob did not reach the channel"
+    );
+}

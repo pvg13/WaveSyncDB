@@ -87,6 +87,10 @@ pub(crate) struct WaveSyncNodeInner {
     /// Base for deriving per-group SQLite URLs. The default group keeps the
     /// original URL; joined groups derive a sibling file. See `join_group`.
     base_database_url: String,
+    /// Capacity for each group's ChangeNotification broadcast channel,
+    /// carried from the builder so runtime-joined groups match the
+    /// default group's setting.
+    change_channel_capacity: usize,
 }
 
 impl Drop for WaveSyncNodeInner {
@@ -1424,6 +1428,7 @@ pub struct WaveSyncDbBuilder {
     keep_alive_interval: std::time::Duration,
     circuit_max_duration: std::time::Duration,
     tcp_enabled: bool,
+    change_channel_capacity: usize,
 }
 
 impl WaveSyncDbBuilder {
@@ -1453,6 +1458,7 @@ impl WaveSyncDbBuilder {
             keep_alive_interval: defaults.keep_alive_interval,
             circuit_max_duration: defaults.circuit_max_duration,
             tcp_enabled: defaults.tcp_enabled,
+            change_channel_capacity: 1024,
         }
     }
 
@@ -1565,6 +1571,16 @@ impl WaveSyncDbBuilder {
 
     pub fn with_sync_interval(mut self, interval: std::time::Duration) -> Self {
         self.sync_interval = interval;
+        self
+    }
+
+    /// Capacity of the per-group `ChangeNotification` broadcast channel
+    /// (default 1024, minimum 16). A subscriber that falls more than this
+    /// many notifications behind sees `Lagged` and the reactive hooks fall
+    /// back to a debounced full-table reload — raise this for bursty
+    /// writers whose subscribers must keep per-row deltas.
+    pub fn with_change_channel_capacity(mut self, capacity: usize) -> Self {
+        self.change_channel_capacity = capacity.max(16);
         self
     }
 
@@ -1758,7 +1774,7 @@ impl WaveSyncDbBuilder {
         let db_version = crate::shadow::get_db_version(&inner).await?;
 
         let (sync_tx, sync_rx) = mpsc::channel::<TaggedChangeset>(256);
-        let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
+        let (change_tx, _) = broadcast::channel::<ChangeNotification>(self.change_channel_capacity);
         // Smaller than change_tx: notifications are post-policy + post-coalesce,
         // so far fewer than raw change events.
         let (notification_tx, _) = broadcast::channel::<crate::notify::Notification>(256);
@@ -1964,6 +1980,7 @@ impl WaveSyncDbBuilder {
             refresh_tx,
             groups: std::sync::Mutex::new(HashMap::new()),
             base_database_url: self.database_url.clone(),
+            change_channel_capacity: self.change_channel_capacity,
         });
 
         let db = WaveSyncDb {
@@ -2049,7 +2066,8 @@ impl WaveSyncNode {
 
         let registry = Arc::new(TableRegistry::new());
         let registry_ready = Arc::new(Notify::new());
-        let (change_tx, _) = broadcast::channel::<ChangeNotification>(1024);
+        let (change_tx, _) =
+            broadcast::channel::<ChangeNotification>(self.inner.change_channel_capacity);
         // Reuse the node-level notification channel (not a fresh per-group one)
         // so this group's notifications reach the same `notification_rx()` every
         // other group does — one `use_sync_notifications` covers the whole node.
