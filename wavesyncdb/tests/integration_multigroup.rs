@@ -265,7 +265,7 @@ async fn test_multigroup_config_persistence() {
     assert_eq!(cfg.groups[0].user_topic, topic_beta);
     assert_eq!(cfg.groups[0].passphrase, "pass-beta");
     assert!(
-        cfg.groups[0].database_url.contains("__wavesync-"),
+        cfg.groups[0].database_url.contains("__wavesync2-"),
         "group gets its own derived DB file: {}",
         cfg.groups[0].database_url
     );
