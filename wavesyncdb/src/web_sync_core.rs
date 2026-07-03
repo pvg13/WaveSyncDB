@@ -429,6 +429,9 @@ pub async fn apply_remote_changeset_core<S: ShadowStore>(
 /// carries the row's causal length forward. All columns plus `db_version`
 /// commit in one atomic batch. Returns the `ColumnChange`s to fan out —
 /// only after the batch committed.
+// Mirrors the native drain's parameter surface; splitting a context
+// struct for one function would obscure the native/web symmetry.
+#[allow(clippy::too_many_arguments)]
 pub async fn submit_local_write_core<S: ShadowStore>(
     store: &S,
     cfg: &WebSyncConfig,

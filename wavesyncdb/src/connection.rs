@@ -522,6 +522,11 @@ impl WaveSyncDb {
     /// [`sync_entity`](Self::sync_entity) for the full create-and-register
     /// flow.
     pub async fn register_table(&self, meta: TableMeta) -> Result<(), DbErr> {
+        // Ensure the shadow schema exists AND is current (idempotent create
+        // + in-place migration) — a manually created shadow table from an
+        // older layout would otherwise break the retention predicates on
+        // first use.
+        crate::shadow::create_shadow_table(&self.inner.inner, &meta.table_name).await?;
         crate::capture::ensure_triggers(&self.inner.inner, &meta).await?;
         self.inner.registry.register(meta);
         Ok(())
