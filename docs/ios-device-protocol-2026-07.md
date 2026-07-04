@@ -212,7 +212,8 @@ with real data instead of the ~30s assumption in its doc comment.
    bg_sync stage=config_loaded elapsed_ms=N
    bg_sync stage=engine_built elapsed_ms=N
    bg_sync stage=registry_ready elapsed_ms=N
-   bg_sync stage=groups_rejoined elapsed_ms=N
+   bg_sync stage=groups_rejoined elapsed_ms=N   (only if extra groups are configured)
+   bg_sync stage=relay_listening elapsed_ms=N   (relay-only sessions; first time only)
    bg_sync stage=first_peer elapsed_ms=N
    bg_sync stage=first_peer_synced elapsed_ms=N
    bg_sync stage=shutdown_started elapsed_ms=N
