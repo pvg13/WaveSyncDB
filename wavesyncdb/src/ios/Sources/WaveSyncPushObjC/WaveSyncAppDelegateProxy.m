@@ -189,16 +189,55 @@ static void install_delegate_methods(NSNotification *note) {
 
 @implementation WaveSyncAppDelegateProxy
 
+// Installation must run exactly once, whichever path triggers it first.
+static void install_once(NSNotification *note) {
+    static dispatch_once_t installed;
+    dispatch_once(&installed, ^{
+        install_delegate_methods(note);
+    });
+}
+
 + (void)load {
-    // `+load` runs before `main()`. Defer the actual installation until after
-    // `UIApplicationMain` has set up the delegate.
+    // Two load timings exist and both must work:
+    //
+    //  (a) Framework linked at process start: `+load` runs before `main()`,
+    //      so we defer installation until `UIApplicationMain` has set up the
+    //      delegate, via the DidFinishLaunching observer.
+    //
+    //  (b) Framework loaded LAZILY (the engine dlopens it during DB init,
+    //      which in a real app happens well after launch — e.g. after login).
+    //      DidFinishLaunching has already fired and the observer would never
+    //      trigger; without the check below the APNs delegate methods are
+    //      never installed, `registerForRemoteNotifications` is never called,
+    //      and the device silently never obtains a push token.
+    //
+    // The main-queue hop makes the "already launched?" probe race-free: by the
+    // time the block runs, either the app is fully launched (delegate set) or
+    // we are pre-main and the observer path applies.
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
-        install_delegate_methods(note);
+        install_once(note);
     }];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        if (app != nil && app.delegate != nil) {
+            // Lazy-load path: launch already happened. Synthesize the
+            // notification the installer expects. launchOptions are gone at
+            // this point, so a cold-start push payload cannot be recovered
+            // here — acceptable: lazy load implies the engine is only now
+            // starting, and its startup catch-up sync fetches the same data
+            // the cold-start payload would have announced.
+            NSNotification *synthetic =
+                [NSNotification notificationWithName:UIApplicationDidFinishLaunchingNotification
+                                              object:app
+                                            userInfo:nil];
+            NSLog(@"[WaveSync] App already launched at proxy load (lazy dlopen) — installing now");
+            install_once(synthetic);
+        }
+    });
     NSLog(@"[WaveSync] AppDelegate proxy scheduled for DidFinishLaunching");
 }
 
