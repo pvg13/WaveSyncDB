@@ -360,6 +360,22 @@ impl PushStore {
         Ok(())
     }
 
+    /// Remove the per-(token, topic) wake stamp, allowing a new wake immediately.
+    ///
+    /// Called when a wake was stamped but subsequently denied by the daily budget
+    /// or another gate. Absence of a stamp means "no recent wake", so deletion
+    /// (rather than restoring a previous value) correctly signals that the next
+    /// notify is allowed. A tiny refund-too-much window is harmless — the daily
+    /// budget still provides a hard cap.
+    pub async fn unstamp_wake(&self, token: &str, topic: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM push_wakes WHERE token = ?1 AND topic = ?2")
+            .bind(token)
+            .bind(topic)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Get tokens registered for a given topic.
     ///
     /// When `exclude_peer_id` is `Some`, tokens registered by that libp2p peer
@@ -828,6 +844,44 @@ mod tests {
             .unwrap();
         // Only tok-new's fresh row remains; tok-old's stale row was pruned.
         assert_eq!(count_after, 1);
+    }
+
+    #[tokio::test]
+    async fn unstamp_allows_immediate_rewake() {
+        let store = mem_store().await;
+        // Stamp a wake at time 1000.
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // Without unstamp, a wake at 1100 (100s later, within 900s window) is suppressed.
+        assert!(
+            !store
+                .check_and_stamp_wake("tok", "topic1", 1100, 900)
+                .await
+                .unwrap()
+        );
+
+        // Unstamp the original wake, clearing the (tok, topic1) entry.
+        store.unstamp_wake("tok", "topic1").await.unwrap();
+
+        // Now the same timestamp 1100 is allowed again (no prior record).
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1100, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unstamp_nonexistent_row_is_ok() {
+        let store = mem_store().await;
+        // Unstamping a (token, topic) that was never stamped succeeds (no-op).
+        store.unstamp_wake("tok", "nonexistent").await.unwrap();
+        // No panic; operation completes successfully.
     }
 
     #[tokio::test]

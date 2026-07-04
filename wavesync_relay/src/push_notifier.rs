@@ -333,6 +333,11 @@ async fn fire_notifications(
                     "Daily push budget exhausted for token={short}...; skipping wake"
                 );
                 metrics.push_sent(&token_entry.platform, "budget_denied");
+                // A denied send must not consume the coalescing window — the deny already means
+                // no wake happened. Refund the stamp we made earlier.
+                if let Err(e) = store.unstamp_wake(&token_entry.token, topic).await {
+                    tracing::debug!("unstamp_wake failed for {short}...: {e}");
+                }
                 continue;
             }
             Err(e) => {
