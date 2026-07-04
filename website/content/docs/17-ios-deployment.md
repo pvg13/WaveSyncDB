@@ -148,6 +148,101 @@ and counted separately (`relay_pushes_sent_total{outcome="coalesced"}` on the
 relay's `/metrics` endpoint) so you can see how often the window is doing its
 job without it looking like a delivery failure.
 
+**The daily budget above governs the *silent* class only.** A changeset that
+touches a `SyncNotify`-visible table wakes iOS peers with an unbudgeted
+ALERT-class push instead — it skips `APNS_COALESCE_SECS` and the daily cap
+entirely, on the reasoning that a user-relevant change should never wait
+behind a throttle built for non-visible background wakes. Alerts get their
+own, much shorter, anti-spam window instead: see [Notification Service
+Extension](#notification-service-extension-nse) below.
+
+## Notification Service Extension (NSE)
+
+A `visible: true` push (any changeset touching a `SyncNotify`-visible table)
+sends `mutable-content: 1` alongside the usual `content-available: 1` — so an
+app with no NSE at all keeps working exactly as described above (background
+sync runs, the user sees the relay operator's placeholder banner), while an
+app that ships a Notification Service Extension gets a chance to rewrite that
+banner with real, on-device-composed content before it's ever shown.
+
+**What the NSE does, precisely:** iOS launches it in place of ordinary
+delivery whenever `mutable-content: 1` is present. The extension calls into
+`wavesyncdb`'s `wavesync_nse_handle_push(config_dir, payload_json,
+budget_secs)`, which runs a short one-shot sync scoped to just the group named
+in the push, and — if a `SyncNotify` policy fired for whatever landed — hands
+back that notification's title/body as JSON. The Swift template
+(`wavesyncdb/src/ios/Sources/WaveSyncPush/WaveSyncNotificationService.swift`)
+rewrites the banner with it; on timeout, a cold key cache, or nothing
+notify-worthy, it leaves the operator's placeholder untouched. Either way the
+user sees a notification — this is a content upgrade, never a dependency the
+sync itself relies on.
+
+**App Group setup.** The NSE is its own process and must open the exact same
+SQLite database as the app, so both need to agree on a data directory shared
+through an [App
+Group](https://developer.apple.com/documentation/xcode/configuring-app-groups)
+container:
+
+1. Add the **App Groups** capability to the *app's* App ID, with a group id
+   like `group.com.example.myapp`, and add the matching entitlement to the
+   app target.
+2. The extension is its own App ID too (e.g. `com.example.myapp.nse`,
+   distinct from the app's) — give it its own App Groups capability, for the
+   SAME group id, and its own entitlement. A profile is scoped to one App ID:
+   the app's provisioning profile cannot sign the extension, and vice versa —
+   plan on requesting/regenerating a separate profile for the NSE's App ID.
+3. At runtime, both binaries resolve the shared directory the same way: call
+   `wavesync_app_group_container(group_id)` (the Rust wrapper in `ffi.rs`,
+   backed by a `wavesync_app_group_container` `@_cdecl` in
+   `WaveSyncPushBridge.swift`) and point `WaveSyncDbBuilder`'s directory at
+   the result instead of the app's private container. If your app predates
+   this and already has data in its private container, that's a one-time
+   migration your app owns (move the old directory into the group container
+   on first launch of the App-Group-enabled build) — `wavesyncdb` has no
+   opinion on how you do that migration, only on where the two binaries end
+   up pointing afterward.
+
+**Appex assembly.** `dx`/`xcodebuild` cannot generate a Notification Service
+Extension target for you — it's its own `.appex` executable, not something
+either build tool creates automatically (see `wavesyncdb/src/ios/README.md`).
+Ship it via your own build script, run before your normal sign/install step:
+build a static library for `aarch64-apple-ios` that links the crates
+registering your `SyncNotify` policies (so the inventory the NSE reads at
+runtime is actually populated), compile
+`WaveSyncNotificationService.swift` (copied out of the template and
+subclassed with your `appGroupId`) against it, assemble an `Info.plist` with
+`NSExtensionPointIdentifier = com.apple.usernotifications.service`, and copy
+the result into `YourApp.app/PlugIns/` before your existing signing pass —
+your signing script needs to also sign the appex bundle, and separately embed
+the NSE's own provisioning profile into it
+(`PlugIns/*.appex/embedded.mobileprovision`), since it has its own App ID and
+can't reuse the app's profile. A build-flag pattern like
+`WITH_NSE=1 NSE_PROFILE=/path/to/nse.mobileprovision ./your_sign_script.sh`
+(opt-in, off by default) keeps a broken or not-yet-provisioned NSE build from
+ever blocking a plain app install — the app works fully without it, per the
+budget-section note above.
+
+**Key-cache tradeoff.** The NSE's ~24 MB memory ceiling can't afford the
+group key's Argon2id derivation (~19 MiB by design — see
+[Authentication](/docs/authentication)), so it never runs the KDF at all: it can only
+load a key the foreground app already derived and cached to disk at
+`build()`/`join_group()` time
+(`WaveSyncDbBuilder::with_group_key_cache`, default `true` on iOS, no-op
+elsewhere). That means a copy of each group's raw 32-byte key sits on disk
+(data-protected, `NSFileProtectionCompleteUntilFirstUserAuthentication`) for
+as long as the app remains joined to that group — the same tradeoff any
+end-to-end-encrypted app with a notification extension makes. If your threat
+model forbids caching key material to disk, call
+`with_group_key_cache(false)`; the NSE then always falls straight through to
+the placeholder banner (safe, just less rich), and nothing else changes.
+
+**Relay config for alert-class pushes:**
+
+| Env var | CLI flag | Default | Notes |
+|---|---|---|---|
+| `APNS_ALERT_TITLE` | `--apns-alert-title` | `Nueva actividad` | The ONLY user-facing text on an alert push — relay-operator branding, never client-supplied. Real content is composed on-device by the NSE (or stays this placeholder without one). |
+| `ALERT_COALESCE_SECS` | `--alert-coalesce-secs` | `30` | Per-device wake-coalescing window for the unbudgeted alert class — independent of `APNS_COALESCE_SECS`, and deliberately much shorter (a real-time banner should still feel real-time). |
+
 ## Further reading
 
 - [Mobile & push notifications](/docs/mobile-and-push) — the general FCM/APNs

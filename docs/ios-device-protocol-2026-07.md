@@ -266,16 +266,181 @@ battery/OS-goodwill cost of running longer.
 
 ---
 
+## E — #78 alert-push verification (unbudgeted alert class + NSE)
+
+Tests the WhatsApp-model realtime push: a changeset touching a
+`SyncNotify`-visible table now wakes iOS peers with an unbudgeted APNs
+ALERT-class push instead of the throttled silent one. E1 needs only a
+rebuild against the redeployed relay (no app changes at all — it's the
+`content-available` + placeholder-banner path every app already has). E2
+needs Mediterranea's App-Group + Notification Service Extension build from
+Task 3; run E1 to completion first so a real content-rewrite in E2 has a
+known-good placeholder baseline to compare against.
+
+### E0 — relay redeploy + env recap
+
+This is the FIRST deploy of `feat/alert-push` — Sections A–D above ran
+against `feat/ios-prep`, which predates the alert class entirely.
+
+1. Redeploy `wavesync_relay` from `feat/alert-push`.
+2. Confirm these two new env vars/flags before starting (no relay log line
+   announces them at startup — check your compose file / process env
+   directly, not a log grep):
+
+   | Env var | CLI flag | Default | Purpose |
+   |---|---|---|---|
+   | `APNS_ALERT_TITLE` | `--apns-alert-title` | `Nueva actividad` | The ONLY user-facing text on an alert push — relay-operator branding. |
+   | `ALERT_COALESCE_SECS` | `--alert-coalesce-secs` | `30` | Per-device wake-coalescing window for the alert class, independent of `APNS_COALESCE_SECS`. |
+
+3. `APNS_COALESCE_SECS`/`FCM_COALESCE_SECS`/`PUSH_DEBOUNCE_SECS` (Section D's
+   flags) are unaffected — alert-class sends never consult them. No reset
+   needed there.
+
+| Check | Done |
+|---|---|
+| Relay running from `feat/alert-push` | ☐ |
+| `APNS_ALERT_TITLE` confirmed (default or overridden — note which) | ☐ |
+| `ALERT_COALESCE_SECS` confirmed (default or overridden — note which) | ☐ |
+
+### E1 — Task-1-only: placeholder banner + background sync (no app changes on iPhone)
+
+Run this against the SAME iPhone build as Sections A–D (just pointed at the
+redeployed relay) — before installing anything from Task 3. This is the
+entire value Task 1 ships standalone: a rebuild against the new relay,
+nothing else.
+
+1. Fully background iPhone (Device A) — same background-not-force-quit state
+   as Section D.
+2. From an Android peer sharing the group, write to a table with a
+   registered `SyncNotify` policy (e.g. add a grocery item) — this is what
+   flips `visible: true` sender-side (`handle_local_changeset`, no app code
+   change needed to trigger it).
+3. Time from the write to the banner appearing on Device A's lock screen.
+   Expect **≤ ~3s** on a healthy connection — this rides `apns-priority: 10`
+   / `apns-push-type: alert`, not the throttled background class. Record the
+   actual time.
+4. Confirm the banner text is the operator's placeholder
+   (`APNS_ALERT_TITLE`) — Task 1 ships no on-device composition, so it MUST
+   be the placeholder, never real content, at this stage.
+5. Watch Device A's console for the SAME `bg_sync` stage lines as Section D
+   (`config_loaded` → … → `done`) — `content-available: 1` still rides
+   alongside the alert payload, so background sync runs on the same push
+   regardless of the banner.
+6. Grep the relay's log for the new field on this send:
+   ```
+   kind=alert
+   ```
+   alongside the existing `topic=… outcome="ok"` push-sent line — confirms
+   this send took the alert branch, not silent.
+7. Confirm the daily silent-push budget is untouched:
+   `sqlite3 <push-db> "SELECT * FROM push_budget WHERE token LIKE '<device-a-token-prefix>%';"`
+   before and after step 2 — alert sends skip `charge_daily_budget` (and its
+   refund path) entirely, so the row must be byte-identical.
+8. Burst test: make 5 writes in quick succession (well inside the 30s
+   `ALERT_COALESCE_SECS` window). Confirm Device A shows exactly **ONE**
+   Notification Center entry for the group, not five stacked banners — the
+   relay's `check_and_stamp_wake` suppresses repeats within the window, and
+   `apns-collapse-id` (topic-derived) makes anything that does land replace
+   in place rather than stack.
+
+### Record sheet
+
+| Check | Result |
+|---|---|
+| Write → banner latency | ___ s |
+| Banner text is the placeholder (`APNS_ALERT_TITLE`) | ☐ |
+| `bg_sync` stages seen on the same push | ☐ |
+| Relay log shows `kind=alert` for this send | ☐ |
+| `push_budget` row unchanged before/after | ☐ |
+| Burst of 5 → exactly ONE Notification Center entry | ☐ |
+| Notes / anomalies | |
+
+**Pass:** all six rows check out. **If banner latency is high or budget
+changed, stop and diagnose before moving to E2** — E2 depends on E1's
+placeholder path working correctly as its fallback.
+
+### E2 — after Mediterranea's NSE build (`WITH_NSE=1` + `NSE_PROFILE`)
+
+Precondition: install Task 3's App-Group + NSE build —
+`WITH_NSE=1 NSE_PROFILE=/path/to/nse.mobileprovision ./scripts/ios_sign_install.sh`
+in Mediterranea — on Device A. Repeat E1's trigger (steps 1–2) against this
+build.
+
+1. Background Device A, trigger the same kind of write as E1 step 2.
+2. Confirm the banner text is now the REAL `SyncNotify`-composed string
+   (e.g. "Ana añadió leche"), not the placeholder — this is the entire point
+   of the extension. Record time-to-rewrite: from the write to the banner
+   showing the REAL text (this includes the NSE's own sync + compose time on
+   top of APNs delivery, budget-capped by
+   `WaveSyncNotificationService.budgetSecs`, 20s default — expect longer
+   than E1's raw delivery number).
+3. **If the placeholder shows instead of real content, the NSE died before
+   finishing** — this is the safe fallback (data still syncs via
+   `content-available` either way), but triage which failure it was:
+   - Device console (Console.app filtered to the device, or Xcode's) —
+     search for `jetsam`; a Notification Service Extension terminated for
+     out-of-memory confirms the ~24 MB cap was exceeded (most likely
+     failure: if the group key wasn't cached yet, `wavesync_nse_handle_push`
+     returns `synced: false` cleanly instead of running the KDF, so a cold
+     cache does NOT show as a memory kill — check for that first, it's the
+     more common case on a fresh install).
+   - Search for `[WaveSyncNSE]` lines (`NSLog` in
+     `WaveSyncNotificationService.swift`) — "No App Group container" means
+     the entitlement/profile setup is wrong and this failed instantly, not
+     after a timeout.
+4. Migration check — **first launch of the App-Group build only**, not every
+   E2 run. Before installing the App-Group build, note a few known values
+   already in the app (e.g. an existing item). After first launch of the new
+   build:
+   - Confirm those values are still visible in the app (data intact — this
+     is the fail-safe migration from Task 3; a partial failure rolls itself
+     back rather than losing anything).
+   - Confirm `.wavesync_migration_done` is present in the group container
+     (via debug logging or a temporary debug button reading
+     `FileManager.default.containerURL(forSecurityApplicationGroupIdentifier:)`
+     — there's no external filesystem access to check this directly).
+   - Confirm the legacy (pre-App-Group) app-private directory is now EMPTY
+     of the migrated entries — not just "app still works". A `Failed`
+     migration outcome deliberately leaves data in the legacy dir and rolls
+     back anything that did move, so a non-empty legacy dir with the app
+     working normally means migration deferred to next launch (expected,
+     not a failure — but note which state you're actually in, and don't
+     conflate "app works" with "migration completed").
+
+### Record sheet
+
+| Check | Result |
+|---|---|
+| Banner shows REAL `SyncNotify` text, not placeholder | ☐ |
+| Time-to-rewrite (write → real banner text) | ___ s |
+| If placeholder shown: jetsam/OOM kill seen in console? | ☐ / n/a |
+| If placeholder shown: cold key cache (no memory kill)? | ☐ / n/a |
+| If placeholder shown: "No App Group container" logged? | ☐ / n/a |
+| Migration: known pre-existing data intact after first launch | ☐ |
+| Migration: `.wavesync_migration_done` present in group container | ☐ |
+| Migration: legacy dir empty of migrated entries | ☐ |
+| Notes / anomalies | |
+
+**Pass:** real content shown, OR (if placeholder shown) a clearly identified
+safe-fallback reason from the triage list above — data still synced either
+way. Migration's three rows must all pass on the first App-Group launch;
+"legacy dir not yet empty + app still works" is an acceptable *deferred*
+state (retries next launch), not a pass for that row.
+
+---
+
 ## What to send back
 
 For each section, paste:
 
-- The four filled record-sheet tables above.
+- All record-sheet tables above (A–E).
 - Any full console log excerpt around an anomaly (not the whole session —
   just ±10 lines around anything unexpected).
 - A one-line verdict per section: A → which arm of the tree; B → pass/fail
   vs. the 3-4s bar; C → per-pairing convergence pass/fail; D → the decided
-  `backgroundSyncTimeoutSecs` value (keep 25, or a new number).
+  `backgroundSyncTimeoutSecs` value (keep 25, or a new number); E1 → pass/fail
+  on the six-row checklist; E2 → real content vs. placeholder-with-reason,
+  plus the three migration rows.
 - Anything that broke Step 0 (build/install) even if you worked around it.
 
 ---
@@ -295,12 +460,12 @@ For each section, paste:
 > poll already bounds recovery well enough that swapping in NWPathMonitor's
 > event-driven immediacy isn't worth the added platform FFI surface.
 
-### #78 (defer)
+### #78 (superseded — see Section E)
 
-> Deferred, demand-gated. No on-device testing tonight touched the
-> Notification Service Extension path — nothing in this round's protocol
-> exercises it, and no consuming app has asked for richer push payload
-> processing (attachment download, payload mutation) that would require an
-> NSE. Revisit if/when a consumer needs it; building it speculatively adds a
-> whole second executable target (with its own memory limits and lifecycle)
-> for a capability nothing currently uses.
+> No longer deferred: a consumer (Mediterranea) asked for exactly this —
+> realtime delivery for user-visible changes instead of the throttled silent
+> class. Alert-class relay pushes, the on-disk group-key cache, the
+> `wavesync_nse_handle_push` FFI, and the `WaveSyncNotificationService.swift`
+> template all landed; Section E above is the on-device verification
+> protocol for it (E1 needs only a rebuild, E2 needs a consuming app's App
+> Group + NSE build). Close once Section E's checklists pass.
