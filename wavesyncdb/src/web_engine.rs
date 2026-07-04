@@ -213,6 +213,16 @@ mod push_codec {
         NotifyTopic {
             topic: String,
             sender_site_id: String,
+            /// Whether this changeset touched at least one table with a
+            /// registered `SyncNotify` policy. Computed sender-side per
+            /// changeset — metadata only, never user-facing text. Drives the
+            /// relay's choice between an unbudgeted ALERT-class APNs send (a
+            /// realtime banner) and today's silent background wake.
+            /// `#[serde(default)]` keeps an old sender's un-tagged message
+            /// wire-compatible: it deserializes to `false`, i.e. today's
+            /// silent behavior exactly.
+            #[serde(default)]
+            visible: bool,
         },
         AnnouncePresence {
             topic: String,
