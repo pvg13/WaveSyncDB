@@ -203,6 +203,24 @@ Measures how long iOS actually gives the app to run after a silent push,
 so the `backgroundSyncTimeoutSecs` default (currently `25`) can be adjusted
 with real data instead of the ~30s assumption in its doc comment.
 
+> **⚠️ Relay config for this section — do this FIRST or trials 2–5 are silently
+> eaten by the relay itself:**
+>
+> - Restart the session relay with **`APNS_COALESCE_SECS=0`** — otherwise the
+>   default 15-minute per-device coalescing window suppresses every push after
+>   the first one, and step 4 below would misread the silence as "the OS killed
+>   the process".
+> - Reset Device A's daily wake budget before starting: point the relay at a
+>   fresh `--push-db` file (or `DELETE FROM push_budget; DELETE FROM push_wakes;`
+>   in the existing one). The hard cap is **5 pushes per device per day** and
+>   sections A–C may already have spent some of it.
+> - Even with coalescing off, **5 trials equals the entire daily budget** — don't
+>   burn trials on setup mistakes.
+> - Whenever a trial shows nothing on-device, check the relay before recording
+>   an OS kill: the log (or `/metrics` scrape) will show
+>   `outcome="coalesced"` or `outcome="budget_denied"` if the relay never sent
+>   the push at all. Only a push that was actually **sent** counts as a trial.
+
 1. Fully background the app on Device A (not force-quit — background
    suspend, the state a silent push actually wakes from).
 2. From Device B (or any peer), make a write that will trigger
