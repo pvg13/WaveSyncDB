@@ -404,6 +404,47 @@ version-vector sync.
   pagination cookie for every namespace, so secondary-group peers were never
   discovered over WAN; each namespace is now discovered with a fresh cookie.
 
+### Added
+- **Relay push-wake coalescing (#76).** The relay now suppresses redundant
+  per-device wake pushes within a configurable window of a device's last
+  wake: a burst of writes to the same topic costs one push, not one per
+  write. Platform-aware — `--apns-coalesce-secs`/`APNS_COALESCE_SECS`
+  (default `900`, 15 min: APNs allows only a handful of silent pushes per
+  device per day) and `--fcm-coalesce-secs`/`FCM_COALESCE_SECS` (default
+  `0`, disabled: FCM has no comparable daily cap and the existing
+  topic-keyed send debounce already smooths bursts). Composes with, doesn't
+  replace, the existing debounce. A suppressed send is not a delivery
+  failure — push is a best-effort wake hint and the next catch-up sync
+  delivers the data regardless; suppressed sends are logged and counted
+  under a new `relay_pushes_sent_total{outcome="coalesced"}` label. Retried
+  sends stay exempt (already-committed).
+- **iOS QUIC bind A/B toggle (experimental, #73).**
+  `WaveSyncDbBuilder::with_ios_unspecified_quic_bind(bool)` (default
+  `false`) plus a runtime env override, `WAVESYNC_IOS_UNSPECIFIED_QUIC=1`
+  (settable from an Xcode scheme without a rebuild), switch iOS from its
+  concrete-interface QUIC bind to the unspecified-address bind every other
+  platform already uses, and disable the associated interface-watch tick.
+  Exists purely to produce an on-device verdict between the two bind
+  strategies — see `docs/ios-device-protocol-2026-07.md`. No-op on
+  non-iOS platforms; zero behavior change at the default.
+- **`WaveSyncPushHandler.backgroundSyncTimeoutSecs` (iOS, #79).** The
+  background-sync deadline passed to the Rust FFI on a push wake is now a
+  host-app-tunable `public static var` (default `25`, unchanged) instead of
+  a buried literal. Rust's internal `background_sync` timers
+  (`fallback_after`, `completion_grace`) now scale to whatever timeout is
+  passed in, so a shorter grant still leaves room for the fallback/linger
+  windows to complete before the hard deadline — identical values to before
+  at the default 25s.
+- **iOS deployment templates and docs (#75).**
+  `wavesyncdb/src/ios/{Entitlements,Info}.template.plist` — a relay-only
+  entitlements/Info.plist starting point (APNs background wake only, no
+  local-network/Bonjour/multicast keys, each omission commented with its
+  rationale) — plus `website/content/docs/17-ios-deployment.md` (entitlements
+  matrix, `.p8` APNs setup against the relay's `APNS_KEY_ID`/`APNS_TEAM_ID`/
+  `APNS_BUNDLE_ID`/`APNS_SANDBOX` config, and the coalescing/timeout knobs
+  above) and `docs/ios-device-protocol-2026-07.md` (the on-device
+  measurement checklist for #73/#74/#77/#79).
+
 ## v0.3.0 — 25/02/2026
 
 ### Architecture rewrite: SeaORM connection wrapper
