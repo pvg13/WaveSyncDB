@@ -159,3 +159,31 @@ public func wavesync_push_bridge_did_receive(
         wrapper.invoke(withResult: Int(result.rawValue))
     }
 }
+
+/// Resolve an iOS App Group container directory by group id.
+///
+/// Exposed as a C symbol so wavesyncdb's Rust side (which has no access to
+/// Foundation) can point both the app's `WaveSyncDbBuilder` and its
+/// Notification Service Extension at the same shared directory, instead of
+/// duplicating `containerURL(forSecurityApplicationGroupIdentifier:)` logic
+/// in Rust. Resolved at runtime via `dlsym` from the Rust side (see
+/// `wavesyncdb::wavesync_app_group_container`) — same dyld-lazy-resolution
+/// idiom as `wavesync_show_notification` above.
+///
+/// Returns a `strdup`'d C string the caller must free with the C library
+/// `free()` — **not** `wavesync_string_free`, which frees a *Rust*-allocated
+/// `CString` from a different allocator. Returns `NULL` if the app has no
+/// entitlement for `groupId` or the container doesn't exist.
+@_cdecl("wavesync_app_group_container")
+public func wavesync_app_group_container(
+    _ groupIdPtr: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard let groupIdPtr = groupIdPtr else { return nil }
+    let groupId = String(cString: groupIdPtr)
+    guard let url = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: groupId)
+    else {
+        return nil
+    }
+    return strdup(url.path)
+}

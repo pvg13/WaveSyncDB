@@ -144,6 +144,26 @@ impl std::fmt::Debug for GroupKey {
     }
 }
 
+// Raw-bytes escape hatch for the on-disk group-key cache (`key_cache` module):
+// lets a call site skip Argon2id entirely when a previously derived key was
+// cached, and lets it persist a freshly derived one. Only `connection.rs`'s
+// iOS branch of `group_key_for_dir` ever calls these — gated the same way so
+// every other target doesn't carry (or warn about) unused raw-key plumbing.
+#[cfg(target_os = "ios")]
+impl GroupKey {
+    /// Wrap raw key bytes without deriving. The caller is responsible for the
+    /// bytes actually being a valid derivation of `(passphrase, user_topic)`
+    /// for some peer in the group — this constructor does no verification.
+    pub(crate) fn from_raw(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+
+    /// Raw key bytes, for persisting to the on-disk cache after derivation.
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

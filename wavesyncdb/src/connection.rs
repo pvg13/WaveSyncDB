@@ -35,6 +35,52 @@ fn may_write(sql: &str) -> bool {
         .any(|kw| upper.contains(kw))
 }
 
+/// Directory the on-disk group-key cache (`key_cache` module) and
+/// `.wavesync_config.json` live in for a given database URL — the same
+/// directory as the SQLite file itself.
+pub(crate) fn key_cache_dir(database_url: &str) -> Option<PathBuf> {
+    SyncConfig::config_path(database_url).and_then(|p| p.parent().map(PathBuf::from))
+}
+
+/// Derive a group key for `(passphrase, user_topic)`, consulting the on-disk
+/// cache first when `cache_enabled` and a `cache_dir` are both available.
+///
+/// iOS only: the Notification Service Extension's ~24 MB memory cap can't
+/// afford Argon2id's ~19 MiB (see `key_cache` module docs), so on iOS a cache
+/// hit skips the KDF entirely, and a miss derives fresh and writes the
+/// result back so a later NSE wake finds it. Every other platform's process
+/// budget can run the KDF outright, so this always derives fresh there —
+/// `cache_dir`/`cache_enabled` are accepted uniformly so call sites don't
+/// need a per-platform branch, but are unused off iOS.
+#[cfg(target_os = "ios")]
+pub(crate) fn group_key_for_dir(
+    passphrase: &str,
+    user_topic: &str,
+    cache_dir: Option<&std::path::Path>,
+    cache_enabled: bool,
+) -> GroupKey {
+    if cache_enabled && let Some(dir) = cache_dir {
+        if let Some(bytes) = crate::key_cache::load_group_key(dir, user_topic) {
+            tracing::debug!("wavesync: group-key cache hit for topic '{user_topic}'");
+            return GroupKey::from_raw(bytes);
+        }
+        let key = GroupKey::from_passphrase(passphrase, user_topic);
+        crate::key_cache::save_group_key(dir, user_topic, key.as_bytes());
+        return key;
+    }
+    GroupKey::from_passphrase(passphrase, user_topic)
+}
+
+#[cfg(not(target_os = "ios"))]
+pub(crate) fn group_key_for_dir(
+    passphrase: &str,
+    user_topic: &str,
+    _cache_dir: Option<&std::path::Path>,
+    _cache_enabled: bool,
+) -> GroupKey {
+    GroupKey::from_passphrase(passphrase, user_topic)
+}
+
 /// Node-level shared state: the single libp2p engine and everything that is
 /// shared across all of its sync groups.
 ///
@@ -105,6 +151,11 @@ pub(crate) struct WaveSyncNodeInner {
     /// group DB this node opens (None = builder untouched; the DB's
     /// persisted value or the 7-day default governs).
     tombstone_retention: Option<Option<std::time::Duration>>,
+    /// Whether the on-disk group-key cache (`key_cache` module) is enabled,
+    /// carried from the builder so `join_group` derives new groups' keys
+    /// with the same opt-in/opt-out the default group used. Meaningful only
+    /// on iOS; every other platform ignores it.
+    group_key_cache_enabled: bool,
 }
 
 impl Drop for WaveSyncNodeInner {
@@ -1369,7 +1420,23 @@ pub struct SyncConfig {
     /// then rejoins each of these. Empty for single-group / back-compat configs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupConfig>,
+    /// Whether the on-disk group-key cache is enabled (iOS only elsewhere a
+    /// no-op) — see [`WaveSyncDbBuilder::with_group_key_cache`]. Persisted so
+    /// a background wake honors the same opt-out the foreground app
+    /// configured, instead of silently defaulting back to enabled.
+    #[serde(default = "default_group_key_cache_enabled")]
+    pub group_key_cache_enabled: bool,
 }
+
+/// Backing default for [`SyncConfig::group_key_cache_enabled`] on configs
+/// written before this field existed — matches
+/// [`WaveSyncDbBuilder::new`]'s default.
+fn default_group_key_cache_enabled() -> bool {
+    true
+}
+
+/// Filename the sync config is stored under, alongside the SQLite database.
+const CONFIG_FILE_NAME: &str = ".wavesync_config.json";
 
 impl SyncConfig {
     /// Derive the config file path from a SQLite database URL.
@@ -1383,16 +1450,30 @@ impl SyncConfig {
             .unwrap_or(database_url);
         let path_str = path_str.split('?').next().unwrap_or(path_str);
         let db_path = PathBuf::from(path_str);
-        db_path
-            .parent()
-            .map(|dir| dir.join(".wavesync_config.json"))
+        db_path.parent().map(|dir| dir.join(CONFIG_FILE_NAME))
     }
 
     /// Read a previously saved config from the database directory.
     pub fn load(database_url: &str) -> Result<Self, String> {
         let path = Self::config_path(database_url)
             .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
-        let json = std::fs::read_to_string(&path)
+        Self::load_path(&path)
+    }
+
+    /// Read a previously saved config directly from its containing
+    /// directory, rather than deriving the directory from a database URL.
+    ///
+    /// Used by the iOS Notification Service Extension: it's handed an App
+    /// Group container directory (see `wavesync_app_group_container` /
+    /// `wavesync_nse_handle_push`), not a database URL, so it can't go
+    /// through [`Self::load`]'s URL-parsing path. Same file, same shape —
+    /// only how the path is found differs.
+    pub fn load_from_dir(dir: &std::path::Path) -> Result<Self, String> {
+        Self::load_path(&dir.join(CONFIG_FILE_NAME))
+    }
+
+    fn load_path(path: &std::path::Path) -> Result<Self, String> {
+        let json = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config at {}: {e}", path.display()))?;
         serde_json::from_str(&json)
             .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))
@@ -1481,6 +1562,9 @@ pub struct WaveSyncDbBuilder {
     change_channel_capacity: usize,
     tombstone_retention: Option<Option<std::time::Duration>>,
     ios_unspecified_quic_bind: bool,
+    /// Whether the on-disk group-key cache is enabled. iOS only — see
+    /// `with_group_key_cache`.
+    group_key_cache_enabled: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1513,6 +1597,7 @@ impl WaveSyncDbBuilder {
             change_channel_capacity: 1024,
             tombstone_retention: None,
             ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
+            group_key_cache_enabled: true,
         }
     }
 
@@ -1698,11 +1783,39 @@ impl WaveSyncDbBuilder {
     pub fn with_passphrase(mut self, passphrase: &str) -> Self {
         // Argon2id derivation, salted with the user topic (fixed at
         // `WaveSyncDbBuilder::new`) — intentionally slow, runs once here.
-        self.group_key = Some(crate::auth::GroupKey::from_passphrase(
+        // On iOS with the group-key cache enabled, a cache hit skips the KDF
+        // entirely (see `group_key_for_dir` / the `key_cache` module); a
+        // miss still derives here and writes the result back.
+        let cache_dir = key_cache_dir(&self.database_url);
+        self.group_key = Some(group_key_for_dir(
             passphrase,
             &self.topic,
+            cache_dir.as_deref(),
+            self.group_key_cache_enabled,
         ));
         self.passphrase = Some(passphrase.to_string());
+        self
+    }
+
+    /// Enable or disable the on-disk group-key cache (default: `true`).
+    /// **iOS only** — every other platform ignores this flag; their process
+    /// memory budgets run Argon2id directly with no need to cache around it.
+    ///
+    /// On iOS, `build()` and `join_group()` persist each derived group key
+    /// to `.wavesync_group_keys.json` beside the database (see the
+    /// `key_cache` module) so the Notification Service Extension — capped at
+    /// roughly 24 MB, well under Argon2id's ~19 MiB footprint — can load a
+    /// ready-made 32-byte key instead of re-deriving it. This is the same
+    /// key-material-at-rest tradeoff any end-to-end-encrypted app with a
+    /// notification extension makes; the app is expected to mark the cache
+    /// file `NSFileProtectionCompleteUntilFirstUserAuthentication` from
+    /// Swift (see `WaveSyncNotificationService`). Opt out with
+    /// `with_group_key_cache(false)` if your threat model forbids caching
+    /// derived key material to disk — the NSE then can't sync (it falls
+    /// back to the operator's placeholder alert content), but nothing else
+    /// changes.
+    pub fn with_group_key_cache(mut self, enabled: bool) -> Self {
+        self.group_key_cache_enabled = enabled;
         self
     }
 
@@ -2003,6 +2116,7 @@ impl WaveSyncDbBuilder {
             fcm_app_id,
             fcm_api_key,
             groups: preserved_groups,
+            group_key_cache_enabled: self.group_key_cache_enabled,
         };
         if let Err(e) = sync_config.save() {
             tracing::warn!("Failed to save sync config for background services: {e}");
@@ -2092,6 +2206,7 @@ impl WaveSyncDbBuilder {
             base_database_url: self.database_url.clone(),
             change_channel_capacity: self.change_channel_capacity,
             tombstone_retention: self.tombstone_retention,
+            group_key_cache_enabled: self.group_key_cache_enabled,
         });
 
         let db = WaveSyncDb {
@@ -2155,7 +2270,15 @@ impl WaveSyncNode {
             return Ok(WaveSyncDb { inner });
         }
 
-        let group_key = GroupKey::from_passphrase(passphrase, user_topic);
+        // Same cache-first derivation `with_passphrase` uses for the default
+        // group — see `group_key_for_dir` / the `key_cache` module.
+        let cache_dir = key_cache_dir(&self.inner.base_database_url);
+        let group_key = group_key_for_dir(
+            passphrase,
+            user_topic,
+            cache_dir.as_deref(),
+            self.inner.group_key_cache_enabled,
+        );
         let effective_topic = group_key.derive_topic(user_topic);
 
         // Per-group DB file derived from the node's base URL. The effective

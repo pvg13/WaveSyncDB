@@ -116,6 +116,58 @@ pub async fn background_sync_with_peers_for_topic(
     peer_addrs: &[String],
     target_effective_topic: Option<&str>,
 ) -> Result<BackgroundSyncResult, BackgroundSyncError> {
+    background_sync_core(
+        database_url,
+        timeout,
+        peer_addrs,
+        target_effective_topic,
+        false,
+    )
+    .await
+    .map(|(result, _)| result)
+}
+
+/// Same as [`background_sync_with_peers_for_topic`], but also captures every
+/// user-facing [`Notification`](crate::notify::Notification) surfaced while
+/// applying remote changes during this sync window.
+///
+/// This is what the iOS Notification Service Extension (NSE) uses: it has no
+/// foreground `use_sync_notifications` hook to render a notification for it,
+/// so it must derive one itself from whatever this sync actually applied.
+/// The returned `Vec` is ordered oldest → newest and already de-duplicated /
+/// coalesced exactly as a foreground session would see it (same registry,
+/// same gate) — most callers only need `.last()`. Empty on timeout, no
+/// matching `SyncNotify` policy, or nothing that policy considered
+/// notify-worthy — exactly like a foreground session seeing nothing.
+pub async fn background_sync_with_capture(
+    database_url: &str,
+    timeout: Duration,
+    peer_addrs: &[String],
+    target_effective_topic: Option<&str>,
+) -> Result<(BackgroundSyncResult, Vec<crate::notify::Notification>), BackgroundSyncError> {
+    background_sync_core(
+        database_url,
+        timeout,
+        peer_addrs,
+        target_effective_topic,
+        true,
+    )
+    .await
+}
+
+/// Shared implementation behind [`background_sync_with_peers_for_topic`] and
+/// [`background_sync_with_capture`]. `capture`, when true, additionally
+/// collects every [`Notification`](crate::notify::Notification) produced
+/// while syncing (see [`background_sync_with_capture`]'s docs); when false
+/// the collection is skipped entirely, so the non-capturing FFI entry point
+/// (`run_background_sync`) pays no extra cost.
+async fn background_sync_core(
+    database_url: &str,
+    timeout: Duration,
+    peer_addrs: &[String],
+    target_effective_topic: Option<&str>,
+    capture: bool,
+) -> Result<(BackgroundSyncResult, Vec<crate::notify::Notification>), BackgroundSyncError> {
     // Per-stage timing. When a sync round is slow (sometimes hits the 25s
     // timeout while typical runs are 2–3s), the question is always "where
     // did the time go". These markers let logcat show the answer:
@@ -149,7 +201,8 @@ pub async fn background_sync_with_peers_for_topic(
     })?;
 
     // 2. Reconstruct the builder
-    let mut builder = WaveSyncDbBuilder::new(database_url, &config.topic);
+    let mut builder = WaveSyncDbBuilder::new(database_url, &config.topic)
+        .with_group_key_cache(config.group_key_cache_enabled);
 
     if let Some(ref relay) = config.relay_server {
         builder = builder.with_relay_server(relay);
@@ -169,7 +222,9 @@ pub async fn background_sync_with_peers_for_topic(
     if let Some(ref api_key) = config.api_key
         && let Some(ref relay) = config.relay_server
     {
-        builder = WaveSyncDbBuilder::new(database_url, &config.topic).managed_relay(relay, api_key);
+        builder = WaveSyncDbBuilder::new(database_url, &config.topic)
+            .with_group_key_cache(config.group_key_cache_enabled)
+            .managed_relay(relay, api_key);
         // Re-apply other settings
         if !config.relay_fallbacks.is_empty() {
             builder = builder.with_relay_fallbacks(&config.relay_fallbacks);
@@ -236,8 +291,27 @@ pub async fn background_sync_with_peers_for_topic(
     // the groups stay joined while we wait for sync below.
     let crate_name: Option<String> = config.crate_name.clone();
     let extra_groups: Vec<crate::connection::GroupConfig> = config.groups.clone();
-    let default_effective = derive_effective_topic(&config.topic, config.passphrase.as_deref());
-    let selected = groups_to_rejoin(target_effective_topic, &default_effective, &extra_groups);
+    // Same cache dir `with_passphrase`/`join_group` use — on iOS, the default
+    // group's key was almost certainly just cached a moment ago inside
+    // `builder.build()` above, so this recomputation (and each extra group's,
+    // in `groups_to_rejoin` below) is a cache hit rather than a redundant
+    // Argon2id derivation. Matters most for the NSE's targeted wake, which
+    // may need to check several extra groups' effective topics against the
+    // push payload's topic before finding (or failing to find) a match.
+    let cache_dir = crate::connection::key_cache_dir(database_url);
+    let default_effective = derive_effective_topic(
+        &config.topic,
+        config.passphrase.as_deref(),
+        cache_dir.as_deref(),
+        config.group_key_cache_enabled,
+    );
+    let selected = groups_to_rejoin(
+        target_effective_topic,
+        &default_effective,
+        &extra_groups,
+        cache_dir.as_deref(),
+        config.group_key_cache_enabled,
+    );
     if let Some(target) = target_effective_topic {
         tracing::info!(
             "bg_sync: targeted wake for topic {target} → rejoining {} of {} extra group(s)",
@@ -280,31 +354,57 @@ pub async fn background_sync_with_peers_for_topic(
     }
 
     // 4c. Pump user-facing notifications. The foreground `use_sync_notifications`
-    // Dioxus hook isn't running in this (FCM service) process, so the
-    // SyncNotify policies the engine evaluates while we sync would fire but
-    // never reach the OS. Subscribe to every group's notification channel
-    // *before* the wait loop (broadcast only delivers to current subscribers)
-    // and post each one natively. Aborted after shutdown below.
+    // Dioxus hook isn't running in this (FCM/APNs service, or NSE) process, so
+    // the SyncNotify policies the engine evaluates while we sync would fire
+    // but never reach anywhere — unless we pump them ourselves. Each group's
+    // `notification_rx()` is a broadcast channel (fan-out, not exclusive), so
+    // the two consumers below can both subscribe independently:
+    //   * `push-sync` builds always post each one as a native OS notification
+    //     (the "app with no NSE" path — see `notify_display`).
+    //   * a `capture` request (the NSE's own path) instead collects them, so
+    //     the caller can build ITS OWN notification content from the last one
+    //     rather than a second, separate OS notification being posted here.
+    // Subscribed *before* the wait loop (broadcast only delivers to current
+    // subscribers); every pump is aborted after shutdown below.
+    let captured: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::Notification>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut notif_pumps: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     #[cfg(feature = "push-sync")]
-    let notif_pumps: Vec<tokio::task::JoinHandle<()>> = {
+    {
         let mut rxs = vec![db.notification_rx()];
         for g in &_group_handles {
             rxs.push(g.notification_rx());
         }
-        rxs.into_iter()
-            .map(|mut rx| {
-                tokio::spawn(async move {
-                    loop {
-                        match rx.recv().await {
-                            Ok(n) => crate::notify_display::show_background(&n),
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        }
+        for mut rx in rxs {
+            notif_pumps.push(tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(n) => crate::notify_display::show_background(&n),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                })
-            })
-            .collect()
-    };
+                }
+            }));
+        }
+    }
+    if capture {
+        let mut rxs = vec![db.notification_rx()];
+        for g in &_group_handles {
+            rxs.push(g.notification_rx());
+        }
+        for mut rx in rxs {
+            let captured = captured.clone();
+            notif_pumps.push(tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(n) => captured.lock().unwrap().push(n),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }));
+        }
+    }
 
     // 5. Wait for peer discovery and let the engine sync on its own.
     //
@@ -403,8 +503,7 @@ pub async fn background_sync_with_peers_for_topic(
     log_stage("shutdown_started");
     // Stop the notification pumps before tearing down the engine — any
     // notification for a change applied during the sync window has already
-    // been posted by now.
-    #[cfg(feature = "push-sync")]
+    // been posted (or captured) by now.
     for h in notif_pumps {
         h.abort();
     }
@@ -423,7 +522,8 @@ pub async fn background_sync_with_peers_for_topic(
         "bg_sync stage=done elapsed_ms={} result={result:?}",
         t_start.elapsed().as_millis()
     );
-    Ok(result)
+    let notifications = std::mem::take(&mut *captured.lock().unwrap());
+    Ok((result, notifications))
 }
 
 /// Scale the "connected-but-no-incremental-sync" fallback timer (see the
@@ -448,9 +548,22 @@ fn scaled_completion_grace(base: Duration, timeout: Duration) -> Duration {
 /// with a passphrase it is `BLAKE3(user_topic, group_key)`; without one the
 /// effective topic is the user topic verbatim. Keep in lockstep with
 /// `engine::run_engine`'s `effective_topic` computation.
-fn derive_effective_topic(user_topic: &str, passphrase: Option<&str>) -> String {
+///
+/// `cache_dir`/`cache_enabled` route the passphrase branch through the same
+/// on-disk group-key cache `with_passphrase`/`join_group` use
+/// (`connection::group_key_for_dir`) — iOS only; every other platform always
+/// derives fresh. Passing `None`/`true` (or `false`) is always safe — it's
+/// exactly "no cache available", which any non-iOS caller (including every
+/// test in this module) already is.
+fn derive_effective_topic(
+    user_topic: &str,
+    passphrase: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+    cache_enabled: bool,
+) -> String {
     match passphrase {
-        Some(p) => crate::auth::GroupKey::from_passphrase(p, user_topic).derive_topic(user_topic),
+        Some(p) => crate::connection::group_key_for_dir(p, user_topic, cache_dir, cache_enabled)
+            .derive_topic(user_topic),
         None => user_topic.to_string(),
     }
 }
@@ -463,10 +576,18 @@ fn derive_effective_topic(user_topic: &str, passphrase: Option<&str>) -> String 
 /// * target matches one or more extra groups → just those.
 /// * target matches nothing known → all groups (safe fallback; the relay should
 ///   only ever push a topic we registered for, so this is belt-and-suspenders).
+///
+/// `cache_dir`/`cache_enabled` are forwarded to [`derive_effective_topic`] for
+/// each group checked — see that function's docs. This matters most for a
+/// targeted (NSE) wake with several extra groups configured: without a cache
+/// hit, checking each one against the payload's topic would re-run Argon2id
+/// once per group just to find (or rule out) a match.
 fn groups_to_rejoin(
     target_effective_topic: Option<&str>,
     default_effective: &str,
     groups: &[crate::connection::GroupConfig],
+    cache_dir: Option<&std::path::Path>,
+    cache_enabled: bool,
 ) -> Vec<usize> {
     let Some(target) = target_effective_topic else {
         return (0..groups.len()).collect();
@@ -477,7 +598,10 @@ fn groups_to_rejoin(
     let matched: Vec<usize> = groups
         .iter()
         .enumerate()
-        .filter(|(_, g)| derive_effective_topic(&g.user_topic, Some(&g.passphrase)) == target)
+        .filter(|(_, g)| {
+            derive_effective_topic(&g.user_topic, Some(&g.passphrase), cache_dir, cache_enabled)
+                == target
+        })
         .map(|(i, _)| i)
         .collect();
     if matched.is_empty() {
@@ -505,44 +629,67 @@ mod tests {
     #[test]
     fn no_target_rejoins_all_groups() {
         let groups = vec![group("beta", "pb"), group("gamma", "pg")];
-        let sel = groups_to_rejoin(None, "wavesync-default", &groups);
+        let sel = groups_to_rejoin(None, "wavesync-default", &groups, None, true);
         assert_eq!(sel, vec![0, 1]);
     }
 
     #[test]
     fn target_default_rejoins_nothing() {
         let groups = vec![group("beta", "pb")];
-        let default_eff = derive_effective_topic("alpha", Some("pa"));
-        let sel = groups_to_rejoin(Some(&default_eff), &default_eff, &groups);
+        let default_eff = derive_effective_topic("alpha", Some("pa"), None, true);
+        let sel = groups_to_rejoin(Some(&default_eff), &default_eff, &groups, None, true);
         assert!(sel.is_empty(), "default-targeted wake skips extra groups");
     }
 
     #[test]
     fn target_extra_rejoins_only_that_group() {
         let groups = vec![group("beta", "pb"), group("gamma", "pg")];
-        let beta_eff = derive_effective_topic("beta", Some("pb"));
-        let sel = groups_to_rejoin(Some(&beta_eff), "wavesync-default", &groups);
+        let beta_eff = derive_effective_topic("beta", Some("pb"), None, true);
+        let sel = groups_to_rejoin(Some(&beta_eff), "wavesync-default", &groups, None, true);
         assert_eq!(sel, vec![0], "only the targeted extra group is rejoined");
     }
 
     #[test]
     fn unknown_target_falls_back_to_all() {
         let groups = vec![group("beta", "pb"), group("gamma", "pg")];
-        let sel = groups_to_rejoin(Some("wavesync-stranger"), "wavesync-default", &groups);
+        let sel = groups_to_rejoin(
+            Some("wavesync-stranger"),
+            "wavesync-default",
+            &groups,
+            None,
+            true,
+        );
         assert_eq!(sel, vec![0, 1], "unknown target falls back to all groups");
     }
 
     #[test]
     fn effective_topic_matches_engine_semantics() {
         // No passphrase → effective == user topic (mirrors engine::run_engine).
-        assert_eq!(derive_effective_topic("plain", None), "plain");
+        assert_eq!(derive_effective_topic("plain", None, None, true), "plain");
         // With passphrase → derived hash, stable and != the raw topic.
-        let eff = derive_effective_topic("plain", Some("secret"));
+        let eff = derive_effective_topic("plain", Some("secret"), None, true);
         assert!(eff.starts_with("wavesync2-"));
         assert_ne!(eff, "plain");
         // Same inputs → same output; different passphrase → different topic.
-        assert_eq!(eff, derive_effective_topic("plain", Some("secret")));
-        assert_ne!(eff, derive_effective_topic("plain", Some("other")));
+        assert_eq!(
+            eff,
+            derive_effective_topic("plain", Some("secret"), None, true)
+        );
+        assert_ne!(
+            eff,
+            derive_effective_topic("plain", Some("other"), None, true)
+        );
+    }
+
+    #[test]
+    fn no_cache_dir_or_disabled_cache_behave_the_same_off_ios() {
+        // On every non-iOS target `group_key_for_dir` always derives fresh
+        // regardless of `cache_enabled`/`cache_dir` — this pins that down so
+        // a future iOS-only behavior change can't silently regress host
+        // (Linux/macOS dev, CI) derivation.
+        let with_cache_flag = derive_effective_topic("plain", Some("secret"), None, true);
+        let without_cache_flag = derive_effective_topic("plain", Some("secret"), None, false);
+        assert_eq!(with_cache_flag, without_cache_flag);
     }
 
     #[test]
