@@ -903,6 +903,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dst_peer_id,
                         error,
                     } => {
+                        // Recomputed from CURRENT membership for the log line only; the ledger
+                        // bills the topic captured at circuit-open time, so this can diverge from
+                        // the billed topic if group membership changed mid-circuit (cosmetic —
+                        // billing itself is unaffected).
                         let topic = metrics::attribute_topic(&src_peer_id, &dst_peer_id, &|p| {
                             topics_for_peer(&topic_peers, &rendezvous_topics, p)
                         });

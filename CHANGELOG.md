@@ -2,7 +2,27 @@
 
 ## Unreleased
 
+### Changed
+- **Logging emits `tracing` natively (#69).** `wavesyncdb` and `wavesync_relay` now emit
+  `tracing` events directly instead of going through the `log` facade (~500 call sites migrated).
+  The `log` bridge is preserved (`tracing = { features = ["log"] }`), so existing `env_logger` /
+  `android_logger` consumers keep working with zero changes, and `RUST_LOG` filtering semantics
+  are unchanged. Structured spans are new visibility for `tracing` subscribers only — plain `log`
+  consumers see the same messages as before, without span context.
+  **Breaking:** `recommended_log_filters()` returns a `&'static str` `EnvFilter`/`RUST_LOG`
+  directive string instead of `Vec<(&str, log::LevelFilter)>` tuples. Migration: pass it to
+  `EnvFilter::new(format!("info,{}", wavesyncdb::recommended_log_filters()))` or
+  `env_logger::Env::default().default_filter_or(...)`. See `REQUESTS.md` Breaking Changes.
+
 ### Added
+- **Structured spans on sync entry points.** `#[tracing::instrument]` spans cover the local
+  write path (`handle_local_changeset`), catch-up (`handle_version_vector_request`,
+  reconcile handlers), real-time push (`handle_push_request`, `apply_remote_changeset`), and
+  `initiate_sync_for_peer` / `drain_and_dispatch`, carrying `peer`, `topic`, `db_version` /
+  `my_db_version` / `your_last_db_version`, `n_changes`, and `committed` fields as applicable;
+  HMAC-reject events carry a `reason` field. All spans `skip_all` — changesets and DB handles
+  are never `Debug`-formatted into span fields. Relay-side spans cover rendezvous, circuit, and
+  push-registration paths.
 - **Relay Prometheus `/metrics` endpoint.** The relay exposes an OpenMetrics HTTP endpoint
   on `METRICS_ADDR` (default loopback `127.0.0.1:9464`, configurable to `0.0.0.0:9464` for
   remote scrape). Metrics include: circuit reservation time per topic (billing meter for
