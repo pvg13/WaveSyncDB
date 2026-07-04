@@ -1953,9 +1953,10 @@ impl WaveSyncDbBuilder {
     /// roughly 24 MB, well under Argon2id's ~19 MiB footprint — can load a
     /// ready-made 32-byte key instead of re-deriving it. This is the same
     /// key-material-at-rest tradeoff any end-to-end-encrypted app with a
-    /// notification extension makes; the app is expected to mark the cache
-    /// file `NSFileProtectionCompleteUntilFirstUserAuthentication` from
-    /// Swift (see `WaveSyncNotificationService`). Opt out with
+    /// notification extension makes. The cache file is automatically marked
+    /// `NSFileProtectionCompleteUntilFirstUserAuthentication` (best-effort,
+    /// via `key_cache::protect_file`), permitting the NSE to read it before
+    /// first unlock while staying encrypted at rest. Opt out with
     /// `with_group_key_cache(false)` if your threat model forbids caching
     /// derived key material to disk — the NSE then can't sync (it falls
     /// back to the operator's placeholder alert content), but nothing else

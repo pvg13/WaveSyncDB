@@ -14,15 +14,20 @@ Both are required. Topic isolation alone is brittle (an attacker who guesses the
 ## How the topic is derived
 
 ```rust
-// The passphrase is first turned into a 32-byte group key via BLAKE3 key derivation
-// (domain-separated — NOT a plain hash of the passphrase):
-let group_key = blake3::derive_key("wavesyncdb-group-key-v1", passphrase.as_bytes());
+// The passphrase is first turned into a 32-byte group key via Argon2id
+// (memory-hard key derivation, salted with the user topic to bind the key to the deployment):
+use argon2::Argon2;
+let salt = &blake3::hash(user_topic.as_bytes()).as_bytes()[..16];
+let mut key = [0u8; 32];
+argon2id.hash_password_into(passphrase.as_bytes(), salt, &mut key);
+// This is intentionally slow (~100 ms) and memory-heavy (~19 MiB) to price out
+// offline dictionary attacks. Called once at engine build or group join, never per-message.
 
-// The topic is then derived from the user topic + the group key, again via keyed derivation:
+// The topic is then derived from the user topic + the group key, via keyed derivation:
 let mut hasher = blake3::Hasher::new_derive_key("wavesyncdb-topic-v1");
 hasher.update(user_topic.as_bytes());
 hasher.update(&group_key);
-let derived_topic = format!("wavesync-{}", hasher.finalize().to_hex());
+let derived_topic = format!("wavesync2-{}", hasher.finalize().to_hex());
 ```
 
 The derived topic — not the raw `user_topic` you pass to `WaveSyncDbBuilder::new()` — is what's:
@@ -109,7 +114,7 @@ The HMAC input is exactly the canonical serialization of the message's content f
 If you call `WaveSyncDbBuilder::new(url, topic).build()` with no `with_passphrase(...)`, you get:
 
 - **No HMAC** on messages.
-- **No `\0passphrase` mixed into the topic** — the raw topic string is hashed alone.
+- **No key derivation** — the raw topic string is hashed alone (no Argon2id).
 - **Anyone on the topic** can read and write the database.
 
 This is appropriate for:

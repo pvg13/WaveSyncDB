@@ -328,7 +328,7 @@ nothing else.
    regardless of the banner.
 6. Grep the relay's log for the new field on this send:
    ```
-   kind=alert
+   kind="alert"
    ```
    alongside the existing `topic=… outcome="ok"` push-sent line — confirms
    this send took the alert branch, not silent.
@@ -350,7 +350,7 @@ nothing else.
 | Write → banner latency | ___ s |
 | Banner text is the placeholder (`APNS_ALERT_TITLE`) | ☐ |
 | `bg_sync` stages seen on the same push | ☐ |
-| Relay log shows `kind=alert` for this send | ☐ |
+| Relay log shows `kind="alert"` for this send | ☐ |
 | `push_budget` row unchanged before/after | ☐ |
 | Burst of 5 → exactly ONE Notification Center entry | ☐ |
 | Notes / anomalies | |
