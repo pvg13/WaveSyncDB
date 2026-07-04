@@ -126,6 +126,14 @@ pub struct ApnsConfig {
     pub bundle_id: String,
     /// Whether to use the sandbox endpoint.
     pub sandbox: bool,
+    /// Relay-operator-configured placeholder title used on ALERT-class
+    /// sends (`visible: true`). This is the ONLY user-facing text that
+    /// ever rides an alert push — it comes from relay operator
+    /// configuration (`--apns-alert-title` / `APNS_ALERT_TITLE`), never
+    /// from client-supplied content. The receiving app's own SyncNotify
+    /// policy is what produces the real title/body once it wakes and
+    /// syncs.
+    pub alert_title: String,
 }
 
 /// Cached JWT for APNs with expiry tracking.
@@ -251,8 +259,26 @@ impl PushSender {
         }
     }
 
-    /// Send a silent/background APNs notification to a device token.
-    pub async fn send_apns(&self, token: &str, topic: &str, peer_addrs: &[String]) -> PushResult {
+    /// Send an APNs notification to a device token.
+    ///
+    /// `visible` selects between the two send classes:
+    /// - `false` (default, unchanged from before #78): silent
+    ///   `content-available` background wake — byte-identical payload and
+    ///   headers to before this was introduced.
+    /// - `true`: unbudgeted ALERT-class send for a changeset that touched a
+    ///   `SyncNotify`-visible table. `aps.alert.title` carries ONLY the
+    ///   relay-operator placeholder (`ApnsConfig::alert_title`) — never
+    ///   client-supplied text. `mutable-content: 1` lets an app's
+    ///   Notification Service Extension rewrite it with real content before
+    ///   display; `content-available: 1` is kept alongside so the existing
+    ///   background-sync path still runs for apps without an NSE.
+    pub async fn send_apns(
+        &self,
+        token: &str,
+        topic: &str,
+        peer_addrs: &[String],
+        visible: bool,
+    ) -> PushResult {
         let apns = match &self.apns {
             Some(c) => c,
             None => {
@@ -281,37 +307,62 @@ impl PushSender {
         };
         let url = format!("{host}/3/device/{token}");
 
-        let body = serde_json::json!({
-            "aps": {
-                "content-available": 1
-            },
-            "topic": topic,
-            "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
-        });
+        let body = if visible {
+            serde_json::json!({
+                "aps": {
+                    "alert": { "title": apns.alert_title },
+                    "mutable-content": 1,
+                    "content-available": 1,
+                    "sound": "default"
+                },
+                "topic": topic,
+                "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
+            })
+        } else {
+            serde_json::json!({
+                "aps": {
+                    "content-available": 1
+                },
+                "topic": topic,
+                "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
+            })
+        };
 
         // Retain the wake for 10 minutes. Without `apns-expiration`, APNs uses
-        // expiry 0 = "deliver now or discard"; combined with `apns-priority: 5`
-        // (throttled background delivery), a device that's asleep/offline at
-        // send time would never get woken. A future expiry makes APNs store and
-        // retry, which is what the "wake a killed device" use case needs.
+        // expiry 0 = "deliver now or discard"; combined with a throttled
+        // background priority, a device that's asleep/offline at send time
+        // would never get woken. A future expiry makes APNs store and retry,
+        // which is what the "wake a killed device" use case needs — kept for
+        // both send classes.
         let expiration = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 600;
 
-        match self
-            .client
-            .post(&url)
-            .bearer_auth(&jwt)
-            .header("apns-push-type", "background")
-            .header("apns-priority", "5")
+        let mut request = self.client.post(&url).bearer_auth(&jwt);
+        request = if visible {
+            // `apns-priority: 10` + `apns-push-type: alert` request immediate
+            // delivery — required for an alert to actually land on the lock
+            // screen rather than being throttled like a background push.
+            // `apns-collapse-id` (topic-derived, already used for relay log
+            // scoping) coalesces bursts of alerts for the same group into one
+            // notification-center entry instead of stacking duplicates.
+            request
+                .header("apns-push-type", "alert")
+                .header("apns-priority", "10")
+                .header("apns-collapse-id", crate::short_topic(topic))
+        } else {
+            request
+                .header("apns-push-type", "background")
+                .header("apns-priority", "5")
+        };
+        request = request
             .header("apns-expiration", expiration.to_string())
             .header("apns-topic", &apns.bundle_id)
-            .json(&body)
-            .send()
-            .await
-        {
+            .json(&body);
+
+        match request.send().await {
             Ok(resp) => {
                 let status = resp.status();
                 let status_u16 = status.as_u16();

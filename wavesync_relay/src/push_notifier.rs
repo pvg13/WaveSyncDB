@@ -38,6 +38,10 @@ pub struct TopicNotification {
     pub notifying_peer: String,
     /// Addresses of the peer that triggered the notification.
     pub peer_addrs: Vec<String>,
+    /// Whether the triggering changeset touched a `SyncNotify`-visible
+    /// table. Drives the unbudgeted ALERT-class APNs send in
+    /// `fire_notifications` — see its doc comment.
+    pub visible: bool,
 }
 
 /// One-shot signal sent from the notifier loop to the retry worker when
@@ -76,6 +80,11 @@ impl PushNotifier {
     /// `apns_coalesce_secs` / `fcm_coalesce_secs` are the per-device
     /// wake-coalescing windows (0 disables coalescing for that platform) —
     /// see [`fire_notifications`]'s gate for the full rationale.
+    /// `alert_coalesce_secs` is the equivalent window for unbudgeted
+    /// ALERT-class sends, kept separate from `apns_coalesce_secs` because
+    /// alerts skip the daily budget entirely and need their own,
+    /// independently-tunable anti-spam window.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         store: Arc<PushStore>,
         sender: Arc<PushSender>,
@@ -83,6 +92,7 @@ impl PushNotifier {
         metrics: RelayMetrics,
         apns_coalesce_secs: u64,
         fcm_coalesce_secs: u64,
+        alert_coalesce_secs: u64,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<TopicNotification>(256);
         let (nudge_tx, nudge_rx) = mpsc::channel::<RetryNudge>(64);
@@ -107,6 +117,7 @@ impl PushNotifier {
             metrics,
             apns_coalesce_secs,
             fcm_coalesce_secs,
+            alert_coalesce_secs,
         ));
 
         Self { tx }
@@ -115,23 +126,42 @@ impl PushNotifier {
     /// Queue a topic for notification (non-blocking, drops if channel full).
     /// `notifying_peer` is the libp2p peer id of the device that sent the
     /// `NotifyTopic`; its own registered token is excluded from the fan-out.
-    pub fn notify(&self, topic: String, notifying_peer: String, peer_addrs: Vec<String>) {
+    /// `visible` is the sender-computed `SyncNotify` signal carried on the
+    /// wire — see `NotifyTopic::visible`.
+    pub fn notify(
+        &self,
+        topic: String,
+        notifying_peer: String,
+        peer_addrs: Vec<String>,
+        visible: bool,
+    ) {
         let _ = self.tx.try_send(TopicNotification {
             topic,
             notifying_peer,
             peer_addrs,
+            visible,
         });
     }
 }
+
+/// A suppressed-during-cooldown notification waiting to fire trailing-edge:
+/// notifying peer id, its addresses, and the visible-wins-merged flag (see
+/// [`CooldownState::pending`]).
+type PendingFire = (String, Vec<String>, bool);
 
 /// Per-topic cooldown state.
 struct CooldownState {
     /// When the cooldown expires (next fire allowed).
     expires_at: Instant,
-    /// If a notification arrived during cooldown, store the notifying peer id
-    /// and its addresses here. When cooldown expires, this fires as a
+    /// If a notification arrived during cooldown, store the notifying peer
+    /// id, its addresses, and whether ANY suppressed notification in this
+    /// window was visible here. When cooldown expires, this fires as a
     /// trailing-edge notification (excluding that peer's own token).
-    pending: Option<(String, Vec<String>)>,
+    /// Visible-wins: a burst that mixes silent and visible writes must
+    /// still surface a realtime banner for the visible one, so the flag is
+    /// OR'd across every suppressed notification rather than only keeping
+    /// the last.
+    pending: Option<PendingFire>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -144,6 +174,7 @@ async fn notifier_loop(
     metrics: RelayMetrics,
     apns_coalesce_secs: u64,
     fcm_coalesce_secs: u64,
+    alert_coalesce_secs: u64,
 ) {
     let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
 
@@ -165,16 +196,20 @@ async fn notifier_loop(
                         if let Some(state) = cooldowns.get_mut(&topic) {
                             if now >= state.expires_at {
                                 // Cooldown expired — fire immediately (leading edge)
-                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
+                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, notification.visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
                                 state.expires_at = now + cooldown_duration;
                                 state.pending = None;
                             } else {
-                                // During cooldown — suppress, but save for trailing edge
-                                state.pending = Some((notification.notifying_peer, notification.peer_addrs));
+                                // During cooldown — suppress, but save for trailing
+                                // edge. Visible-wins merge against whatever was
+                                // already pending this window.
+                                let merged_visible = state.pending.as_ref().map(|(_, _, v)| *v).unwrap_or(false)
+                                    || notification.visible;
+                                state.pending = Some((notification.notifying_peer, notification.peer_addrs, merged_visible));
                             }
                         } else {
                             // First notification for this topic — fire immediately
-                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
+                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, notification.visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
                             cooldowns.insert(topic, CooldownState {
                                 expires_at: now + cooldown_duration,
                                 pending: None,
@@ -192,14 +227,14 @@ async fn notifier_loop(
             } => {
                 // Check for expired cooldowns with pending notifications
                 let now = Instant::now();
-                let expired: Vec<(String, (String, Vec<String>))> = cooldowns
+                let expired: Vec<(String, PendingFire)> = cooldowns
                     .iter()
                     .filter(|(_, state)| state.pending.is_some() && state.expires_at <= now)
                     .map(|(topic, state)| (topic.clone(), state.pending.clone().unwrap()))
                     .collect();
 
-                for (topic, (notifying_peer, peer_addrs)) in expired {
-                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
+                for (topic, (notifying_peer, peer_addrs, visible)) in expired {
+                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
                     if let Some(state) = cooldowns.get_mut(&topic) {
                         state.expires_at = now + cooldown_duration;
                         state.pending = None;
@@ -226,6 +261,15 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// `visible` selects the send class for every APNs token in this fire round:
+/// `true` means the triggering changeset touched a `SyncNotify`-visible
+/// table, so APNs tokens get an unbudgeted ALERT-class send (skips
+/// `charge_daily_budget` entirely — including its deny-path refund, which
+/// only exists for that budget-gated branch — but keeps
+/// `check_and_stamp_wake` under its own `alert_coalesce_secs` window rather
+/// than `apns_coalesce_secs`). FCM is unaffected either way: Android stays
+/// on the data-only class here, since the app-side `SyncNotify` policy
+/// already renders a rich local notification once it wakes and syncs.
 #[allow(clippy::too_many_arguments)]
 async fn fire_notifications(
     store: &PushStore,
@@ -233,10 +277,12 @@ async fn fire_notifications(
     topic: &str,
     notifying_peer: &str,
     peer_addrs: &[String],
+    visible: bool,
     nudge_tx: &mpsc::Sender<RetryNudge>,
     metrics: &RelayMetrics,
     apns_coalesce_secs: u64,
     fcm_coalesce_secs: u64,
+    alert_coalesce_secs: u64,
 ) {
     // Exclude the writer's own token: a device uses the same libp2p peer id for
     // its RegisterToken and its NotifyTopic, so a local write must not wake the
@@ -278,6 +324,12 @@ async fn fire_notifications(
     let today = now / 86_400;
 
     for token_entry in &tokens {
+        // ALERT-class only applies to APNs — FCM keeps the data-only class
+        // today regardless of `visible` (Android's SyncNotify already
+        // renders the rich local once it wakes and syncs).
+        let is_alert = visible && token_entry.platform == "Apns";
+        let kind_label = if is_alert { "alert" } else { "silent" };
+
         // Per-(token, topic) wake-coalescing window: a burst of writes to the
         // same topic must cost this device ONE wake, not one per write, since
         // APNs throttles silent background pushes to only a handful per device
@@ -289,10 +341,18 @@ async fn fire_notifications(
         // own catch-up sync (periodic / on-open version-vector exchange) still
         // delivers on its next wake — so a store error here fails OPEN (send
         // anyway) rather than fail closed like the budget check below.
-        let coalesce_window_secs = match token_entry.platform.as_str() {
-            "Apns" => apns_coalesce_secs,
-            "Fcm" => fcm_coalesce_secs,
-            _ => 0,
+        // ALERT-class sends get their own independent coalescing window
+        // (`alert_coalesce_secs`) instead of `apns_coalesce_secs` — they skip
+        // the daily budget below, so this window is the only anti-spam guard
+        // they have.
+        let coalesce_window_secs = if is_alert {
+            alert_coalesce_secs
+        } else {
+            match token_entry.platform.as_str() {
+                "Apns" => apns_coalesce_secs,
+                "Fcm" => fcm_coalesce_secs,
+                _ => 0,
+            }
         };
         match store
             .check_and_stamp_wake(&token_entry.token, topic, now, coalesce_window_secs as i64)
@@ -304,6 +364,7 @@ async fn fire_notifications(
                 tracing::debug!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     "Coalescing wake for token={short}... (within {coalesce_window_secs}s window)"
                 );
                 metrics.push_sent(&token_entry.platform, "coalesced");
@@ -313,6 +374,7 @@ async fn fire_notifications(
                 tracing::warn!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     "Wake-coalescing check failed, sending anyway: {e}"
                 );
             }
@@ -322,35 +384,44 @@ async fn fire_notifications(
         // would throttle/drop wakes anyway; skipping here keeps a spammy or hostile
         // notifier from burning a device's budget and silencing legitimate wakes.
         // The device still catches up on its next foreground resume / periodic sync.
-        match store.charge_daily_budget(&token_entry.token, today).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let short = token_entry.token.chars().take(20).collect::<String>();
-                tracing::warn!(
-                    topic = %topic_short,
-                    platform = %token_entry.platform,
-                    outcome = "budget_denied",
-                    "Daily push budget exhausted for token={short}...; skipping wake"
-                );
-                metrics.push_sent(&token_entry.platform, "budget_denied");
-                // A denied send must not consume the coalescing window — the deny already means
-                // no wake happened. Refund the stamp we made earlier.
-                if let Err(e) = store.unstamp_wake(&token_entry.token, topic).await {
-                    tracing::debug!("unstamp_wake failed for {short}...: {e}");
+        //
+        // ALERT-class sends bypass this entirely (including the deny-path
+        // refund below, which only exists for the budget-gated branch) — an
+        // unbudgeted alert is the whole point of the SyncNotify-visible
+        // signal; the per-device coalescing window above is its only cap.
+        if !is_alert {
+            match store.charge_daily_budget(&token_entry.token, today).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let short = token_entry.token.chars().take(20).collect::<String>();
+                    tracing::warn!(
+                        topic = %topic_short,
+                        platform = %token_entry.platform,
+                        kind = kind_label,
+                        outcome = "budget_denied",
+                        "Daily push budget exhausted for token={short}...; skipping wake"
+                    );
+                    metrics.push_sent(&token_entry.platform, "budget_denied");
+                    // A denied send must not consume the coalescing window — the deny already means
+                    // no wake happened. Refund the stamp we made earlier.
+                    if let Err(e) = store.unstamp_wake(&token_entry.token, topic).await {
+                        tracing::debug!("unstamp_wake failed for {short}...: {e}");
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(e) => {
-                tracing::error!(
-                    topic = %topic_short,
-                    platform = %token_entry.platform,
-                    outcome = "budget_check_error",
-                    error = %e,
-                    "Daily budget check failed"
-                );
-                // Fail closed on the budget check: skip rather than risk unbounded sends.
-                metrics.push_sent(&token_entry.platform, "budget_check_error");
-                continue;
+                Err(e) => {
+                    tracing::error!(
+                        topic = %topic_short,
+                        platform = %token_entry.platform,
+                        kind = kind_label,
+                        outcome = "budget_check_error",
+                        error = %e,
+                        "Daily budget check failed"
+                    );
+                    // Fail closed on the budget check: skip rather than risk unbounded sends.
+                    metrics.push_sent(&token_entry.platform, "budget_check_error");
+                    continue;
+                }
             }
         }
 
@@ -358,7 +429,7 @@ async fn fire_notifications(
             "Fcm" => sender.send_fcm(&token_entry.token, topic, peer_addrs).await,
             "Apns" => {
                 sender
-                    .send_apns(&token_entry.token, topic, peer_addrs)
+                    .send_apns(&token_entry.token, topic, peer_addrs, is_alert)
                     .await
             }
             other => {
@@ -373,6 +444,7 @@ async fn fire_notifications(
                 tracing::info!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     outcome = "ok",
                     "Push sent to token={short}..."
                 );
@@ -389,6 +461,7 @@ async fn fire_notifications(
                 tracing::info!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     outcome = "token_invalid",
                     reason = ?reason,
                     "Pruning invalid push token {short}..."
@@ -416,6 +489,7 @@ async fn fire_notifications(
                 tracing::warn!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     outcome = "transient",
                     error = ?err,
                     "Push transient failure for {short}...; queueing retry #1/7 in ~{next_delay:?}"
@@ -426,6 +500,7 @@ async fn fire_notifications(
                         topic,
                         &token_entry.token,
                         &token_entry.platform,
+                        is_alert,
                         &peer_addrs_json,
                         1,
                         next_attempt_at,
@@ -445,6 +520,7 @@ async fn fire_notifications(
                 tracing::error!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
+                    kind = kind_label,
                     outcome = "permanent",
                     error = ?err,
                     "Push permanent failure for {short}...; dropping (misconfiguration won't resolve itself)"
@@ -581,6 +657,11 @@ async fn process_retry(
     let short = row.token.chars().take(20).collect::<String>();
     let platform_label = row.platform.clone();
     let topic_short = crate::short_topic(&row.topic);
+    // A retried alert must keep firing as an alert (and a retried silent
+    // send must not get promoted into one) — `row.is_alert` is what the
+    // original `fire_notifications` call decided, carried through the
+    // `push_retries` row.
+    let kind_label = if row.is_alert { "alert" } else { "silent" };
 
     let result = match row.platform.as_str() {
         "Fcm" => {
@@ -590,7 +671,7 @@ async fn process_retry(
         }
         "Apns" => {
             sender
-                .send_apns(&row.token, &row.topic, &row.peer_addrs)
+                .send_apns(&row.token, &row.topic, &row.peer_addrs, row.is_alert)
                 .await
         }
         other => {
@@ -605,6 +686,7 @@ async fn process_retry(
             tracing::info!(
                 topic = %topic_short,
                 platform = %platform_label,
+                kind = kind_label,
                 outcome = "ok",
                 "Push retry succeeded to token={short}... (attempt {})",
                 row.attempts
@@ -616,6 +698,7 @@ async fn process_retry(
             tracing::info!(
                 topic = %topic_short,
                 platform = %platform_label,
+                kind = kind_label,
                 outcome = "token_invalid",
                 reason = ?reason,
                 "Push retry hit TokenInvalid for {short}...; pruning token + retries"
@@ -628,6 +711,7 @@ async fn process_retry(
             tracing::error!(
                 topic = %topic_short,
                 platform = %platform_label,
+                kind = kind_label,
                 outcome = "permanent",
                 error = ?err,
                 "Push retry hit Permanent for {short}...; dropping"
@@ -641,6 +725,7 @@ async fn process_retry(
                 tracing::info!(
                     topic = %topic_short,
                     platform = %platform_label,
+                    kind = kind_label,
                     outcome = "age_exceeded",
                     "Push retry: dropping {short}... — age exceeded ({}s old)",
                     now - row.first_failed_at
@@ -658,6 +743,7 @@ async fn process_retry(
                     tracing::info!(
                         topic = %topic_short,
                         platform = %platform_label,
+                        kind = kind_label,
                         outcome = "transient",
                         "Push retry attempt {} failed for {short}...; scheduling attempt {} in ~{:?}",
                         row.attempts,
@@ -676,6 +762,7 @@ async fn process_retry(
                             &row.topic,
                             &row.token,
                             &row.platform,
+                            row.is_alert,
                             // serialize the addrs we already have
                             &serde_json::to_string(&row.peer_addrs)
                                 .unwrap_or_else(|_| "[]".to_string()),
@@ -692,6 +779,7 @@ async fn process_retry(
                     tracing::info!(
                         topic = %topic_short,
                         platform = %platform_label,
+                        kind = kind_label,
                         outcome = "retry_budget_exhausted",
                         "Push retry budget exhausted for {short}... after {} attempts; dropping",
                         row.attempts

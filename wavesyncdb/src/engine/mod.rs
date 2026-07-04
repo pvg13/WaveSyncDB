@@ -2355,8 +2355,13 @@ impl EngineRunner {
             changeset,
         } = tc;
 
-        let (topic_name, group_key) = match self.groups.get(&effective_topic) {
-            Some(g) => (g.topic_name.clone(), g.group_key.clone()),
+        let (topic_name, group_key, notification_registry) = match self.groups.get(&effective_topic)
+        {
+            Some(g) => (
+                g.topic_name.clone(),
+                g.group_key.clone(),
+                g.notification_registry.clone(),
+            ),
             None => {
                 tracing::debug!(
                     topic = %short_topic(&effective_topic),
@@ -2365,6 +2370,17 @@ impl EngineRunner {
                 return;
             }
         };
+
+        // Sender-side visibility: true only when this changeset touched at
+        // least one table with a registered SyncNotify policy. This is the
+        // only signal the relay gets for choosing an unbudgeted ALERT-class
+        // APNs send over today's silent background wake — it carries no
+        // user-facing text, just "does the receiver have a reason to show a
+        // realtime banner for this write".
+        let visible = changeset
+            .changes
+            .iter()
+            .any(|c| notification_registry.has(&c.table.0));
 
         // Update local db_version for this group, and record this changeset as
         // pending confirmed delivery so a dropped push is redelivered promptly
@@ -2464,7 +2480,7 @@ impl EngineRunner {
         // Must run even when peer_ids is empty — that's the case where both
         // peers are behind NAT with no direct connection, and push is the
         // only way to wake the other side.
-        self.notify_relay_topic(&effective_topic);
+        self.notify_relay_topic(&effective_topic, visible);
     }
 
     /// Connected peers eligible for a fan-out push of `effective_topic`: every

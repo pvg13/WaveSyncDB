@@ -74,6 +74,12 @@ pub struct RetryRow {
     #[allow(dead_code)]
     pub next_attempt_at: i64,
     pub first_failed_at: i64,
+    /// Whether the original send this row is retrying was an unbudgeted
+    /// ALERT-class send (`true`) or the default silent background wake
+    /// (`false`). Threaded through so a retried alert keeps firing as an
+    /// alert — a retry must never silently downgrade an ALERT to a
+    /// background wake, or vice versa promote one.
+    pub is_alert: bool,
 }
 
 /// Async wrapper around an sqlx SQLite pool for push token storage.
@@ -146,11 +152,29 @@ impl PushStore {
                 last_error_kind  TEXT NOT NULL,
                 last_error_code  INTEGER,
                 last_error_body  TEXT,
+                kind             INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (topic, token)
             )",
         )
         .execute(&pool)
         .await?;
+
+        // Migrate pre-#78 on-disk push_retries tables in place. CREATE IF NOT
+        // EXISTS does nothing for a table that already exists, so a DB from
+        // before the ALERT-class retry column was added needs it backfilled
+        // explicitly. SQLite has no ADD COLUMN IF NOT EXISTS; the
+        // duplicate-column error is the idempotence signal (fresh tables
+        // already got `kind` from the CREATE above and hit this every time).
+        if let Err(e) =
+            sqlx::query("ALTER TABLE push_retries ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")
+                .execute(&pool)
+                .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(e);
+            }
+        }
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_push_retries_next_attempt
@@ -432,12 +456,18 @@ impl PushStore {
     ///
     /// `peer_addrs` is JSON-encoded by the caller to keep this method
     /// platform-agnostic (the relay never inspects the array contents).
+    ///
+    /// `is_alert` records whether the send being retried was an unbudgeted
+    /// ALERT-class send; a re-armed retry for the same `(topic, token)`
+    /// overwrites it with the latest value, matching how `peer_addrs` and
+    /// `attempts` are already re-armed on each UPSERT.
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_retry(
         &self,
         topic: &str,
         token: &str,
         platform: &str,
+        is_alert: bool,
         peer_addrs_json: &str,
         attempts: u32,
         next_attempt_at: i64,
@@ -448,12 +478,13 @@ impl PushStore {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO push_retries (
-                topic, token, platform, peer_addrs,
+                topic, token, platform, kind, peer_addrs,
                 attempts, next_attempt_at, first_failed_at,
                 last_error_kind, last_error_code, last_error_body
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(topic, token) DO UPDATE SET
                 platform = excluded.platform,
+                kind = excluded.kind,
                 peer_addrs = excluded.peer_addrs,
                 attempts = excluded.attempts,
                 next_attempt_at = excluded.next_attempt_at,
@@ -465,6 +496,7 @@ impl PushStore {
         .bind(topic)
         .bind(token)
         .bind(platform)
+        .bind(is_alert as i64)
         .bind(peer_addrs_json)
         .bind(attempts as i64)
         .bind(next_attempt_at)
@@ -498,7 +530,7 @@ impl PushStore {
     ) -> Result<Vec<RetryRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT topic, token, platform, peer_addrs,
-                    attempts, next_attempt_at, first_failed_at
+                    attempts, next_attempt_at, first_failed_at, kind
              FROM push_retries
              WHERE next_attempt_at <= ?1
              ORDER BY next_attempt_at ASC
@@ -516,6 +548,7 @@ impl PushStore {
                 let peer_addrs: Vec<String> =
                     serde_json::from_str(&peer_addrs_json).unwrap_or_default();
                 let attempts: i64 = row.get("attempts");
+                let kind: i64 = row.get("kind");
                 RetryRow {
                     topic: row.get("topic"),
                     token: row.get("token"),
@@ -524,6 +557,7 @@ impl PushStore {
                     attempts: attempts as u32,
                     next_attempt_at: row.get("next_attempt_at"),
                     first_failed_at: row.get("first_failed_at"),
+                    is_alert: kind != 0,
                 }
             })
             .collect())
@@ -988,6 +1022,7 @@ mod tests {
                 topic,
                 token,
                 "Fcm",
+                false,
                 r#"["/ip4/1.2.3.4/udp/4001/quic-v1"]"#,
                 1,
                 next,
@@ -1022,6 +1057,7 @@ mod tests {
                 "topic1",
                 "token-a",
                 "Fcm",
+                false,
                 r#"["/ip4/9.9.9.9/udp/4001/quic-v1"]"#,
                 3,
                 2000,
@@ -1038,6 +1074,65 @@ mod tests {
         assert_eq!(due[0].next_attempt_at, 2000);
         // Latest peer_addrs wins.
         assert_eq!(due[0].peer_addrs[0], "/ip4/9.9.9.9/udp/4001/quic-v1");
+    }
+
+    #[tokio::test]
+    async fn retry_kind_roundtrip() {
+        let store = mem_store().await;
+        // A silent (non-alert) retry defaults to is_alert = false.
+        enqueue_simple(&store, "topic1", "token-silent", 1000).await;
+        // An alert-class retry is recorded and survives the round trip.
+        store
+            .enqueue_retry(
+                "topic1",
+                "token-alert",
+                "Apns",
+                true,
+                r#"["/ip4/1.2.3.4/udp/4001/quic-v1"]"#,
+                1,
+                1000,
+                970,
+                "http_status",
+                Some(500),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let due = store.fetch_due_retries(1000, 10).await.unwrap();
+        assert_eq!(due.len(), 2);
+        let silent = due.iter().find(|r| r.token == "token-silent").unwrap();
+        let alert = due.iter().find(|r| r.token == "token-alert").unwrap();
+        assert!(!silent.is_alert);
+        assert!(alert.is_alert);
+    }
+
+    #[tokio::test]
+    async fn retry_kind_re_armed_on_upsert() {
+        let store = mem_store().await;
+        // First failure was a silent send.
+        enqueue_simple(&store, "topic1", "token-a", 1000).await;
+        // A later failure for the same (topic, token) was an alert send —
+        // the UPSERT must overwrite `kind`, not leave the stale value.
+        store
+            .enqueue_retry(
+                "topic1",
+                "token-a",
+                "Apns",
+                true,
+                r#"["/ip4/9.9.9.9/udp/4001/quic-v1"]"#,
+                2,
+                2000,
+                970,
+                "transport",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let due = store.fetch_due_retries(5000, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].is_alert);
     }
 
     #[tokio::test]
@@ -1146,5 +1241,75 @@ mod tests {
         let due = store.fetch_due_retries(100_000, 10).await.unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].token, "new");
+    }
+
+    /// A pre-#78 on-disk database has a `push_retries` table with no `kind`
+    /// column. `PushStore::open` must migrate it in place (guarded ALTER)
+    /// rather than erroring on "table already exists" from the `CREATE TABLE
+    /// IF NOT EXISTS`.
+    #[tokio::test]
+    async fn migration_adds_kind_column_to_existing_db() {
+        let path = std::env::temp_dir().join(format!(
+            "wavesync_relay_migration_test_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        // Simulate a pre-#78 database: create push_retries without `kind`,
+        // bypassing PushStore::open's up-to-date schema entirely.
+        {
+            let url = format!("sqlite:{path_str}?mode=rwc");
+            let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE push_retries (
+                    topic            TEXT NOT NULL,
+                    token            TEXT NOT NULL,
+                    platform         TEXT NOT NULL,
+                    peer_addrs       TEXT NOT NULL,
+                    attempts         INTEGER NOT NULL,
+                    next_attempt_at  INTEGER NOT NULL,
+                    first_failed_at  INTEGER NOT NULL,
+                    last_error_kind  TEXT NOT NULL,
+                    last_error_code  INTEGER,
+                    last_error_body  TEXT,
+                    PRIMARY KEY (topic, token)
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        // Reopening through the real path must migrate the existing table
+        // rather than fail, and the new column must actually work.
+        let store = PushStore::open(&path_str).await.unwrap();
+        store
+            .enqueue_retry(
+                "topic1",
+                "tok-a",
+                "Apns",
+                true,
+                r#"["/ip4/1.2.3.4/udp/4001/quic-v1"]"#,
+                1,
+                1000,
+                970,
+                "http_status",
+                Some(500),
+                None,
+            )
+            .await
+            .unwrap();
+        let due = store.fetch_due_retries(1000, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].is_alert);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 }

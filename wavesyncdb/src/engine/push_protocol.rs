@@ -36,6 +36,16 @@ pub enum PushRequest {
     NotifyTopic {
         topic: String,
         sender_site_id: String,
+        /// Whether this changeset touched at least one table with a
+        /// registered `SyncNotify` policy. Computed sender-side per
+        /// changeset — metadata only, never user-facing text. Drives the
+        /// relay's choice between an unbudgeted ALERT-class APNs send (a
+        /// realtime banner) and today's silent background wake.
+        /// `#[serde(default)]` keeps an old sender's un-tagged message
+        /// wire-compatible: it deserializes to `false`, i.e. today's
+        /// silent behavior exactly.
+        #[serde(default)]
+        visible: bool,
     },
     /// Sent by a peer on relay connect to announce presence for a topic
     /// and receive the list of other peers currently registered on that
@@ -214,6 +224,7 @@ mod tests {
         let req = PushRequest::NotifyTopic {
             topic: "topic-hash".to_string(),
             sender_site_id: "site-abc".to_string(),
+            visible: false,
         };
         let mut buf = Cursor::new(Vec::new());
         codec.write_request(&protocol, &mut buf, req).await.unwrap();
@@ -224,9 +235,56 @@ mod tests {
             PushRequest::NotifyTopic {
                 topic,
                 sender_site_id,
+                visible,
             } => {
                 assert_eq!(topic, "topic-hash");
                 assert_eq!(sender_site_id, "site-abc");
+                assert!(!visible);
+            }
+            _ => panic!("Expected NotifyTopic"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_codec_request_roundtrip_notify_visible() {
+        let mut codec = PushCodec;
+        let protocol = PUSH_PROTOCOL;
+        let req = PushRequest::NotifyTopic {
+            topic: "topic-hash".to_string(),
+            sender_site_id: "site-abc".to_string(),
+            visible: true,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        codec.write_request(&protocol, &mut buf, req).await.unwrap();
+        let written = buf.into_inner();
+        let mut reader = Cursor::new(written);
+        let result = codec.read_request(&protocol, &mut reader).await.unwrap();
+        match result {
+            PushRequest::NotifyTopic {
+                topic,
+                sender_site_id,
+                visible,
+            } => {
+                assert_eq!(topic, "topic-hash");
+                assert_eq!(sender_site_id, "site-abc");
+                assert!(visible);
+            }
+            _ => panic!("Expected NotifyTopic"),
+        }
+    }
+
+    /// A pre-#78 sender never wrote `visible` on the wire at all. The field
+    /// must deserialize to `false` in that case — old-format compatibility
+    /// is what keeps `visible`'s absence equivalent to today's silent
+    /// behavior rather than a hard decode failure.
+    #[test]
+    fn test_notify_topic_old_format_compat_defaults_to_not_visible() {
+        let old_format_json =
+            r#"{"NotifyTopic":{"topic":"topic-hash","sender_site_id":"site-abc"}}"#;
+        let req: PushRequest = serde_json::from_str(old_format_json).unwrap();
+        match req {
+            PushRequest::NotifyTopic { visible, .. } => {
+                assert!(!visible);
             }
             _ => panic!("Expected NotifyTopic"),
         }

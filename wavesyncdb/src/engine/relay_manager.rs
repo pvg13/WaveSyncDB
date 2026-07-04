@@ -760,8 +760,14 @@ impl EngineRunner {
     }
 
     /// Send a NotifyTopic request to the relay after pushing changesets to peers
-    /// for the group identified by `effective_topic`.
-    pub(super) fn notify_relay_topic(&mut self, effective_topic: &str) {
+    /// for the group identified by `effective_topic`. `visible` is computed
+    /// sender-side per changeset — true only when the changeset touched a
+    /// table with a registered `SyncNotify` policy — and tells the relay
+    /// whether it may spend an unbudgeted ALERT-class APNs send (realtime
+    /// banner) instead of today's silent background wake. Callers outside
+    /// the local-changeset path (no changeset content to inspect) must pass
+    /// `false`.
+    pub(super) fn notify_relay_topic(&mut self, effective_topic: &str, visible: bool) {
         let relay_peer_id = match &self.relay_state {
             RelayState::Connected { relay_peer_id, .. }
             | RelayState::Listening { relay_peer_id } => *relay_peer_id,
@@ -786,6 +792,7 @@ impl EngineRunner {
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>(),
+            visible,
         };
 
         tracing::info!(
