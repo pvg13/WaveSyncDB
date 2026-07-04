@@ -13,25 +13,33 @@
 //! file, `.wavesync_group_keys.json`, keyed by the plaintext user topic. The
 //! NSE reads that file — a 32-byte load, not a KDF — and gets a ready-made
 //! key. If the cache is missing (fresh install, cache cleared, or the app
-//! never got a chance to warm it), the NSE has no way to derive the key
-//! itself; the sync for that wake simply doesn't happen and the OS shows the
-//! operator's placeholder alert content instead (safe fallback by
-//! construction — see `ffi::wavesync_nse_handle_push`).
+//! never got a chance to warm it), the NSE is invoked with
+//! `key_cache_load_only = true` (`connection::group_key_for_dir`'s
+//! `load_only` parameter), which turns a miss into
+//! `GroupKeyLoadOnlyMiss` instead of a fallback derivation — the branch that
+//! would call `GroupKey::from_passphrase` is textually unreachable in that
+//! mode, so "never runs the KDF inside the NSE" is enforced by the code
+//! shape, not just documented as a convention. The sync for that wake simply
+//! doesn't happen and the OS shows the operator's placeholder alert content
+//! instead (safe fallback by construction — see `ffi::wavesync_nse_handle_push`).
 //!
 //! This module holds only the pure load/save logic and is compiled on every
 //! native target so it can be unit-tested on the host. Whether it is ever
 //! *called* is gated at the call sites (`connection::group_key_for_dir`) to
-//! `#[cfg(target_os = "ios")]` — every other platform's process budget can
-//! afford the KDF outright and gains nothing from caching key material to
-//! disk (and every unnecessary copy of a symmetric secret at rest is a cost,
-//! not a feature).
+//! `#[cfg(any(target_os = "ios", test))]` — every other platform's process
+//! budget can afford the KDF outright and gains nothing from caching key
+//! material to disk (and every unnecessary copy of a symmetric secret at
+//! rest is a cost, not a feature). The `test` half of that cfg exists solely
+//! so the load-only contract itself is host-testable; production non-iOS
+//! builds never consult this cache.
 //!
-//! **At-rest protection**: this module only writes bytes; it does not set
-//! any iOS data-protection class. The app is expected to mark the cache file
-//! `NSFileProtectionCompleteUntilFirstUserAuthentication` from Swift (the
-//! same class `WaveSyncPushHandler` already uses for the APNs token file) —
+//! **At-rest protection**: `save_group_key` best-effort calls the bundled
+//! Swift `wavesync_protect_file` helper (via `dlsym`, iOS only) to mark the
+//! cache file `NSFileProtectionCompleteUntilFirstUserAuthentication` — the
+//! same class `WaveSyncPushHandler` already uses for the APNs token file —
 //! background-launchable (the NSE can run before first unlock) while still
-//! encrypted at rest. See the `WaveSyncNotificationService` template.
+//! encrypted at rest. See `protect_file` and the `WaveSyncNotificationService`
+//! template.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -87,8 +95,11 @@ fn load_map(dir: &Path) -> HashMap<String, String> {
 /// Atomic: writes to a sibling temp file and renames over the real path, so
 /// a process kill mid-write (very much the normal case for anything sharing
 /// a codepath with the NSE) never leaves a truncated or half-written cache
-/// for the next reader to choke on.
-pub fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
+/// for the next reader to choke on. On unix the temp file is created with
+/// `0o600` from the moment it exists (see `write_tmp_file`) — `rename`
+/// preserves those permissions onto the final path, so there is never a
+/// window where the key material is readable beyond the owner.
+pub(crate) fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
     let mut map = load_map(dir);
     map.insert(topic_name.to_string(), encode_hex(key));
 
@@ -102,7 +113,7 @@ pub fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
 
     let path = cache_path(dir);
     let tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
-    if let Err(e) = std::fs::write(&tmp_path, &json) {
+    if let Err(e) = write_tmp_file(&tmp_path, &json) {
         tracing::warn!(
             "key_cache: failed to write temp cache file {}: {e}",
             tmp_path.display()
@@ -118,15 +129,80 @@ pub fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
         return;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+    // Best-effort iOS data protection: mark the cache file so the NSE can
+    // still read it before first unlock while it stays encrypted at rest.
+    // See `protect_file`'s docs.
+    #[cfg(target_os = "ios")]
+    protect_file(&path);
+}
+
+/// Write `contents` to `path`, restricted to owner-only permissions for its
+/// entire existence on unix — no window between "file exists" and "file is
+/// locked down" for another local user/process to read it in.
+#[cfg(unix)]
+fn write_tmp_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `.mode()` above only governs permissions at creation time; a stale
+    // tmp file left over from a killed previous run (this path is shared
+    // with the NSE, which the OS can and does kill mid-write) could already
+    // exist with looser permissions. Fix them up unconditionally rather
+    // than trusting that this call always creates the file fresh.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_tmp_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
+/// Best-effort iOS data-protection: calls the bundled Swift
+/// `wavesync_protect_file` C-ABI helper (`WaveSyncPushBridge.swift`) to mark
+/// `path` `NSFileProtectionCompleteUntilFirstUserAuthentication` — the same
+/// protection class already used for the APNs token file
+/// (`WaveSyncPushHandler`), chosen so the Notification Service Extension can
+/// still read this cache before first unlock while it stays encrypted at
+/// rest. Resolved via `dlsym`, mirroring
+/// `dioxus::notifications::show_ios_notification`'s pattern for calling into
+/// the already-loaded WaveSyncPush framework; a no-op if the symbol can't be
+/// resolved (host app hasn't linked WaveSyncPush, or linked a version
+/// predating this helper).
+#[cfg(target_os = "ios")]
+fn protect_file(path: &Path) {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_void};
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
+    type ProtectFn = unsafe extern "C" fn(*const c_char);
+
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+    let Ok(path_c) = CString::new(path_str) else {
+        return;
+    };
+
+    unsafe {
+        let sym = dlsym(RTLD_DEFAULT, c"wavesync_protect_file".as_ptr());
+        if sym.is_null() {
             tracing::warn!(
-                "key_cache: could not restrict permissions on {}: {e}",
-                path.display()
+                "key_cache: wavesync_protect_file not found (WaveSyncPush framework not loaded?)"
             );
+            return;
         }
+        let protect: ProtectFn = std::mem::transmute(sym);
+        protect(path_c.as_ptr());
     }
 }
 
@@ -134,7 +210,7 @@ pub fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
 /// every failure mode — missing file, unreadable, corrupt JSON, wrong shape,
 /// malformed hex, or no entry for this topic — so a caller can always treat
 /// `None` uniformly as "derive it yourself"; this function never panics.
-pub fn load_group_key(dir: &Path, topic_name: &str) -> Option<[u8; 32]> {
+pub(crate) fn load_group_key(dir: &Path, topic_name: &str) -> Option<[u8; 32]> {
     let map = load_map(dir);
     map.get(topic_name).and_then(|hex| decode_hex(hex))
 }
@@ -215,6 +291,45 @@ mod tests {
         save_group_key(&dir, "roommates", &[2u8; 32]);
         assert_eq!(load_group_key(&dir, "roommates"), Some([2u8; 32]));
         assert!(!dir.join(".wavesync_group_keys.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_file_is_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        save_group_key(&dir, "roommates", &[1u8; 32]);
+        let mode = std::fs::metadata(dir.join(".wavesync_group_keys.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "cache file must never be group/world-readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_loose_permission_tmp_file_is_locked_down_before_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let tmp_path = dir.join(".wavesync_group_keys.json.tmp");
+        // Simulate a leftover tmp file from a killed previous run, with
+        // default (loose) permissions.
+        std::fs::write(&tmp_path, b"stale").unwrap();
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_group_key(&dir, "roommates", &[9u8; 32]);
+
+        // The tmp file is renamed away, but if it still existed the fix-up
+        // in `write_tmp_file` guarantees it would be 0o600, never the stale
+        // 0o644 — proven indirectly here by the final path's permissions
+        // (renamed from that same, now-locked-down, tmp file).
+        let mode = std::fs::metadata(dir.join(".wavesync_group_keys.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

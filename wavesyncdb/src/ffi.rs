@@ -415,14 +415,17 @@ fn nse_result_json(synced: bool, title: Option<String>, body: Option<String>) ->
 /// so callers should pass something well under that, leaving room for
 /// process teardown.
 ///
-/// The KDF (Argon2id, ~19 MiB) is **never** run here:
-/// `background_sync_with_capture` derives group keys via
-/// `connection::group_key_for_dir`, which on iOS tries the on-disk
-/// group-key cache first (see the `key_cache` module) and simply can't sync
-/// a group whose key isn't already cached there. In that case (or on
-/// timeout) the caller sees `synced: false` with no title/body and falls
-/// back to the operator's placeholder alert content — a safe fallback by
-/// construction, not a special case this function has to detect.
+/// The KDF (Argon2id, ~19 MiB) can **never** run here, by construction: this
+/// function calls `background_sync_with_capture` with `key_cache_load_only =
+/// true`, which threads through to every group-key derivation the sync makes
+/// (`connection::group_key_for_dir`) and turns a cache miss into an error
+/// instead of a fallback derivation — the branch that would call
+/// `GroupKey::from_passphrase` is unreachable in load-only mode (see
+/// `GroupKeyLoadOnlyMiss`). A group whose key isn't already cached there
+/// simply can't be synced. In that case (or on timeout) the caller sees
+/// `synced: false` with no title/body and falls back to the operator's
+/// placeholder alert content — a safe fallback by construction, not a
+/// special case this function has to detect.
 ///
 /// Returns a JSON string `{"synced": bool, "title": string|null, "body":
 /// string|null}` — `title`/`body` are the last captured `SyncNotify`
@@ -496,6 +499,9 @@ pub extern "C" fn wavesync_nse_handle_push(
             budget,
             &peer_addrs,
             Some(&topic),
+            // Never let the NSE's sync fall back to running the KDF — see
+            // this function's doc comment.
+            true,
         )
         .await
         {

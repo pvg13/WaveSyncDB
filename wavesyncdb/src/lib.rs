@@ -73,13 +73,15 @@ pub mod connection;
 pub mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
-// On-disk cache for derived group keys (iOS only at the call sites — see
-// module docs). Compiled on every native target so its pure load/save logic
-// is host-testable regardless of platform.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]
 mod ffi;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod key_cache;
+// On-disk cache for derived group keys. Only ever called from
+// `connection::group_key_for_dir` on iOS — every other platform's process
+// budget affords the KDF directly (see module docs). Also compiled under
+// `cfg(test)` on every native target so the load-only contract is
+// host-testable; a plain non-iOS build never links it in.
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "ios", test)))]
+pub(crate) mod key_cache;
 // Lets an app resolve the iOS App Group container directory it shares with
 // its Notification Service Extension, so both point their `WaveSyncDbBuilder`
 // at the same directory. See `ffi::wavesync_app_group_container`'s docs.

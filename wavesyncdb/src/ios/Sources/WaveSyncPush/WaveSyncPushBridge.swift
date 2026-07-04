@@ -139,6 +139,28 @@ public func wavesync_show_notification(
     }
 }
 
+/// Mark a file `NSFileProtectionCompleteUntilFirstUserAuthentication`.
+///
+/// Called from Rust (`key_cache::save_group_key`) via `dlsym` after writing
+/// the on-disk group-key cache — same dyld-lazy-resolution idiom as
+/// `wavesync_show_notification` above. This protection class matches the one
+/// `WaveSyncPushHandler.writeDeviceToken` already uses for the APNs token
+/// file: background-launchable (the Notification Service Extension can read
+/// it before first unlock) while the file stays encrypted at rest whenever
+/// the device is locked. Best-effort — a failure is logged, never fatal.
+@_cdecl("wavesync_protect_file")
+public func wavesync_protect_file(_ pathPtr: UnsafePointer<CChar>?) {
+    guard let pathPtr = pathPtr else { return }
+    let path = String(cString: pathPtr)
+    do {
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: path)
+    } catch {
+        NSLog("[WaveSync] Failed to protect file %@: %@", path, error.localizedDescription)
+    }
+}
+
 @_cdecl("wavesync_push_bridge_did_receive")
 public func wavesync_push_bridge_did_receive(
     _ userInfoPtr: UnsafeRawPointer?,

@@ -42,43 +42,159 @@ pub(crate) fn key_cache_dir(database_url: &str) -> Option<PathBuf> {
     SyncConfig::config_path(database_url).and_then(|p| p.parent().map(PathBuf::from))
 }
 
+/// Returned by [`group_key_for_dir`] when called with `load_only: true` and
+/// the on-disk cache has no entry for the requested topic.
+///
+/// The Notification Service Extension (NSE) sets `load_only` because its
+/// ~24 MB memory cap can't afford Argon2id's ~19 MiB footprint (see the
+/// `key_cache` module docs) — a miss in this mode must surface as a failure
+/// the caller can turn into the uniform "sync didn't happen" fallback,
+/// never as a reason to derive the key itself. This is what makes "the KDF
+/// never runs inside the NSE" true by construction rather than a documented
+/// convention: the branch that would call `GroupKey::from_passphrase` is
+/// textually unreachable once this error is returned.
+#[derive(Debug)]
+pub(crate) struct GroupKeyLoadOnlyMiss;
+
 /// Derive a group key for `(passphrase, user_topic)`, consulting the on-disk
 /// cache first when `cache_enabled` and a `cache_dir` are both available.
 ///
 /// iOS only: the Notification Service Extension's ~24 MB memory cap can't
 /// afford Argon2id's ~19 MiB (see `key_cache` module docs), so on iOS a cache
-/// hit skips the KDF entirely, and a miss derives fresh and writes the
-/// result back so a later NSE wake finds it. Every other platform's process
-/// budget can run the KDF outright, so this always derives fresh there —
-/// `cache_dir`/`cache_enabled` are accepted uniformly so call sites don't
-/// need a per-platform branch, but are unused off iOS.
-#[cfg(target_os = "ios")]
+/// hit skips the KDF entirely, and (outside load-only mode) a miss derives
+/// fresh and writes the result back so a later NSE wake finds it. Every
+/// other platform's process budget can run the KDF outright, so this always
+/// derives fresh there — `cache_dir`/`cache_enabled` are accepted uniformly
+/// so call sites don't need a per-platform branch, but are unused off iOS.
+///
+/// `load_only`, when `true`, forbids deriving on a cache miss altogether:
+/// the function returns [`GroupKeyLoadOnlyMiss`] instead. Only the NSE path
+/// (`background_sync_core`, set via `WaveSyncDbBuilder::with_key_cache_load_only`
+/// / `WaveSyncNode::join_group_load_only`) ever passes `true`; every
+/// foreground caller passes `false` and this can never error for them.
+///
+/// Compiled under `#[cfg(test)]` on every platform (not just iOS) so the
+/// load-only contract is host-testable — see the tests below. Only the iOS
+/// build ever *calls* this variant in production; every other platform's
+/// production build uses the `derive`-only variant further down.
+#[cfg(any(target_os = "ios", test))]
 pub(crate) fn group_key_for_dir(
     passphrase: &str,
     user_topic: &str,
     cache_dir: Option<&std::path::Path>,
     cache_enabled: bool,
-) -> GroupKey {
+    load_only: bool,
+) -> Result<GroupKey, GroupKeyLoadOnlyMiss> {
     if cache_enabled && let Some(dir) = cache_dir {
         if let Some(bytes) = crate::key_cache::load_group_key(dir, user_topic) {
             tracing::debug!("wavesync: group-key cache hit for topic '{user_topic}'");
-            return GroupKey::from_raw(bytes);
+            return Ok(GroupKey::from_raw(bytes));
+        }
+        if load_only {
+            tracing::debug!(
+                "wavesync: group-key cache miss for topic '{user_topic}' in load-only \
+                 mode — refusing to run the KDF"
+            );
+            return Err(GroupKeyLoadOnlyMiss);
         }
         let key = GroupKey::from_passphrase(passphrase, user_topic);
         crate::key_cache::save_group_key(dir, user_topic, key.as_bytes());
-        return key;
+        return Ok(key);
     }
-    GroupKey::from_passphrase(passphrase, user_topic)
+    if load_only {
+        // No usable cache at all (disabled, or no directory) — load-only
+        // still must not fall back to deriving.
+        return Err(GroupKeyLoadOnlyMiss);
+    }
+    Ok(GroupKey::from_passphrase(passphrase, user_topic))
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", test)))]
 pub(crate) fn group_key_for_dir(
     passphrase: &str,
     user_topic: &str,
     _cache_dir: Option<&std::path::Path>,
     _cache_enabled: bool,
-) -> GroupKey {
-    GroupKey::from_passphrase(passphrase, user_topic)
+    _load_only: bool,
+) -> Result<GroupKey, GroupKeyLoadOnlyMiss> {
+    // Off iOS the on-disk cache is never consulted, so `load_only` has
+    // nothing to bite on — this can never error.
+    Ok(GroupKey::from_passphrase(passphrase, user_topic))
+}
+
+#[cfg(test)]
+mod group_key_for_dir_tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wavesync_group_key_for_dir_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn load_only_cache_miss_errors_without_deriving() {
+        let dir = temp_dir(); // empty — no cache file at all
+        let result = group_key_for_dir(
+            "correct horse battery staple",
+            "roommates",
+            Some(&dir),
+            true,
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "load-only mode must error on a cache miss, never derive"
+        );
+    }
+
+    #[test]
+    fn load_only_missing_cache_dir_errors_without_deriving() {
+        let result = group_key_for_dir("pw", "topic", None, true, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_only_cache_disabled_errors_without_deriving() {
+        let dir = temp_dir();
+        let result = group_key_for_dir("pw", "topic", Some(&dir), false, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_only_cache_hit_returns_cached_key_ignoring_passphrase() {
+        let dir = temp_dir();
+        // Simulate a key the foreground app already warmed with the REAL
+        // passphrase.
+        let real_key = GroupKey::from_passphrase("hunter2", "roommates");
+        crate::key_cache::save_group_key(&dir, "roommates", real_key.as_bytes());
+
+        // A wrong passphrase is passed here — load-only must never touch it;
+        // the cache hit is the only source of truth.
+        let result = group_key_for_dir(
+            "totally-wrong-passphrase",
+            "roommates",
+            Some(&dir),
+            true,
+            true,
+        )
+        .expect("cache hit must succeed even with a mismatched passphrase argument");
+        assert_eq!(result.as_bytes(), real_key.as_bytes());
+    }
+
+    #[test]
+    fn non_load_only_cache_miss_still_derives_and_saves() {
+        let dir = temp_dir();
+        let result = group_key_for_dir("pw", "topic", Some(&dir), true, false);
+        assert!(result.is_ok());
+        assert!(
+            crate::key_cache::load_group_key(&dir, "topic").is_some(),
+            "a normal (non-load-only) miss must derive and warm the cache"
+        );
+    }
 }
 
 /// Node-level shared state: the single libp2p engine and everything that is
@@ -1565,6 +1681,14 @@ pub struct WaveSyncDbBuilder {
     /// Whether the on-disk group-key cache is enabled. iOS only — see
     /// `with_group_key_cache`.
     group_key_cache_enabled: bool,
+    /// NSE-only: forbid `with_passphrase` from deriving on a cache miss. See
+    /// `with_key_cache_load_only`.
+    key_cache_load_only: bool,
+    /// Set by `with_passphrase` when `key_cache_load_only` was on and the
+    /// cache missed. `build()` fails closed on this instead of silently
+    /// proceeding with no group key (which would mean an unauthenticated,
+    /// unencrypted topic — the opposite of what a passphrase was asked for).
+    key_cache_load_only_miss: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1598,6 +1722,8 @@ impl WaveSyncDbBuilder {
             tombstone_retention: None,
             ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
             group_key_cache_enabled: true,
+            key_cache_load_only: false,
+            key_cache_load_only_miss: false,
         }
     }
 
@@ -1785,15 +1911,35 @@ impl WaveSyncDbBuilder {
         // `WaveSyncDbBuilder::new`) — intentionally slow, runs once here.
         // On iOS with the group-key cache enabled, a cache hit skips the KDF
         // entirely (see `group_key_for_dir` / the `key_cache` module); a
-        // miss still derives here and writes the result back.
+        // miss still derives here and writes the result back — unless
+        // `key_cache_load_only` is set (NSE only), in which case a miss
+        // must not derive at all; `build()` fails closed on that below.
         let cache_dir = key_cache_dir(&self.database_url);
-        self.group_key = Some(group_key_for_dir(
+        match group_key_for_dir(
             passphrase,
             &self.topic,
             cache_dir.as_deref(),
             self.group_key_cache_enabled,
-        ));
+            self.key_cache_load_only,
+        ) {
+            Ok(key) => self.group_key = Some(key),
+            Err(GroupKeyLoadOnlyMiss) => {
+                self.group_key = None;
+                self.key_cache_load_only_miss = true;
+            }
+        }
         self.passphrase = Some(passphrase.to_string());
+        self
+    }
+
+    /// NSE-only: when set, a group-key cache miss in `with_passphrase` (and
+    /// `WaveSyncNode::join_group_load_only`) never falls back to running the
+    /// KDF — `build()` fails instead. Set by `background_sync_core` only
+    /// when servicing `wavesync_nse_handle_push`; every other caller leaves
+    /// this at the default `false`, under which this can never change
+    /// behavior. See [`GroupKeyLoadOnlyMiss`].
+    pub(crate) fn with_key_cache_load_only(mut self, load_only: bool) -> Self {
+        self.key_cache_load_only = load_only;
         self
     }
 
@@ -1897,6 +2043,18 @@ impl WaveSyncDbBuilder {
 
     #[allow(unused_mut)]
     pub async fn build(mut self) -> Result<WaveSyncDb, DbErr> {
+        // Fail closed rather than silently building an unauthenticated,
+        // unencrypted group: `with_passphrase` only sets this when
+        // `key_cache_load_only` (NSE only) forbade deriving on a cache miss.
+        // Checked before any other work so the NSE's fast fallback path
+        // costs nothing beyond this one check.
+        if self.key_cache_load_only_miss {
+            return Err(DbErr::Custom(
+                "group key cache miss in load-only mode (NSE): refusing to derive via KDF"
+                    .to_string(),
+            ));
+        }
+
         // Auto-read FCM token from file written by WaveSyncInitProvider / WaveSyncService.
         // The ContentProvider writes the token on a background thread at app startup,
         // so we retry a few times with a short delay to handle the race.
@@ -2257,6 +2415,33 @@ impl WaveSyncNode {
         passphrase: &str,
         kind: Option<&str>,
     ) -> Result<WaveSyncDb, DbErr> {
+        self.join_group_inner(user_topic, passphrase, kind, false)
+            .await
+    }
+
+    /// NSE-only sibling of [`join_group`](Self::join_group): identical except
+    /// a group-key cache miss returns an error instead of running the KDF —
+    /// see [`GroupKeyLoadOnlyMiss`] and
+    /// `WaveSyncDbBuilder::with_key_cache_load_only`. Used by
+    /// `background_sync_core` when rejoining extra groups for
+    /// `wavesync_nse_handle_push`.
+    pub(crate) async fn join_group_load_only(
+        &self,
+        user_topic: &str,
+        passphrase: &str,
+        kind: Option<&str>,
+    ) -> Result<WaveSyncDb, DbErr> {
+        self.join_group_inner(user_topic, passphrase, kind, true)
+            .await
+    }
+
+    async fn join_group_inner(
+        &self,
+        user_topic: &str,
+        passphrase: &str,
+        kind: Option<&str>,
+        load_only: bool,
+    ) -> Result<WaveSyncDb, DbErr> {
         // Idempotency: return the existing handle if still alive. A dead `Weak`
         // (handle already dropped) falls through to a fresh join.
         if let Some(inner) = self
@@ -2278,7 +2463,14 @@ impl WaveSyncNode {
             user_topic,
             cache_dir.as_deref(),
             self.inner.group_key_cache_enabled,
-        );
+            load_only,
+        )
+        .map_err(|_| {
+            DbErr::Custom(format!(
+                "group key cache miss for topic '{user_topic}' in load-only mode (NSE): \
+                 refusing to derive via KDF"
+            ))
+        })?;
         let effective_topic = group_key.derive_topic(user_topic);
 
         // Per-group DB file derived from the node's base URL. The effective

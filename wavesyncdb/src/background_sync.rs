@@ -122,6 +122,7 @@ pub async fn background_sync_with_peers_for_topic(
         peer_addrs,
         target_effective_topic,
         false,
+        false,
     )
     .await
     .map(|(result, _)| result)
@@ -139,11 +140,18 @@ pub async fn background_sync_with_peers_for_topic(
 /// same gate) — most callers only need `.last()`. Empty on timeout, no
 /// matching `SyncNotify` policy, or nothing that policy considered
 /// notify-worthy — exactly like a foreground session seeing nothing.
+///
+/// `key_cache_load_only`, when `true`, forbids every group-key derivation this
+/// call makes (default group and every rejoined extra group) from running the
+/// KDF on a cache miss — the miss is surfaced as a sync failure for that group
+/// instead. `wavesync_nse_handle_push` always passes `true`: this is what
+/// keeps the ~19 MiB Argon2id derivation out of the NSE's ~24 MB budget.
 pub async fn background_sync_with_capture(
     database_url: &str,
     timeout: Duration,
     peer_addrs: &[String],
     target_effective_topic: Option<&str>,
+    key_cache_load_only: bool,
 ) -> Result<(BackgroundSyncResult, Vec<crate::notify::Notification>), BackgroundSyncError> {
     background_sync_core(
         database_url,
@@ -151,6 +159,7 @@ pub async fn background_sync_with_capture(
         peer_addrs,
         target_effective_topic,
         true,
+        key_cache_load_only,
     )
     .await
 }
@@ -160,13 +169,17 @@ pub async fn background_sync_with_capture(
 /// collects every [`Notification`](crate::notify::Notification) produced
 /// while syncing (see [`background_sync_with_capture`]'s docs); when false
 /// the collection is skipped entirely, so the non-capturing FFI entry point
-/// (`run_background_sync`) pays no extra cost.
+/// (`run_background_sync`) pays no extra cost. `key_cache_load_only` is
+/// documented on [`background_sync_with_capture`]; every non-NSE caller in
+/// this file passes `false`, under which this function's group-key handling
+/// is byte-for-byte what it was before load-only mode existed.
 async fn background_sync_core(
     database_url: &str,
     timeout: Duration,
     peer_addrs: &[String],
     target_effective_topic: Option<&str>,
     capture: bool,
+    key_cache_load_only: bool,
 ) -> Result<(BackgroundSyncResult, Vec<crate::notify::Notification>), BackgroundSyncError> {
     // Per-stage timing. When a sync round is slow (sometimes hits the 25s
     // timeout while typical runs are 2–3s), the question is always "where
@@ -202,7 +215,8 @@ async fn background_sync_core(
 
     // 2. Reconstruct the builder
     let mut builder = WaveSyncDbBuilder::new(database_url, &config.topic)
-        .with_group_key_cache(config.group_key_cache_enabled);
+        .with_group_key_cache(config.group_key_cache_enabled)
+        .with_key_cache_load_only(key_cache_load_only);
 
     if let Some(ref relay) = config.relay_server {
         builder = builder.with_relay_server(relay);
@@ -224,6 +238,7 @@ async fn background_sync_core(
     {
         builder = WaveSyncDbBuilder::new(database_url, &config.topic)
             .with_group_key_cache(config.group_key_cache_enabled)
+            .with_key_cache_load_only(key_cache_load_only)
             .managed_relay(relay, api_key);
         // Re-apply other settings
         if !config.relay_fallbacks.is_empty() {
@@ -299,18 +314,27 @@ async fn background_sync_core(
     // may need to check several extra groups' effective topics against the
     // push payload's topic before finding (or failing to find) a match.
     let cache_dir = crate::connection::key_cache_dir(database_url);
+    // Falls back to the plaintext topic if this can't be derived (only
+    // possible in load-only mode, and only if the default group's key
+    // somehow wasn't cached — which `builder.build()` above would already
+    // have failed on, so this is unreachable in practice; the fallback is
+    // just defensive). It's only ever used for topic-string comparison
+    // below, never for anything cryptographic.
     let default_effective = derive_effective_topic(
         &config.topic,
         config.passphrase.as_deref(),
         cache_dir.as_deref(),
         config.group_key_cache_enabled,
-    );
+        key_cache_load_only,
+    )
+    .unwrap_or_else(|| config.topic.clone());
     let selected = groups_to_rejoin(
         target_effective_topic,
         &default_effective,
         &extra_groups,
         cache_dir.as_deref(),
         config.group_key_cache_enabled,
+        key_cache_load_only,
     );
     if let Some(target) = target_effective_topic {
         tracing::info!(
@@ -322,11 +346,19 @@ async fn background_sync_core(
     let mut _group_handles: Vec<crate::WaveSyncDb> = Vec::new();
     for &idx in &selected {
         let group = &extra_groups[idx];
-        match db
-            .node()
-            .join_group(&group.user_topic, &group.passphrase, group.kind.as_deref())
-            .await
-        {
+        // `join_group_load_only` never derives on a cache miss (NSE path);
+        // `join_group` is the normal, KDF-allowed path every other caller
+        // uses.
+        let join_result = if key_cache_load_only {
+            db.node()
+                .join_group_load_only(&group.user_topic, &group.passphrase, group.kind.as_deref())
+                .await
+        } else {
+            db.node()
+                .join_group(&group.user_topic, &group.passphrase, group.kind.as_deref())
+                .await
+        };
+        match join_result {
             Ok(group_db) => {
                 if let Some(ref cn) = crate_name {
                     if let Err(e) = group_db.get_schema_registry(cn).sync().await {
@@ -555,16 +587,25 @@ fn scaled_completion_grace(base: Duration, timeout: Duration) -> Duration {
 /// derives fresh. Passing `None`/`true` (or `false`) is always safe — it's
 /// exactly "no cache available", which any non-iOS caller (including every
 /// test in this module) already is.
+///
+/// Returns `None` only when `load_only` forbade deriving and the cache
+/// missed — the caller can't know this group's effective topic without
+/// running the KDF, and load-only mode means it must not. Off iOS this can
+/// never happen (`group_key_for_dir` ignores `load_only` there).
 fn derive_effective_topic(
     user_topic: &str,
     passphrase: Option<&str>,
     cache_dir: Option<&std::path::Path>,
     cache_enabled: bool,
-) -> String {
+    load_only: bool,
+) -> Option<String> {
     match passphrase {
-        Some(p) => crate::connection::group_key_for_dir(p, user_topic, cache_dir, cache_enabled)
-            .derive_topic(user_topic),
-        None => user_topic.to_string(),
+        Some(p) => {
+            crate::connection::group_key_for_dir(p, user_topic, cache_dir, cache_enabled, load_only)
+                .ok()
+                .map(|k| k.derive_topic(user_topic))
+        }
+        None => Some(user_topic.to_string()),
     }
 }
 
@@ -577,17 +618,22 @@ fn derive_effective_topic(
 /// * target matches nothing known → all groups (safe fallback; the relay should
 ///   only ever push a topic we registered for, so this is belt-and-suspenders).
 ///
-/// `cache_dir`/`cache_enabled` are forwarded to [`derive_effective_topic`] for
-/// each group checked — see that function's docs. This matters most for a
-/// targeted (NSE) wake with several extra groups configured: without a cache
-/// hit, checking each one against the payload's topic would re-run Argon2id
-/// once per group just to find (or rule out) a match.
+/// `cache_dir`/`cache_enabled`/`load_only` are forwarded to
+/// [`derive_effective_topic`] for each group checked — see that function's
+/// docs. This matters most for a targeted (NSE) wake with several extra
+/// groups configured: without a cache hit, checking each one against the
+/// payload's topic would otherwise re-run Argon2id once per group just to
+/// find (or rule out) a match — `load_only` forbids that; a group whose
+/// effective topic can't be determined without deriving is simply treated as
+/// not matching (its actual rejoin attempt below will independently, and
+/// harmlessly, fail the same cache-miss check).
 fn groups_to_rejoin(
     target_effective_topic: Option<&str>,
     default_effective: &str,
     groups: &[crate::connection::GroupConfig],
     cache_dir: Option<&std::path::Path>,
     cache_enabled: bool,
+    load_only: bool,
 ) -> Vec<usize> {
     let Some(target) = target_effective_topic else {
         return (0..groups.len()).collect();
@@ -599,8 +645,14 @@ fn groups_to_rejoin(
         .iter()
         .enumerate()
         .filter(|(_, g)| {
-            derive_effective_topic(&g.user_topic, Some(&g.passphrase), cache_dir, cache_enabled)
-                == target
+            derive_effective_topic(
+                &g.user_topic,
+                Some(&g.passphrase),
+                cache_dir,
+                cache_enabled,
+                load_only,
+            )
+            .is_some_and(|eff| eff == target)
         })
         .map(|(i, _)| i)
         .collect();
@@ -626,26 +678,44 @@ mod tests {
         }
     }
 
+    /// Convenience for tests: the non-load-only path never returns `None`.
+    fn eff(
+        user_topic: &str,
+        passphrase: Option<&str>,
+        cache_dir: Option<&std::path::Path>,
+        cache_enabled: bool,
+    ) -> String {
+        derive_effective_topic(user_topic, passphrase, cache_dir, cache_enabled, false)
+            .expect("non-load-only derivation never misses")
+    }
+
     #[test]
     fn no_target_rejoins_all_groups() {
         let groups = vec![group("beta", "pb"), group("gamma", "pg")];
-        let sel = groups_to_rejoin(None, "wavesync-default", &groups, None, true);
+        let sel = groups_to_rejoin(None, "wavesync-default", &groups, None, true, false);
         assert_eq!(sel, vec![0, 1]);
     }
 
     #[test]
     fn target_default_rejoins_nothing() {
         let groups = vec![group("beta", "pb")];
-        let default_eff = derive_effective_topic("alpha", Some("pa"), None, true);
-        let sel = groups_to_rejoin(Some(&default_eff), &default_eff, &groups, None, true);
+        let default_eff = eff("alpha", Some("pa"), None, true);
+        let sel = groups_to_rejoin(Some(&default_eff), &default_eff, &groups, None, true, false);
         assert!(sel.is_empty(), "default-targeted wake skips extra groups");
     }
 
     #[test]
     fn target_extra_rejoins_only_that_group() {
         let groups = vec![group("beta", "pb"), group("gamma", "pg")];
-        let beta_eff = derive_effective_topic("beta", Some("pb"), None, true);
-        let sel = groups_to_rejoin(Some(&beta_eff), "wavesync-default", &groups, None, true);
+        let beta_eff = eff("beta", Some("pb"), None, true);
+        let sel = groups_to_rejoin(
+            Some(&beta_eff),
+            "wavesync-default",
+            &groups,
+            None,
+            true,
+            false,
+        );
         assert_eq!(sel, vec![0], "only the targeted extra group is rejoined");
     }
 
@@ -658,6 +728,7 @@ mod tests {
             &groups,
             None,
             true,
+            false,
         );
         assert_eq!(sel, vec![0, 1], "unknown target falls back to all groups");
     }
@@ -665,20 +736,14 @@ mod tests {
     #[test]
     fn effective_topic_matches_engine_semantics() {
         // No passphrase → effective == user topic (mirrors engine::run_engine).
-        assert_eq!(derive_effective_topic("plain", None, None, true), "plain");
+        assert_eq!(eff("plain", None, None, true), "plain");
         // With passphrase → derived hash, stable and != the raw topic.
-        let eff = derive_effective_topic("plain", Some("secret"), None, true);
-        assert!(eff.starts_with("wavesync2-"));
-        assert_ne!(eff, "plain");
+        let topic = eff("plain", Some("secret"), None, true);
+        assert!(topic.starts_with("wavesync2-"));
+        assert_ne!(topic, "plain");
         // Same inputs → same output; different passphrase → different topic.
-        assert_eq!(
-            eff,
-            derive_effective_topic("plain", Some("secret"), None, true)
-        );
-        assert_ne!(
-            eff,
-            derive_effective_topic("plain", Some("other"), None, true)
-        );
+        assert_eq!(topic, eff("plain", Some("secret"), None, true));
+        assert_ne!(topic, eff("plain", Some("other"), None, true));
     }
 
     #[test]
@@ -687,9 +752,67 @@ mod tests {
         // regardless of `cache_enabled`/`cache_dir` — this pins that down so
         // a future iOS-only behavior change can't silently regress host
         // (Linux/macOS dev, CI) derivation.
-        let with_cache_flag = derive_effective_topic("plain", Some("secret"), None, true);
-        let without_cache_flag = derive_effective_topic("plain", Some("secret"), None, false);
+        let with_cache_flag = eff("plain", Some("secret"), None, true);
+        let without_cache_flag = eff("plain", Some("secret"), None, false);
         assert_eq!(with_cache_flag, without_cache_flag);
+    }
+
+    #[test]
+    fn load_only_cache_miss_yields_none_and_does_not_derive() {
+        // A cache dir that exists but has never been warmed for this topic.
+        let dir = std::env::temp_dir().join(format!(
+            "wavesync_bg_sync_load_only_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = derive_effective_topic("plain", Some("secret"), Some(&dir), true, true);
+        assert_eq!(
+            result, None,
+            "load-only mode must not derive on a cache miss"
+        );
+    }
+
+    #[test]
+    fn load_only_cache_hit_still_resolves() {
+        let dir = std::env::temp_dir().join(format!(
+            "wavesync_bg_sync_load_only_hit_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Warm the cache the way a normal (non-load-only) derivation would.
+        let warmed = derive_effective_topic("plain", Some("secret"), Some(&dir), true, false)
+            .expect("warm derivation must succeed");
+        let loaded = derive_effective_topic("plain", Some("secret"), Some(&dir), true, true)
+            .expect("load-only must resolve from a warm cache");
+        assert_eq!(warmed, loaded);
+    }
+
+    #[test]
+    fn groups_to_rejoin_load_only_miss_treats_group_as_non_matching() {
+        // With load_only and an unwarmed cache, an extra group's effective
+        // topic can't be determined — it must be filtered out of `matched`
+        // rather than derived. Here that means the (only) group doesn't
+        // match, so the "unknown target" fallback (sync everything) applies —
+        // the important assertion is that this never panics or derives.
+        let dir = std::env::temp_dir().join(format!(
+            "wavesync_bg_sync_groups_to_rejoin_load_only_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let groups = vec![group("beta", "pb")];
+        let sel = groups_to_rejoin(
+            Some("wavesync2-somehash"),
+            "wavesync-default",
+            &groups,
+            Some(&dir),
+            true,
+            true,
+        );
+        assert_eq!(
+            sel,
+            vec![0],
+            "cache-miss group falls back via the unknown-target path"
+        );
     }
 
     #[test]
