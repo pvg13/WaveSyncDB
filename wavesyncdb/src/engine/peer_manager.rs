@@ -77,6 +77,8 @@ impl EngineRunner {
         tracing::info!(
             my_db_version,
             your_last_db_version = their_last_db_version,
+            peer = %peer_id,
+            topic = %short_topic(effective_topic),
             "requesting version vector sync"
         );
 

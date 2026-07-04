@@ -163,7 +163,7 @@ async fn apply_to_native(peer: &WaveSyncDb, changes: Vec<ColumnChange>, from_sit
     if changes.is_empty() {
         return;
     }
-    apply_remote_changeset(
+    let committed = apply_remote_changeset(
         peer.inner(),
         peer.change_tx(),
         peer.registry(),
@@ -175,6 +175,7 @@ async fn apply_to_native(peer: &WaveSyncDb, changes: Vec<ColumnChange>, from_sit
         None,
     )
     .await;
+    assert!(committed, "native apply must commit");
 }
 
 /// Full-state exchange in both directions, then assert the digests match.

@@ -142,13 +142,17 @@ pub fn Page() -> Element {
         CodeBlock { html: CODE_LOGGING }
 
         p { class: "note",
-            "If you're scraping relay output with an "
+            "If you're using an "
             code { "env_logger" }
-            "-based tool, nothing changes on your end: every "
+            "-based log consumer, the same messages are emitted and "
+            code { "RUST_LOG" }
+            " filtering works unchanged — every "
             code { "tracing" }
-            " event the relay emits is also published as a "
+            " event is published as a "
             code { "log" }
-            " record, so existing log-based tailing/parsing keeps working unmodified."
+            " record. Note that the line format changed to "
+            code { "tracing-subscriber" }
+            "'s output; log-line parsers that match the old format may need updating."
         }
 
         p {

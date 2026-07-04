@@ -172,11 +172,15 @@ pub fn Page() -> Element {
         p { class: "note",
             "Already tailing relay output with an "
             code { "env_logger" }
-            "-based setup? No changes needed — every "
+            "-based setup? The same messages are emitted with "
+            code { "RUST_LOG" }
+            " filtering unchanged — every "
             code { "tracing" }
-            " event is also emitted as a "
+            " event becomes a "
             code { "log" }
-            " record, so existing log-based tooling keeps receiving relay events unmodified."
+            " record. The line format changed to "
+            code { "tracing-subscriber" }
+            "'s format; if your parsers depend on the old format, update them."
         }
 
         p {

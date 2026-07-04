@@ -734,6 +734,8 @@ impl EngineRunner {
         tracing::info!(
             n_changes = changeset.changes.len(),
             db_version = changeset.db_version,
+            peer = %peer,
+            topic = %short_topic(&effective),
             "received push from peer"
         );
 
