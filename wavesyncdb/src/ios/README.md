@@ -40,3 +40,18 @@ container. `wavesync_app_group_container(groupId)` (Rust) /
 `wavesync_app_group_container` (the `@_cdecl` it calls into, in
 `WaveSyncPushBridge.swift`) resolves that container's path so both binaries
 can point their `WaveSyncDbBuilder` at the same directory.
+
+**If your app keeps the database somewhere other than the container root**
+(e.g. a per-account subdirectory), the NSE has no way to know that on its
+own — it's only ever handed the container root, never told the app's layout.
+Bridge the gap with a pointer file: on every launch/login (whenever the
+active account's directory is decided), write
+`<container root>/.wavesync_config_dir` containing a single line — the
+active config directory's path, RELATIVE to the container root (e.g.
+`u/<user_id>` if that's where `.wavesync_config.json` lives). Overwrite it
+every time, so switching accounts on the same device retargets the NSE
+without reinstalling. `resolveConfigDir` in the Swift template reads this
+pointer first and falls back to the container root if it's absent or
+doesn't resolve to a directory that actually holds
+`.wavesync_config.json` — so an app that keeps its database directly at the
+root needs no pointer file at all.

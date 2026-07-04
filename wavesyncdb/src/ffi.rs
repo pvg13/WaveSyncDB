@@ -484,7 +484,17 @@ pub extern "C" fn wavesync_nse_handle_push(
             }
         };
 
+    // A single worker thread — unlike `run_background_sync`'s runtime above,
+    // which serves the app process (Android's background service, or iOS's
+    // own foreground-triggered wake) with no comparable constraint. Every
+    // extra worker thread costs its own OS stack (default 2 MiB, reducible
+    // but still not free) against the NSE's ~24 MB total ceiling (see this
+    // function's doc comment and the key-cache tradeoff it links) — a
+    // multi-thread pool sized to available cores has nothing to parallelize
+    // here anyway (one push, one group, one sync) and would only spend that
+    // budget on idle threads.
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
     {

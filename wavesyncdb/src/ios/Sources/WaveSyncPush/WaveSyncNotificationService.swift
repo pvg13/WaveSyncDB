@@ -75,6 +75,10 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
 
+    /// Serializes `deliver`'s read-nil-call of `contentHandler` — see that
+    /// method's doc comment for the race it closes.
+    private let deliverQueue = DispatchQueue(label: "com.wavesyncdb.nse.deliver")
+
     override open func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
@@ -142,23 +146,58 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
 
     /// Calls the content handler exactly once. Both `didReceive`'s early-exit
     /// paths and `applyResult`'s completion path funnel through here, and
-    /// `serviceExtensionTimeWillExpire` may race either of them — guard
-    /// against a double call, which UNNotificationServiceExtension logs as a
+    /// `serviceExtensionTimeWillExpire` may race either of them — one runs on
+    /// the utility queue `didReceive` dispatched onto, the other on whatever
+    /// queue iOS calls the expiry callback on, and both can land at once.
+    /// `deliverQueue` serializes the read-nil-call sequence so only one of
+    /// them ever wins the `guard`, closing the race that would otherwise let
+    /// both call the handler — logged by UNNotificationServiceExtension as a
     /// programmer error.
     private func deliver(_ content: UNNotificationContent) {
-        guard let handler = contentHandler else { return }
-        contentHandler = nil
-        handler(content)
+        deliverQueue.sync {
+            guard let handler = contentHandler else { return }
+            contentHandler = nil
+            handler(content)
+        }
     }
 
     /// App Group container path as a plain filesystem path string (not a
     /// `URL`) — matches the `config_dir` contract `wavesync_nse_handle_push`
     /// expects (the directory containing `.wavesync_config.json`).
+    ///
+    /// The container ROOT is not necessarily where `.wavesync_config.json`
+    /// lives — an app with a per-account (or otherwise nested) data layout
+    /// keeps it in a subdirectory instead. Such an app is expected to write
+    /// a pointer file, `.wavesync_config_dir`, at the container root on
+    /// every launch/login: a single line holding the path of the currently
+    /// active config directory, RELATIVE to the container root (so the
+    /// pointer keeps working if the container itself is ever relocated by
+    /// iOS between launches). If the pointer exists and names a directory
+    /// that actually holds `.wavesync_config.json`, use it; otherwise fall
+    /// back to the root itself, which is correct for an app that keeps its
+    /// database directly there and never writes a pointer at all.
     private static func resolveConfigDir(groupId: String) -> String? {
         guard !groupId.isEmpty else { return nil }
-        return FileManager.default
+        guard let root = FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: groupId)?
             .path
+        else {
+            return nil
+        }
+
+        let pointerPath = (root as NSString).appendingPathComponent(".wavesync_config_dir")
+        if let pointerContents = try? String(contentsOfFile: pointerPath, encoding: .utf8) {
+            let relative = pointerContents.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !relative.isEmpty {
+                let candidate = (root as NSString).appendingPathComponent(relative)
+                let configPath = (candidate as NSString).appendingPathComponent(".wavesync_config.json")
+                if FileManager.default.fileExists(atPath: configPath) {
+                    return candidate
+                }
+            }
+        }
+
+        return root
     }
 
     /// APNs delivers `userInfo` as an `[AnyHashable: Any]` dictionary;

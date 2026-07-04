@@ -354,6 +354,11 @@ async fn fire_notifications(
                 _ => 0,
             }
         };
+        // `push_wakes` stamps one row per (token, topic) regardless of which
+        // window checked it, so the stamp is class-agnostic: a silent wake
+        // just inside the alert window can suppress the next alert, and vice
+        // versa — benign, since whichever wake actually landed already
+        // carried content-available and woke the device.
         match store
             .check_and_stamp_wake(&token_entry.token, topic, now, coalesce_window_secs as i64)
             .await

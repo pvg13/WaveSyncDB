@@ -389,20 +389,25 @@ async fn background_sync_core(
     // Dioxus hook isn't running in this (FCM/APNs service, or NSE) process, so
     // the SyncNotify policies the engine evaluates while we sync would fire
     // but never reach anywhere — unless we pump them ourselves. Each group's
-    // `notification_rx()` is a broadcast channel (fan-out, not exclusive), so
-    // the two consumers below can both subscribe independently:
-    //   * `push-sync` builds always post each one as a native OS notification
-    //     (the "app with no NSE" path — see `notify_display`).
+    // `notification_rx()` is a broadcast channel (fan-out, not exclusive), but
+    // the two consumers below are mutually exclusive on `capture`, not both
+    // active whenever `push-sync` is compiled in:
+    //   * non-capture `push-sync` builds post each one as a native OS
+    //     notification (the "app with no NSE" path — see `notify_display`).
     //   * a `capture` request (the NSE's own path) instead collects them, so
-    //     the caller can build ITS OWN notification content from the last one
-    //     rather than a second, separate OS notification being posted here.
+    //     the caller builds ITS OWN notification content — the rewritten
+    //     banner — from the last one. Also gating the first branch on
+    //     `!capture` matters here: a consumer that links `push-sync` INTO the
+    //     NSE (as the README instructs, so `wavesync_nse_handle_push` has a
+    //     notify registry to walk) would otherwise get both — the pump's
+    //     native notification AND the rewritten banner — for the same event.
     // Subscribed *before* the wait loop (broadcast only delivers to current
     // subscribers); every pump is aborted after shutdown below.
     let captured: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::Notification>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut notif_pumps: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     #[cfg(feature = "push-sync")]
-    {
+    if !capture {
         let mut rxs = vec![db.notification_rx()];
         for g in &_group_handles {
             rxs.push(g.notification_rx());
