@@ -209,6 +209,9 @@ pub struct EngineConfig {
     /// Push notification token: (platform, device_token).
     /// Platform is "Fcm" or "Apns".
     pub push_token: Option<(String, String)>,
+    /// Database URL, used on mobile to re-read the push-token file mid-run
+    /// when the OS delivered the token after engine start (fresh installs).
+    pub database_url: String,
     /// API key for managed relay authentication.
     pub api_key: Option<String>,
     /// Interval for libp2p ping keep-alives (default: 90s).
@@ -257,6 +260,7 @@ impl Default for EngineConfig {
             rendezvous_ttl: 300,
             ipv6: true,
             push_token: None,
+            database_url: String::new(),
             api_key: None,
             keep_alive_interval: Duration::from_secs(90),
             circuit_max_duration: Duration::from_secs(3600),
@@ -614,7 +618,7 @@ fn build_swarm(
         }
         Err(e) => {
             tracing::warn!(
-                "System DNS resolver failed (expected on Android): {e}. \
+                "System DNS resolver failed (expected on mobile targets): {e}. \
                  Falling back to Google public DNS."
             );
             let mdns_cfg = mdns_config;
@@ -673,7 +677,7 @@ fn build_swarm_with_tcp(
         }
         Err(e) => {
             tracing::warn!(
-                "System DNS resolver failed (expected on Android): {e}. \
+                "System DNS resolver failed (expected on mobile targets): {e}. \
                  Falling back to Google public DNS."
             );
             let mdns_cfg = mdns_config;
@@ -782,6 +786,7 @@ async fn run_engine(
     let rendezvous_namespace = effective_topic.clone();
 
     let push_token = config.push_token.clone();
+    let database_url = config.database_url.clone();
     let api_key = config.api_key.clone();
 
     // Collect infrastructure peer IDs (relay + rendezvous) so they are excluded
@@ -849,6 +854,8 @@ async fn run_engine(
         dialing_peers: std::collections::HashSet::new(),
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
+        database_url,
+        push_token_skip_logged: false,
         push_registered_topics: std::collections::HashSet::new(),
         push_pending_registrations: std::collections::HashMap::new(),
         pending_push_reqs: std::collections::HashMap::new(),
@@ -1114,6 +1121,14 @@ struct EngineRunner {
     pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
     pub(crate) push_token: Option<(String, String)>,
+    // Read only by the mobile push-token re-read paths.
+    #[cfg_attr(
+        not(all(feature = "push-sync", any(target_os = "ios", target_os = "android"))),
+        allow(dead_code)
+    )]
+    pub(crate) database_url: String,
+    /// The no-token skip is logged once at info; repeats drop to debug.
+    pub(crate) push_token_skip_logged: bool,
     /// Group topics whose push token has already been registered with the
     /// current relay connection. Tracked per-topic (not a single bool) so a
     /// group joined *after* the relay connect still gets a `RegisterToken`,

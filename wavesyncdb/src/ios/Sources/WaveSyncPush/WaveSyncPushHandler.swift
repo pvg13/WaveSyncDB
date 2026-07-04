@@ -78,12 +78,31 @@ public enum WaveSyncPushHandler {
     /// the next `WaveSyncDbBuilder::build()` call via the retry loop in
     /// `wavesyncdb/src/connection.rs`.
     public static func writeDeviceToken(_ data: Data) {
+        writeDeviceToken(data, attempt: 0)
+    }
+
+    /// On a fresh install the APNs token typically arrives BEFORE the app's
+    /// first `build()` finishes writing `.wavesync_config.json`, so the
+    /// target directory does not exist yet. Retry every 2s (up to 2 minutes)
+    /// until the config appears instead of deferring to the next launch —
+    /// push must work from the very first install.
+    private static func writeDeviceToken(_ data: Data, attempt: Int) {
         let hex = data.map { String(format: "%02x", $0) }.joined()
 
         guard let dir = findTokenDirectory() else {
-            NSLog("[WaveSync] APNs token received but no .wavesync_config.json "
-                  + "found yet — nothing to pair the token with. Will be picked "
-                  + "up on next app launch once the config file exists.")
+            if attempt == 0 {
+                NSLog("[WaveSync] APNs token received before .wavesync_config.json "
+                      + "exists (fresh install) — waiting for the first build() to "
+                      + "write it, retrying every 2s…")
+            }
+            if attempt < 60 {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+                    writeDeviceToken(data, attempt: attempt + 1)
+                }
+            } else {
+                NSLog("[WaveSync] Gave up waiting for .wavesync_config.json after "
+                      + "2 minutes — token will be written on next app launch.")
+            }
             return
         }
 

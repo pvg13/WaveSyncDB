@@ -2009,6 +2009,7 @@ impl WaveSyncDbBuilder {
         }
 
         let engine_config = crate::engine::EngineConfig {
+            database_url: self.database_url.clone(),
             sync_interval: self.sync_interval,
             mdns_enabled: self.mdns_enabled,
             mdns_query_interval: self.mdns_query_interval,
