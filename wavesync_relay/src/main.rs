@@ -159,6 +159,23 @@ struct Cli {
     #[arg(long, env = "PUSH_DEBOUNCE_SECS", default_value_t = 1)]
     push_debounce_secs: u64,
 
+    /// Per-device APNs wake-coalescing window in seconds (default: 900 / 15
+    /// min). A burst of writes to the same topic within this window of a
+    /// device's last wake costs that device ONE push, not one per write —
+    /// required because APNs throttles silent background pushes to only a
+    /// handful per device per day, and a write burst must not burn through
+    /// that budget in minutes. 15 min budgets roughly one wake per ~3 waking
+    /// hours against a 5/day allowance. 0 disables coalescing.
+    #[arg(long, env = "APNS_COALESCE_SECS", default_value_t = 900)]
+    apns_coalesce_secs: u64,
+
+    /// Per-device FCM wake-coalescing window in seconds (default: 0 =
+    /// disabled). FCM has no comparable hard daily push cap, and the
+    /// existing PUSH_DEBOUNCE_SECS topic-keyed debounce already smooths
+    /// bursts, so no extra per-device window is needed by default.
+    #[arg(long, env = "FCM_COALESCE_SECS", default_value_t = 0)]
+    fcm_coalesce_secs: u64,
+
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
     /// Required when running behind NAT or in Docker.
     #[arg(long, env = "EXTERNAL_ADDRESS", value_delimiter = ',')]
@@ -572,6 +589,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sender,
             debounce,
             relay_metrics.clone(),
+            cli.apns_coalesce_secs,
+            cli.fcm_coalesce_secs,
         );
 
         // The token store is persistent across restarts, but the gauge

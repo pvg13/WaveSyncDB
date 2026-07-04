@@ -72,11 +72,17 @@ pub struct PushNotifier {
 
 impl PushNotifier {
     /// Spawn both the notifier loop and the retry worker.
+    ///
+    /// `apns_coalesce_secs` / `fcm_coalesce_secs` are the per-device
+    /// wake-coalescing windows (0 disables coalescing for that platform) —
+    /// see [`fire_notifications`]'s gate for the full rationale.
     pub fn spawn(
         store: Arc<PushStore>,
         sender: Arc<PushSender>,
         cooldown_duration: Duration,
         metrics: RelayMetrics,
+        apns_coalesce_secs: u64,
+        fcm_coalesce_secs: u64,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<TopicNotification>(256);
         let (nudge_tx, nudge_rx) = mpsc::channel::<RetryNudge>(64);
@@ -99,6 +105,8 @@ impl PushNotifier {
             cooldown_duration,
             nudge_tx,
             metrics,
+            apns_coalesce_secs,
+            fcm_coalesce_secs,
         ));
 
         Self { tx }
@@ -126,6 +134,7 @@ struct CooldownState {
     pending: Option<(String, Vec<String>)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn notifier_loop(
     mut rx: mpsc::Receiver<TopicNotification>,
     store: Arc<PushStore>,
@@ -133,6 +142,8 @@ async fn notifier_loop(
     cooldown_duration: Duration,
     nudge_tx: mpsc::Sender<RetryNudge>,
     metrics: RelayMetrics,
+    apns_coalesce_secs: u64,
+    fcm_coalesce_secs: u64,
 ) {
     let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
 
@@ -154,7 +165,7 @@ async fn notifier_loop(
                         if let Some(state) = cooldowns.get_mut(&topic) {
                             if now >= state.expires_at {
                                 // Cooldown expired — fire immediately (leading edge)
-                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics).await;
+                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
                                 state.expires_at = now + cooldown_duration;
                                 state.pending = None;
                             } else {
@@ -163,7 +174,7 @@ async fn notifier_loop(
                             }
                         } else {
                             // First notification for this topic — fire immediately
-                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics).await;
+                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
                             cooldowns.insert(topic, CooldownState {
                                 expires_at: now + cooldown_duration,
                                 pending: None,
@@ -188,7 +199,7 @@ async fn notifier_loop(
                     .collect();
 
                 for (topic, (notifying_peer, peer_addrs)) in expired {
-                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx, &metrics).await;
+                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs).await;
                     if let Some(state) = cooldowns.get_mut(&topic) {
                         state.expires_at = now + cooldown_duration;
                         state.pending = None;
@@ -215,6 +226,7 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fire_notifications(
     store: &PushStore,
     sender: &PushSender,
@@ -223,6 +235,8 @@ async fn fire_notifications(
     peer_addrs: &[String],
     nudge_tx: &mpsc::Sender<RetryNudge>,
     metrics: &RelayMetrics,
+    apns_coalesce_secs: u64,
+    fcm_coalesce_secs: u64,
 ) {
     // Exclude the writer's own token: a device uses the same libp2p peer id for
     // its RegisterToken and its NotifyTopic, so a local write must not wake the
@@ -260,9 +274,50 @@ async fn fire_notifications(
 
     let peer_addrs_json = serde_json::to_string(peer_addrs).unwrap_or_else(|_| "[]".to_string());
 
-    let today = now_unix() / 86_400;
+    let now = now_unix();
+    let today = now / 86_400;
 
     for token_entry in &tokens {
+        // Per-(token, topic) wake-coalescing window: a burst of writes to the
+        // same topic must cost this device ONE wake, not one per write, since
+        // APNs throttles silent background pushes to only a handful per device
+        // per day. This composes with (doesn't replace) the topic-keyed
+        // debounce above it in the call chain — that coalesces bursts across
+        // *all* devices within ~1s; this coalesces a *single* device's wakes
+        // across a much longer (minutes) window. Push is only a best-effort
+        // wake hint — a suppressed wake never loses data because the device's
+        // own catch-up sync (periodic / on-open version-vector exchange) still
+        // delivers on its next wake — so a store error here fails OPEN (send
+        // anyway) rather than fail closed like the budget check below.
+        let coalesce_window_secs = match token_entry.platform.as_str() {
+            "Apns" => apns_coalesce_secs,
+            "Fcm" => fcm_coalesce_secs,
+            _ => 0,
+        };
+        match store
+            .check_and_stamp_wake(&token_entry.token, topic, now, coalesce_window_secs as i64)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let short = token_entry.token.chars().take(20).collect::<String>();
+                tracing::debug!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    "Coalescing wake for token={short}... (within {coalesce_window_secs}s window)"
+                );
+                metrics.push_sent(&token_entry.platform, "coalesced");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    topic = %topic_short,
+                    platform = %token_entry.platform,
+                    "Wake-coalescing check failed, sending anyway: {e}"
+                );
+            }
+        }
+
         // Enforce the per-token daily silent-push budget. Beyond it the platform
         // would throttle/drop wakes anyway; skipping here keeps a spammy or hostile
         // notifier from burning a device's budget and silencing legitimate wakes.
@@ -513,6 +568,11 @@ async fn process_retry(
     // The row was inserted at attempts=N meaning "next retry is the
     // Nth". Now that we're firing it, the *result* should be processed
     // at attempts=N+1 if it fails again.
+    //
+    // Deliberately not gated by check_and_stamp_wake: this is a retry of an
+    // already-decided send (the original fire_notifications call already
+    // passed or bypassed the coalescing window), so re-applying it here would
+    // just drop a send the caller already committed to.
     let short = row.token.chars().take(20).collect::<String>();
     let platform_label = row.platform.clone();
     let topic_short = crate::short_topic(&row.topic);
