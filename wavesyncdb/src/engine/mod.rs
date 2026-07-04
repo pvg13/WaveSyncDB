@@ -225,6 +225,21 @@ pub struct EngineConfig {
     /// cellular (see `build_swarm` doc-comment); only flip on if the
     /// QUIC-only failure mode is actually hurting your users.
     pub tcp_enabled: bool,
+    /// EXPERIMENTAL, iOS-only, no-op elsewhere. Default: `false`.
+    ///
+    /// iOS binds QUIC to the device's concrete routable interface address(es)
+    /// by default (see the iOS listen path in `run_engine` and #72's
+    /// doc-comment there) with a 3s interface-watch tick to re-bind on
+    /// handoff. This flag selects the alternative: bind to the unspecified
+    /// address instead (the same strategy every non-iOS platform already
+    /// uses) and disable the interface watch. It exists solely to produce an
+    /// on-device A/B verdict between the two strategies (#73); one of them
+    /// is expected to be deleted once that verdict is in. Can also be forced
+    /// on via the `WAVESYNC_IOS_UNSPECIFIED_QUIC` environment variable
+    /// (truthy: "1" or "true"), which is checked in addition to this flag at
+    /// engine start — that lets the bind strategy be flipped from an Xcode
+    /// scheme without a rebuild.
+    pub ios_unspecified_quic_bind: bool,
 }
 
 impl Default for EngineConfig {
@@ -246,6 +261,7 @@ impl Default for EngineConfig {
             keep_alive_interval: Duration::from_secs(90),
             circuit_max_duration: Duration::from_secs(3600),
             tcp_enabled: false,
+            ios_unspecified_quic_bind: false,
         }
     }
 }
@@ -1307,6 +1323,31 @@ impl EngineRunner {
     #[cfg(not(target_os = "ios"))]
     fn reconcile_quic_listeners(&mut self) {}
 
+    /// Listen on the unspecified QUIC address(es): `/ip4/0.0.0.0/udp/0/quic-v1`
+    /// always, plus `/ip6/::/udp/0/quic-v1` when IPv6 is enabled. This is the
+    /// default bind strategy on every platform except iOS's concrete-interface
+    /// bind (#72); iOS also falls back to it when the experimental
+    /// `ios_unspecified_quic_bind` toggle selects the unspecified arm for the
+    /// on-device A/B verdict (#73) — shared here so the two call sites can't
+    /// drift apart. A v4 listen failure is fatal (propagated, matching the
+    /// pre-existing non-iOS behavior this was extracted from); a v6 failure is
+    /// logged and non-fatal since dual-stack is a bonus, not a requirement.
+    fn listen_quic_unspecified(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
+
+        tracing::info!("DIAG calling listen_on(QUIC)={v4_quic}");
+        let t1 = std::time::Instant::now();
+        self.swarm.listen_on(v4_quic.parse().unwrap())?;
+        tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+
+        if self.config.ipv6
+            && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
+        {
+            tracing::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
+        }
+        Ok(())
+    }
+
     /// Rebuild the full network status snapshot from internal state.
     fn update_network_status(&self) {
         use crate::network_status as ns;
@@ -1901,6 +1942,29 @@ impl EngineRunner {
             std::env::consts::OS
         );
 
+        // #73 on-device bind A/B toggle: the concrete-interface bind below is
+        // the default; the experimental `ios_unspecified_quic_bind` flag (or
+        // its env override, settable from an Xcode scheme without a rebuild)
+        // selects the unspecified-bind arm instead so the two strategies can
+        // be compared on real hardware. Computed unconditionally (cheap) since
+        // `watch_interfaces` below also reads it; it is a no-op on every
+        // non-iOS platform, which always uses the unspecified path regardless.
+        let ios_unspecified_env = std::env::var("WAVESYNC_IOS_UNSPECIFIED_QUIC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let ios_unspecified_effective =
+            self.config.ios_unspecified_quic_bind || ios_unspecified_env;
+        if ios_unspecified_effective && cfg!(target_os = "ios") {
+            tracing::info!(
+                "iOS QUIC bind: unspecified-listen override ACTIVE (experimental #73 toggle; source={})",
+                if ios_unspecified_env {
+                    "env WAVESYNC_IOS_UNSPECIFIED_QUIC"
+                } else {
+                    "builder config"
+                }
+            );
+        }
+
         // QUIC-only listeners. See `build_swarm` for the rationale.
         //
         // iOS: bind to the device's *concrete* active-interface address(es),
@@ -1914,43 +1978,37 @@ impl EngineRunner {
         // unspecified) binds also sidestep the unspecified-bind code path that
         // the previous loopback workaround was guarding against. The
         // interface-watch tick (below) re-binds when the active interface
-        // changes (Wi-Fi↔cellular handoff, DHCP renew).
+        // changes (Wi-Fi↔cellular handoff, DHCP renew). Unless the #73 toggle
+        // above selects the unspecified arm instead — see `listen_quic_unspecified`.
         #[cfg(target_os = "ios")]
         {
-            let ips = routable_listen_ips(self.config.ipv6);
-            if ips.is_empty() {
-                tracing::warn!(
-                    "No routable network interface at startup; QUIC listen deferred \
-                     to the interface watch (will bind once an interface appears)"
-                );
-            }
-            for ip in ips {
-                let addr = quic_listen_multiaddr(ip);
-                tracing::info!("DIAG calling listen_on(QUIC)={addr}");
-                let t1 = std::time::Instant::now();
-                match self.swarm.listen_on(addr.clone()) {
-                    Ok(id) => {
-                        self.quic_listeners.insert(ip, id);
-                        tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+            if ios_unspecified_effective {
+                self.listen_quic_unspecified()?;
+            } else {
+                let ips = routable_listen_ips(self.config.ipv6);
+                if ips.is_empty() {
+                    tracing::warn!(
+                        "No routable network interface at startup; QUIC listen deferred \
+                         to the interface watch (will bind once an interface appears)"
+                    );
+                }
+                for ip in ips {
+                    let addr = quic_listen_multiaddr(ip);
+                    tracing::info!("DIAG calling listen_on(QUIC)={addr}");
+                    let t1 = std::time::Instant::now();
+                    match self.swarm.listen_on(addr.clone()) {
+                        Ok(id) => {
+                            self.quic_listeners.insert(ip, id);
+                            tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
+                        }
+                        Err(e) => tracing::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
                     }
-                    Err(e) => tracing::warn!("QUIC listen on {addr} failed (non-fatal): {e}"),
                 }
             }
         }
         #[cfg(not(target_os = "ios"))]
         {
-            let (v4_quic, v6_quic) = ("/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1");
-
-            tracing::info!("DIAG calling listen_on(QUIC)={v4_quic}");
-            let t1 = std::time::Instant::now();
-            self.swarm.listen_on(v4_quic.parse().unwrap())?;
-            tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
-
-            if self.config.ipv6
-                && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
-            {
-                tracing::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
-            }
+            self.listen_quic_unspecified()?;
         }
 
         // If a relay server is configured, dial it. Set state to Connecting
@@ -2055,8 +2113,10 @@ impl EngineRunner {
         // (vs an NWPathMonitor callback) keeps the swarm mutation on the event
         // loop and adds no platform FFI; 3s is well inside human-perceptible
         // handoff recovery. Disabled on every other platform (those bind to
-        // unspecified and let libp2p track interfaces itself).
-        let watch_interfaces = cfg!(target_os = "ios");
+        // unspecified and let libp2p track interfaces itself) — and disabled
+        // on iOS too when the #73 toggle above selected the unspecified arm,
+        // since there's no concrete bind to keep current in that case.
+        let watch_interfaces = cfg!(target_os = "ios") && !ios_unspecified_effective;
         let mut interface_watch = tokio::time::interval(Duration::from_secs(3));
 
         // Fast-path redelivery of un-acked local pushes (#81 Option A). Short

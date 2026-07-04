@@ -57,6 +57,17 @@ public enum WaveSyncPushHandler {
     /// Name of the sync config file Rust writes at `WaveSyncDbBuilder::build()`.
     public static let configFilename = ".wavesync_config.json"
 
+    /// Timeout (seconds) passed to the Rust background-sync FFI call in
+    /// `handleRemoteNotification`. Host apps may tune this after measuring
+    /// their actual granted background-execution window (varies by device,
+    /// OS version, and background-modes entitlement — see the on-device A/B
+    /// verdict process in docs/ios-device-protocol). Default of 25s assumes
+    /// iOS's typical ~30s grant, leaving headroom for tokio shutdown and the
+    /// UIKit completion handshake; Rust's internal timers
+    /// (`background_sync`'s fallback/completion-grace windows) scale to
+    /// whatever value is passed here.
+    public static var backgroundSyncTimeoutSecs: UInt64 = 25
+
     // MARK: - Device token
 
     /// Hex-encode the APNs device token and persist it next to the database.
@@ -93,8 +104,11 @@ public enum WaveSyncPushHandler {
     // MARK: - Remote notification dispatch
 
     /// Parse the APNs payload, locate the database, and run background sync.
-    /// iOS grants roughly 30 s of background execution; the FFI uses a 25 s
-    /// timeout to leave headroom for tokio shutdown and the UIKit handshake.
+    /// iOS grants roughly 30 s of background execution; the FFI call below
+    /// uses `backgroundSyncTimeoutSecs` (25s default) to leave headroom for
+    /// tokio shutdown and the UIKit handshake. The grant varies in practice
+    /// (device, OS version, background-modes entitlement) — tune the static
+    /// var after measuring on real hardware; see docs/ios-device-protocol.
     public static func handleRemoteNotification(
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
@@ -119,7 +133,8 @@ public enum WaveSyncPushHandler {
             let rc: Int32 = dbUrl.withCString { urlPtr in
                 withOptionalCString(peerAddrsJson) { peersPtr in
                     withOptionalCString(topic) { topicPtr in
-                        wavesync_background_sync_targeted(urlPtr, 25, peersPtr, topicPtr)
+                        wavesync_background_sync_targeted(
+                            urlPtr, UInt32(backgroundSyncTimeoutSecs), peersPtr, topicPtr)
                     }
                 }
             }

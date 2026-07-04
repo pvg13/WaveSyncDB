@@ -314,10 +314,14 @@ pub async fn background_sync_with_peers_for_topic(
     // sync — fast, and the whole point of waking incrementally. Forcing a full
     // sync would re-pull the entire database on every wake.
     //
-    // Two timers bound the wait:
-    //   * COMPLETION_GRACE — after the first PeerSynced, linger briefly so a
+    // Two timers bound the wait, both scaled to the caller's `timeout` (the
+    // OS-granted background-execution budget — see `scaled_completion_grace`
+    // / `scaled_fallback_after`) so a short grant still leaves the fallback
+    // and linger window room to run before the hard deadline. At the
+    // historical fixed 25s grant both scale to their original fixed values:
+    //   * completion_grace — after the first PeerSynced, linger briefly so a
     //     second/third peer can also finish before we tear down.
-    //   * FALLBACK_AFTER — if a peer connected but no incremental sync has
+    //   * fallback_after — if a peer connected but no incremental sync has
     //     completed by then (first-ever contact, or our persisted view of the
     //     peer was somehow ahead), ask for a full sync once. Preserves new-peer
     //     onboarding (db_version=0 semantics) without making it the default.
@@ -325,17 +329,18 @@ pub async fn background_sync_with_peers_for_topic(
     // tear down. With extra groups joined, give their (fast, incremental)
     // version-vector round-trips room to land too — they share the connections
     // but emit their own PeerSynced events.
-    let completion_grace = if joined_any_extra {
+    let completion_grace_base = if joined_any_extra {
         Duration::from_millis(1500)
     } else {
         Duration::from_millis(500)
     };
-    const FALLBACK_AFTER: Duration = Duration::from_secs(5);
+    let completion_grace = scaled_completion_grace(completion_grace_base, timeout);
+    let fallback_after = scaled_fallback_after(timeout);
 
     let mut events = db.network_event_rx();
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
-    let fallback = tokio::time::sleep(FALLBACK_AFTER);
+    let fallback = tokio::time::sleep(fallback_after);
     tokio::pin!(fallback);
 
     let mut synced_peers = HashSet::new();
@@ -419,6 +424,24 @@ pub async fn background_sync_with_peers_for_topic(
         t_start.elapsed().as_millis()
     );
     Ok(result)
+}
+
+/// Scale the "connected-but-no-incremental-sync" fallback timer (see the
+/// `FALLBACK_AFTER` doc comment above) to the granted background-execution
+/// budget `timeout`, so the fallback still has room to complete before the
+/// hard deadline on a short grant. At the historical 25s grant this returns
+/// the original fixed 5s value unchanged.
+fn scaled_fallback_after(timeout: Duration) -> Duration {
+    Duration::from_secs(5).min(timeout / 3)
+}
+
+/// Scale the post-first-sync linger window (`base`, see `COMPLETION_GRACE` in
+/// the doc comment above) to the granted background-execution budget
+/// `timeout`, floored at 200ms so even a very short grant leaves a moment for
+/// a second peer to finish. At the historical 25s grant this returns `base`
+/// unchanged.
+fn scaled_completion_grace(base: Duration, timeout: Duration) -> Duration {
+    base.min(timeout / 10).max(Duration::from_millis(200))
 }
 
 /// Derive the effective (PSK-derived) topic for a group, mirroring the engine:
@@ -520,5 +543,59 @@ mod tests {
         // Same inputs → same output; different passphrase → different topic.
         assert_eq!(eff, derive_effective_topic("plain", Some("secret")));
         assert_ne!(eff, derive_effective_topic("plain", Some("other")));
+    }
+
+    #[test]
+    fn scaled_timers_preserve_current_values_at_25s_grant() {
+        // The historical fixed grant (background_sync's default `timeout`).
+        // Both scaled functions must reproduce the exact pre-scaling
+        // constants at this timeout — zero behavior change at defaults.
+        let timeout = Duration::from_secs(25);
+        assert_eq!(scaled_fallback_after(timeout), Duration::from_secs(5));
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(1500), timeout),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(500), timeout),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn scaled_timers_shrink_on_a_short_grant() {
+        // timeout=6s: fallback = min(5s, 6s/3=2s) = 2s.
+        let timeout = Duration::from_secs(6);
+        assert_eq!(scaled_fallback_after(timeout), Duration::from_secs(2));
+        // completion_grace(base=1500ms) = min(1500ms, 6s/10=600ms).max(200ms) = 600ms.
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(1500), timeout),
+            Duration::from_millis(600)
+        );
+        // completion_grace(base=500ms) = min(500ms, 600ms).max(200ms) = 500ms
+        // (base is already below the scaled cap, so it passes through).
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(500), timeout),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn scaled_timers_floor_on_a_very_short_grant() {
+        // timeout=1s: fallback = min(5s, 1s/3) = 1s/3 (~333ms; Duration
+        // division truncates, so compare against the same expression rather
+        // than a rounded millisecond literal).
+        let timeout = Duration::from_secs(1);
+        assert_eq!(scaled_fallback_after(timeout), timeout / 3);
+        // completion_grace: timeout/10=100ms, below the 200ms floor regardless
+        // of base, so the floor wins for any base.
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(1500), timeout),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            scaled_completion_grace(Duration::from_millis(500), timeout),
+            Duration::from_millis(200)
+        );
     }
 }

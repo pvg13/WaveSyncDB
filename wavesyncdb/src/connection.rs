@@ -1480,6 +1480,7 @@ pub struct WaveSyncDbBuilder {
     tcp_enabled: bool,
     change_channel_capacity: usize,
     tombstone_retention: Option<Option<std::time::Duration>>,
+    ios_unspecified_quic_bind: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1511,6 +1512,7 @@ impl WaveSyncDbBuilder {
             tcp_enabled: defaults.tcp_enabled,
             change_channel_capacity: 1024,
             tombstone_retention: None,
+            ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
         }
     }
 
@@ -1618,6 +1620,23 @@ impl WaveSyncDbBuilder {
     /// flipping it on.
     pub fn with_tcp_enabled(mut self, enabled: bool) -> Self {
         self.tcp_enabled = enabled;
+        self
+    }
+
+    /// EXPERIMENTAL: select iOS's QUIC bind strategy. Default: `false`
+    /// (unchanged concrete-interface bind). No-op on every non-iOS platform.
+    ///
+    /// iOS binds QUIC to the device's concrete routable interface address(es)
+    /// by default, with a 3s interface-watch tick to re-bind on Wi-Fi↔cellular
+    /// handoff (#72). Passing `true` here switches to the unspecified-address
+    /// bind every other platform already uses, and disables the interface
+    /// watch. This exists purely to produce an on-device A/B verdict between
+    /// the two strategies (#73); expect one of them to be deleted once that
+    /// verdict is in — don't build long-term behavior on this flag. Can also
+    /// be forced on via `WAVESYNC_IOS_UNSPECIFIED_QUIC=1` at runtime without
+    /// a rebuild (checked in addition to this flag at engine start).
+    pub fn with_ios_unspecified_quic_bind(mut self, enabled: bool) -> Self {
+        self.ios_unspecified_quic_bind = enabled;
         self
     }
 
@@ -2006,6 +2025,7 @@ impl WaveSyncDbBuilder {
             keep_alive_interval: self.keep_alive_interval,
             circuit_max_duration: self.circuit_max_duration,
             tcp_enabled: self.tcp_enabled,
+            ios_unspecified_quic_bind: self.ios_unspecified_quic_bind,
         };
 
         // Diagnostics counters are owned jointly by the engine task (writer)
