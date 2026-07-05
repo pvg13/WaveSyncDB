@@ -40,6 +40,20 @@ private final class WaveSyncNotificationDelegate: NSObject, UNUserNotificationCe
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        // Suppress the relay's generic alert placeholder while the app is in
+        // the FOREGROUND (willPresent only runs then): the live engine is
+        // receiving this change over its open connections right now, and the
+        // SyncNotify policy posts the specific local notification — or
+        // nothing, if it deems the change not notify-worthy. Either way the
+        // generic banner is redundant noise on top of an app the user is
+        // already looking at. WaveSync remote pushes are identified by the
+        // "topic" payload key + remote trigger; everything else (including
+        // our own specific local notifications) presents normally.
+        if notification.request.trigger is UNPushNotificationTrigger,
+           notification.request.content.userInfo["topic"] != nil {
+            completionHandler([])
+            return
+        }
         completionHandler([.banner, .sound])
     }
 }

@@ -142,10 +142,15 @@ public enum WaveSyncPushHandler {
         // change over its open streams — often it already has by the time the
         // push lands. Skip the FFI call entirely rather than block a worker
         // for the whole budget waiting on a sync that has nothing left to do.
-        // (This delegate callback runs on the main thread, where
-        // `applicationState` is safe to read.)
+        // Sweep any delivered placeholders too: the user is looking at the
+        // data itself, so a "something changed" banner is pure noise (the
+        // notification-center delegate also suppresses their presentation
+        // while active — this removes ones delivered before that, or while
+        // transitioning). (This delegate callback runs on the main thread,
+        // where `applicationState` is safe to read.)
         if UIApplication.shared.applicationState == .active {
             NSLog("[WaveSync] Push received while active — live engine handles sync")
+            clearDeliveredPlaceholders()
             completionHandler(.noData)
             return
         }
@@ -175,6 +180,13 @@ public enum WaveSyncPushHandler {
             switch rc {
             case 0:
                 NSLog("[WaveSync] Background sync completed successfully")
+                // Everything the push announced has been applied. If the
+                // SyncNotify policy produced a specific notification it was
+                // already posted (and evicted the placeholder itself); if the
+                // policy DECLINED — deemed the change not notify-worthy — the
+                // placeholder must not linger either: a decline means "no
+                // notification for this change", not "show the generic one".
+                clearDeliveredPlaceholders()
                 result = .newData
             case 1:
                 NSLog("[WaveSync] Background sync: no peers found")
@@ -199,6 +211,36 @@ public enum WaveSyncPushHandler {
 
             DispatchQueue.main.async {
                 completionHandler(result)
+            }
+        }
+    }
+
+    // MARK: - Placeholder cleanup
+
+    /// Remove every delivered WaveSync *remote* notification — the relay's
+    /// generic alert placeholder ("Nueva actividad") — from Notification
+    /// Center and the lock screen.
+    ///
+    /// Identified by the remote-push trigger plus the top-level `"topic"`
+    /// key the relay stamps on every push payload; the app's own specific
+    /// local notifications never carry `"topic"` and are untouched. Called
+    /// once a wake sync has fully applied the pushed change (whether or not
+    /// the `SyncNotify` policy chose to post a specific notification — a
+    /// declining policy means "no notification", not "keep the generic
+    /// one"), and on foreground delivery where the user is already looking
+    /// at the data. The placeholder only persists when the sync could NOT
+    /// run — its designed fallback role.
+    public static func clearDeliveredPlaceholders() {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let ids = delivered
+                .filter {
+                    $0.request.trigger is UNPushNotificationTrigger
+                        && $0.request.content.userInfo["topic"] != nil
+                }
+                .map { $0.request.identifier }
+            if !ids.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: ids)
             }
         }
     }
