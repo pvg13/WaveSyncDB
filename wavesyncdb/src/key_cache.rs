@@ -120,49 +120,74 @@ pub(crate) fn save_group_key(dir: &Path, topic_name: &str, key: &[u8; 32]) {
         );
         return;
     }
+    match std::fs::rename(&tmp_path, &path) {
+        Err(e) => {
+            tracing::warn!(
+                "key_cache: failed to atomically install cache file {}: {e}",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        Ok(()) => {
+            // Best-effort iOS data protection: mark the cache file so the
+            // NSE can still read it before first unlock while it stays
+            // encrypted at rest. See `protect_file`'s docs.
+            #[cfg(target_os = "ios")]
+            protect_file(&path);
+        }
+    }
+}
+
+/// Remove `topic_name`'s cached key, preserving other topics' entries.
+/// When the removal leaves the map empty, the cache file itself is deleted
+/// so no key-shaped artifact lingers on disk. Best-effort like every other
+/// write in this module. Called on `leave_group` (a left group's key must
+/// not stay readable on the device), by `build()`'s cache opt-out, and by
+/// `WaveSyncDbBuilder::invalidate_group_key_cache` (passphrase rotation).
+pub(crate) fn remove_group_key(dir: &Path, topic_name: &str) {
+    let mut map = load_map(dir);
+    if map.remove(topic_name).is_none() {
+        return;
+    }
+    let path = cache_path(dir);
+    if map.is_empty() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                "key_cache: failed to remove empty cache file {}: {e}",
+                path.display()
+            );
+        }
+        return;
+    }
+    let json = match serde_json::to_string_pretty(&map) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("key_cache: failed to serialize group key cache: {e}");
+            return;
+        }
+    };
+    let tmp_path = dir.join(format!("{CACHE_FILE_NAME}.tmp"));
+    if let Err(e) = write_tmp_file(&tmp_path, &json) {
+        tracing::warn!(
+            "key_cache: failed to write temp cache file {}: {e}",
+            tmp_path.display()
+        );
+        return;
+    }
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
         tracing::warn!(
             "key_cache: failed to atomically install cache file {}: {e}",
             path.display()
         );
         let _ = std::fs::remove_file(&tmp_path);
-        return;
     }
-
-    // Best-effort iOS data protection: mark the cache file so the NSE can
-    // still read it before first unlock while it stays encrypted at rest.
-    // See `protect_file`'s docs.
-    #[cfg(target_os = "ios")]
-    protect_file(&path);
 }
 
-/// Write `contents` to `path`, restricted to owner-only permissions for its
-/// entire existence on unix — no window between "file exists" and "file is
-/// locked down" for another local user/process to read it in.
-#[cfg(unix)]
-fn write_tmp_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `.mode()` above only governs permissions at creation time; a stale
-    // tmp file left over from a killed previous run (this path is shared
-    // with the NSE, which the OS can and does kill mid-write) could already
-    // exist with looser permissions. Fix them up unconditionally rather
-    // than trusting that this call always creates the file fresh.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents.as_bytes())
-}
-
-#[cfg(not(unix))]
-fn write_tmp_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    std::fs::write(path, contents)
-}
+// The owner-only tmp-file write half of the atomic write-then-rename idiom
+// lives in `connection::write_tmp_file` (compiled on every platform — the
+// sync config uses the same idiom); re-exported here so this module's
+// call sites read naturally.
+pub(crate) use crate::connection::write_tmp_file;
 
 /// Best-effort iOS data-protection: calls the bundled Swift
 /// `wavesync_protect_file` C-ABI helper (`WaveSyncPushBridge.swift`) to mark
@@ -341,5 +366,32 @@ mod tests {
         let dir = temp_dir();
         save_group_key(&dir, "x", &key);
         assert_eq!(load_group_key(&dir, "x"), Some(key));
+    }
+
+    #[test]
+    fn remove_group_key_preserves_other_topics() {
+        let dir = temp_dir();
+        save_group_key(&dir, "roommates", &[1u8; 32]);
+        save_group_key(&dir, "family", &[2u8; 32]);
+
+        remove_group_key(&dir, "roommates");
+
+        assert_eq!(load_group_key(&dir, "roommates"), None);
+        assert_eq!(load_group_key(&dir, "family"), Some([2u8; 32]));
+    }
+
+    #[test]
+    fn remove_last_group_key_deletes_the_cache_file() {
+        let dir = temp_dir();
+        save_group_key(&dir, "roommates", &[1u8; 32]);
+
+        remove_group_key(&dir, "roommates");
+
+        assert!(
+            !dir.join(".wavesync_group_keys.json").exists(),
+            "an empty cache file must not linger on disk"
+        );
+        // Removing a topic that isn't cached is a quiet no-op.
+        remove_group_key(&dir, "roommates");
     }
 }

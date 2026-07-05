@@ -137,9 +137,11 @@ pub async fn background_sync_with_peers_for_topic(
 /// so it must derive one itself from whatever this sync actually applied.
 /// The returned `Vec` is ordered oldest → newest and already de-duplicated /
 /// coalesced exactly as a foreground session would see it (same registry,
-/// same gate) — most callers only need `.last()`. Empty on timeout, no
-/// matching `SyncNotify` policy, or nothing that policy considered
-/// notify-worthy — exactly like a foreground session seeing nothing.
+/// same gate) — most callers only need `.last()`. Notifications captured
+/// before a timeout are still returned; the `Vec` is empty only when no
+/// matching `SyncNotify` policy fired (or nothing that policy considered
+/// notify-worthy applied) — exactly like a foreground session seeing
+/// nothing.
 ///
 /// `key_cache_load_only`, when `true`, forbids every group-key derivation this
 /// call makes (default group and every rejoined extra group) from running the
@@ -203,6 +205,15 @@ async fn background_sync_core(
             t_start.elapsed().as_millis()
         );
     };
+
+    // `timeout` is the OS-granted background-execution budget for the WHOLE
+    // wake, so the hard deadline is anchored HERE — before config load,
+    // engine build, and group rejoin — not after setup. Anchoring it after
+    // setup (the previous behavior) meant total wall time = setup + timeout;
+    // on a slow cold start that overruns the ~30s grant, iOS suspends the
+    // process before the completion handler runs, and repeated overruns
+    // teach iOS to stop delivering background pushes at all.
+    let hard_deadline = tokio::time::Instant::now() + timeout;
 
     // 1. Load saved config
     let config = SyncConfig::load(database_url).map_err(|e| {
@@ -285,6 +296,14 @@ async fn background_sync_core(
         .await
         .map_err(|e| BackgroundSyncError::DatabaseError(e.to_string()))?;
     log_stage("engine_built");
+
+    // Subscribe to network events BEFORE the remaining setup (registry sync,
+    // group rejoin) — broadcast channels only deliver to existing
+    // subscribers, and a fast direct-dialed peer can connect and even finish
+    // its sync while the rejoin loop is still running. Subscribing late
+    // (the previous behavior) lost those events and reported a spurious
+    // "no peers"/"timed out" for a wake that actually synced.
+    let mut events = db.network_event_rx();
 
     // 4. Initialize schema registry (tables already exist, but registry needs populating)
     if let Some(ref crate_name) = config.crate_name {
@@ -471,11 +490,15 @@ async fn background_sync_core(
     } else {
         Duration::from_millis(500)
     };
-    let completion_grace = scaled_completion_grace(completion_grace_base, timeout);
-    let fallback_after = scaled_fallback_after(timeout);
+    // Scale both timers to the budget actually LEFT after setup — the hard
+    // deadline is anchored at function entry (see `hard_deadline` above), so
+    // on a slow cold start the wait loop may have much less than `timeout`
+    // remaining.
+    let remaining = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let completion_grace = scaled_completion_grace(completion_grace_base, remaining);
+    let fallback_after = scaled_fallback_after(remaining);
 
-    let mut events = db.network_event_rx();
-    let deadline = tokio::time::sleep(timeout);
+    let deadline = tokio::time::sleep_until(hard_deadline);
     tokio::pin!(deadline);
     let fallback = tokio::time::sleep(fallback_after);
     tokio::pin!(fallback);
@@ -485,6 +508,7 @@ async fn background_sync_core(
     let mut full_sync_fallback_done = false;
     let mut logged_relay_listening = false;
     let mut logged_first_peer = false;
+    let mut engine_failed: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -528,6 +552,14 @@ async fn background_sync_core(
                         tokio::time::sleep(completion_grace).await;
                         break;
                     }
+                    Ok(NetworkEvent::EngineFailed { reason }) => {
+                        // A dead engine cannot sync — burning the rest of the
+                        // grant waiting on it just delays the completion
+                        // handler. Bail out now and report the failure.
+                        log_stage("engine_failed");
+                        engine_failed = Some(reason);
+                        break;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     _ => continue,
@@ -547,6 +579,11 @@ async fn background_sync_core(
     db.shutdown().await;
 
     // 8. Return result
+    if let Some(reason) = engine_failed {
+        return Err(BackgroundSyncError::DatabaseError(format!(
+            "engine failed during background sync: {reason}"
+        )));
+    }
     let peers_synced = synced_peers.len();
     let result = if peers_synced > 0 {
         BackgroundSyncResult::Synced { peers_synced }

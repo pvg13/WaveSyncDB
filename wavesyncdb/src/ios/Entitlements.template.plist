@@ -33,6 +33,23 @@
 	</array>
 
 	<!--
+		OPTIONAL — required only for the Notification Service Extension flow
+		(rich alert-class banners rewritten by wavesync_nse_handle_push).
+
+		The app and its NSE run as separate processes and can only share the
+		database through an App Group container. Uncomment on BOTH targets
+		(app + .appex) with the same group id, register the group id in the
+		Apple Developer portal, and point WaveSyncDbBuilder at the container
+		via wavesync_app_group_container(groupId). Apps without an NSE need
+		none of this — silent background wakes work without an App Group.
+
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.example.yourapp</string>
+	</array>
+	-->
+
+	<!--
 		Deliberately NOT requesting com.apple.developer.networking.multicast.
 
 		That entitlement is required for a raw multicast/broadcast responder

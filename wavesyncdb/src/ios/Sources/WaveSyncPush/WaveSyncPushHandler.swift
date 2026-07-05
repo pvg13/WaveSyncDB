@@ -7,6 +7,7 @@ import UIKit
 //   0  — sync completed with at least one peer
 //   1  — no peers found within timeout
 //   2  — timed out (some peers may have synced)
+//   3  — skipped: the app's own live engine handles the sync itself
 //   <0 — error (see `wavesyncdb::ffi` docs)
 //
 // Resolved at runtime by dyld against the main executable's exports; the
@@ -167,7 +168,17 @@ public enum WaveSyncPushHandler {
                 NSLog("[WaveSync] Background sync: no peers found")
                 result = .noData
             case 2:
+                // Timed out — but some peers may have synced before the
+                // deadline. Report .newData rather than .noData: telling iOS
+                // "no data" on wakes that actually delivered teaches it to
+                // deprioritize this app's future background pushes.
                 NSLog("[WaveSync] Background sync: timed out")
+                result = .newData
+            case 3:
+                // The app's own engine is live in this process and receives
+                // the change through its open connections; nothing for this
+                // wake to do.
+                NSLog("[WaveSync] Background sync skipped: live engine handles it")
                 result = .noData
             default:
                 NSLog("[WaveSync] Background sync failed with code %d", rc)
@@ -182,15 +193,24 @@ public enum WaveSyncPushHandler {
 
     // MARK: - Discovery helpers
 
+    /// Name of the pointer file Rust's `SyncConfig::save` writes at each
+    /// search root: a single line holding the config directory's path
+    /// relative to that root ("." when the config lives at the root itself).
+    /// Must match `CONFIG_DIR_POINTER_FILE_NAME` in
+    /// `wavesyncdb/src/connection.rs` (and the NSE's `resolveConfigDir`,
+    /// which reads the same pointer at the App Group container root).
+    public static let configDirPointerFilename = ".wavesync_config_dir"
+
     /// Return the URL of the `.wavesync_config.json` file that
     /// `WaveSyncDbBuilder::build()` wrote alongside the SQLite database.
     ///
-    /// Search order matches where Rust most plausibly put it:
-    ///   1. `Application Support/…` — used by `dioxus-sdk-storage::data_directory()`
-    ///      on iOS and therefore the default for Dioxus apps.
-    ///   2. `Documents/…` — non-Dioxus apps that manage their own paths.
-    ///
-    /// Each directory is checked directly and one subdirectory level deep.
+    /// Search order, per root (`Application Support` — the
+    /// `dioxus-sdk-storage::data_directory()` default — then `Documents`):
+    ///   1. The `.wavesync_config_dir` pointer Rust writes on every config
+    ///      save. This is the only path that works for configs nested more
+    ///      than one level deep (e.g. a per-account `u/<user_id>/` layout).
+    ///   2. The root itself, then one subdirectory level — the pre-pointer
+    ///      fallback, kept for apps whose config predates the pointer file.
     static func findConfigFile() -> URL? {
         let fm = FileManager.default
         let roots: [URL] = [
@@ -199,6 +219,9 @@ public enum WaveSyncPushHandler {
         ].compactMap { $0 }
 
         for root in roots {
+            if let pointed = configViaPointer(root: root, fileManager: fm) {
+                return pointed
+            }
             let rootConfig = root.appendingPathComponent(configFilename)
             if fm.fileExists(atPath: rootConfig.path) {
                 return rootConfig
@@ -215,6 +238,22 @@ public enum WaveSyncPushHandler {
             }
         }
         return nil
+    }
+
+    /// Resolve the config via `root`'s `.wavesync_config_dir` pointer, or nil
+    /// when the pointer is absent, empty, or names a directory that doesn't
+    /// actually hold a config (stale pointer → fall through to the search).
+    private static func configViaPointer(root: URL, fileManager fm: FileManager) -> URL? {
+        let pointer = root.appendingPathComponent(configDirPointerFilename)
+        guard let contents = try? String(contentsOf: pointer, encoding: .utf8) else {
+            return nil
+        }
+        let relative = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !relative.isEmpty else { return nil }
+        let config = root
+            .appendingPathComponent(relative)
+            .appendingPathComponent(configFilename)
+        return fm.fileExists(atPath: config.path) ? config.standardizedFileURL : nil
     }
 
     /// Directory where the APNs token file should be written — same parent

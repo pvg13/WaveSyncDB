@@ -1599,15 +1599,34 @@ impl SyncConfig {
     ///
     /// The file holds the group passphrase(s) in cleartext. On mobile the app
     /// sandbox already isolates it, but on a shared desktop the default umask can
-    /// leave it world-readable, so restrict it to owner-only (`0600`) on Unix.
+    /// leave it world-readable, so it is owner-only (`0600`) on Unix from the
+    /// moment it exists.
+    ///
+    /// Atomic (tmp + rename): this file is read by the Swift APNs token writer
+    /// and by the Notification Service Extension, and written both by the app
+    /// and by background wakes — processes iOS kills at hard deadlines. A plain
+    /// `fs::write` interrupted mid-way would leave truncated JSON that bricks
+    /// every reader until the next foreground `build()`.
     fn save(&self) -> Result<(), String> {
         let path = Self::config_path(&self.database_url)
             .ok_or_else(|| "Cannot derive config path from database URL".to_string())?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write config to {}: {e}", path.display()))?;
-        restrict_file_permissions(&path);
+        let tmp_path = path.with_file_name(format!("{CONFIG_FILE_NAME}.tmp"));
+        write_tmp_file(&tmp_path, &json)
+            .map_err(|e| format!("Failed to write config to {}: {e}", tmp_path.display()))?;
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to atomically install config at {}: {e}",
+                path.display()
+            ));
+        }
+        // Keep the pointer files the iOS push components use to find this
+        // config in step with where it actually lives (no-op off iOS).
+        if let Some(dir) = path.parent() {
+            write_config_dir_pointers(dir);
+        }
         Ok(())
     }
 
@@ -1635,19 +1654,164 @@ impl SyncConfig {
     }
 }
 
-/// Restrict a file to owner read/write (`0600`) on Unix. No-op elsewhere and
-/// best-effort — a failure to tighten permissions must not fail the write that
-/// already succeeded, but it is logged so a misconfigured environment is visible.
-fn restrict_file_permissions(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!("Could not restrict permissions on {}: {e}", path.display());
+/// Write `contents` to `path`, restricted to owner-only permissions for its
+/// entire existence on unix — no window between "file exists" and "file is
+/// locked down" for another local user/process to read it in. The tmp-write
+/// half of the atomic write-then-rename idiom shared by `SyncConfig::save`
+/// and the `key_cache` module (both files are read by iOS processes the OS
+/// kills at hard deadlines).
+#[cfg(unix)]
+pub(crate) fn write_tmp_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `.mode()` above only governs permissions at creation time; a stale
+    // tmp file left over from a killed previous run (this path is shared
+    // with the NSE, which the OS can and does kill mid-write) could already
+    // exist with looser permissions. Fix them up unconditionally rather
+    // than trusting that this call always creates the file fresh.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_tmp_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
+/// Filename of the config-directory pointer the iOS push components read:
+/// a single line holding the active config directory's path RELATIVE to the
+/// file's own directory ("." when the config lives at that root). Read by
+/// `WaveSyncPushHandler.findConfigFile` (APNs token writer) and
+/// `WaveSyncNotificationService.resolveConfigDir` (NSE) — both in
+/// `src/ios/Sources/WaveSyncPush/`.
+const CONFIG_DIR_POINTER_FILE_NAME: &str = ".wavesync_config_dir";
+
+/// The iOS search roots the Swift push components scan, expressed as
+/// ancestors of `config_dir`: the app sandbox's `Application Support` and
+/// `Documents` directories, and an App Group container root
+/// (`…/Containers/Shared/AppGroup/<UUID>`). Pure path inspection so the
+/// pointer contract is host-testable; returns every matching ancestor
+/// (nested layouts can sit under both an app-group root and a
+/// per-container `Application Support`).
+fn config_dir_pointer_roots(config_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    // `ancestors()` yields `config_dir` itself first — deliberate: a config
+    // living directly at a search root gets a "." pointer there.
+    for ancestor in config_dir.ancestors() {
+        let name = ancestor.file_name().and_then(|n| n.to_str());
+        let is_search_root = matches!(name, Some("Application Support") | Some("Documents"));
+        // An app-group container root is the UUID directory directly under
+        // an `AppGroup` component.
+        let is_app_group_root = ancestor
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("AppGroup");
+        if is_search_root || is_app_group_root {
+            roots.push(ancestor.to_path_buf());
         }
     }
-    #[cfg(not(unix))]
-    let _ = path;
+    roots
+}
+
+/// Write (or refresh) the `.wavesync_config_dir` pointer at every iOS search
+/// root that is an ancestor of `config_dir`, so the Swift APNs token writer
+/// and the Notification Service Extension can find a config nested arbitrarily
+/// deep (e.g. a per-account `u/<user_id>/` layout) without scanning. Called on
+/// every config save — overwriting keeps the pointer current across account
+/// switches. Best-effort: a failed pointer write only degrades discovery back
+/// to the shallow search, so it is logged and swallowed.
+///
+/// iOS-only at runtime: on other platforms nothing reads the pointer, and
+/// "Documents"/"Application Support" path components are common enough on
+/// desktops that writing outside the config directory would be rude.
+fn write_config_dir_pointers(config_dir: &std::path::Path) {
+    if !cfg!(any(target_os = "ios", test)) {
+        return;
+    }
+    for root in config_dir_pointer_roots(config_dir) {
+        let relative = config_dir
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|r| r.to_str())
+            .filter(|r| !r.is_empty())
+            .unwrap_or(".")
+            .to_string();
+        let pointer = root.join(CONFIG_DIR_POINTER_FILE_NAME);
+        if let Err(e) = std::fs::write(&pointer, &relative) {
+            tracing::warn!(
+                "Failed to write config-dir pointer {}: {e}",
+                pointer.display()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_dir_pointer_tests {
+    use super::*;
+
+    fn temp_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("wavesync_pointer_{}", uuid::Uuid::new_v4()))
+            .join(suffix);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn nested_app_support_layout_yields_root_and_relative_path() {
+        // Mirrors MediterraneaDiente's on-device layout:
+        //   <sandbox>/Library/Application Support/Mediterranea/u/<user>/
+        let config_dir = temp_dir("Library/Application Support/Mediterranea/u/user123");
+        let roots = config_dir_pointer_roots(&config_dir);
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].ends_with("Application Support"));
+
+        write_config_dir_pointers(&config_dir);
+        let pointer = roots[0].join(CONFIG_DIR_POINTER_FILE_NAME);
+        let contents = std::fs::read_to_string(&pointer).expect("pointer written");
+        assert_eq!(contents, "Mediterranea/u/user123");
+        assert!(roots[0].join(&contents).is_dir());
+    }
+
+    #[test]
+    fn config_at_search_root_writes_dot() {
+        let config_dir = temp_dir("Documents");
+        write_config_dir_pointers(&config_dir);
+        let contents = std::fs::read_to_string(config_dir.join(CONFIG_DIR_POINTER_FILE_NAME))
+            .expect("pointer written");
+        assert_eq!(contents, ".");
+    }
+
+    #[test]
+    fn app_group_container_root_is_detected() {
+        // …/Containers/Shared/AppGroup/<UUID>/u/user123
+        let config_dir = temp_dir("Containers/Shared/AppGroup/ABCD-1234/u/user123");
+        let roots = config_dir_pointer_roots(&config_dir);
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].ends_with("AppGroup/ABCD-1234"));
+
+        write_config_dir_pointers(&config_dir);
+        let contents = std::fs::read_to_string(roots[0].join(CONFIG_DIR_POINTER_FILE_NAME))
+            .expect("pointer written");
+        assert_eq!(contents, "u/user123");
+    }
+
+    #[test]
+    fn no_recognized_ancestor_writes_nothing() {
+        let config_dir = temp_dir("plain/nested/dir");
+        assert!(config_dir_pointer_roots(&config_dir).is_empty());
+        // And the write helper is a clean no-op.
+        write_config_dir_pointers(&config_dir);
+    }
 }
 
 /// Builder for `WaveSyncDb`.
@@ -1681,14 +1845,13 @@ pub struct WaveSyncDbBuilder {
     /// Whether the on-disk group-key cache is enabled. iOS only — see
     /// `with_group_key_cache`.
     group_key_cache_enabled: bool,
-    /// NSE-only: forbid `with_passphrase` from deriving on a cache miss. See
-    /// `with_key_cache_load_only`.
+    /// NSE-only: forbid the passphrase derivation in `build()` from running
+    /// the KDF on a cache miss. See `with_key_cache_load_only`.
     key_cache_load_only: bool,
-    /// Set by `with_passphrase` when `key_cache_load_only` was on and the
-    /// cache missed. `build()` fails closed on this instead of silently
-    /// proceeding with no group key (which would mean an unauthenticated,
-    /// unencrypted topic — the opposite of what a passphrase was asked for).
-    key_cache_load_only_miss: bool,
+    /// Drop the cached group key for this builder's topic before deriving in
+    /// `build()`, forcing a fresh KDF run (and re-cache). See
+    /// `invalidate_group_key_cache`.
+    invalidate_key_cache: bool,
 }
 
 impl WaveSyncDbBuilder {
@@ -1723,7 +1886,7 @@ impl WaveSyncDbBuilder {
             ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
             group_key_cache_enabled: true,
             key_cache_load_only: false,
-            key_cache_load_only_miss: false,
+            invalidate_key_cache: false,
         }
     }
 
@@ -1907,27 +2070,15 @@ impl WaveSyncDbBuilder {
     }
 
     pub fn with_passphrase(mut self, passphrase: &str) -> Self {
-        // Argon2id derivation, salted with the user topic (fixed at
-        // `WaveSyncDbBuilder::new`) — intentionally slow, runs once here.
-        // On iOS with the group-key cache enabled, a cache hit skips the KDF
-        // entirely (see `group_key_for_dir` / the `key_cache` module); a
-        // miss still derives here and writes the result back — unless
-        // `key_cache_load_only` is set (NSE only), in which case a miss
-        // must not derive at all; `build()` fails closed on that below.
-        let cache_dir = key_cache_dir(&self.database_url);
-        match group_key_for_dir(
-            passphrase,
-            &self.topic,
-            cache_dir.as_deref(),
-            self.group_key_cache_enabled,
-            self.key_cache_load_only,
-        ) {
-            Ok(key) => self.group_key = Some(key),
-            Err(GroupKeyLoadOnlyMiss) => {
-                self.group_key = None;
-                self.key_cache_load_only_miss = true;
-            }
-        }
+        // Derivation is deferred to `build()` — deliberately NOT done here:
+        //  (a) `build()` dlopens the WaveSyncPush framework first, so the
+        //      key-cache write's `wavesync_protect_file` dlsym actually
+        //      resolves and the cache file gets its iOS data-protection
+        //      class on the fresh-install derivation (the only write that
+        //      matters — later launches are cache hits that never re-save);
+        //  (b) builder-method order can't change behavior — previously
+        //      `.with_passphrase(x).with_group_key_cache(false)` had already
+        //      written the key to disk before the opt-out was seen.
         self.passphrase = Some(passphrase.to_string());
         self
     }
@@ -1958,11 +2109,32 @@ impl WaveSyncDbBuilder {
     /// via `key_cache::protect_file`), permitting the NSE to read it before
     /// first unlock while staying encrypted at rest. Opt out with
     /// `with_group_key_cache(false)` if your threat model forbids caching
-    /// derived key material to disk — the NSE then can't sync (it falls
-    /// back to the operator's placeholder alert content), but nothing else
+    /// derived key material to disk — `build()` then also deletes this
+    /// topic's previously-cached key, and the NSE can't sync (it falls back
+    /// to the operator's placeholder alert content), but nothing else
     /// changes.
+    ///
+    /// **Passphrase-rotation caveat:** a cache hit returns the stored key
+    /// without consulting the passphrase at all — that's the entire point
+    /// (no KDF run), but it means a CHANGED passphrase is silently ignored
+    /// while the old key stays cached. When your app rotates a group's
+    /// passphrase, chain [`invalidate_group_key_cache`](Self::invalidate_group_key_cache)
+    /// to force a fresh derivation. There is no cheap way to detect the
+    /// rotation automatically: verifying the passphrase against the cached
+    /// key requires exactly the KDF run the cache exists to avoid.
     pub fn with_group_key_cache(mut self, enabled: bool) -> Self {
         self.group_key_cache_enabled = enabled;
+        self
+    }
+
+    /// Drop the on-disk cached group key for this builder's topic before
+    /// `build()` derives, forcing a fresh Argon2id run from the passphrase
+    /// (which is then re-cached, unless the cache is disabled). Call this
+    /// when the group's passphrase has been rotated — see the caveat on
+    /// [`with_group_key_cache`](Self::with_group_key_cache). iOS only; a
+    /// no-op wherever the cache itself is.
+    pub fn invalidate_group_key_cache(mut self) -> Self {
+        self.invalidate_key_cache = true;
         self
     }
 
@@ -2044,16 +2216,56 @@ impl WaveSyncDbBuilder {
 
     #[allow(unused_mut)]
     pub async fn build(mut self) -> Result<WaveSyncDb, DbErr> {
-        // Fail closed rather than silently building an unauthenticated,
-        // unencrypted group: `with_passphrase` only sets this when
-        // `key_cache_load_only` (NSE only) forbade deriving on a cache miss.
-        // Checked before any other work so the NSE's fast fallback path
-        // costs nothing beyond this one check.
-        if self.key_cache_load_only_miss {
-            return Err(DbErr::Custom(
-                "group key cache miss in load-only mode (NSE): refusing to derive via KDF"
-                    .to_string(),
-            ));
+        // Force-load the WaveSyncPush framework BEFORE any group-key work:
+        // the key-cache write below protects its file via a dlsym'd Swift
+        // helper (`wavesync_protect_file`), which only resolves once the
+        // framework is loaded. dx embeds the framework in `.app/Frameworks/`
+        // without an `LC_LOAD_DYLIB` entry on the Rust binary, so dyld never
+        // loads it on its own — see the APNs token block further down for
+        // the delegate-proxy half of this. Idempotent (refcounted dlopen).
+        #[cfg(all(feature = "push-sync", target_os = "ios"))]
+        crate::push::load_ios_push_framework();
+
+        // Derive (or load from the on-disk cache) the group key recorded by
+        // `with_passphrase`. Runs here rather than at the builder call so
+        // framework loading above precedes the cache write, and so the
+        // cache opt-out / invalidation flags are all settled regardless of
+        // builder-method order.
+        if self.group_key.is_none()
+            && let Some(passphrase) = self.passphrase.clone()
+        {
+            let cache_dir = key_cache_dir(&self.database_url);
+            #[cfg(any(target_os = "ios", test))]
+            if let Some(ref dir) = cache_dir {
+                if self.invalidate_key_cache {
+                    // Forget the cached key so this build re-derives from
+                    // the (possibly rotated) passphrase and re-caches.
+                    crate::key_cache::remove_group_key(dir, &self.topic);
+                }
+                if !self.group_key_cache_enabled {
+                    // Opting out must also remove key material a previous
+                    // opted-in run left on disk.
+                    crate::key_cache::remove_group_key(dir, &self.topic);
+                }
+            }
+            match group_key_for_dir(
+                &passphrase,
+                &self.topic,
+                cache_dir.as_deref(),
+                self.group_key_cache_enabled,
+                self.key_cache_load_only,
+            ) {
+                Ok(key) => self.group_key = Some(key),
+                // Fail closed rather than silently building an
+                // unauthenticated, unencrypted group (NSE only — see
+                // `GroupKeyLoadOnlyMiss`).
+                Err(GroupKeyLoadOnlyMiss) => {
+                    return Err(DbErr::Custom(
+                        "group key cache miss in load-only mode (NSE): refusing to derive via KDF"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         // Auto-read FCM token from file written by WaveSyncInitProvider / WaveSyncService.
@@ -2087,37 +2299,33 @@ impl WaveSyncDbBuilder {
 
         // On iOS the APNs token is written by the Swift `WaveSyncPush`
         // package's `didRegisterForRemoteNotificationsWithDeviceToken:`
-        // swizzle (installed at image load by `WaveSyncAppDelegateProxy+load`).
+        // swizzle (installed at image load by `WaveSyncAppDelegateProxy+load`,
+        // which the framework dlopen at the very top of `build()` armed).
         // The Swift side discovers where to write the token by locating the
-        // `.wavesync_config.json` file that `SyncConfig::save` writes below.
+        // `.wavesync_config.json` file that `SyncConfig::save` writes below
+        // (via the `.wavesync_config_dir` pointer it also writes).
         //
-        // First, force-load the framework: dx embeds it in `.app/Frameworks/`
-        // but does not add an `LC_LOAD_DYLIB` entry on the Rust binary, so
-        // dyld would otherwise never load it and `+load` would never run.
-        // We dlopen it here, early in `build()`, so the observer registers
-        // before `UIApplicationDidFinishLaunchingNotification` fires.
+        // Poll briefly for a token file left by a previous run. First-ever
+        // launch produces no file; Swift writes it once APNs responds, and
+        // the engine's periodic `maybe_register_push_token` re-read picks it
+        // up mid-run.
         //
-        // Then poll briefly for a token file left by a previous run.
-        // First-ever launch produces no file; Swift will write it on the
-        // *next* launch once APNs responds, and we pick it up then.
+        // Skipped in NSE mode (`key_cache_load_only`): the extension neither
+        // registers for push nor should it burn up to 4s of its much tighter
+        // wall-clock budget sleeping on a file the app owns.
         #[cfg(all(feature = "push-sync", target_os = "ios"))]
-        {
-            crate::push::load_ios_push_framework();
+        if !self.key_cache_load_only && self.push_token.is_none() {
+            for attempt in 0..5 {
+                if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
+                    self.push_token = Some(("Apns".to_string(), token));
+                    break;
+                }
+                if attempt < 4 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
             if self.push_token.is_none() {
-                for attempt in 0..5 {
-                    if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
-                        self.push_token = Some(("Apns".to_string(), token));
-                        break;
-                    }
-                    if attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-                if self.push_token.is_none() {
-                    tracing::info!(
-                        "No APNs token file found — push will be registered on next launch"
-                    );
-                }
+                tracing::info!("No APNs token file found — push will be registered on next launch");
             }
         }
 
@@ -2128,6 +2336,20 @@ impl WaveSyncDbBuilder {
         // actually diagnosing slow queries.
         opts.sqlx_logging_level(log::LevelFilter::Debug);
         let inner = Database::connect(opts).await?;
+
+        // Pin WAL explicitly for the two-process design (foreground app +
+        // background wake / NSE opening the same file): WAL lets a reader
+        // proceed while the other process writes. sqlx's SQLite defaults
+        // already select WAL and a 5s busy_timeout, but the journal mode is
+        // load-bearing here, not a default we want to inherit silently —
+        // WAL is persistent in the file, so pinning it once at open covers
+        // every later connection from any process.
+        if inner.get_database_backend() == DatabaseBackend::Sqlite {
+            inner
+                .execute_unprepared("PRAGMA journal_mode=WAL;")
+                .await
+                .map_err(|e| DbErr::Custom(format!("failed to set WAL journal mode: {e}")))?;
+        }
 
         // Create meta table and get/generate persistent site_id
         crate::shadow::create_meta_table(&inner).await?;
@@ -2283,6 +2505,12 @@ impl WaveSyncDbBuilder {
 
         let engine_config = crate::engine::EngineConfig {
             database_url: self.database_url.clone(),
+            // `key_cache_load_only` is set exclusively by the NSE path
+            // (`background_sync_core` servicing `wavesync_nse_handle_push`),
+            // so it doubles as the "this engine runs in the extension
+            // process" marker — which selects the NSE's separate libp2p
+            // identity (see `EngineConfig::nse_process`).
+            nse_process: self.key_cache_load_only,
             sync_interval: self.sync_interval,
             mdns_enabled: self.mdns_enabled,
             mdns_query_interval: self.mdns_query_interval,
@@ -2629,6 +2857,14 @@ impl WaveSyncNode {
                 SyncConfig::persist_group_left(&self.inner.base_database_url, &user_topic)
             {
                 tracing::debug!("Could not remove left group '{user_topic}' from config: {e}");
+            }
+            // A left group's raw key must not stay readable on disk: without
+            // this, `.wavesync_group_keys.json` retained the 32-byte group
+            // key indefinitely after the user left (iOS-only; the cache
+            // doesn't exist elsewhere).
+            #[cfg(any(target_os = "ios", test))]
+            if let Some(dir) = key_cache_dir(&self.inner.base_database_url) {
+                crate::key_cache::remove_group_key(&dir, &user_topic);
             }
         }
     }

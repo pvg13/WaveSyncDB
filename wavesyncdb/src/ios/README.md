@@ -44,14 +44,15 @@ can point their `WaveSyncDbBuilder` at the same directory.
 **If your app keeps the database somewhere other than the container root**
 (e.g. a per-account subdirectory), the NSE has no way to know that on its
 own — it's only ever handed the container root, never told the app's layout.
-Bridge the gap with a pointer file: on every launch/login (whenever the
-active account's directory is decided), write
-`<container root>/.wavesync_config_dir` containing a single line — the
-active config directory's path, RELATIVE to the container root (e.g.
-`u/<user_id>` if that's where `.wavesync_config.json` lives). Overwrite it
-every time, so switching accounts on the same device retargets the NSE
-without reinstalling. `resolveConfigDir` in the Swift template reads this
-pointer first and falls back to the container root if it's absent or
-doesn't resolve to a directory that actually holds
-`.wavesync_config.json` — so an app that keeps its database directly at the
-root needs no pointer file at all.
+The bridge is a pointer file, `<container root>/.wavesync_config_dir`,
+containing a single line — the active config directory's path, RELATIVE to
+the container root (e.g. `u/<user_id>` if that's where
+`.wavesync_config.json` lives). **Rust writes this pointer automatically**:
+every `WaveSyncDbBuilder::build()` (and every later config save) refreshes
+it at each recognized search root that is an ancestor of the config
+directory — the app-sandbox `Application Support` and `Documents`
+directories and an App Group container root — so switching accounts on the
+same device retargets the NSE without any app code. `resolveConfigDir` in
+the Swift template (and the app-side token writer's `findConfigFile`) reads
+the pointer first and falls back to scanning if it's absent or doesn't
+resolve to a directory that actually holds `.wavesync_config.json`.

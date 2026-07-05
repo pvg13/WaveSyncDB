@@ -16,15 +16,24 @@ import UserNotifications
 // Notification Service Extension), copy this file into it, subclass
 // `WaveSyncNotificationService` overriding `appGroupId` (and optionally
 // `budgetSecs`), link the NSE target against the same WaveSyncPush framework
-// the app uses, and give the NSE target's Info.plist an
-// `NSExtensionPrincipalClass` pointing at your subclass. The NSE target also
-// needs its own App Groups entitlement for the SAME group id as the app.
+// the app uses, AND link it against a wavesyncdb Rust STATIC library built
+// with `features = ["mobile-ffi", "push-sync"]` — see the resolution note on
+// the `@_silgen_name` declarations below; without the staticlib the
+// extension aborts with a dyld "symbol not found" on its first push. Give
+// the NSE target's Info.plist an `NSExtensionPrincipalClass` pointing at
+// your subclass. The NSE target also needs its own App Groups entitlement
+// for the SAME group id as the app.
 // ============================================================================
 
 // Declared by wavesyncdb's C FFI (features = ["mobile-ffi", "push-sync"],
-// target_os = "ios"). Resolved at runtime by dyld against the main
-// executable's exports, same as `WaveSyncPushHandler`'s `@_silgen_name`
-// declarations — the Swift compiler and the Rust linker stay independent.
+// target_os = "ios"). Resolution differs from `WaveSyncPushHandler`'s
+// `@_silgen_name` declarations, and the difference matters: in the APP
+// process dyld resolves those against the main executable (the Rust binary),
+// but this file runs in the .appex process, whose main executable is the
+// extension stub — the symbol only resolves if the NSE target itself links
+// the wavesyncdb Rust staticlib (see the setup steps above and
+// docs/ios-deployment). The Swift compiler and the Rust linker still stay
+// independent either way.
 @_silgen_name("wavesync_nse_handle_push")
 private func wavesync_nse_handle_push(
     _ configDir: UnsafePointer<CChar>,
@@ -135,13 +144,17 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
             deliver(best)
             return
         }
-        if let title = obj["title"] as? String, !title.isEmpty {
-            best.title = title
+        let title = (obj["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let body = (obj["body"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        // Mutate inside `deliver`'s serial queue: `serviceExtensionTimeWillExpire`
+        // can hand this same object to the OS concurrently, and an unserialized
+        // write here could produce a torn title/body pairing on the delivered
+        // banner. If expiry already won, the mutation is skipped entirely —
+        // the placeholder went out and this result is moot.
+        deliver(best) {
+            if let title = title { best.title = title }
+            if let body = body { best.body = body }
         }
-        if let body = obj["body"] as? String, !body.isEmpty {
-            best.body = body
-        }
-        deliver(best)
     }
 
     /// Calls the content handler exactly once. Both `didReceive`'s early-exit
@@ -153,10 +166,16 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
     /// them ever wins the `guard`, closing the race that would otherwise let
     /// both call the handler — logged by UNNotificationServiceExtension as a
     /// programmer error.
-    private func deliver(_ content: UNNotificationContent) {
+    /// `mutate`, when supplied, runs inside the same serial-queue critical
+    /// section, after the "am I first?" guard and before the handler call —
+    /// so content mutations can never race a concurrent delivery of the
+    /// same object, and are skipped entirely if another path already
+    /// delivered.
+    private func deliver(_ content: UNNotificationContent, mutate: (() -> Void)? = nil) {
         deliverQueue.sync {
             guard let handler = contentHandler else { return }
             contentHandler = nil
+            mutate?()
             handler(content)
         }
     }
@@ -167,15 +186,16 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
     ///
     /// The container ROOT is not necessarily where `.wavesync_config.json`
     /// lives — an app with a per-account (or otherwise nested) data layout
-    /// keeps it in a subdirectory instead. Such an app is expected to write
+    /// keeps it in a subdirectory instead. Rust's `SyncConfig::save` writes
     /// a pointer file, `.wavesync_config_dir`, at the container root on
-    /// every launch/login: a single line holding the path of the currently
+    /// every config save: a single line holding the path of the currently
     /// active config directory, RELATIVE to the container root (so the
     /// pointer keeps working if the container itself is ever relocated by
     /// iOS between launches). If the pointer exists and names a directory
     /// that actually holds `.wavesync_config.json`, use it; otherwise fall
     /// back to the root itself, which is correct for an app that keeps its
-    /// database directly there and never writes a pointer at all.
+    /// database directly there (no pointer needed, though one saying "."
+    /// may exist).
     private static func resolveConfigDir(groupId: String) -> String? {
         guard !groupId.isEmpty else { return nil }
         guard let root = FileManager.default

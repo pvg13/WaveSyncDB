@@ -226,6 +226,22 @@ pub async fn set_db_version(db: &impl ConnectionTrait, version: u64) -> Result<(
 pub async fn get_or_create_libp2p_keypair(
     db: &impl ConnectionTrait,
 ) -> Result<libp2p::identity::Keypair, DbErr> {
+    get_or_create_libp2p_keypair_named(db, "libp2p_keypair").await
+}
+
+/// Like [`get_or_create_libp2p_keypair`], but under an explicit meta key.
+///
+/// The iOS Notification Service Extension runs in its OWN process, and iOS
+/// can (and does) run it while the main app is foregrounded with a live
+/// engine. Two simultaneous swarms with the same PeerId clobber each other's
+/// rendezvous registrations and relay reservations, so the NSE persists a
+/// separate identity under `libp2p_keypair_nse` — a second stable PeerId for
+/// the same device, harmless to sync (peers verify by group key, not
+/// identity) but isolated at the relay.
+pub async fn get_or_create_libp2p_keypair_named(
+    db: &impl ConnectionTrait,
+    meta_key: &str,
+) -> Result<libp2p::identity::Keypair, DbErr> {
     #[derive(Debug, FromQueryResult)]
     struct MetaRow {
         value: Vec<u8>,
@@ -234,7 +250,7 @@ pub async fn get_or_create_libp2p_keypair(
     let row = MetaRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "SELECT value FROM _wavesync_meta WHERE key = $1",
-        ["libp2p_keypair".into()],
+        [meta_key.into()],
     ))
     .one(db)
     .await?;
@@ -258,7 +274,7 @@ pub async fn get_or_create_libp2p_keypair(
     db.execute_raw(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
-        ["libp2p_keypair".into(), bytes.into()],
+        [meta_key.into(), bytes.into()],
     ))
     .await?;
     Ok(keypair)

@@ -54,40 +54,68 @@ fn ensure_android_logger() {
 /// `target_topic`, when `Some`, is the effective (PSK-derived) topic from the
 /// push payload — only that group is brought up for this wake. `None` rejoins
 /// every configured group (the conservative wake).
+///
+/// Panic-safe: the whole body runs under `catch_unwind` so a panic anywhere
+/// in the setup or sync path returns `-6` instead of unwinding across the
+/// `extern "C"` boundary and aborting the host app — on iOS, repeated
+/// background crashes teach the OS to throttle the app's background pushes.
 fn run_background_sync(
     database_url: &str,
     timeout_secs: u32,
     peer_addrs: &[String],
     target_topic: Option<&str>,
 ) -> i32 {
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => return -6,
-    };
+    // A push delivered while the app's own engine is live (foreground
+    // delivery, or backgrounded-but-not-suspended) must not build a second
+    // engine: it would load the same persisted libp2p keypair and register
+    // the same PeerId at the rendezvous/relay with its own short-lived
+    // addresses, clobbering the live engine's state. The live engine
+    // receives the change through its open connections anyway.
+    if crate::engine::any_engine_live() {
+        tracing::info!(
+            "background sync skipped: an engine is already live in this \
+             process and will handle the sync itself"
+        );
+        return 3;
+    }
 
-    let timeout = Duration::from_secs(timeout_secs.into());
-
-    rt.block_on(async {
-        match background_sync::background_sync_with_peers_for_topic(
-            database_url,
-            timeout,
-            peer_addrs,
-            target_topic,
-        )
-        .await
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
         {
-            Ok(BackgroundSyncResult::Synced { .. }) => 0,
-            Ok(BackgroundSyncResult::NoPeers) => 1,
-            Ok(BackgroundSyncResult::TimedOut { .. }) => 2,
-            Err(background_sync::BackgroundSyncError::ConfigNotFound(_)) => -1,
-            Err(background_sync::BackgroundSyncError::ConfigInvalid(_)) => -2,
-            Err(background_sync::BackgroundSyncError::DatabaseError(_)) => -3,
-            Err(background_sync::BackgroundSyncError::RegistryError(_)) => -4,
+            Ok(rt) => rt,
+            Err(_) => return -6,
+        };
+
+        let timeout = Duration::from_secs(timeout_secs.into());
+
+        rt.block_on(async {
+            match background_sync::background_sync_with_peers_for_topic(
+                database_url,
+                timeout,
+                peer_addrs,
+                target_topic,
+            )
+            .await
+            {
+                Ok(BackgroundSyncResult::Synced { .. }) => 0,
+                Ok(BackgroundSyncResult::NoPeers) => 1,
+                Ok(BackgroundSyncResult::TimedOut { .. }) => 2,
+                Err(background_sync::BackgroundSyncError::ConfigNotFound(_)) => -1,
+                Err(background_sync::BackgroundSyncError::ConfigInvalid(_)) => -2,
+                Err(background_sync::BackgroundSyncError::DatabaseError(_)) => -3,
+                Err(background_sync::BackgroundSyncError::RegistryError(_)) => -4,
+            }
+        })
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            tracing::error!("background sync panicked; returning -6");
+            -6
         }
-    })
+    }
 }
 
 /// C FFI entry point for background sync. Called from iOS Swift via `@_silgen_name`.
@@ -97,12 +125,15 @@ fn run_background_sync(
 /// * `0` — Successfully synced with at least one peer
 /// * `1` — No peers found within timeout
 /// * `2` — Timed out (some peers may have synced)
+/// * `3` — Skipped: the app's own engine is live in this process and handles
+///   the sync itself (treat as "nothing for this call to do", not an error)
 /// * `-1` — Config not found (app was never started)
 /// * `-2` — Invalid config
 /// * `-3` — Database error
 /// * `-4` — Registry error
 /// * `-5` — Invalid arguments (null pointer or bad UTF-8)
-/// * `-6` — Runtime creation failed
+/// * `-6` — Runtime creation failed, or an internal panic (caught; never
+///   unwinds into the caller)
 ///
 /// # Safety
 ///
@@ -276,7 +307,9 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSync(
         "background_sync starting: db={url}, {} bootstrap peer(s) from FCM payload",
         peer_addrs.len()
     );
-    run_background_sync(&url, timeout_secs as u32, &peer_addrs, None)
+    // `jint` is signed — clamp instead of `as u32`, which would turn a
+    // negative caller value into a ~136-year timeout.
+    run_background_sync(&url, timeout_secs.max(0) as u32, &peer_addrs, None)
 }
 
 /// JNI entry point for **targeted** background sync. Called from Dioxus-generated
@@ -336,7 +369,13 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSyncTarget
         !peer_addrs_json.is_null(),
         target.is_some()
     );
-    run_background_sync(&url, timeout_secs as u32, &peer_addrs, target.as_deref())
+    // `jint` is signed — clamp instead of `as u32` (see `backgroundSync`).
+    run_background_sync(
+        &url,
+        timeout_secs.max(0) as u32,
+        &peer_addrs,
+        target.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -371,6 +410,56 @@ fn parse_push_payload(json: &str) -> Option<(String, Vec<String>)> {
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
         .unwrap_or_default();
     Some((topic, peer_addrs))
+}
+
+/// Re-anchor a config-recorded `database_url` against the directory the
+/// config was actually found in.
+///
+/// The config file itself is located relocation-safely (App Group container
+/// lookup + `.wavesync_config_dir` pointer), but the `database_url` recorded
+/// INSIDE it is an absolute path written by the app on some earlier launch —
+/// and iOS is free to relocate containers between launches (restore,
+/// migration, `.appex` vs app path differences). Trusting the stale absolute
+/// path made the NSE fail to open the DB on every wake after a relocation,
+/// silently, until the app next foregrounded and rewrote the config.
+///
+/// Resolution: if the recorded path still exists, keep it; otherwise, if a
+/// file with the same name exists in `config_dir` (the DB always lives
+/// beside its config), rebuild the URL against that. If neither exists the
+/// original URL is returned and the open fails downstream with its normal
+/// error.
+#[cfg(any(all(target_os = "ios", feature = "push-sync"), test))]
+fn resolve_database_url_for_dir(config_dir: &std::path::Path, database_url: &str) -> String {
+    let (scheme, rest) = match database_url.split_once(':') {
+        Some((s, r)) if s.starts_with("sqlite") => (format!("{s}:"), r),
+        _ => (String::new(), database_url),
+    };
+    let (path_str, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let path_str = path_str.strip_prefix("//").unwrap_or(path_str);
+
+    let recorded = std::path::Path::new(path_str);
+    if recorded.exists() {
+        return database_url.to_string();
+    }
+    let Some(file_name) = recorded.file_name() else {
+        return database_url.to_string();
+    };
+    let candidate = config_dir.join(file_name);
+    if !candidate.exists() {
+        return database_url.to_string();
+    }
+    tracing::info!(
+        "NSE: recorded database path {} is stale; using co-located {}",
+        recorded.display(),
+        candidate.display()
+    );
+    match query {
+        Some(q) => format!("{scheme}{}?{q}", candidate.display()),
+        None => format!("{scheme}{}", candidate.display()),
+    }
 }
 
 /// JSON shape returned by [`wavesync_nse_handle_push`]. See that function's
@@ -483,6 +572,10 @@ pub extern "C" fn wavesync_nse_handle_push(
                 return fallback();
             }
         };
+    // The recorded absolute path can be stale after a container relocation —
+    // re-anchor it against where the config was actually found.
+    let database_url =
+        resolve_database_url_for_dir(std::path::Path::new(config_dir), &config.database_url);
 
     // A single worker thread — unlike `run_background_sync`'s runtime above,
     // which serves the app process (Android's background service, or iOS's
@@ -503,31 +596,44 @@ pub extern "C" fn wavesync_nse_handle_push(
     };
 
     let budget = Duration::from_secs(budget_secs.into());
-    let (synced, title, body) = rt.block_on(async {
-        match background_sync::background_sync_with_capture(
-            &config.database_url,
-            budget,
-            &peer_addrs,
-            Some(&topic),
-            // Never let the NSE's sync fall back to running the KDF — see
-            // this function's doc comment.
-            true,
-        )
-        .await
-        {
-            Ok((result, notifications)) => {
-                let synced = matches!(result, BackgroundSyncResult::Synced { .. });
-                match notifications.into_iter().last() {
-                    Some(n) => (synced, Some(n.title), Some(n.body)),
-                    None => (synced, None, None),
+    // catch_unwind: a panic must never unwind across this `extern "C"`
+    // boundary — it would abort the NSE outright, and repeated extension
+    // crashes make iOS stop invoking it. The uniform `synced:false`
+    // fallback (placeholder banner) is exactly the right degradation.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            match background_sync::background_sync_with_capture(
+                &database_url,
+                budget,
+                &peer_addrs,
+                Some(&topic),
+                // Never let the NSE's sync fall back to running the KDF — see
+                // this function's doc comment.
+                true,
+            )
+            .await
+            {
+                Ok((result, notifications)) => {
+                    let synced = matches!(result, BackgroundSyncResult::Synced { .. });
+                    match notifications.into_iter().last() {
+                        Some(n) => (synced, Some(n.title), Some(n.body)),
+                        None => (synced, None, None),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("wavesync_nse_handle_push: background sync failed: {e}");
+                    (false, None, None)
                 }
             }
-            Err(e) => {
-                tracing::warn!("wavesync_nse_handle_push: background sync failed: {e}");
-                (false, None, None)
-            }
+        })
+    }));
+    let (synced, title, body) = match outcome {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::error!("wavesync_nse_handle_push: sync panicked; returning fallback");
+            (false, None, None)
         }
-    });
+    };
 
     to_cstring(nse_result_json(synced, title, body))
 }
@@ -673,5 +779,55 @@ mod nse_tests {
         assert_eq!(value["synced"], false);
         assert!(value["title"].is_null());
         assert!(value["body"].is_null());
+    }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wavesync_nse_url_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn existing_recorded_path_is_kept_verbatim() {
+        let dir = temp_dir();
+        let db = dir.join("app.db");
+        std::fs::write(&db, b"x").unwrap();
+        let url = format!("sqlite:{}?mode=rwc", db.display());
+        // Even with a different config_dir, an existing path wins.
+        assert_eq!(
+            resolve_database_url_for_dir(std::path::Path::new("/nonexistent"), &url),
+            url
+        );
+    }
+
+    #[test]
+    fn stale_recorded_path_reanchors_to_config_dir() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("app.db"), b"x").unwrap();
+        let stale = "sqlite:/private/var/mobile/OLD-UUID/app.db?mode=rwc";
+        let resolved = resolve_database_url_for_dir(&dir, stale);
+        assert_eq!(
+            resolved,
+            format!("sqlite:{}?mode=rwc", dir.join("app.db").display())
+        );
+    }
+
+    #[test]
+    fn stale_path_with_no_colocated_file_returns_original() {
+        let dir = temp_dir(); // empty — no app.db here either
+        let stale = "sqlite:/private/var/mobile/OLD-UUID/app.db?mode=rwc";
+        assert_eq!(resolve_database_url_for_dir(&dir, stale), stale);
+    }
+
+    #[test]
+    fn sqlite_double_slash_prefix_is_handled() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("app.db"), b"x").unwrap();
+        let stale = "sqlite:///private/var/mobile/OLD-UUID/app.db";
+        let resolved = resolve_database_url_for_dir(&dir, stale);
+        assert_eq!(
+            resolved,
+            format!("sqlite:{}", dir.join("app.db").display())
+        );
     }
 }
