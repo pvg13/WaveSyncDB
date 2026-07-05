@@ -156,9 +156,32 @@ struct ApnsJwtCache {
     created_at: Instant,
 }
 
+/// Full error chain ("outer: cause: root cause"). reqwest's `Display` alone
+/// reports only "error sending request for url (…)" — the actionable part
+/// (TLS alert, connection reset, DNS failure, ALPN mismatch) lives in the
+/// `source()` chain and was previously never logged.
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        cur = src.source();
+    }
+    out
+}
+
 /// Push notification sender supporting FCM and APNs.
 pub struct PushSender {
     client: reqwest::Client,
+    /// Separate client for APNs. Apple's push endpoints are HTTP/2-ONLY —
+    /// a client that ends up on HTTP/1.1 (e.g. an ALPN that didn't offer
+    /// h2) gets its connection torn down at the transport level with no
+    /// HTTP status to diagnose. This client pins rustls (deterministic
+    /// ALPN behavior regardless of what TLS backends are compiled in) and
+    /// HTTP/2-only, matching the endpoint's contract instead of hoping
+    /// negotiation lands there.
+    apns_client: reqwest::Client,
     fcm: Option<FcmConfig>,
     apns: Option<ApnsConfig>,
     apns_jwt_cache: Mutex<Option<ApnsJwtCache>>,
@@ -166,9 +189,31 @@ pub struct PushSender {
 
 impl PushSender {
     /// Create a new push sender with optional FCM and APNs configs.
+    ///
+    /// Both clients carry explicit timeouts: the notifier loop awaits sends
+    /// serially, so a single hung connection (no default timeout in
+    /// `Client::new()`) would stall every subsequent push for every device.
     pub fn new(fcm: Option<FcmConfig>, apns: Option<ApnsConfig>) -> Self {
+        let base = || {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+        };
+        let client = base().build().unwrap_or_else(|e| {
+            tracing::warn!("push: falling back to default reqwest client: {e}");
+            reqwest::Client::new()
+        });
+        let apns_client = base()
+            .use_rustls_tls()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap_or_else(|e| {
+                tracing::warn!("push: APNs h2 client build failed, using shared client: {e}");
+                client.clone()
+            });
         Self {
-            client: reqwest::Client::new(),
+            client,
+            apns_client,
             fcm,
             apns,
             apns_jwt_cache: Mutex::new(None),
@@ -268,7 +313,7 @@ impl PushSender {
             }
             Err(e) => PushResult::Transient(TransientError::Transport {
                 platform: Platform::Fcm,
-                message: e.to_string(),
+                message: error_chain(&e),
             }),
         }
     }
@@ -354,7 +399,7 @@ impl PushSender {
             .as_secs()
             + 600;
 
-        let mut request = self.client.post(&url).bearer_auth(&jwt);
+        let mut request = self.apns_client.post(&url).bearer_auth(&jwt);
         request = if visible {
             // `apns-priority: 10` + `apns-push-type: alert` request immediate
             // delivery — required for an alert to actually land on the lock
@@ -418,7 +463,7 @@ impl PushSender {
             }
             Err(e) => PushResult::Transient(TransientError::Transport {
                 platform: Platform::Apns,
-                message: e.to_string(),
+                message: error_chain(&e),
             }),
         }
     }
