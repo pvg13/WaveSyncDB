@@ -204,12 +204,16 @@ container:
 4. If your database doesn't live directly at the container root — e.g. a
    per-account layout that nests it under a subdirectory — the NSE has no
    way to discover that on its own; `wavesync_nse_handle_push` is only ever
-   handed the container root. Have the app write a pointer file,
-   `.wavesync_config_dir`, at the container root on every launch/login: a
-   single line naming the active config directory's path RELATIVE to the
-   root. The Swift template's `resolveConfigDir` reads it first and falls
-   back to the root when it's absent or stale, so this step is a no-op for
-   an app that keeps its database directly at the root.
+   handed the container root. The bridge is a pointer file,
+   `.wavesync_config_dir`, at the container root: a single line naming the
+   active config directory's path RELATIVE to the root. **`build()` writes
+   and refreshes this pointer automatically** on every config save (at each
+   recognized search root — `Application Support`, `Documents`, and the App
+   Group container root when the database lives inside one), so account
+   switches retarget it without app code. The Swift template's
+   `resolveConfigDir` (and the app-side APNs token writer's
+   `findConfigFile`) read it first and fall back to a shallow scan when
+   it's absent or stale.
 
 **Appex assembly.** `dx`/`xcodebuild` cannot generate a Notification Service
 Extension target for you — it's its own `.appex` executable, not something

@@ -2,6 +2,80 @@
 
 ## Unreleased
 
+### Fixed (on-device iOS review, 2026-07)
+- **APNs token discovery for nested database layouts.** `SyncConfig::save`
+  now writes a `.wavesync_config_dir` pointer file at each iOS search root
+  (`Application Support`, `Documents`, App Group container root) holding the
+  config directory's relative path, and `WaveSyncPushHandler.findConfigFile`
+  resolves through it before falling back to the old shallow scan. Previously
+  a database nested more than one level deep (e.g. a per-account
+  `u/<user_id>/` layout) was invisible to the Swift token writer: the APNs
+  token file was never written, the device never registered for push, and
+  background sync never ran. The NSE's `resolveConfigDir` reads the same
+  pointer, so nested layouts no longer need to hand-write it.
+- **Peer-discovery latency over the relay.** Four compounding client-side
+  defects fixed: (1) cold-start pre-dial of cached peer addresses now waits
+  for the relay connection when one is configured — dialing circuit
+  addresses before it guaranteed failures that seeded the per-peer dial
+  backoff; (2) the peer-address cache only records outbound, transport-
+  bearing addresses (inbound relayed connections were caching undialable
+  bare `/p2p/…` and WSS-circuit junk); (3) a relay `PeerJoined` announce now
+  clears the target's dial backoff (the peer just proved it's online) and a
+  backoff-suppressed introduction is logged instead of silently dropped;
+  (4) rendezvous discovery races ALL of a registration's addresses in one
+  dial (like `dial_introduced_peer`) instead of trying only the first.
+  Additionally, `PeerJoined` introductions are now honored for every local
+  group topic — previously any topic other than the default group's was
+  ignored, so secondary-group peers were never introduced.
+- **Relay wake coalescing defers instead of dropping (#76 follow-up).** A
+  send suppressed by the per-device coalescing window is now flushed when
+  the window expires (trailing edge), instead of dropped. Dropping meant the
+  leading-edge wake — fired before writes 2..N of a burst even existed — was
+  the ONLY wake for the whole window (15 min for silent APNs by default),
+  and alert-class banners lost within their 30s window were never shown at
+  all (a banner has no catch-up path). Wake stamps are also class-keyed now
+  (`silent` vs `alert`, `push_wakes.kind`), so a silent wake can no longer
+  suppress a later alert; a pending visible flag can no longer be lost to
+  the leading-edge/trailing-timer race; and every undelivered send (budget
+  denial or error, permanent failure, failed retry enqueue) refunds its
+  stamp. APNs `apns-collapse-id` is now plain-ASCII and ≤64 bytes.
+- **Background sync robustness (iOS/Android).** The `timeout` budget now
+  bounds the WHOLE wake (deadline anchored before engine setup, remaining
+  budget scales the internal timers) so a slow cold start can't overrun the
+  OS grant and teach iOS to throttle future pushes. Network events are
+  subscribed before registry sync/group rejoin, so a sync that completes
+  during setup is no longer reported as "no peers". `PeerConnected` is now
+  emitted for group peers (not just bootstrap peers), so the
+  connected-but-not-synced full-sync fallback actually arms for peers
+  reached via relay/rendezvous discovery. A push handled while the app's own
+  engine is live returns new code `3` (skipped — the live engine syncs
+  through its open connections) instead of spinning up a second engine with
+  the same PeerId that clobbered the live one's relay/rendezvous state; the
+  NSE process now persists its own separate libp2p identity
+  (`libp2p_keypair_nse`) for the same reason. All `extern "C"` entry points
+  catch panics (`-6`) instead of aborting the host app. An `EngineFailed`
+  event aborts the wait loop immediately. Swift maps rc=2 (timed out, data
+  may have synced) to `.newData` and negative JNI timeouts are clamped.
+- **Group-key cache hardening (iOS).** `with_passphrase` no longer derives
+  eagerly at the builder call — derivation happens in `build()` after the
+  WaveSyncPush framework dlopen, so the cache file's data-protection class
+  is actually applied on the fresh-install write (previously the
+  `wavesync_protect_file` dlsym always failed there) and builder-method
+  order can no longer leak a key to disk past `with_group_key_cache(false)`
+  (which now also deletes a previously-cached entry). `leave_group` removes
+  the left group's cached key. New
+  `WaveSyncDbBuilder::invalidate_group_key_cache()` forces a fresh KDF run
+  after a passphrase rotation — a cache hit deliberately never consults the
+  passphrase, so rotation is otherwise invisible (documented caveat).
+  `.wavesync_config.json` is written atomically (tmp + rename), closing a
+  truncation window for the config the NSE, the Swift token writer, and
+  every background wake all depend on. The NSE re-anchors the config's
+  recorded `database_url` against the directory the config was found in
+  (container relocations left it pointing at a dead absolute path), skips
+  the APNs token-file poll (up to 4s of its ~20s budget), and its template
+  now documents that the .appex must link the Rust staticlib; the
+  entitlements template gained a commented App Groups block.
+
 ### Changed
 - **Logging emits `tracing` natively (#69).** `wavesyncdb` and `wavesync_relay` now emit
   `tracing` events directly instead of going through the `log` facade (~500 call sites migrated).
