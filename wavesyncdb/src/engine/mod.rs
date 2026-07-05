@@ -212,6 +212,12 @@ pub struct EngineConfig {
     /// Database URL, used on mobile to re-read the push-token file mid-run
     /// when the OS delivered the token after engine start (fresh installs).
     pub database_url: String,
+    /// Whether this engine runs inside the iOS Notification Service
+    /// Extension. Selects a separate persisted libp2p identity
+    /// (`libp2p_keypair_nse`) so the NSE — which iOS can run while the main
+    /// app's engine is live — never registers the app's own PeerId at the
+    /// rendezvous/relay with its short-lived addresses.
+    pub nse_process: bool,
     /// API key for managed relay authentication.
     pub api_key: Option<String>,
     /// Interval for libp2p ping keep-alives (default: 90s).
@@ -261,6 +267,7 @@ impl Default for EngineConfig {
             ipv6: true,
             push_token: None,
             database_url: String::new(),
+            nse_process: false,
             api_key: None,
             keep_alive_interval: Duration::from_secs(90),
             circuit_max_duration: Duration::from_secs(3600),
@@ -303,6 +310,11 @@ pub(crate) fn start_engine(
     notification_registry: Arc<crate::registry::NotificationRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Count this engine as live for the whole task, panic included —
+        // `run_background_sync` refuses to spin up its own engine while the
+        // app's is running (same persisted PeerId; a second one would clobber
+        // the live engine's rendezvous/relay registrations).
+        let _live = EngineLiveGuard::new();
         let event_tx = network_event_tx.clone();
         let result = AssertUnwindSafe(run_engine(
             db,
@@ -346,6 +358,36 @@ pub(crate) fn start_engine(
             }
         }
     })
+}
+
+/// Number of engines currently running in this process. Read by
+/// `ffi::run_background_sync` to skip building a duplicate engine (same
+/// persisted PeerId as the live one) when a push is delivered to an app
+/// whose engine is already up — the live engine handles the sync itself.
+static LIVE_ENGINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any engine is currently running in this process.
+// Only called from `ffi::run_background_sync` (mobile-ffi feature).
+#[cfg_attr(not(feature = "mobile-ffi"), allow(dead_code))]
+pub(crate) fn any_engine_live() -> bool {
+    LIVE_ENGINES.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
+/// RAII increment of [`LIVE_ENGINES`] for the engine task's lifetime;
+/// decrements on drop so a panicking engine still deregisters.
+struct EngineLiveGuard;
+
+impl EngineLiveGuard {
+    fn new() -> Self {
+        LIVE_ENGINES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for EngineLiveGuard {
+    fn drop(&mut self) {
+        LIVE_ENGINES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Build the libp2p swarm with DNS resolution.
@@ -526,6 +568,17 @@ fn dialable_addrs_preferring_direct(
     } else {
         addrs
     }
+}
+
+/// Whether a multiaddr names an actual transport endpoint (a UDP or TCP
+/// component) rather than being a bare `/p2p/<peer>` identity — the latter is
+/// what libp2p reports as the remote address of some relayed inbound
+/// connections, and dialing it can never succeed ("Unsupported resolved
+/// address"). Used to keep such junk out of the cold-start peer-address cache.
+fn addr_has_transport(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter()
+        .any(|p| matches!(p, Protocol::Udp(_) | Protocol::Tcp(_)))
 }
 
 /// Whether a multiaddr is on the local network — RFC1918 private IPv4, IPv4
@@ -724,8 +777,15 @@ async fn run_engine(
     // Load (or create on first launch) the persistent libp2p keypair from
     // _wavesync_meta. Stable PeerId across restarts is necessary so the
     // relay-side push-token store doesn't accumulate stale duplicates and
-    // peer_versions tracking actually points at a stable identity.
-    let keypair = shadow::get_or_create_libp2p_keypair(&db).await?;
+    // peer_versions tracking actually points at a stable identity. The NSE
+    // process gets its own (also stable) identity so it never fights the
+    // main app's live engine over rendezvous/relay state — see
+    // `get_or_create_libp2p_keypair_named`.
+    let keypair = if config.nse_process {
+        shadow::get_or_create_libp2p_keypair_named(&db, "libp2p_keypair_nse").await?
+    } else {
+        shadow::get_or_create_libp2p_keypair(&db).await?
+    };
     let mdns_config = if config.mdns_enabled {
         Some(config.mdns_config())
     } else {
@@ -853,6 +913,7 @@ async fn run_engine(
         infrastructure_peers,
         dialing_peers: std::collections::HashSet::new(),
         pending_rendezvous_dials: VecDeque::new(),
+        predialed_cache: false,
         push_token,
         database_url,
         push_token_skip_logged: false,
@@ -1118,7 +1179,12 @@ struct EngineRunner {
     /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
     pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
-    pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
+    pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, Vec<libp2p::Multiaddr>)>,
+    /// Whether the once-per-engine cold-start pre-dial of cached peer
+    /// addresses (#29) has run. With a relay configured it is deferred to
+    /// the first relay attach (cached circuit addresses can only succeed
+    /// there); without one it runs at startup.
+    pub(crate) predialed_cache: bool,
     /// Push notification token to register with relay: (platform, device_token).
     pub(crate) push_token: Option<(String, String)>,
     // Read only by the mobile push-token re-read paths.
@@ -1560,6 +1626,13 @@ impl EngineRunner {
             // reconnect paths (after a disconnect) can re-arm.
             self.relay_dial_pending = false;
             self.handle_relay_peer_connected(peer_id, relay_addr.clone());
+            // Deferred cold-start pre-dial (#29): now that the relay is up,
+            // cached circuit addresses are actually dialable. Once per
+            // engine lifetime, like the no-relay startup path.
+            if !self.predialed_cache {
+                self.predialed_cache = true;
+                self.predial_cached_addrs().await;
+            }
         }
 
         // If this is a rendezvous server, discover peers
@@ -1583,6 +1656,30 @@ impl EngineRunner {
             self.peers
                 .entry(peer_id)
                 .or_insert_with(|| endpoint.get_remote_address().clone());
+            // Emit PeerConnected for group peers too, not just bootstrap
+            // peers (whose handler above already emitted it). Background
+            // sync arms its "connected but not synced → request full sync"
+            // fallback off this event; a first-ever peer reached via relay
+            // or rendezvous discovery would otherwise never trigger it and
+            // the wake would end with nothing synced.
+            if !self.bootstrap_peers.contains(&peer_id) {
+                self.emit_network_event(crate::network_status::NetworkEvent::PeerConnected(
+                    crate::network_status::PeerInfo {
+                        peer_id: crate::network_status::PeerId(peer_id.to_string()),
+                        address: endpoint.get_remote_address().to_string(),
+                        db_version: None,
+                        is_bootstrap: false,
+                        is_group_member: false,
+                        app_id: None,
+                        via_relay: self.peer_via_relay.get(&peer_id).copied().unwrap_or(false),
+                        bytes_in: 0,
+                        bytes_out: 0,
+                        last_synced_at_ms: None,
+                        last_converged_at_ms: None,
+                        sync_rtt_ms: None,
+                    },
+                ));
+            }
             // Kick an immediate catch-up for EVERY ready group this peer isn't
             // rejected for — not just the default group. A multi-group node
             // otherwise leaves its non-default groups to wait for the next 30s
@@ -2104,7 +2201,18 @@ impl EngineRunner {
         // / relay-PeerList discovery; whichever produces a connection
         // first wins. On a warm cache this typically shaves the discovery
         // round-trip off the first sync.
-        self.predial_cached_addrs().await;
+        //
+        // Only when NO relay is configured. With a relay, pre-dialing here
+        // is guaranteed to fail for cached circuit addresses (the relay
+        // connection isn't up yet — "oneshot canceled"), and those failures
+        // seed the per-peer dial backoff, whose guard then silently swallows
+        // the relay's one-shot PeerJoined introduction when the peer next
+        // comes online. Deferred to `handle_connection_established`'s relay
+        // branch instead, where the circuit path can actually succeed.
+        if self.config.relay_server.is_none() {
+            self.predialed_cache = true;
+            self.predial_cached_addrs().await;
+        }
 
         let mut sync_interval = tokio::time::interval(self.config.sync_interval);
         let mut rendezvous_interval =
@@ -2945,16 +3053,26 @@ impl EngineRunner {
                     // Cache this (peer_id, multiaddr) so the next cold start
                     // can dial it directly before discovery (#29). Skip the
                     // relay so the cache stays a sync-peer set.
-                    let db = self.default_group().db.clone();
-                    let peer_str = peer_id.to_string();
-                    let addr_str = endpoint.get_remote_address().to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::peer_addrs::record_success(&db, &peer_str, &addr_str).await
-                        {
-                            tracing::debug!("peer_addrs::record_success failed: {e}");
-                        }
-                    });
+                    //
+                    // Outbound dials only: an inbound connection's remote
+                    // address is whatever the swarm saw the peer come from —
+                    // an ephemeral NAT'd UDP source, or for relayed inbound a
+                    // bare `/p2p/<peer>` — junk that can never be re-dialed.
+                    // Caching it used to guarantee cold-start dial failures
+                    // that fed the per-peer backoff and slowed discovery. The
+                    // transport check is belt-and-braces for the same reason.
+                    if endpoint.is_dialer() && addr_has_transport(endpoint.get_remote_address()) {
+                        let db = self.default_group().db.clone();
+                        let peer_str = peer_id.to_string();
+                        let addr_str = endpoint.get_remote_address().to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::peer_addrs::record_success(&db, &peer_str, &addr_str).await
+                            {
+                                tracing::debug!("peer_addrs::record_success failed: {e}");
+                            }
+                        });
+                    }
                 }
                 self.handle_connection_established(peer_id, &endpoint).await;
             }
@@ -3181,7 +3299,12 @@ impl EngineRunner {
                         .peerlist_introductions
                         .fetch_add(by_peer.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     for (_pid, addrs) in by_peer {
-                        self.dial_introduced_peer(&addrs);
+                        // PeerList entries answer OUR announce; they say the
+                        // peer was present recently, not that it just joined
+                        // — so the dial backoff still applies (the relay
+                        // re-sends this list on every announce, and clearing
+                        // backoff here would re-open the #84 redial storm).
+                        self.dial_introduced_peer(&addrs, false);
                     }
                 }
             },
@@ -3213,9 +3336,15 @@ impl EngineRunner {
                             );
                             return;
                         }
-                        if *topic != self.default_group().topic_name {
+                        // Accept the introduction for ANY of our group topics,
+                        // not just the default group's — we announce presence
+                        // under every group topic, so the relay legitimately
+                        // fans PeerJoined out per topic. Matching only the
+                        // default group silently dropped introductions for
+                        // every secondary group.
+                        if !self.groups.values().any(|g| g.topic_name == *topic) {
                             tracing::debug!(
-                                "Ignoring PeerJoined for foreign topic (ours vs theirs hash mismatch)"
+                                "Ignoring PeerJoined for foreign topic (no local group matches)"
                             );
                             let _ = self
                                 .swarm
@@ -3233,7 +3362,8 @@ impl EngineRunner {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // peer_addrs is already a single peer's address set —
                         // pass them all to the dialer so libp2p races them.
-                        self.dial_introduced_peer(peer_addrs);
+                        // fresh_announce: the peer just attached to the relay.
+                        self.dial_introduced_peer(peer_addrs, true);
                         let _ = self
                             .swarm
                             .behaviour_mut()

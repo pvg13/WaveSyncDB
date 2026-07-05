@@ -268,8 +268,14 @@ impl EngineRunner {
                     registrations.len()
                 );
 
-                // Collect one address per peer, skip ineligible
-                let mut to_dial: Vec<(libp2p::PeerId, libp2p::Multiaddr)> = Vec::new();
+                // Collect every registered address per peer, skip ineligible.
+                // All addresses are raced in a single dial (like
+                // `dial_introduced_peer`): a registration typically holds
+                // both direct and circuit addresses, and picking just the
+                // first meant one stale direct address could fail the whole
+                // attempt, feed the dial backoff, and stall discovery until
+                // the next tick.
+                let mut to_dial: Vec<(libp2p::PeerId, Vec<libp2p::Multiaddr>)> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for registration in registrations {
                     let peer_id = registration.record.peer_id();
@@ -294,21 +300,16 @@ impl EngineRunner {
                         }
                         continue;
                     }
-                    // Take first address for this peer
-                    if let Some(addr) = registration.record.addresses().first() {
-                        to_dial.push((peer_id, addr.clone()));
+                    let addrs = registration.record.addresses().to_vec();
+                    if !addrs.is_empty() {
+                        to_dial.push((peer_id, addrs));
                     }
                 }
 
                 // Dial up to MAX immediately, queue the rest
                 let immediate = to_dial.len().min(MAX_CONCURRENT_RENDEZVOUS_DIALS);
-                for (peer_id, addr) in to_dial.drain(..immediate) {
-                    tracing::info!("Rendezvous dialing peer {peer_id} at {addr}");
-                    if let Err(e) = self.swarm.dial(addr) {
-                        tracing::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
-                    } else {
-                        self.dialing_peers.insert(peer_id);
-                    }
+                for (peer_id, addrs) in to_dial.drain(..immediate) {
+                    self.dial_rendezvous_peer(peer_id, addrs);
                 }
                 if !to_dial.is_empty() {
                     tracing::info!(
@@ -677,7 +678,17 @@ impl EngineRunner {
     ///
     /// Skips self, infra peers, rejected peers, and peers we're already
     /// connected to or actively dialing.
-    pub(super) fn dial_introduced_peer(&mut self, addr_strs: &[String]) {
+    ///
+    /// `fresh_announce` marks a `PeerJoined` push (the peer just attached to
+    /// the relay — live right now, by definition) as opposed to a `PeerList`
+    /// re-introduction on our own announce. A fresh announce clears any
+    /// standing dial backoff for the peer: the backoff exists to stop
+    /// re-dialing an *unreachable* peer that discovery keeps re-surfacing,
+    /// and fresh liveness evidence invalidates that premise. Without this,
+    /// a backoff seeded by earlier failures (e.g. stale cold-start cache
+    /// dials) silently swallowed the relay's one-shot introduction and
+    /// discovery stalled until the next rendezvous tick.
+    pub(super) fn dial_introduced_peer(&mut self, addr_strs: &[String], fresh_announce: bool) {
         let addrs: Vec<libp2p::Multiaddr> = addr_strs
             .iter()
             .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
@@ -709,6 +720,10 @@ impl EngineRunner {
             return;
         };
 
+        if fresh_announce {
+            self.clear_dial_backoff(&peer_id);
+        }
+
         let rejected_by_all =
             !self.groups.is_empty() && self.groups.values().all(|g| g.is_rejected(&peer_id));
         if peer_id == self.local_peer_id
@@ -716,8 +731,13 @@ impl EngineRunner {
             || rejected_by_all
             || self.swarm.is_connected(&peer_id)
             || self.dialing_peers.contains(&peer_id)
-            || !self.dial_backoff_ok(&peer_id)
         {
+            return;
+        }
+        if !self.dial_backoff_ok(&peer_id) {
+            // Never silent: a dropped introduction is otherwise
+            // indistinguishable from the relay not introducing at all.
+            tracing::debug!("Skipping introduced peer {peer_id}: inside dial backoff window");
             return;
         }
 
@@ -805,22 +825,34 @@ impl EngineRunner {
             .send_request(&relay_peer_id, req);
     }
 
+    /// Dial a rendezvous-discovered peer, racing all of its registered
+    /// addresses in one attempt (libp2p connects via whichever works first).
+    fn dial_rendezvous_peer(&mut self, peer_id: libp2p::PeerId, addrs: Vec<libp2p::Multiaddr>) {
+        tracing::info!(
+            "Rendezvous dialing peer {peer_id} with {} address(es): {addrs:?}",
+            addrs.len()
+        );
+        let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+            .addresses(addrs)
+            .build();
+        if let Err(e) = self.swarm.dial(dial_opts) {
+            tracing::warn!("Failed to dial rendezvous peer {peer_id}: {e}");
+        } else {
+            self.dialing_peers.insert(peer_id);
+        }
+    }
+
     /// Pop peers from the rendezvous dial queue until we hit the concurrency limit
     /// or the queue is empty. Called after each connection completes or fails.
     pub(super) fn drain_pending_rendezvous_dials(&mut self) {
         while self.dialing_peers.len() < MAX_CONCURRENT_RENDEZVOUS_DIALS {
-            let Some((peer_id, addr)) = self.pending_rendezvous_dials.pop_front() else {
+            let Some((peer_id, addrs)) = self.pending_rendezvous_dials.pop_front() else {
                 break;
             };
             if self.swarm.is_connected(&peer_id) || self.dialing_peers.contains(&peer_id) {
                 continue;
             }
-            tracing::info!("Rendezvous dialing queued peer {peer_id} at {addr}");
-            if let Err(e) = self.swarm.dial(addr) {
-                tracing::warn!("Failed to dial queued rendezvous peer {peer_id}: {e}");
-            } else {
-                self.dialing_peers.insert(peer_id);
-            }
+            self.dial_rendezvous_peer(peer_id, addrs);
         }
     }
 }

@@ -317,6 +317,20 @@ impl EngineRunner {
                     continue;
                 }
             };
+            // Legacy cache rows (written before record_success validated
+            // addresses) can hold bare `/p2p/<peer>` identities or circuit
+            // addresses cached without a relay being configured — both are
+            // guaranteed dial failures that would seed the per-peer backoff
+            // before discovery even starts. Skip them.
+            if !super::addr_has_transport(&addr)
+                || (self.config.relay_server.is_none()
+                    && addr
+                        .iter()
+                        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)))
+            {
+                tracing::debug!("skipping undialable cached multiaddr {addr}");
+                continue;
+            }
             match self.swarm.dial(addr.clone()) {
                 Ok(()) => {
                     self.diagnostics
