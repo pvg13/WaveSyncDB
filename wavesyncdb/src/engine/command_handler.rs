@@ -11,6 +11,13 @@ impl EngineRunner {
                 while let Ok(EngineCommand::Resume) = self.cmd_rx.try_recv() {}
                 // Plain resume: keep healthy relay/peer connections (no churn).
                 self.handle_resume(false).await;
+                // Arm the zombie-connection probe: if the relay shows no sign
+                // of life within this window (a healthy resume answers the
+                // re-registrations above in well under a second), the
+                // suspended socket is presumed dead and the transport is
+                // rebound — see `check_post_resume_liveness`.
+                let now = tokio::time::Instant::now();
+                self.resume_probe = Some((now + Duration::from_secs(3), now));
                 false
             }
             EngineCommand::NetworkTransition => {

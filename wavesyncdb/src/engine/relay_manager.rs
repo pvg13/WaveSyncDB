@@ -215,6 +215,9 @@ impl EngineRunner {
                 tracing::info!(
                     "Registered at rendezvous server {rendezvous_node} with namespace '{namespace}' (TTL: {ttl}s)"
                 );
+                // Sign of life from the relay/rendezvous server — feeds the
+                // post-resume zombie-connection detector.
+                self.last_relay_activity = tokio::time::Instant::now();
                 // Mark the matching group's namespace as registered.
                 let ns = namespace.to_string();
                 if let Some(g) = self
@@ -453,6 +456,16 @@ impl EngineRunner {
                 // With 5s base interval: 5s, 10s, 20s, 40s, 40s, 40s...
                 let skip = 1u32 << count.min(3); // 1, 2, 4, 8, 8, 8...
                 if count % skip == 0 {
+                    // From the second dial attempt on, rebind the QUIC
+                    // listeners first. Repeated handshake timeouts to a relay
+                    // that is demonstrably up are the signature of a dead
+                    // local socket (iOS kills UDP sockets during suspension /
+                    // VPN flaps) — libp2p-quic dials from the listen socket,
+                    // so retrying through the corpse fails forever no matter
+                    // how many dials we issue.
+                    if count > 0 {
+                        self.rebind_quic_listeners();
+                    }
                     tracing::info!("Attempting relay reconnection (attempt {})", count + 1);
                     self.try_dial_relay();
                 }

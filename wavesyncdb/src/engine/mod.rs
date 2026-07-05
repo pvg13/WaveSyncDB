@@ -995,6 +995,10 @@ async fn run_engine(
         reconcile_capable: std::collections::HashSet::new(),
         #[cfg(target_os = "ios")]
         quic_listeners: std::collections::HashMap::new(),
+        unspecified_quic_listeners: Vec::new(),
+        ios_unspecified_bind: false,
+        last_relay_activity: tokio::time::Instant::now(),
+        resume_probe: None,
     };
 
     // Set initial network status with local_peer_id and topic.
@@ -1397,6 +1401,26 @@ struct EngineRunner {
     #[cfg(target_os = "ios")]
     pub(crate) quic_listeners:
         std::collections::HashMap<std::net::IpAddr, libp2p::core::transport::ListenerId>,
+    /// Listener ids from `listen_quic_unspecified` (every non-iOS platform,
+    /// plus iOS's #73 unspecified arm). Tracked so `rebind_quic_listeners`
+    /// can drop and recreate them when the underlying socket dies.
+    pub(crate) unspecified_quic_listeners: Vec<libp2p::core::transport::ListenerId>,
+    /// Whether iOS runs the #73 unspecified-bind arm (computed once at
+    /// engine start from config + env). Read by `rebind_quic_listeners` to
+    /// re-bind with the same strategy.
+    pub(crate) ios_unspecified_bind: bool,
+    /// Wall-clock of the last observed sign of life from the relay (connect,
+    /// successful ping, rendezvous registration confirmation, push ack).
+    /// Compared against the app-resume instant to detect a zombie
+    /// connection: iOS kills UDP sockets during suspension, and a dead
+    /// socket under an unchanged interface address wedges every dial with
+    /// handshake timeouts until the socket is rebound.
+    pub(crate) last_relay_activity: tokio::time::Instant,
+    /// Armed by `EngineCommand::Resume`: `(probe_deadline, resumed_at)`.
+    /// When the deadline fires and the relay has produced no activity since
+    /// `resumed_at`, the transport is presumed wedged — QUIC listeners are
+    /// rebound and a full reconnect is forced. See `check_post_resume_liveness`.
+    pub(crate) resume_probe: Option<(tokio::time::Instant, tokio::time::Instant)>,
 }
 
 impl EngineRunner {
@@ -1471,15 +1495,98 @@ impl EngineRunner {
 
         tracing::info!("DIAG calling listen_on(QUIC)={v4_quic}");
         let t1 = std::time::Instant::now();
-        self.swarm.listen_on(v4_quic.parse().unwrap())?;
+        let id = self.swarm.listen_on(v4_quic.parse().unwrap())?;
+        self.unspecified_quic_listeners.push(id);
         tracing::info!("DIAG listen_on(QUIC) returned in {:?}", t1.elapsed());
 
-        if self.config.ipv6
-            && let Err(e) = self.swarm.listen_on(v6_quic.parse().unwrap())
-        {
-            tracing::warn!("QUIC IPv6 listen failed (non-fatal): {e}");
+        if self.config.ipv6 {
+            match self.swarm.listen_on(v6_quic.parse().unwrap()) {
+                Ok(id) => self.unspecified_quic_listeners.push(id),
+                Err(e) => tracing::warn!("QUIC IPv6 listen failed (non-fatal): {e}"),
+            }
         }
         Ok(())
+    }
+
+    /// Drop every QUIC listener and bind fresh ones with the platform's
+    /// current strategy.
+    ///
+    /// The dead-socket recovery primitive: iOS invalidates UDP sockets while
+    /// the app is suspended (and when a VPN/interface flaps), after which
+    /// every send fails with `Broken pipe` — but the interface watch only
+    /// rebinds when the *address list* changes, so a dead socket under an
+    /// unchanged address wedges all dials with handshake timeouts
+    /// indefinitely. libp2p-quic sources outbound dials from the listen
+    /// socket, so recreating the listeners gives reconnects a live socket.
+    /// Called from `check_post_resume_liveness` (relay silent after an app
+    /// resume) and from the relay reconnect loop (repeated dial failures).
+    fn rebind_quic_listeners(&mut self) {
+        #[cfg(target_os = "ios")]
+        let concrete = self.quic_listeners.len();
+        #[cfg(not(target_os = "ios"))]
+        let concrete = 0;
+        tracing::info!(
+            "Rebinding QUIC listeners ({} concrete, {} unspecified) — presumed-dead socket recovery",
+            concrete,
+            self.unspecified_quic_listeners.len()
+        );
+
+        #[cfg(target_os = "ios")]
+        {
+            let ids: Vec<_> = self.quic_listeners.drain().map(|(_, id)| id).collect();
+            for id in ids {
+                let _ = self.swarm.remove_listener(id);
+            }
+        }
+        for id in std::mem::take(&mut self.unspecified_quic_listeners) {
+            let _ = self.swarm.remove_listener(id);
+        }
+
+        #[cfg(target_os = "ios")]
+        {
+            if self.ios_unspecified_bind {
+                if let Err(e) = self.listen_quic_unspecified() {
+                    tracing::warn!("QUIC rebind (unspecified) failed: {e}");
+                }
+            } else {
+                // Concrete-interface arm: the reconcile helper re-adds a
+                // listener for every currently-routable interface address
+                // (the map was just drained, so nothing is considered known).
+                self.reconcile_quic_listeners();
+            }
+        }
+        #[cfg(not(target_os = "ios"))]
+        if let Err(e) = self.listen_quic_unspecified() {
+            tracing::warn!("QUIC rebind failed: {e}");
+        }
+    }
+
+    /// Post-resume zombie-connection check, armed by `EngineCommand::Resume`.
+    ///
+    /// A healthy resume produces relay activity (rendezvous registration
+    /// confirmations, pings) within well under a second. If the relay still
+    /// looks attached but has been silent since the resume instant, the
+    /// suspended socket is presumed dead: rebind the QUIC listeners and run
+    /// the force-reset resume path (tear down relay + peers, reconnect on
+    /// the fresh socket). Without this, sync stays wedged until QUIC's 30s
+    /// idle timeout fires — and even then, reconnect dials keep going out
+    /// the dead socket and time out forever.
+    async fn check_post_resume_liveness(&mut self) {
+        let Some((_, resumed_at)) = self.resume_probe.take() else {
+            return;
+        };
+        let relay_attached = matches!(
+            self.relay_state,
+            RelayState::Connected { .. } | RelayState::Listening { .. }
+        );
+        if relay_attached && self.last_relay_activity < resumed_at {
+            tracing::warn!(
+                "Relay silent since app resume — presuming the suspended socket is dead; \
+                 rebinding QUIC listeners and forcing a clean reconnect"
+            );
+            self.rebind_quic_listeners();
+            self.handle_resume(true).await;
+        }
     }
 
     /// Rebuild the full network status snapshot from internal state.
@@ -1804,6 +1911,7 @@ impl EngineRunner {
         tracing::info!("Connected to relay server {peer_id}");
         self.infrastructure_peers.insert(peer_id);
         self.circuit_retry_count = 0;
+        self.last_relay_activity = tokio::time::Instant::now();
         self.relay_state = RelayState::Connected {
             relay_peer_id: peer_id,
             connected_at: tokio::time::Instant::now(),
@@ -2119,6 +2227,7 @@ impl EngineRunner {
             .unwrap_or(false);
         let ios_unspecified_effective =
             self.config.ios_unspecified_quic_bind || ios_unspecified_env;
+        self.ios_unspecified_bind = ios_unspecified_effective;
         if ios_unspecified_effective && cfg!(target_os = "ios") {
             tracing::info!(
                 "iOS QUIC bind: unspecified-listen override ACTIVE (experimental #73 toggle; source={})",
@@ -2450,6 +2559,14 @@ impl EngineRunner {
                     if self.default_group().registry_is_ready {
                         self.sync_all_known_peers().await;
                     }
+                },
+                _ = async {
+                    match self.resume_probe {
+                        Some((deadline, _)) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.resume_probe.is_some() => {
+                    self.check_post_resume_liveness().await;
                 },
                 _ = async {
                     match self.nat_assumption_deadline {
@@ -2941,6 +3058,16 @@ impl EngineRunner {
                     }
                 } else {
                     tracing::debug!("Ping event with {peer:?} over {connection:?}: {result:?}");
+                    // A successful relay ping is proof of a live socket +
+                    // connection — feeds the post-resume zombie detector.
+                    if matches!(
+                        &self.relay_state,
+                        RelayState::Connected { relay_peer_id, .. }
+                        | RelayState::Listening { relay_peer_id }
+                        if peer == *relay_peer_id
+                    ) {
+                        self.last_relay_activity = tokio::time::Instant::now();
+                    }
                 }
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mdns(event)) => {
@@ -3282,7 +3409,13 @@ impl EngineRunner {
                         request_id,
                     },
                 ..
-            } => match response {
+            } => {
+                // Any push-protocol response from the relay is a sign of a
+                // live connection — feeds the post-resume zombie detector.
+                if self.infrastructure_peers.contains(&peer) {
+                    self.last_relay_activity = tokio::time::Instant::now();
+                }
+                match response {
                 push_protocol::PushResponse::Ok => {
                     // If this acks an in-flight RegisterToken, the relay now
                     // holds our token for that topic — mark it registered so
@@ -3360,7 +3493,7 @@ impl EngineRunner {
                         self.dial_introduced_peer(&addrs, false);
                     }
                 }
-            },
+            }},
             request_response::Event::Message {
                 peer,
                 message:
