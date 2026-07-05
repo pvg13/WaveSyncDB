@@ -160,6 +160,14 @@ struct Cli {
     #[arg(long, env = "APNS_ALERT_TITLE", default_value = "Nueva actividad")]
     apns_alert_title: String,
 
+    /// Sound for the ALERT-class placeholder (default "default", the system
+    /// sound). Set to the empty string for a silent banner — appropriate when
+    /// every client app posts its own specific local notification after the
+    /// wake sync (which plays its own sound), so the transient placeholder
+    /// doesn't produce a duplicate ding.
+    #[arg(long, env = "APNS_ALERT_SOUND", default_value = "default")]
+    apns_alert_sound: String,
+
     /// Push notification cooldown window in seconds (default: 1).
     /// First notification fires immediately; subsequent ones within this
     /// window are batched. The shorter the window, the faster trailing-edge
@@ -592,6 +600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bundle_id: bundle_id.clone(),
                 sandbox: cli.apns_sandbox,
                 alert_title: cli.apns_alert_title.clone(),
+                alert_sound: cli.apns_alert_sound.clone(),
             })
         } else {
             None

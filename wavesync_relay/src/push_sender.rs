@@ -148,6 +148,11 @@ pub struct ApnsConfig {
     /// policy is what produces the real title/body once it wakes and
     /// syncs.
     pub alert_title: String,
+    /// Sound for the ALERT-class placeholder (`--apns-alert-sound` /
+    /// `APNS_ALERT_SOUND`). Empty string = omit the `sound` key, so the
+    /// placeholder banner is silent — for deployments whose apps always
+    /// post their own (sounding) specific notification after the wake sync.
+    pub alert_sound: String,
 }
 
 /// Cached JWT for APNs with expiry tracking.
@@ -367,13 +372,16 @@ impl PushSender {
         let url = format!("{host}/3/device/{token}");
 
         let body = if visible {
+            let mut aps = serde_json::json!({
+                "alert": { "title": apns.alert_title },
+                "mutable-content": 1,
+                "content-available": 1
+            });
+            if !apns.alert_sound.is_empty() {
+                aps["sound"] = serde_json::json!(apns.alert_sound);
+            }
             serde_json::json!({
-                "aps": {
-                    "alert": { "title": apns.alert_title },
-                    "mutable-content": 1,
-                    "content-available": 1,
-                    "sound": "default"
-                },
+                "aps": aps,
                 "topic": topic,
                 "peer_addrs": serde_json::to_string(peer_addrs).unwrap_or_default()
             })

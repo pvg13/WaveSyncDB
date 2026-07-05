@@ -165,6 +165,18 @@ sync runs, the user sees the relay operator's placeholder banner), while an
 app that ships a Notification Service Extension gets a chance to rewrite that
 banner with real, on-device-composed content before it's ever shown.
 
+**Placeholder de-duplication (no NSE needed).** When the background wake's
+sync applies a change and the app's `SyncNotify` policy posts its own specific
+local notification, that post automatically **removes the delivered
+placeholder** from Notification Center / the lock screen — WaveSync remote
+pushes are identified by the `"topic"` key in their payload, so nothing else
+is touched. The user briefly sees the placeholder, then it's replaced; the end
+state is a single, specific notification. (A policy that declines — returns
+`None` — leaves the placeholder in place as the only signal.) If your app
+always posts specifics this way, silence the placeholder's duplicate ding with
+`APNS_ALERT_SOUND=""` on the relay so only the specific notification plays a
+sound.
+
 **What the NSE does, precisely:** iOS launches it in place of ordinary
 delivery whenever `mutable-content: 1` is present. The extension calls into
 `wavesyncdb`'s `wavesync_nse_handle_push(config_dir, payload_json,
@@ -254,6 +266,7 @@ the placeholder banner (safe, just less rich), and nothing else changes.
 | Env var | CLI flag | Default | Notes |
 |---|---|---|---|
 | `APNS_ALERT_TITLE` | `--apns-alert-title` | `Nueva actividad` | The ONLY user-facing text on an alert push — relay-operator branding, never client-supplied. Real content is composed on-device by the NSE (or stays this placeholder without one). |
+| `APNS_ALERT_SOUND` | `--apns-alert-sound` | `default` | Sound for the alert placeholder. Empty string = silent banner — use when client apps always post their own (sounding) specific notification after the wake sync, so the placeholder doesn't ding twice. |
 | `ALERT_COALESCE_SECS` | `--alert-coalesce-secs` | `30` | Per-device wake-coalescing window for the unbudgeted alert class — independent of `APNS_COALESCE_SECS`, and deliberately much shorter (a real-time banner should still feel real-time). |
 
 ## Further reading

@@ -3,6 +3,16 @@
 ## Unreleased
 
 ### Fixed (on-device iOS review, 2026-07)
+- **Single specific notification instead of placeholder + specific.** When
+  the app's `SyncNotify` policy posts its specific local notification after a
+  push-wake sync, `wavesync_show_notification` now removes the delivered
+  relay placeholder ("Nueva actividad") from Notification Center first —
+  WaveSync remote pushes are identified by the `"topic"` payload key, so
+  nothing else is affected. End state is one notification; a declining policy
+  still leaves the placeholder as the fallback signal. New relay knob
+  `APNS_ALERT_SOUND` / `--apns-alert-sound` (default `default`, empty =
+  silent) lets deployments whose apps always post specifics silence the
+  placeholder's duplicate ding.
 - **APNs token discovery for nested database layouts.** `SyncConfig::save`
   now writes a `.wavesync_config_dir` pointer file at each iOS search root
   (`Application Support`, `Documents`, App Group container root) holding the

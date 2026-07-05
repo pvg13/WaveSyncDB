@@ -100,6 +100,20 @@ public func wavesync_request_push_authorization() {
 ///
 /// Authorization is requested idempotently — iOS caches the user's choice, so
 /// this only prompts once; subsequent calls just deliver (or no-op if denied).
+///
+/// Before delivering, any already-delivered WaveSync *remote* notification —
+/// the relay's generic alert-class placeholder ("Nueva actividad") that iOS
+/// displayed the moment the push arrived — is removed, so the end state is a
+/// single, specific notification rather than the placeholder stacked under
+/// it. WaveSync placeholders are identified by the top-level `"topic"` key
+/// the relay puts in every push payload plus the remote-push trigger; the
+/// app's own local notifications never carry `"topic"`, and other apps'
+/// notifications are invisible to this process. Once a Notification Service
+/// Extension exists, this same sweep harmlessly replaces the NSE-rewritten
+/// banner with identical content. When the `SyncNotify` policy declines to
+/// notify (returns `None`), this function is never called and the
+/// placeholder stays — the intended fallback so the user still gets SOME
+/// signal for the change.
 @_cdecl("wavesync_show_notification")
 public func wavesync_show_notification(
     _ titlePtr: UnsafePointer<CChar>?,
@@ -128,12 +142,29 @@ public func wavesync_show_notification(
             NSLog("[WaveSync] Notification permission not granted; skipping display")
             return
         }
-        // Stable identifier per group → replace-in-place; immediate delivery.
-        let identifier = (group?.isEmpty == false ? group! : UUID().uuidString)
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-        center.add(request) { addError in
-            if let addError = addError {
-                NSLog("[WaveSync] Failed to add notification: %@", addError.localizedDescription)
+        // Evict delivered relay placeholders BEFORE adding, inside the same
+        // completion, so remove→add ordering is deterministic and the
+        // specific notification can never be swept by its own cleanup.
+        center.getDeliveredNotifications { delivered in
+            let placeholders = delivered
+                .filter {
+                    $0.request.trigger is UNPushNotificationTrigger
+                        && $0.request.content.userInfo["topic"] != nil
+                }
+                .map { $0.request.identifier }
+            if !placeholders.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: placeholders)
+            }
+
+            // Stable identifier per group → replace-in-place; immediate delivery.
+            let identifier = (group?.isEmpty == false ? group! : UUID().uuidString)
+            let request = UNNotificationRequest(
+                identifier: identifier, content: content, trigger: nil)
+            center.add(request) { addError in
+                if let addError = addError {
+                    NSLog("[WaveSync] Failed to add notification: %@",
+                          addError.localizedDescription)
+                }
             }
         }
     }
