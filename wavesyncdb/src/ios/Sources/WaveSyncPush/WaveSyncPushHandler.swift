@@ -138,6 +138,18 @@ public enum WaveSyncPushHandler {
             return
         }
 
+        // Foreground delivery: the live engine is connected and receives the
+        // change over its open streams — often it already has by the time the
+        // push lands. Skip the FFI call entirely rather than block a worker
+        // for the whole budget waiting on a sync that has nothing left to do.
+        // (This delegate callback runs on the main thread, where
+        // `applicationState` is safe to read.)
+        if UIApplication.shared.applicationState == .active {
+            NSLog("[WaveSync] Push received while active — live engine handles sync")
+            completionHandler(.noData)
+            return
+        }
+
         NSLog("[WaveSync] Received sync push, starting background sync")
         let peerAddrsJson = userInfo["peer_addrs"] as? String
 

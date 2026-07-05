@@ -66,17 +66,19 @@ fn run_background_sync(
     target_topic: Option<&str>,
 ) -> i32 {
     // A push delivered while the app's own engine is live (foreground
-    // delivery, or backgrounded-but-not-suspended) must not build a second
-    // engine: it would load the same persisted libp2p keypair and register
-    // the same PeerId at the rendezvous/relay with its own short-lived
-    // addresses, clobbering the live engine's state. The live engine
-    // receives the change through its open connections anyway.
+    // delivery, or a background wake resuming the suspended app process)
+    // must not build a second engine: it would load the same persisted
+    // libp2p keypair and register the same PeerId at the rendezvous/relay
+    // with its own short-lived addresses, clobbering the live engine's
+    // state. But the live engine can't be left to fend for itself either —
+    // its connections died while the app was suspended, and returning
+    // immediately would let Swift call the completion handler, at which
+    // point iOS re-freezes the process before the engine reconnects. So:
+    // nudge the live engine (same Resume command the app-lifecycle hook
+    // sends) and BLOCK until it reports a peer synced or the OS-granted
+    // budget runs out — that block is what keeps the process executing.
     if crate::engine::any_engine_live() {
-        tracing::info!(
-            "background sync skipped: an engine is already live in this \
-             process and will handle the sync itself"
-        );
-        return 3;
+        return nudge_live_engines_and_wait(timeout_secs);
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -118,6 +120,93 @@ fn run_background_sync(
     }
 }
 
+/// Push-wake path for a process whose engine is already live: send
+/// [`EngineCommand::Resume`](crate::engine::EngineCommand::Resume) to every
+/// registered engine (rediscovery + immediate re-sync, exactly what the
+/// foreground lifecycle hook sends on app resume) and wait for the first
+/// `PeerSynced` event, up to `timeout_secs`. The blocking wait is
+/// deliberate — it holds the OS-granted background-execution window open so
+/// the live engine has CPU time to reconnect and sync before Swift calls
+/// the completion handler and iOS re-suspends the process.
+///
+/// Returns `0` once a peer synced (plus a short linger for stragglers),
+/// `2` on timeout (the engine may still be mid-sync — data that arrived
+/// still counts), `3` if no live engine could be signaled (registry empty
+/// or channels closed — the engine died between the liveness check and
+/// here).
+fn nudge_live_engines_and_wait(timeout_secs: u32) -> i32 {
+    use crate::engine::EngineCommand;
+    use crate::network_status::NetworkEvent;
+
+    let hooks = crate::engine::snapshot_wake_hooks();
+    if hooks.is_empty() {
+        tracing::warn!("push wake: engine reported live but no wake hook registered");
+        return 3;
+    }
+    tracing::info!(
+        "push wake: nudging {} live engine(s) and waiting for sync (budget {timeout_secs}s)",
+        hooks.len()
+    );
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return -6,
+    };
+
+    rt.block_on(async {
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        for (cmd_tx, mut events) in hooks {
+            // Resume: clears stale peer state and dial backoff, triggers
+            // rediscovery and an immediate sync pass. Bounded send so a
+            // wedged command channel can't eat the wake budget.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                cmd_tx.send(EngineCommand::Resume),
+            )
+            .await;
+            let done = done_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(NetworkEvent::PeerSynced { .. }) => {
+                            let _ = done.try_send(());
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+
+        match tokio::time::timeout(
+            Duration::from_secs(timeout_secs.into()),
+            done_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(())) => {
+                // Brief linger so a second peer/group mid-sync can finish
+                // before the completion handler suspends us.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                tracing::info!("push wake: live engine synced");
+                0
+            }
+            // Every event channel closed without a sync — engines torn down.
+            Ok(None) => 3,
+            Err(_) => {
+                tracing::info!("push wake: timed out waiting for live engine sync");
+                2
+            }
+        }
+    })
+}
+
 /// C FFI entry point for background sync. Called from iOS Swift via `@_silgen_name`.
 ///
 /// # Returns
@@ -125,8 +214,11 @@ fn run_background_sync(
 /// * `0` — Successfully synced with at least one peer
 /// * `1` — No peers found within timeout
 /// * `2` — Timed out (some peers may have synced)
-/// * `3` — Skipped: the app's own engine is live in this process and handles
-///   the sync itself (treat as "nothing for this call to do", not an error)
+/// * `3` — An engine is live in this process but could not be signaled
+///   (torn down mid-call); treat as "nothing for this call to do". When a
+///   live engine CAN be signaled, this call nudges it and blocks until it
+///   syncs (`0`) or the budget expires (`2`) — see
+///   `nudge_live_engines_and_wait`.
 /// * `-1` — Config not found (app was never started)
 /// * `-2` — Invalid config
 /// * `-3` — Database error

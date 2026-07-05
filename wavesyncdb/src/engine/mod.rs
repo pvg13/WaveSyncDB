@@ -373,6 +373,59 @@ pub(crate) fn any_engine_live() -> bool {
     LIVE_ENGINES.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
+/// A live engine's wake hook: lets `ffi::run_background_sync` nudge the
+/// app's own engine — instead of building a duplicate one with the same
+/// PeerId — when a push wakes the process, and observe its sync progress so
+/// the wake's completion handler isn't called until the sync actually ran.
+///
+/// Registered by `WaveSyncDbBuilder::build()` for each node and removed by
+/// `WaveSyncNodeInner::drop`. A stale hook (engine died without the node
+/// dropping) is harmless: its `cmd_tx` send fails and its event channel
+/// yields nothing, so the waiter just times out.
+pub(crate) struct WakeHook {
+    id: u64,
+    pub(crate) cmd_tx: mpsc::Sender<EngineCommand>,
+    pub(crate) event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+}
+
+static WAKE_HOOKS: std::sync::Mutex<Vec<WakeHook>> = std::sync::Mutex::new(Vec::new());
+static NEXT_WAKE_HOOK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Register a live engine's wake hook; returns the id to pass to
+/// [`deregister_wake_hook`] on teardown.
+pub(crate) fn register_wake_hook(
+    cmd_tx: mpsc::Sender<EngineCommand>,
+    event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
+) -> u64 {
+    let id = NEXT_WAKE_HOOK_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    WAKE_HOOKS.lock().unwrap().push(WakeHook {
+        id,
+        cmd_tx,
+        event_tx,
+    });
+    id
+}
+
+pub(crate) fn deregister_wake_hook(id: u64) {
+    WAKE_HOOKS.lock().unwrap().retain(|h| h.id != id);
+}
+
+/// Snapshot the live wake hooks: a cloned command sender plus a fresh event
+/// subscription per registered engine. Subscriptions are created inside the
+/// lock so no event can slip between snapshot and subscribe.
+#[cfg_attr(not(feature = "mobile-ffi"), allow(dead_code))]
+pub(crate) fn snapshot_wake_hooks() -> Vec<(
+    mpsc::Sender<EngineCommand>,
+    broadcast::Receiver<crate::network_status::NetworkEvent>,
+)> {
+    WAKE_HOOKS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|h| (h.cmd_tx.clone(), h.event_tx.subscribe()))
+        .collect()
+}
+
 /// RAII increment of [`LIVE_ENGINES`] for the engine task's lifetime;
 /// decrements on drop so a panicking engine still deregisters.
 struct EngineLiveGuard;

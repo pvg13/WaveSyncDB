@@ -272,10 +272,16 @@ pub(crate) struct WaveSyncNodeInner {
     /// with the same opt-in/opt-out the default group used. Meaningful only
     /// on iOS; every other platform ignores it.
     group_key_cache_enabled: bool,
+    /// Id of this node's entry in the process-global wake-hook registry
+    /// (`engine::register_wake_hook`) — the channel the FFI background-sync
+    /// entry point uses to nudge this live engine on a push wake instead of
+    /// building a duplicate one.
+    wake_hook_id: u64,
 }
 
 impl Drop for WaveSyncNodeInner {
     fn drop(&mut self) {
+        crate::engine::deregister_wake_hook(self.wake_hook_id);
         // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk
         // between tests). Use get_mut() instead of lock() — since we have
         // &mut self, no other thread can hold a reference, so we can access the
@@ -2577,12 +2583,20 @@ impl WaveSyncDbBuilder {
         // `Arc` is held by every group handle, so the engine is aborted only
         // when the last handle (and any held `WaveSyncNode`) drops — preserving
         // the original single-group teardown behaviour.
+        // Register the live engine's wake hook so a push delivered to this
+        // process wakes THIS engine (via ffi::run_background_sync) instead of
+        // spinning up a duplicate with the same PeerId. Deregistered in
+        // WaveSyncNodeInner::drop.
+        let wake_hook_id =
+            crate::engine::register_wake_hook(cmd_tx.clone(), network_event_tx.clone());
+
         let node = Arc::new(WaveSyncNodeInner {
             cmd_tx,
             tagged_sync_tx: sync_tx,
             engine_handle: std::sync::Mutex::new(Some(engine_handle)),
             network_status,
             network_event_tx,
+            wake_hook_id,
             diagnostics,
             peer_health,
             // The default group's channel is the node-level channel; joined
