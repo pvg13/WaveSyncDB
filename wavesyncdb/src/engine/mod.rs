@@ -1812,10 +1812,16 @@ impl EngineRunner {
         }
 
         if !self.infrastructure_peers.contains(&peer_id) {
-            // Ensure reconnecting peer is tracked for future periodic syncs
-            self.peers
-                .entry(peer_id)
-                .or_insert_with(|| endpoint.get_remote_address().clone());
+            // Ensure reconnecting peer is tracked for future periodic syncs.
+            // Skip transport-less remote addresses (bare `/p2p/<peer>` from
+            // some inbound relayed connections): `self.peers` seeds redials,
+            // and a stored undialable entry turns every future redial into a
+            // guaranteed failure that feeds the dial backoff.
+            if addr_has_transport(endpoint.get_remote_address()) {
+                self.peers
+                    .entry(peer_id)
+                    .or_insert_with(|| endpoint.get_remote_address().clone());
+            }
             // Emit PeerConnected for group peers too, not just bootstrap
             // peers (whose handler above already emitted it). Background
             // sync arms its "connected but not synced → request full sync"

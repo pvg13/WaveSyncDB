@@ -357,6 +357,11 @@ impl EngineRunner {
                         && !self.dialing_peers.contains(&peer)
                         && self.dial_backoff_ok(&peer)
                         && !(addr_is_relayed(&addr) && self.suppress_relay_dial(&peer))
+                        // A transport-less `/p2p/<peer>` entry (the remote
+                        // address some inbound relayed connections report)
+                        // can never be dialed — attempting it just burns a
+                        // dial-backoff slot on a guaranteed failure.
+                        && super::addr_has_transport(&addr)
                     {
                         tracing::info!("Re-dialing {peer} after outbound failure");
                         let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
