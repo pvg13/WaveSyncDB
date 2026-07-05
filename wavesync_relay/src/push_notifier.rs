@@ -164,6 +164,69 @@ struct CooldownState {
     pending: Option<PendingFire>,
 }
 
+/// Key of a wake deferred by the per-device coalescing window: one slot per
+/// `(token, topic, class)`. Class-keyed to match the `push_wakes` stamp —
+/// a deferred silent wake and a deferred alert for the same device coexist
+/// and flush independently.
+type DeferredKey = (String, String, bool);
+
+/// A send suppressed by [`PushStore::check_and_stamp_wake`], waiting for its
+/// coalescing window to expire. Unlike the pre-#78 behavior (drop the send
+/// and rely on the device's own catch-up), the trailing-edge flush guarantees
+/// that the LAST write of a burst also produces a wake — the leading-edge
+/// wake fires before writes 2..N of the burst even exist, so dropping the
+/// rest silenced everything for the remainder of the window. Alerts have no
+/// catch-up path at all (a banner only ever comes from an actually-sent
+/// push), so for them the flush is the difference between "delayed banner"
+/// and "no banner, ever".
+///
+/// Held in memory: losing a pending flush to a relay restart costs one wake
+/// (recovered by the device's next catch-up sync or the next write), same
+/// class of loss as the in-memory topic debounce above it.
+struct DeferredWake {
+    /// When the coalescing window expires and this can fire.
+    due_at: Instant,
+    platform: String,
+    /// Latest writer addresses observed while suppressed — each newer
+    /// suppressed notify overwrites these, so the flush carries the
+    /// freshest dial hints.
+    peer_addrs: Vec<String>,
+}
+
+/// Everything the notifier and flush paths need to gate + send one wake.
+/// Bundled so the per-token pipeline (`coalesce_gate_and_send`, `send_wake`)
+/// doesn't take a dozen loose parameters.
+struct SendCtx<'a> {
+    store: &'a PushStore,
+    sender: &'a PushSender,
+    nudge_tx: &'a mpsc::Sender<RetryNudge>,
+    metrics: &'a RelayMetrics,
+    apns_coalesce_secs: u64,
+    fcm_coalesce_secs: u64,
+    alert_coalesce_secs: u64,
+}
+
+impl SendCtx<'_> {
+    /// Coalescing window applying to a send of the given class/platform.
+    fn coalesce_window_secs(&self, platform: &str, is_alert: bool) -> u64 {
+        if is_alert {
+            self.alert_coalesce_secs
+        } else {
+            match platform {
+                "Apns" => self.apns_coalesce_secs,
+                "Fcm" => self.fcm_coalesce_secs,
+                _ => 0,
+            }
+        }
+    }
+}
+
+/// Stamp-table class label for a send. Must be stable — it is persisted in
+/// `push_wakes.kind`.
+fn wake_kind(is_alert: bool) -> &'static str {
+    if is_alert { "alert" } else { "silent" }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn notifier_loop(
     mut rx: mpsc::Receiver<TopicNotification>,
@@ -177,6 +240,16 @@ async fn notifier_loop(
     alert_coalesce_secs: u64,
 ) {
     let mut cooldowns: HashMap<String, CooldownState> = HashMap::new();
+    let mut deferred: HashMap<DeferredKey, DeferredWake> = HashMap::new();
+    let ctx = SendCtx {
+        store: &store,
+        sender: &sender,
+        nudge_tx: &nudge_tx,
+        metrics: &metrics,
+        apns_coalesce_secs,
+        fcm_coalesce_secs,
+        alert_coalesce_secs,
+    };
 
     loop {
         // Find the next cooldown expiry to check for trailing-edge fires
@@ -185,6 +258,8 @@ async fn notifier_loop(
             .filter(|s| s.pending.is_some())
             .map(|s| s.expires_at)
             .min();
+        // ...and the next deferred per-device wake to flush.
+        let next_deferred = deferred.values().map(|d| d.due_at).min();
 
         tokio::select! {
             msg = rx.recv() => {
@@ -195,8 +270,17 @@ async fn notifier_loop(
 
                         if let Some(state) = cooldowns.get_mut(&topic) {
                             if now >= state.expires_at {
-                                // Cooldown expired — fire immediately (leading edge)
-                                fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, notification.visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
+                                // Cooldown expired — fire immediately (leading
+                                // edge). If a suppressed notification is still
+                                // pending from the previous window (the timer
+                                // branch hasn't won the select yet), merge its
+                                // visible-wins flag in rather than dropping it:
+                                // this fire replaces that trailing edge, and a
+                                // pending visible write must not be downgraded
+                                // to a silent wake by losing the race.
+                                let merged_visible = notification.visible
+                                    || state.pending.take().map(|(_, _, v)| v).unwrap_or(false);
+                                fire_notifications(&ctx, &topic, &notification.notifying_peer, &notification.peer_addrs, merged_visible, &mut deferred).await;
                                 state.expires_at = now + cooldown_duration;
                                 state.pending = None;
                             } else {
@@ -209,7 +293,7 @@ async fn notifier_loop(
                             }
                         } else {
                             // First notification for this topic — fire immediately
-                            fire_notifications(&store, &sender, &topic, &notification.notifying_peer, &notification.peer_addrs, notification.visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
+                            fire_notifications(&ctx, &topic, &notification.notifying_peer, &notification.peer_addrs, notification.visible, &mut deferred).await;
                             cooldowns.insert(topic, CooldownState {
                                 expires_at: now + cooldown_duration,
                                 pending: None,
@@ -234,7 +318,7 @@ async fn notifier_loop(
                     .collect();
 
                 for (topic, (notifying_peer, peer_addrs, visible)) in expired {
-                    fire_notifications(&store, &sender, &topic, &notifying_peer, &peer_addrs, visible, &nudge_tx, &metrics, apns_coalesce_secs, fcm_coalesce_secs, alert_coalesce_secs).await;
+                    fire_notifications(&ctx, &topic, &notifying_peer, &peer_addrs, visible, &mut deferred).await;
                     if let Some(state) = cooldowns.get_mut(&topic) {
                         state.expires_at = now + cooldown_duration;
                         state.pending = None;
@@ -246,6 +330,67 @@ async fn notifier_loop(
                 cooldowns.retain(|_, state| {
                     state.pending.is_some() || state.expires_at > stale_threshold
                 });
+            }
+            _ = async {
+                match next_deferred {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                flush_due_deferred(&ctx, &mut deferred).await;
+            }
+        }
+    }
+}
+
+/// Fire every deferred wake whose coalescing window has expired. Each flush
+/// re-runs the normal coalescing gate: `Allowed` is the expected case (the
+/// window that deferred it has lapsed) and stamps the new window; a
+/// `Suppressed` result means some fresher leading-edge send stamped a new
+/// window after this entry was queued — that send already woke the device
+/// with newer dial hints, so the stale entry is simply dropped.
+async fn flush_due_deferred(ctx: &SendCtx<'_>, deferred: &mut HashMap<DeferredKey, DeferredWake>) {
+    let now = Instant::now();
+    let due: Vec<(DeferredKey, DeferredWake)> = {
+        let keys: Vec<DeferredKey> = deferred
+            .iter()
+            .filter(|(_, d)| d.due_at <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| deferred.remove(&k).map(|d| (k, d)))
+            .collect()
+    };
+
+    for ((token, topic, is_alert), wake) in due {
+        let window = ctx.coalesce_window_secs(&wake.platform, is_alert);
+        match ctx
+            .store
+            .check_and_stamp_wake(&token, &topic, wake_kind(is_alert), now_unix(), window as i64)
+            .await
+        {
+            Ok(crate::push_store::WakeGate::Allowed) => {
+                tracing::info!(
+                    topic = %crate::short_topic(&topic),
+                    platform = %wake.platform,
+                    kind = wake_kind(is_alert),
+                    "Flushing deferred (coalesced) wake"
+                );
+                send_wake(ctx, &topic, &token, &wake.platform, is_alert, &wake.peer_addrs).await;
+            }
+            Ok(crate::push_store::WakeGate::Suppressed { .. }) => {
+                // A fresher send won the window since this was deferred.
+                tracing::debug!(
+                    topic = %crate::short_topic(&topic),
+                    kind = wake_kind(is_alert),
+                    "Dropping deferred wake — a newer send already covered it"
+                );
+            }
+            Err(e) => {
+                // Same fail-open policy as the leading-edge gate: push is a
+                // best-effort wake hint, so a store error sends anyway.
+                tracing::warn!("Wake-coalescing check failed on deferred flush, sending anyway: {e}");
+                send_wake(ctx, &topic, &token, &wake.platform, is_alert, &wake.peer_addrs).await;
             }
         }
     }
@@ -270,24 +415,19 @@ fn now_unix() -> i64 {
 /// than `apns_coalesce_secs`). FCM is unaffected either way: Android stays
 /// on the data-only class here, since the app-side `SyncNotify` policy
 /// already renders a rich local notification once it wakes and syncs.
-#[allow(clippy::too_many_arguments)]
 async fn fire_notifications(
-    store: &PushStore,
-    sender: &PushSender,
+    ctx: &SendCtx<'_>,
     topic: &str,
     notifying_peer: &str,
     peer_addrs: &[String],
     visible: bool,
-    nudge_tx: &mpsc::Sender<RetryNudge>,
-    metrics: &RelayMetrics,
-    apns_coalesce_secs: u64,
-    fcm_coalesce_secs: u64,
-    alert_coalesce_secs: u64,
+    deferred: &mut HashMap<DeferredKey, DeferredWake>,
 ) {
     // Exclude the writer's own token: a device uses the same libp2p peer id for
     // its RegisterToken and its NotifyTopic, so a local write must not wake the
     // device that made it.
-    let tokens = match store
+    let tokens = match ctx
+        .store
         .get_tokens_for_topic(topic, Some(notifying_peer))
         .await
     {
@@ -318,61 +458,64 @@ async fn fire_notifications(
         peer_addrs.len(),
     );
 
-    let peer_addrs_json = serde_json::to_string(peer_addrs).unwrap_or_else(|_| "[]".to_string());
-
     let now = now_unix();
-    let today = now / 86_400;
 
     for token_entry in &tokens {
         // ALERT-class only applies to APNs — FCM keeps the data-only class
         // today regardless of `visible` (Android's SyncNotify already
         // renders the rich local once it wakes and syncs).
         let is_alert = visible && token_entry.platform == "Apns";
-        let kind_label = if is_alert { "alert" } else { "silent" };
+        let kind_label = wake_kind(is_alert);
 
-        // Per-(token, topic) wake-coalescing window: a burst of writes to the
-        // same topic must cost this device ONE wake, not one per write, since
-        // APNs throttles silent background pushes to only a handful per device
-        // per day. This composes with (doesn't replace) the topic-keyed
-        // debounce above it in the call chain — that coalesces bursts across
-        // *all* devices within ~1s; this coalesces a *single* device's wakes
-        // across a much longer (minutes) window. Push is only a best-effort
-        // wake hint — a suppressed wake never loses data because the device's
-        // own catch-up sync (periodic / on-open version-vector exchange) still
-        // delivers on its next wake — so a store error here fails OPEN (send
-        // anyway) rather than fail closed like the budget check below.
+        // Per-(token, topic, class) wake-coalescing window: a burst of writes
+        // to the same topic must cost this device ONE wake per window, not
+        // one per write, since APNs throttles silent background pushes to
+        // only a handful per device per day. This composes with (doesn't
+        // replace) the topic-keyed debounce above it in the call chain —
+        // that coalesces bursts across *all* devices within ~1s; this
+        // coalesces a *single* device's wakes across a much longer (minutes)
+        // window. A suppressed send is DEFERRED to the window's expiry (see
+        // [`DeferredWake`]), not dropped — the leading-edge wake fires before
+        // the rest of the burst exists, so a dropped trailing edge would
+        // silence every later write of the window. A store error fails OPEN
+        // (send anyway): push is a best-effort wake hint, and losing the
+        // gate must not lose the wake.
         // ALERT-class sends get their own independent coalescing window
         // (`alert_coalesce_secs`) instead of `apns_coalesce_secs` — they skip
-        // the daily budget below, so this window is the only anti-spam guard
-        // they have.
-        let coalesce_window_secs = if is_alert {
-            alert_coalesce_secs
-        } else {
-            match token_entry.platform.as_str() {
-                "Apns" => apns_coalesce_secs,
-                "Fcm" => fcm_coalesce_secs,
-                _ => 0,
-            }
-        };
-        // `push_wakes` stamps one row per (token, topic) regardless of which
-        // window checked it, so the stamp is class-agnostic: a silent wake
-        // just inside the alert window can suppress the next alert, and vice
-        // versa — benign, since whichever wake actually landed already
-        // carried content-available and woke the device.
-        match store
-            .check_and_stamp_wake(&token_entry.token, topic, now, coalesce_window_secs as i64)
+        // the daily budget, so this window is the only anti-spam guard they
+        // have.
+        let coalesce_window_secs = ctx.coalesce_window_secs(&token_entry.platform, is_alert);
+        match ctx
+            .store
+            .check_and_stamp_wake(
+                &token_entry.token,
+                topic,
+                kind_label,
+                now,
+                coalesce_window_secs as i64,
+            )
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(crate::push_store::WakeGate::Allowed) => {}
+            Ok(crate::push_store::WakeGate::Suppressed { retry_in_secs }) => {
                 let short = token_entry.token.chars().take(20).collect::<String>();
                 tracing::debug!(
                     topic = %topic_short,
                     platform = %token_entry.platform,
                     kind = kind_label,
-                    "Coalescing wake for token={short}... (within {coalesce_window_secs}s window)"
+                    "Deferring wake for token={short}... ({retry_in_secs}s left in {coalesce_window_secs}s window)"
                 );
-                metrics.push_sent(&token_entry.platform, "coalesced");
+                ctx.metrics.push_sent(&token_entry.platform, "coalesced");
+                // Upsert: newer suppressed notifies refresh the dial hints;
+                // due_at converges on the same window expiry either way.
+                deferred.insert(
+                    (token_entry.token.clone(), topic.to_string(), is_alert),
+                    DeferredWake {
+                        due_at: Instant::now() + Duration::from_secs(retry_in_secs as u64),
+                        platform: token_entry.platform.clone(),
+                        peer_addrs: peer_addrs.to_vec(),
+                    },
+                );
                 continue;
             }
             Err(e) => {
@@ -385,159 +528,203 @@ async fn fire_notifications(
             }
         }
 
-        // Enforce the per-token daily silent-push budget. Beyond it the platform
-        // would throttle/drop wakes anyway; skipping here keeps a spammy or hostile
-        // notifier from burning a device's budget and silencing legitimate wakes.
-        // The device still catches up on its next foreground resume / periodic sync.
-        //
-        // ALERT-class sends bypass this entirely (including the deny-path
-        // refund below, which only exists for the budget-gated branch) — an
-        // unbudgeted alert is the whole point of the SyncNotify-visible
-        // signal; the per-device coalescing window above is its only cap.
-        if !is_alert {
-            match store.charge_daily_budget(&token_entry.token, today).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    let short = token_entry.token.chars().take(20).collect::<String>();
-                    tracing::warn!(
-                        topic = %topic_short,
-                        platform = %token_entry.platform,
-                        kind = kind_label,
-                        outcome = "budget_denied",
-                        "Daily push budget exhausted for token={short}...; skipping wake"
-                    );
-                    metrics.push_sent(&token_entry.platform, "budget_denied");
-                    // A denied send must not consume the coalescing window — the deny already means
-                    // no wake happened. Refund the stamp we made earlier.
-                    if let Err(e) = store.unstamp_wake(&token_entry.token, topic).await {
-                        tracing::debug!("unstamp_wake failed for {short}...: {e}");
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        topic = %topic_short,
-                        platform = %token_entry.platform,
-                        kind = kind_label,
-                        outcome = "budget_check_error",
-                        error = %e,
-                        "Daily budget check failed"
-                    );
-                    // Fail closed on the budget check: skip rather than risk unbounded sends.
-                    metrics.push_sent(&token_entry.platform, "budget_check_error");
-                    continue;
-                }
-            }
+        send_wake(
+            ctx,
+            topic,
+            &token_entry.token,
+            &token_entry.platform,
+            is_alert,
+            peer_addrs,
+        )
+        .await;
+    }
+}
+
+/// Budget-gate and send one wake whose coalescing window already allowed it
+/// (and stamped). Shared by the leading-edge path (`fire_notifications`) and
+/// the trailing-edge flush (`flush_due_deferred`), so both charge the daily
+/// budget identically. Every path that ends with nothing delivered — budget
+/// denial, budget-check error, permanent send failure, failure to even queue
+/// a retry — refunds the wake stamp, so an undelivered wake never blocks the
+/// device's next one.
+async fn send_wake(
+    ctx: &SendCtx<'_>,
+    topic: &str,
+    token: &str,
+    platform: &str,
+    is_alert: bool,
+    peer_addrs: &[String],
+) {
+    let store = ctx.store;
+    let topic_short = crate::short_topic(topic);
+    let kind_label = wake_kind(is_alert);
+    let short = token.chars().take(20).collect::<String>();
+    let now = now_unix();
+    let today = now / 86_400;
+
+    // Refund the coalescing stamp when this send ends up not delivering —
+    // absence of a stamp means "no recent wake", which is exactly the truth.
+    let unstamp = || async {
+        if let Err(e) = store.unstamp_wake(token, topic, kind_label).await {
+            tracing::debug!("unstamp_wake failed for {short}...: {e}");
         }
+    };
 
-        let result = match token_entry.platform.as_str() {
-            "Fcm" => sender.send_fcm(&token_entry.token, topic, peer_addrs).await,
-            "Apns" => {
-                sender
-                    .send_apns(&token_entry.token, topic, peer_addrs, is_alert)
-                    .await
-            }
-            other => {
-                tracing::warn!("Unknown push platform: {other}");
-                continue;
-            }
-        };
-
-        let short = token_entry.token.chars().take(20).collect::<String>();
-        match result {
-            PushResult::Sent => {
-                tracing::info!(
-                    topic = %topic_short,
-                    platform = %token_entry.platform,
-                    kind = kind_label,
-                    outcome = "ok",
-                    "Push sent to token={short}..."
-                );
-                metrics.push_sent(&token_entry.platform, "ok");
-                // A fresh send succeeded — clear any stale retry row
-                // that had been queued from an earlier failure for the
-                // same (topic, token). Latest peer_addrs already won
-                // via the debouncer; this just sweeps the stale row.
-                if let Err(e) = store.remove_retry(topic, &token_entry.token).await {
-                    tracing::debug!("remove_retry after Sent failed for {short}...: {e}");
-                }
-            }
-            PushResult::TokenInvalid { reason } => {
-                tracing::info!(
-                    topic = %topic_short,
-                    platform = %token_entry.platform,
-                    kind = kind_label,
-                    outcome = "token_invalid",
-                    reason = ?reason,
-                    "Pruning invalid push token {short}..."
-                );
-                metrics.push_sent(&token_entry.platform, "token_invalid");
-                if let Err(e) = store.remove_token(&token_entry.token).await {
-                    tracing::error!("Failed to remove invalid token: {e}");
-                }
-                // Token is dead; corresponding retry rows are now
-                // orphans that would never succeed. Sweep them.
-                if let Err(e) = store.purge_retries_for_token(&token_entry.token).await {
-                    tracing::error!("Failed to purge retries for invalidated token: {e}");
-                }
-            }
-            PushResult::Transient(err) => {
-                let now = now_unix();
-                let (error_kind, error_code, error_body, retry_after) = classify_transient(&err);
-
-                let next_delay = match compute_delay(1, retry_after) {
-                    Some(d) => d,
-                    None => unreachable!("compute_delay(1, _) is always Some"),
-                };
-                let next_attempt_at = now + next_delay.as_secs() as i64;
-
+    // Enforce the per-token daily silent-push budget. Beyond it the platform
+    // would throttle/drop wakes anyway; skipping here keeps a spammy or hostile
+    // notifier from burning a device's budget and silencing legitimate wakes.
+    // The device still catches up on its next foreground resume / periodic sync.
+    //
+    // ALERT-class sends bypass this entirely — an unbudgeted alert is the
+    // whole point of the SyncNotify-visible signal; the per-device coalescing
+    // window is its only cap.
+    if !is_alert {
+        match store.charge_daily_budget(token, today).await {
+            Ok(true) => {}
+            Ok(false) => {
                 tracing::warn!(
                     topic = %topic_short,
-                    platform = %token_entry.platform,
+                    platform = %platform,
                     kind = kind_label,
-                    outcome = "transient",
-                    error = ?err,
-                    "Push transient failure for {short}...; queueing retry #1/7 in ~{next_delay:?}"
+                    outcome = "budget_denied",
+                    "Daily push budget exhausted for token={short}...; skipping wake"
                 );
-                metrics.push_sent(&token_entry.platform, "transient");
-                if let Err(e) = store
-                    .enqueue_retry(
-                        topic,
-                        &token_entry.token,
-                        &token_entry.platform,
-                        is_alert,
-                        &peer_addrs_json,
-                        1,
-                        next_attempt_at,
-                        now,
-                        error_kind,
-                        error_code,
-                        error_body.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::error!("Failed to enqueue retry: {e}");
-                    continue;
-                }
-                let _ = nudge_tx.try_send(RetryNudge);
+                ctx.metrics.push_sent(platform, "budget_denied");
+                unstamp().await;
+                return;
             }
-            PushResult::Permanent(err) => {
+            Err(e) => {
                 tracing::error!(
                     topic = %topic_short,
-                    platform = %token_entry.platform,
+                    platform = %platform,
                     kind = kind_label,
-                    outcome = "permanent",
-                    error = ?err,
-                    "Push permanent failure for {short}...; dropping (misconfiguration won't resolve itself)"
+                    outcome = "budget_check_error",
+                    error = %e,
+                    "Daily budget check failed"
                 );
-                metrics.push_sent(&token_entry.platform, "permanent");
-                // Clear any retry row that might be in flight for this
-                // (topic, token) — once we've classified the failure as
-                // permanent, retries won't help.
-                let _ = store.remove_retry(topic, &token_entry.token).await;
+                // Fail closed on the budget check: skip rather than risk unbounded sends.
+                ctx.metrics.push_sent(platform, "budget_check_error");
+                unstamp().await;
+                return;
             }
         }
     }
+
+    let result = match platform {
+        "Fcm" => ctx.sender.send_fcm(token, topic, peer_addrs).await,
+        "Apns" => ctx.sender.send_apns(token, topic, peer_addrs, is_alert).await,
+        other => {
+            tracing::warn!("Unknown push platform: {other}");
+            return;
+        }
+    };
+
+    match result {
+        PushResult::Sent => {
+            tracing::info!(
+                topic = %topic_short,
+                platform = %platform,
+                kind = kind_label,
+                outcome = "ok",
+                "Push sent to token={short}..."
+            );
+            ctx.metrics.push_sent(platform, "ok");
+            // A fresh send succeeded — clear any stale retry row
+            // that had been queued from an earlier failure for the
+            // same (topic, token). Latest peer_addrs already won
+            // via the debouncer; this just sweeps the stale row.
+            if let Err(e) = store.remove_retry(topic, token).await {
+                tracing::debug!("remove_retry after Sent failed for {short}...: {e}");
+            }
+        }
+        PushResult::TokenInvalid { reason } => {
+            tracing::info!(
+                topic = %topic_short,
+                platform = %platform,
+                kind = kind_label,
+                outcome = "token_invalid",
+                reason = ?reason,
+                "Pruning invalid push token {short}..."
+            );
+            ctx.metrics.push_sent(platform, "token_invalid");
+            if let Err(e) = store.remove_token(token).await {
+                tracing::error!("Failed to remove invalid token: {e}");
+            }
+            // Token is dead; corresponding retry rows are now
+            // orphans that would never succeed. Sweep them.
+            if let Err(e) = store.purge_retries_for_token(token).await {
+                tracing::error!("Failed to purge retries for invalidated token: {e}");
+            }
+        }
+        PushResult::Transient(err) => {
+            let now = now_unix();
+            let (error_kind, error_code, error_body, retry_after) = classify_transient(&err);
+
+            let next_delay = match compute_delay(1, retry_after) {
+                Some(d) => d,
+                None => unreachable!("compute_delay(1, _) is always Some"),
+            };
+            let next_attempt_at = now + next_delay.as_secs() as i64;
+
+            tracing::warn!(
+                topic = %topic_short,
+                platform = %platform,
+                kind = kind_label,
+                outcome = "transient",
+                error = ?err,
+                "Push transient failure for {short}...; queueing retry #1/7 in ~{next_delay:?}"
+            );
+            ctx.metrics.push_sent(platform, "transient");
+            let peer_addrs_json =
+                serde_json::to_string(peer_addrs).unwrap_or_else(|_| "[]".to_string());
+            if let Err(e) = store
+                .enqueue_retry(
+                    topic,
+                    token,
+                    platform,
+                    is_alert,
+                    &peer_addrs_json,
+                    1,
+                    next_attempt_at,
+                    now,
+                    error_kind,
+                    error_code,
+                    error_body.as_deref(),
+                )
+                .await
+            {
+                tracing::error!("Failed to enqueue retry: {e}");
+                // Nothing was sent and nothing will retry — refund the
+                // stamp so the next write isn't coalesced into the void.
+                unstamp().await;
+                return;
+            }
+            nudge_tx_send(ctx.nudge_tx);
+        }
+        PushResult::Permanent(err) => {
+            tracing::error!(
+                topic = %topic_short,
+                platform = %platform,
+                kind = kind_label,
+                outcome = "permanent",
+                error = ?err,
+                "Push permanent failure for {short}...; dropping (misconfiguration won't resolve itself)"
+            );
+            ctx.metrics.push_sent(platform, "permanent");
+            // Clear any retry row that might be in flight for this
+            // (topic, token) — once we've classified the failure as
+            // permanent, retries won't help.
+            let _ = store.remove_retry(topic, token).await;
+            // Nothing was delivered; don't let the dead send hold the window.
+            unstamp().await;
+        }
+    }
+}
+
+/// Non-blocking retry-worker nudge; a full channel just means the worker is
+/// already scheduled to wake.
+fn nudge_tx_send(tx: &mpsc::Sender<RetryNudge>) {
+    let _ = tx.try_send(RetryNudge);
 }
 
 /// Decompose a `TransientError` into the (kind, code, body, retry_after)

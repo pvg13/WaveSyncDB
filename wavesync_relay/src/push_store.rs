@@ -82,6 +82,36 @@ pub struct RetryRow {
     pub is_alert: bool,
 }
 
+/// Outcome of [`PushStore::check_and_stamp_wake`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeGate {
+    /// The wake is allowed and `now` was stamped as the new window anchor.
+    Allowed,
+    /// A wake for this `(token, topic, kind)` fired less than the window
+    /// ago. `retry_in_secs` is how long until the window expires — the
+    /// notifier uses it to schedule the deferred trailing-edge flush
+    /// instead of dropping the wake.
+    Suppressed { retry_in_secs: i64 },
+}
+
+/// Whether the `push_wakes` table has a row schema including `column` —
+/// SQLite-schema probe used for in-place migrations, replacing fragile
+/// duplicate-column error-message matching.
+async fn table_has_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+) -> Result<bool, sqlx::Error> {
+    // PRAGMA table_info doesn't support bind parameters for the table name;
+    // both callers pass string literals, never external input.
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .any(|r| r.get::<String, _>("name").eq_ignore_ascii_case(column)))
+}
+
 /// Async wrapper around an sqlx SQLite pool for push token storage.
 pub struct PushStore {
     pool: SqlitePool,
@@ -162,18 +192,13 @@ impl PushStore {
         // Migrate pre-#78 on-disk push_retries tables in place. CREATE IF NOT
         // EXISTS does nothing for a table that already exists, so a DB from
         // before the ALERT-class retry column was added needs it backfilled
-        // explicitly. SQLite has no ADD COLUMN IF NOT EXISTS; the
-        // duplicate-column error is the idempotence signal (fresh tables
-        // already got `kind` from the CREATE above and hit this every time).
-        if let Err(e) =
+        // explicitly. SQLite has no ADD COLUMN IF NOT EXISTS; probe the
+        // actual schema instead of pattern-matching an error message (whose
+        // wording is a sqlx/SQLite implementation detail).
+        if !table_has_column(&pool, "push_retries", "kind").await? {
             sqlx::query("ALTER TABLE push_retries ADD COLUMN kind INTEGER NOT NULL DEFAULT 0")
                 .execute(&pool)
-                .await
-        {
-            let msg = e.to_string();
-            if !msg.contains("duplicate column") {
-                return Err(e);
-            }
+                .await?;
         }
 
         sqlx::query(
@@ -199,20 +224,39 @@ impl PushStore {
         .execute(&pool)
         .await?;
 
-        // Per-(token, topic) wake-coalescing window. Stamps the wall-clock time
-        // of the last wake actually sent to a device for a topic. A burst of
+        // Per-(token, topic, kind) wake-coalescing window. Stamps the
+        // wall-clock time of the last wake actually sent to a device for a
+        // topic, separately per send class ("silent" vs "alert"). A burst of
         // writes must cost that device ONE wake, not one per write — the daily
         // budget above caps sustained rate, this caps burst rate on top of it.
         // Composes with (doesn't replace) the topic-keyed notifier debounce:
         // the debounce coalesces across all devices within ~1s, this coalesces
         // a single device's wakes across a much longer (minutes) window. Old
         // rows are pruned lazily, alongside the budget ledger's own prune.
+        //
+        // Class-keyed so a silent wake can never suppress a later alert
+        // banner (which has no catch-up path) and vice versa — each class
+        // runs its own independent window. A pre-`kind` table (missing the
+        // column) is dropped rather than migrated: its contents are pure
+        // rate-limit state with a two-day retention, and the worst case of
+        // losing it is one extra wake per device.
+        if sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'push_wakes'",
+        )
+        .fetch_one(&pool)
+        .await?
+            > 0
+            && !table_has_column(&pool, "push_wakes", "kind").await?
+        {
+            sqlx::query("DROP TABLE push_wakes").execute(&pool).await?;
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS push_wakes (
                 token         TEXT NOT NULL,
                 topic         TEXT NOT NULL,
+                kind          TEXT NOT NULL,
                 last_wake_at  INTEGER NOT NULL,
-                PRIMARY KEY (token, topic)
+                PRIMARY KEY (token, topic, kind)
             )",
         )
         .execute(&pool)
@@ -315,48 +359,64 @@ impl PushStore {
         Ok(count <= MAX_PUSHES_PER_TOKEN_PER_DAY)
     }
 
-    /// Atomically check and stamp the per-(token, topic) wake-coalescing window.
+    /// Atomically check and stamp the per-(token, topic, kind) wake-coalescing
+    /// window. `kind` is the send class — `"silent"` or `"alert"` — each of
+    /// which runs its own independent window, so a silent wake can never
+    /// suppress a later alert banner (which has no catch-up path) or vice
+    /// versa.
     ///
-    /// Returns `true` if this wake is allowed (either no prior wake is on record,
-    /// or the last one is at least `window_secs` old) and stamps `now_secs` as
-    /// the new `last_wake_at`. Returns `false` if a wake for this `(token,
-    /// topic)` fired less than `window_secs` ago — the caller must skip the
-    /// send. A suppressed check does NOT reset the stamp: the window is
-    /// anchored to the last *allowed* wake, not to the last attempt, so a
-    /// steady stream of writes still costs only one wake per window rather
-    /// than sliding forever.
+    /// Returns [`WakeGate::Allowed`] if this wake may fire (either no prior
+    /// wake is on record, or the last one is at least `window_secs` old) and
+    /// stamps `now_secs` as the new `last_wake_at`. Returns
+    /// [`WakeGate::Suppressed`] — with the seconds remaining until the window
+    /// expires — if a wake for this `(token, topic, kind)` fired less than
+    /// `window_secs` ago; the caller defers a trailing-edge flush by that
+    /// long instead of sending. A suppressed check does NOT reset the stamp:
+    /// the window is anchored to the last *allowed* wake, not to the last
+    /// attempt, so a steady stream of writes still costs only one wake per
+    /// window rather than sliding forever.
     ///
-    /// `window_secs == 0` disables coalescing entirely: always returns `true`
-    /// and writes no row (mirrors "no state" rather than a zero-width window).
+    /// `window_secs == 0` disables coalescing entirely: always allowed,
+    /// writes no row (mirrors "no state" rather than a zero-width window).
     pub async fn check_and_stamp_wake(
         &self,
         token: &str,
         topic: &str,
+        kind: &str,
         now_secs: i64,
         window_secs: i64,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<WakeGate, sqlx::Error> {
         if window_secs == 0 {
-            return Ok(true);
+            return Ok(WakeGate::Allowed);
         }
 
         let mut tx = self.pool.begin().await?;
         let last_wake_at: Option<i64> = sqlx::query_scalar(
-            "SELECT last_wake_at FROM push_wakes WHERE token = ?1 AND topic = ?2",
+            "SELECT last_wake_at FROM push_wakes WHERE token = ?1 AND topic = ?2 AND kind = ?3",
         )
         .bind(token)
         .bind(topic)
+        .bind(kind)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let allow = !matches!(last_wake_at, Some(last) if now_secs - last < window_secs);
+        let gate = match last_wake_at {
+            Some(last) if now_secs - last < window_secs => WakeGate::Suppressed {
+                // At least 1s so a caller sleeping on this can't busy-loop
+                // on a sub-second remainder.
+                retry_in_secs: (last + window_secs - now_secs).max(1),
+            },
+            _ => WakeGate::Allowed,
+        };
 
-        if allow {
+        if gate == WakeGate::Allowed {
             sqlx::query(
-                "INSERT INTO push_wakes (token, topic, last_wake_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(token, topic) DO UPDATE SET last_wake_at = excluded.last_wake_at",
+                "INSERT INTO push_wakes (token, topic, kind, last_wake_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(token, topic, kind) DO UPDATE SET last_wake_at = excluded.last_wake_at",
             )
             .bind(token)
             .bind(topic)
+            .bind(kind)
             .bind(now_secs)
             .execute(&mut *tx)
             .await?;
@@ -371,7 +431,7 @@ impl PushStore {
             .await?;
 
         tx.commit().await?;
-        Ok(allow)
+        Ok(gate)
     }
 
     /// Unregister a specific token from a topic.
@@ -384,17 +444,25 @@ impl PushStore {
         Ok(())
     }
 
-    /// Remove the per-(token, topic) wake stamp, allowing a new wake immediately.
+    /// Remove the per-(token, topic, kind) wake stamp, allowing a new wake of
+    /// that class immediately.
     ///
-    /// Called when a wake was stamped but subsequently denied by the daily budget
-    /// or another gate. Absence of a stamp means "no recent wake", so deletion
-    /// (rather than restoring a previous value) correctly signals that the next
-    /// notify is allowed. A tiny refund-too-much window is harmless — the daily
-    /// budget still provides a hard cap.
-    pub async fn unstamp_wake(&self, token: &str, topic: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM push_wakes WHERE token = ?1 AND topic = ?2")
+    /// Called when a wake was stamped but subsequently not delivered — denied
+    /// by the daily budget, failed permanently, or couldn't even be queued
+    /// for retry. Absence of a stamp means "no recent wake", so deletion
+    /// (rather than restoring a previous value) correctly signals that the
+    /// next notify is allowed. A tiny refund-too-much window is harmless —
+    /// the daily budget still provides a hard cap.
+    pub async fn unstamp_wake(
+        &self,
+        token: &str,
+        topic: &str,
+        kind: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM push_wakes WHERE token = ?1 AND topic = ?2 AND kind = ?3")
             .bind(token)
             .bind(topic)
+            .bind(kind)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -741,39 +809,40 @@ mod tests {
         assert!(store.charge_daily_budget("tok2", day).await.unwrap());
     }
 
+    /// Shorthand for asserting the gate outcome in the wake tests below.
+    async fn gate(store: &PushStore, token: &str, topic: &str, kind: &str, now: i64) -> WakeGate {
+        store
+            .check_and_stamp_wake(token, topic, kind, now, 900)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn wake_within_window_suppressed() {
+    async fn wake_within_window_suppressed_with_remaining() {
         let store = mem_store().await;
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
-        // 100s later, well inside the 900s window — suppressed.
-        assert!(
-            !store
-                .check_and_stamp_wake("tok", "topic1", 1100, 900)
-                .await
-                .unwrap()
+        // 100s later, well inside the 900s window — suppressed, with the
+        // remaining window reported so the caller can defer the flush.
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1100).await,
+            WakeGate::Suppressed { retry_in_secs: 800 }
         );
     }
 
     #[tokio::test]
     async fn wake_after_window_allowed() {
         let store = mem_store().await;
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
         // Exactly the window width later — no longer suppressed.
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1900, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1900).await,
+            WakeGate::Allowed
         );
     }
 
@@ -781,82 +850,106 @@ mod tests {
     async fn wake_window_zero_always_allows_and_writes_nothing() {
         let store = mem_store().await;
         for _ in 0..3 {
-            assert!(
+            assert_eq!(
                 store
-                    .check_and_stamp_wake("tok", "topic1", 1000, 0)
+                    .check_and_stamp_wake("tok", "topic1", "silent", 1000, 0)
                     .await
-                    .unwrap()
+                    .unwrap(),
+                WakeGate::Allowed
             );
         }
         // Disabled coalescing must leave no row behind: a subsequent call with a
         // real window at the exact same instant still behaves like a first-ever
         // wake (allowed), proving nothing was stamped while window_secs was 0.
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
     }
 
     #[tokio::test]
     async fn wake_per_token_independent() {
         let store = mem_store().await;
-        assert!(
-            store
-                .check_and_stamp_wake("tok-a", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok-a", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
         // A different token on the same topic has its own window.
-        assert!(
-            store
-                .check_and_stamp_wake("tok-b", "topic1", 1050, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok-b", "topic1", "silent", 1050).await,
+            WakeGate::Allowed
         );
         // tok-a is still inside its own window.
-        assert!(
-            !store
-                .check_and_stamp_wake("tok-a", "topic1", 1050, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok-a", "topic1", "silent", 1050).await,
+            WakeGate::Suppressed { retry_in_secs: 850 }
         );
     }
 
     #[tokio::test]
     async fn wake_per_topic_independent() {
         let store = mem_store().await;
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
         // The same token on a different topic has its own window.
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic2", 1050, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic2", "silent", 1050).await,
+            WakeGate::Allowed
         );
         // topic1 is still inside its own window.
-        assert!(
-            !store
-                .check_and_stamp_wake("tok", "topic1", 1050, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1050).await,
+            WakeGate::Suppressed { retry_in_secs: 850 }
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_per_class_independent() {
+        let store = mem_store().await;
+        // A silent wake must not suppress a following ALERT-class send —
+        // the alert has no catch-up path, so its window is independent.
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
+        );
+        assert_eq!(
+            gate(&store, "tok", "topic1", "alert", 1010).await,
+            WakeGate::Allowed
+        );
+        // ...and each class then enforces its own window.
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1020).await,
+            WakeGate::Suppressed { retry_in_secs: 880 }
+        );
+        assert_eq!(
+            gate(&store, "tok", "topic1", "alert", 1020).await,
+            WakeGate::Suppressed { retry_in_secs: 890 }
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_suppressed_remainder_is_at_least_one_second() {
+        let store = mem_store().await;
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
+        );
+        // 1s before expiry the true remainder is 1; at the same second the
+        // clamp keeps it from reporting 0 (which callers treat as a sleep).
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1899).await,
+            WakeGate::Suppressed { retry_in_secs: 1 }
         );
     }
 
     #[tokio::test]
     async fn wake_prune_drops_stale_rows() {
         let store = mem_store().await;
-        assert!(
-            store
-                .check_and_stamp_wake("tok-old", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok-old", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
         let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_wakes")
             .fetch_one(&store.pool)
@@ -867,10 +960,7 @@ mod tests {
         // A later check for an unrelated (token, topic), far enough past the
         // 2-day retention window, sweeps the stale row as a side effect.
         let far_future = 1000 + 2 * 86_400 + 10;
-        store
-            .check_and_stamp_wake("tok-new", "topic2", far_future, 900)
-            .await
-            .unwrap();
+        gate(&store, "tok-new", "topic2", "silent", far_future).await;
 
         let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_wakes")
             .fetch_one(&store.pool)
@@ -884,37 +974,69 @@ mod tests {
     async fn unstamp_allows_immediate_rewake() {
         let store = mem_store().await;
         // Stamp a wake at time 1000.
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1000, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1000).await,
+            WakeGate::Allowed
         );
         // Without unstamp, a wake at 1100 (100s later, within 900s window) is suppressed.
-        assert!(
-            !store
-                .check_and_stamp_wake("tok", "topic1", 1100, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1100).await,
+            WakeGate::Suppressed { retry_in_secs: 800 }
         );
 
-        // Unstamp the original wake, clearing the (tok, topic1) entry.
-        store.unstamp_wake("tok", "topic1").await.unwrap();
+        // Unstamp the original wake, clearing the (tok, topic1, silent) entry.
+        store.unstamp_wake("tok", "topic1", "silent").await.unwrap();
 
         // Now the same timestamp 1100 is allowed again (no prior record).
-        assert!(
-            store
-                .check_and_stamp_wake("tok", "topic1", 1100, 900)
-                .await
-                .unwrap()
+        assert_eq!(
+            gate(&store, "tok", "topic1", "silent", 1100).await,
+            WakeGate::Allowed
         );
+    }
+
+    #[tokio::test]
+    async fn pre_kind_push_wakes_table_is_dropped_and_recreated() {
+        // Simulate a DB written by the pre-class-keyed schema, then reopen.
+        let dir = std::env::temp_dir().join(format!("wavesync_wakes_migr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("push.db");
+        let _ = std::fs::remove_file(&path);
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let store = PushStore::open(&path_str).await.unwrap();
+            sqlx::query("DROP TABLE push_wakes").execute(&store.pool).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE push_wakes (
+                    token TEXT NOT NULL, topic TEXT NOT NULL,
+                    last_wake_at INTEGER NOT NULL, PRIMARY KEY (token, topic))",
+            )
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO push_wakes VALUES ('t', 'x', 123)")
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+
+        // Reopen: the old-shape table is dropped and the class-keyed one works.
+        let store = PushStore::open(&path_str).await.unwrap();
+        assert_eq!(
+            gate(&store, "t", "x", "silent", 1000).await,
+            WakeGate::Allowed
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn unstamp_nonexistent_row_is_ok() {
         let store = mem_store().await;
         // Unstamping a (token, topic) that was never stamped succeeds (no-op).
-        store.unstamp_wake("tok", "nonexistent").await.unwrap();
+        store
+            .unstamp_wake("tok", "nonexistent", "silent")
+            .await
+            .unwrap();
         // No panic; operation completes successfully.
     }
 

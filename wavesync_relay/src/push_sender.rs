@@ -106,6 +106,20 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
         .map(Duration::from_secs)
 }
 
+/// Derive an APNs `apns-collapse-id` from a topic: ASCII-safe characters
+/// only (alphanumeric, `-`, `_`), truncated to APNs' documented 64-byte
+/// identifier limit. Standard topics (`wavesync2-<64 hex>`) keep their
+/// prefix plus enough of the hash that collisions are practically
+/// impossible; anything else degrades to its sanitized prefix rather than
+/// risking a `BadCollapseId` rejection.
+pub(crate) fn collapse_id(topic: &str) -> String {
+    topic
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect()
+}
+
 /// Configuration for FCM (Firebase Cloud Messaging) HTTP v1 API.
 pub struct FcmConfig {
     /// Google Cloud project ID.
@@ -345,13 +359,18 @@ impl PushSender {
             // `apns-priority: 10` + `apns-push-type: alert` request immediate
             // delivery — required for an alert to actually land on the lock
             // screen rather than being throttled like a background push.
-            // `apns-collapse-id` (topic-derived, already used for relay log
-            // scoping) coalesces bursts of alerts for the same group into one
-            // notification-center entry instead of stacking duplicates.
+            // `apns-collapse-id` (topic-derived) coalesces bursts of alerts
+            // for the same group into one notification-center entry instead
+            // of stacking duplicates. Not `crate::short_topic` — that embeds
+            // a non-ASCII ellipsis and is unbounded for non-standard topics,
+            // while APNs documents collapse-id as an identifier of at most
+            // 64 bytes with undocumented non-ASCII behavior (a BadCollapseId
+            // rejection would classify as Permanent and silently drop the
+            // alert).
             request
                 .header("apns-push-type", "alert")
                 .header("apns-priority", "10")
-                .header("apns-collapse-id", crate::short_topic(topic))
+                .header("apns-collapse-id", collapse_id(topic))
         } else {
             request
                 .header("apns-push-type", "background")
@@ -498,5 +517,27 @@ impl PushSender {
         });
 
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod collapse_id_tests {
+    use super::collapse_id;
+
+    #[test]
+    fn standard_topic_is_ascii_and_bounded() {
+        let topic = format!("wavesync2-{}", "ab".repeat(32));
+        let id = collapse_id(&topic);
+        assert!(id.len() <= 64);
+        assert!(id.is_ascii());
+        assert!(id.starts_with("wavesync2-"));
+    }
+
+    #[test]
+    fn non_ascii_and_oversize_topics_are_sanitized() {
+        let id = collapse_id(&format!("groc…ery/list {}", "x".repeat(100)));
+        assert!(id.len() <= 64);
+        assert!(id.is_ascii());
+        assert!(!id.contains('…') && !id.contains('/') && !id.contains(' '));
     }
 }
