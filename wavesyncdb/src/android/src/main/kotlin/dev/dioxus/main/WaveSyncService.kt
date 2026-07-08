@@ -91,21 +91,35 @@ class WaveSyncService : FirebaseMessagingService() {
          *
          * The config is written by Rust alongside the database file
          * (`SyncConfig::save`), which an app may nest arbitrarily deep below
-         * `filesDir` (e.g. `filesDir/<app>/u/<userhash>/`). A shallow scan
-         * misses it and may instead pick up a stale config left at a shallower
-         * level. We therefore search the whole `filesDir` subtree and prefer
-         * the config that actually carries the `fcm_*` credentials — that is
-         * the one `with_google_services()` persisted into the active group.
+         * `filesDir` (e.g. `filesDir/<app>/u/<userhash>/`). With per-account
+         * layouts there can be several candidates (a stale shallow config plus
+         * one per account), so selection must be deterministic: prefer
+         * credential-bearing configs, newest-written first. Rust re-saves the
+         * active config on every `build()`, so the active account's config
+         * always has the newest mtime — stale or inactive-account configs lose.
          */
         private fun findConfigFile(context: Context): File? {
+            return configCandidates(context)
+                .map { it to configHasFcmCredentials(it) }
+                .sortedWith(
+                    compareByDescending<Pair<File, Boolean>> { it.second }
+                        .thenByDescending { it.first.lastModified() }
+                )
+                .firstOrNull()?.first
+        }
+
+        /**
+         * Every existing `.wavesync_config.json` under `filesDir` (bounded by
+         * [MAX_CONFIG_SEARCH_DEPTH]) plus the SQLite databases dir, which
+         * `getDatabasePath` places outside `filesDir`.
+         */
+        private fun configCandidates(context: Context): List<File> {
             val candidates = mutableListOf<File>()
             collectConfigFiles(context.filesDir, candidates, MAX_CONFIG_SEARCH_DEPTH)
-            // The SQLite databases dir (getDatabasePath) is outside filesDir; check it too.
             context.getDatabasePath("dummy").parentFile?.let { dbDir ->
                 File(dbDir, ".wavesync_config.json").takeIf { it.exists() }?.let { candidates.add(it) }
             }
-            if (candidates.isEmpty()) return null
-            return candidates.firstOrNull { configHasFcmCredentials(it) } ?: candidates.first()
+            return candidates
         }
 
         private fun collectConfigFiles(dir: File, out: MutableList<File>, depthRemaining: Int) {
@@ -125,18 +139,35 @@ class WaveSyncService : FirebaseMessagingService() {
         }
 
         /**
-         * The directory the FCM token must be written to so Rust can find it.
+         * Every file the FCM token must be written to so Rust can find it.
          *
-         * Rust (`push.rs::read_token_from_file`) reads the token from the
-         * database's parent directory, which is exactly where the active config
-         * lives. Keeping the write next to the discovered config guarantees the
-         * write location (here) and the read location (Rust) agree even when the
-         * data dir is nested below `filesDir`. Falls back to `filesDir` only when
-         * no config exists yet (very first launch, before Rust writes one).
+         * Rust (`push.rs::read_token_from_file`) reads the token strictly from
+         * the active database's parent directory — but only Rust knows which of
+         * several per-account config dirs is active. The FCM token is per
+         * app-install, not per account, so the same value is valid everywhere:
+         * write it next to EVERY discovered config. Whichever database the app
+         * opens, the token is already in its directory; inactive dirs just hold
+         * a harmless duplicate. Falls back to `filesDir` only when no config
+         * exists yet (very first launch, before Rust writes one).
          */
-        private fun tokenFile(context: Context): File {
-            val configDir = findConfigFile(context)?.parentFile ?: context.filesDir
-            return File(configDir, TOKEN_FILENAME)
+        private fun tokenFiles(context: Context): List<File> {
+            val dirs = configCandidates(context)
+                .mapNotNull { it.parentFile }
+                .distinctBy { it.absolutePath }
+                .ifEmpty { listOf(context.filesDir) }
+            return dirs.map { File(it, TOKEN_FILENAME) }
+        }
+
+        /** Best-effort write of [token] to every location in [tokenFiles]. */
+        private fun writeTokenFiles(context: Context, token: String) {
+            for (dest in tokenFiles(context)) {
+                try {
+                    dest.writeText(token)
+                    Log.i(TAG, "FCM token written to ${dest.absolutePath}: ${token.take(10)}...")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to write token file ${dest.absolutePath}: ${e.message}")
+                }
+            }
         }
 
         /**
@@ -153,9 +184,7 @@ class WaveSyncService : FirebaseMessagingService() {
                     FirebaseMessaging.getInstance().token
                 )
                 if (token != null) {
-                    val dest = tokenFile(context)
-                    dest.writeText(token)
-                    Log.i(TAG, "FCM token written to ${dest.absolutePath}: ${token.take(10)}...")
+                    writeTokenFiles(context, token)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Could not get FCM token yet: ${e.message}")
@@ -350,13 +379,10 @@ class WaveSyncService : FirebaseMessagingService() {
             .putString("fcm_token", token)
             .apply()
 
-        // Write to file so Rust can read it without JNI. Must land in the DB
-        // directory (next to the active config), where Rust looks for it.
-        try {
-            tokenFile(applicationContext).writeText(token)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to write token file: ${e.message}")
-        }
+        // Write to file so Rust can read it without JNI. Broadcast to every
+        // candidate config dir — Rust reads from the active DB's directory,
+        // and only Rust knows which one that is.
+        writeTokenFiles(applicationContext, token)
     }
 
     private fun findDatabaseUrl(): String? {
