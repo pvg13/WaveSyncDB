@@ -91,21 +91,35 @@ class WaveSyncService : FirebaseMessagingService() {
          *
          * The config is written by Rust alongside the database file
          * (`SyncConfig::save`), which an app may nest arbitrarily deep below
-         * `filesDir` (e.g. `filesDir/<app>/u/<userhash>/`). A shallow scan
-         * misses it and may instead pick up a stale config left at a shallower
-         * level. We therefore search the whole `filesDir` subtree and prefer
-         * the config that actually carries the `fcm_*` credentials — that is
-         * the one `with_google_services()` persisted into the active group.
+         * `filesDir` (e.g. `filesDir/<app>/u/<userhash>/`). With per-account
+         * layouts there can be several candidates (a stale shallow config plus
+         * one per account), so selection must be deterministic: prefer
+         * credential-bearing configs, newest-written first. Rust re-saves the
+         * active config on every `build()`, so the active account's config
+         * always has the newest mtime — stale or inactive-account configs lose.
          */
         private fun findConfigFile(context: Context): File? {
+            return configCandidates(context)
+                .map { it to configHasFcmCredentials(it) }
+                .sortedWith(
+                    compareByDescending<Pair<File, Boolean>> { it.second }
+                        .thenByDescending { it.first.lastModified() }
+                )
+                .firstOrNull()?.first
+        }
+
+        /**
+         * Every existing `.wavesync_config.json` under `filesDir` (bounded by
+         * [MAX_CONFIG_SEARCH_DEPTH]) plus the SQLite databases dir, which
+         * `getDatabasePath` places outside `filesDir`.
+         */
+        private fun configCandidates(context: Context): List<File> {
             val candidates = mutableListOf<File>()
             collectConfigFiles(context.filesDir, candidates, MAX_CONFIG_SEARCH_DEPTH)
-            // The SQLite databases dir (getDatabasePath) is outside filesDir; check it too.
             context.getDatabasePath("dummy").parentFile?.let { dbDir ->
                 File(dbDir, ".wavesync_config.json").takeIf { it.exists() }?.let { candidates.add(it) }
             }
-            if (candidates.isEmpty()) return null
-            return candidates.firstOrNull { configHasFcmCredentials(it) } ?: candidates.first()
+            return candidates
         }
 
         private fun collectConfigFiles(dir: File, out: MutableList<File>, depthRemaining: Int) {
