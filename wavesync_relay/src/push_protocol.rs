@@ -37,6 +37,12 @@ pub enum PushRequest {
     NotifyTopic {
         topic: String,
         sender_site_id: String,
+        /// Whether this changeset touched at least one table with a
+        /// registered `SyncNotify` policy — see the mirrored doc comment
+        /// on `wavesyncdb/src/engine/push_protocol.rs`. `#[serde(default)]`
+        /// keeps an old sender's un-tagged message wire-compatible.
+        #[serde(default)]
+        visible: bool,
     },
     /// Sent by a peer on relay connect to announce presence for a topic
     /// and receive the list of other peers currently registered on that

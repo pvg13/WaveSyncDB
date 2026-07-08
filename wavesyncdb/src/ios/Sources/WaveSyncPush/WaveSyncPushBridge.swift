@@ -139,6 +139,28 @@ public func wavesync_show_notification(
     }
 }
 
+/// Mark a file `NSFileProtectionCompleteUntilFirstUserAuthentication`.
+///
+/// Called from Rust (`key_cache::save_group_key`) via `dlsym` after writing
+/// the on-disk group-key cache — same dyld-lazy-resolution idiom as
+/// `wavesync_show_notification` above. This protection class matches the one
+/// `WaveSyncPushHandler.writeDeviceToken` already uses for the APNs token
+/// file: background-launchable (the Notification Service Extension can read
+/// it before first unlock) while the file stays encrypted at rest whenever
+/// the device is locked. Best-effort — a failure is logged, never fatal.
+@_cdecl("wavesync_protect_file")
+public func wavesync_protect_file(_ pathPtr: UnsafePointer<CChar>?) {
+    guard let pathPtr = pathPtr else { return }
+    let path = String(cString: pathPtr)
+    do {
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: path)
+    } catch {
+        NSLog("[WaveSync] Failed to protect file %@: %@", path, error.localizedDescription)
+    }
+}
+
 @_cdecl("wavesync_push_bridge_did_receive")
 public func wavesync_push_bridge_did_receive(
     _ userInfoPtr: UnsafeRawPointer?,
@@ -158,4 +180,32 @@ public func wavesync_push_bridge_did_receive(
         // selector takes `NSInteger` which bridges to `Int`.
         wrapper.invoke(withResult: Int(result.rawValue))
     }
+}
+
+/// Resolve an iOS App Group container directory by group id.
+///
+/// Exposed as a C symbol so wavesyncdb's Rust side (which has no access to
+/// Foundation) can point both the app's `WaveSyncDbBuilder` and its
+/// Notification Service Extension at the same shared directory, instead of
+/// duplicating `containerURL(forSecurityApplicationGroupIdentifier:)` logic
+/// in Rust. Resolved at runtime via `dlsym` from the Rust side (see
+/// `wavesyncdb::wavesync_app_group_container`) — same dyld-lazy-resolution
+/// idiom as `wavesync_show_notification` above.
+///
+/// Returns a `strdup`'d C string the caller must free with the C library
+/// `free()` — **not** `wavesync_string_free`, which frees a *Rust*-allocated
+/// `CString` from a different allocator. Returns `NULL` if the app has no
+/// entitlement for `groupId` or the container doesn't exist.
+@_cdecl("wavesync_app_group_container")
+public func wavesync_app_group_container(
+    _ groupIdPtr: UnsafePointer<CChar>?
+) -> UnsafeMutablePointer<CChar>? {
+    guard let groupIdPtr = groupIdPtr else { return nil }
+    let groupId = String(cString: groupIdPtr)
+    guard let url = FileManager.default
+        .containerURL(forSecurityApplicationGroupIdentifier: groupId)
+    else {
+        return nil
+    }
+    return strdup(url.path)
 }

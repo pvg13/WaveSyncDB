@@ -82,6 +82,40 @@
   `APNS_BUNDLE_ID`/`APNS_SANDBOX` config, and the coalescing/timeout knobs
   above) and `docs/ios-device-protocol-2026-07.md` (the on-device
   measurement checklist for #73/#74/#77/#79).
+- **Alert-class relay pushes + Notification Service Extension support (#78).**
+  A changeset that touches a `SyncNotify`-visible table now wakes iOS peers
+  with an unbudgeted APNs ALERT-class push instead of the budgeted silent
+  one — real-time delivery for user-relevant changes, not throttled by the
+  daily silent-push cap. **Zero user data crosses the relay for this:** the
+  only new wire field is `NotifyTopic.visible: bool`, a metadata flag
+  computed sender-side from the changeset's table names — no row content,
+  no app-supplied text. The alert's title comes exclusively from the relay
+  operator's `APNS_ALERT_TITLE` env var (default `"Nueva actividad"`), the
+  same placeholder for every alert on that deployment; the real
+  per-notification text is composed entirely on-device, after the normal
+  end-to-end-encrypted sync completes, and never touches the relay. Per-device
+  anti-spam guard is `ALERT_COALESCE_SECS` (default 30s, independent of the
+  silent class's `APNS_COALESCE_SECS`), and `apns-collapse-id` keeps a burst
+  of alerts for one topic to a single Notification Center entry.
+  Complementary iOS library support (`wavesyncdb`, iOS targets only):
+  an on-disk group-key cache (`.wavesync_group_keys.json`,
+  `WaveSyncDbBuilder::with_group_key_cache`, default on) lets a Notification
+  Service Extension load an already-derived 32-byte group key instead of
+  running the Argon2id KDF, whose ~19 MiB footprint the NSE's ~24 MB memory
+  cap can't afford. **This is a structural guarantee, not a convention:**
+  when the NSE's sync path sets `key_cache_load_only`, the code branch that
+  would call `GroupKey::from_passphrase` is unreachable — a cache miss
+  returns `GroupKeyLoadOnlyMiss` instead of falling back to deriving, so the
+  KDF cannot run inside the extension under any code path. A new FFI entry
+  point, `wavesync_nse_handle_push`, runs a budget-scoped one-shot sync and
+  returns the latest captured `SyncNotify` notification's title/body (or
+  `None` on timeout / cache miss / nothing notify-worthy), and a
+  `WaveSyncNotificationService.swift` template + `wavesync_app_group_container`
+  helper let an app share its database with the extension via an iOS App
+  Group. The NSE's failure mode is always safe: if it can't finish (killed,
+  cold key cache, no App Group), the operator's placeholder banner is shown
+  as-is and the data still syncs on the next catch-up — the extension is
+  purely a content upgrade, never a sync dependency.
 
 ### Changed
 - **Sync protocol 4.0.0.** The `deleted_ts` field is covered by message

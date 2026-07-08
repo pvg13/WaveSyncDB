@@ -151,6 +151,15 @@ struct Cli {
     #[arg(long, env = "APNS_SANDBOX")]
     apns_sandbox: bool,
 
+    /// Placeholder title for unbudgeted ALERT-class APNs sends (issue #78,
+    /// default "Nueva actividad"). This is relay-operator branding, set at
+    /// deploy time — it is the ONLY user-facing text on an alert push and
+    /// must never be client-supplied. Apps with a Notification Service
+    /// Extension replace it with real content before display; apps without
+    /// one show this placeholder as-is.
+    #[arg(long, env = "APNS_ALERT_TITLE", default_value = "Nueva actividad")]
+    apns_alert_title: String,
+
     /// Push notification cooldown window in seconds (default: 1).
     /// First notification fires immediately; subsequent ones within this
     /// window are batched. The shorter the window, the faster trailing-edge
@@ -175,6 +184,15 @@ struct Cli {
     /// bursts, so no extra per-device window is needed by default.
     #[arg(long, env = "FCM_COALESCE_SECS", default_value_t = 0)]
     fcm_coalesce_secs: u64,
+
+    /// Per-device wake-coalescing window in seconds for unbudgeted
+    /// ALERT-class APNs sends (default: 30). Alerts bypass the daily push
+    /// budget entirely (issue #78) — this window is their only anti-spam
+    /// guard, so it stays deliberately short (real-time banners should
+    /// still feel real-time) and independent of APNS_COALESCE_SECS, which
+    /// only governs the budget-gated silent wake.
+    #[arg(long, env = "ALERT_COALESCE_SECS", default_value_t = 30)]
+    alert_coalesce_secs: u64,
 
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
     /// Required when running behind NAT or in Docker.
@@ -573,6 +591,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 team_id: team_id.clone(),
                 bundle_id: bundle_id.clone(),
                 sandbox: cli.apns_sandbox,
+                alert_title: cli.apns_alert_title.clone(),
             })
         } else {
             None
@@ -591,6 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relay_metrics.clone(),
             cli.apns_coalesce_secs,
             cli.fcm_coalesce_secs,
+            cli.alert_coalesce_secs,
         );
 
         // The token store is persistent across restarts, but the gauge
@@ -1277,6 +1297,7 @@ async fn handle_push_request(
         PushRequest::NotifyTopic {
             topic,
             sender_site_id,
+            visible,
         } => {
             // Require the notifier to already hold a registered token for this
             // topic. The relay can't prove group membership (no key), but this
@@ -1313,13 +1334,17 @@ async fn handle_push_request(
                 topic = %short_topic(topic),
                 peer = %peer_id,
                 site = %sender_site_id,
+                visible = %visible,
                 outcome = "accepted",
                 "NotifyTopic"
             );
             relay_metrics.push_notify(topic);
             // Pass the sender's peer id so the fan-out skips the writer's own
-            // registered token (no self-wake on a local write).
-            notifier.notify(topic.clone(), peer_id.to_string(), sender_addrs);
+            // registered token (no self-wake on a local write). `visible`
+            // carries the sender-computed SyncNotify signal through to the
+            // debounce coordinator, which decides silent vs unbudgeted
+            // ALERT-class send per issue #78.
+            notifier.notify(topic.clone(), peer_id.to_string(), sender_addrs, *visible);
             PushResponse::Ok
         }
         // Handled inline in the main loop — needs swarm access to fan out

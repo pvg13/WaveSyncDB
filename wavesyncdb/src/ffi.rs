@@ -1,6 +1,6 @@
 //! FFI exports for native mobile push notification services.
 //!
-//! Two interfaces are provided:
+//! Three interfaces are provided:
 //!
 //! - **C FFI** (`wavesync_background_sync`) — called from iOS Swift via `@_silgen_name`.
 //!   Enable with `features = ["mobile-ffi"]`.
@@ -8,6 +8,12 @@
 //! - **JNI** (`Java_dev_dioxus_main_WaveSyncService_backgroundSync`) — called from
 //!   Android Kotlin via `WaveSyncService` in `dev.dioxus.main`.
 //!   Enable with `features = ["push-sync"]`.
+//!
+//! - **NSE C FFI** (`wavesync_nse_handle_push`) — called from the iOS
+//!   Notification Service Extension template (`WaveSyncNotificationService`).
+//!   `#[cfg(all(target_os = "ios", feature = "push-sync"))]` — see that
+//!   function's docs for why it takes a config *directory* rather than a
+//!   database URL, and never runs the KDF.
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -331,4 +337,341 @@ pub extern "system" fn Java_dev_dioxus_main_WaveSyncService_backgroundSyncTarget
         target.is_some()
     );
     run_background_sync(&url, timeout_secs as u32, &peer_addrs, target.as_deref())
+}
+
+// ---------------------------------------------------------------------
+// Notification Service Extension (NSE) support
+// ---------------------------------------------------------------------
+
+/// Parse the NSE's push payload JSON for the effective topic and any direct
+/// peer-address hints.
+///
+/// Mirrors the exact keys `WaveSyncPushHandler` reads from the APNs
+/// `userInfo` dictionary on the app side (`WaveSyncPushHandler.swift`): a
+/// top-level `"topic"` string (the effective/PSK-derived topic the relay
+/// stamped on the alert push) and an optional `"peer_addrs"` string, itself
+/// JSON-encoding an array of multiaddr strings.
+///
+/// Returns `None` only when `topic` is missing or not a string — a push with
+/// no topic can't be targeted at any group. A missing or malformed
+/// `peer_addrs` degrades to an empty `Vec` rather than failing the whole
+/// parse: peer hints are a cold-start latency optimization (direct dial
+/// instead of waiting on discovery), not a requirement for sync to succeed.
+///
+/// Compiled whenever the real (iOS + `push-sync`) call site is, or under
+/// `cfg(test)` so this pure logic is host-testable on every platform without
+/// pulling in the target-gated caller.
+#[cfg(any(all(target_os = "ios", feature = "push-sync"), test))]
+fn parse_push_payload(json: &str) -> Option<(String, Vec<String>)> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let topic = value.get("topic")?.as_str()?.to_string();
+    let peer_addrs = value
+        .get("peer_addrs")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    Some((topic, peer_addrs))
+}
+
+/// JSON shape returned by [`wavesync_nse_handle_push`]. See that function's
+/// docs for what `title`/`body` mean when absent.
+#[cfg(any(all(target_os = "ios", feature = "push-sync"), test))]
+#[derive(serde::Serialize)]
+struct NsePushResult {
+    synced: bool,
+    title: Option<String>,
+    body: Option<String>,
+}
+
+#[cfg(any(all(target_os = "ios", feature = "push-sync"), test))]
+fn nse_result_json(synced: bool, title: Option<String>, body: Option<String>) -> String {
+    serde_json::to_string(&NsePushResult {
+        synced,
+        title,
+        body,
+    })
+    // `NsePushResult` has no field that can fail to serialize (plain
+    // bool/String/Option<String>) — this is unreachable in practice, but a
+    // literal fallback beats unwrapping into a panic across an FFI boundary.
+    .unwrap_or_else(|_| "{\"synced\":false,\"title\":null,\"body\":null}".to_string())
+}
+
+/// C FFI entry point for the iOS Notification Service Extension (NSE).
+///
+/// Unlike every other entry point in this module, the NSE is NOT handed a
+/// database URL — it's handed `config_dir`, the shared App Group container
+/// directory (see [`wavesync_app_group_container`] and the
+/// `WaveSyncNotificationService` Swift template). `.wavesync_config.json`'s
+/// `database_url` field is read directly from that directory
+/// (`SyncConfig::load_from_dir`), so the NSE never needs to be told the
+/// database URL separately — one less thing that can drift out of sync
+/// between the app and its extension.
+///
+/// `payload_json` is the APNs `userInfo` dictionary, JSON-encoded by the
+/// Swift template (see [`parse_push_payload`] for the keys read).
+/// `budget_secs` bounds the sync the same way `timeout_secs` does for the
+/// other background entry points — the NSE's OS-enforced wall-clock budget
+/// is much tighter (~30s total, shared with the extension's own startup),
+/// so callers should pass something well under that, leaving room for
+/// process teardown.
+///
+/// The KDF (Argon2id, ~19 MiB) can **never** run here, by construction: this
+/// function calls `background_sync_with_capture` with `key_cache_load_only =
+/// true`, which threads through to every group-key derivation the sync makes
+/// (`connection::group_key_for_dir`) and turns a cache miss into an error
+/// instead of a fallback derivation — the branch that would call
+/// `GroupKey::from_passphrase` is unreachable in load-only mode (see
+/// `GroupKeyLoadOnlyMiss`). A group whose key isn't already cached there
+/// simply can't be synced. In that case (or on timeout) the caller sees
+/// `synced: false` with no title/body and falls back to the operator's
+/// placeholder alert content — a safe fallback by construction, not a
+/// special case this function has to detect.
+///
+/// Returns a JSON string `{"synced": bool, "title": string|null, "body":
+/// string|null}` — `title`/`body` are the last captured `SyncNotify`
+/// notification's, or `null` if none fired (timeout, no matching policy, or
+/// the change wasn't notify-worthy). The returned pointer is heap-allocated
+/// by Rust (`CString::into_raw`) and **must** be freed with
+/// [`wavesync_string_free`] — never Swift's `free()` (different allocator;
+/// contrast with [`wavesync_app_group_container`]'s Swift-`strdup`'d return
+/// value, which is freed the other way).
+///
+/// # Safety
+///
+/// `config_dir` and `payload_json` must be valid, null-terminated UTF-8
+/// string pointers.
+#[cfg(all(target_os = "ios", feature = "push-sync"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn wavesync_nse_handle_push(
+    config_dir: *const c_char,
+    payload_json: *const c_char,
+    budget_secs: u32,
+) -> *mut c_char {
+    fn to_cstring(json: String) -> *mut c_char {
+        match std::ffi::CString::new(json) {
+            Ok(c) => c.into_raw(),
+            // A NUL byte inside our own serde_json output can't happen for
+            // this shape, but never hand back a dangling pointer if it did.
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+    let fallback = || to_cstring(nse_result_json(false, None, None));
+    let cstr_to_str = |ptr: *const c_char| -> Option<&str> {
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+    };
+
+    let Some(config_dir) = cstr_to_str(config_dir) else {
+        return fallback();
+    };
+    let Some(payload_json) = cstr_to_str(payload_json) else {
+        return fallback();
+    };
+    let Some((topic, peer_addrs)) = parse_push_payload(payload_json) else {
+        return fallback();
+    };
+
+    let config =
+        match crate::connection::SyncConfig::load_from_dir(std::path::Path::new(config_dir)) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "wavesync_nse_handle_push: could not load config from {config_dir}: {e}"
+                );
+                return fallback();
+            }
+        };
+
+    // A single worker thread — unlike `run_background_sync`'s runtime above,
+    // which serves the app process (Android's background service, or iOS's
+    // own foreground-triggered wake) with no comparable constraint. Every
+    // extra worker thread costs its own OS stack (default 2 MiB, reducible
+    // but still not free) against the NSE's ~24 MB total ceiling (see this
+    // function's doc comment and the key-cache tradeoff it links) — a
+    // multi-thread pool sized to available cores has nothing to parallelize
+    // here anyway (one push, one group, one sync) and would only spend that
+    // budget on idle threads.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return fallback(),
+    };
+
+    let budget = Duration::from_secs(budget_secs.into());
+    let (synced, title, body) = rt.block_on(async {
+        match background_sync::background_sync_with_capture(
+            &config.database_url,
+            budget,
+            &peer_addrs,
+            Some(&topic),
+            // Never let the NSE's sync fall back to running the KDF — see
+            // this function's doc comment.
+            true,
+        )
+        .await
+        {
+            Ok((result, notifications)) => {
+                let synced = matches!(result, BackgroundSyncResult::Synced { .. });
+                match notifications.into_iter().last() {
+                    Some(n) => (synced, Some(n.title), Some(n.body)),
+                    None => (synced, None, None),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("wavesync_nse_handle_push: background sync failed: {e}");
+                (false, None, None)
+            }
+        }
+    });
+
+    to_cstring(nse_result_json(synced, title, body))
+}
+
+/// Frees a string returned by [`wavesync_nse_handle_push`].
+///
+/// Every other FFI entry point in this module returns a plain integer, so
+/// this is currently the only pointer this crate hands to Swift that Swift
+/// must give back — a `CString::into_raw` allocation, which only Rust may
+/// reclaim (`CString::from_raw`, then drop). Do not pass a Swift-`strdup`'d
+/// pointer here (e.g. [`wavesync_app_group_container`]'s return value on
+/// the Swift side) — that is a different allocator, and freeing it this way
+/// corrupts the heap; free those with the C library `free()` instead.
+///
+/// # Safety
+///
+/// `s` must be exactly a pointer previously returned by
+/// `wavesync_nse_handle_push`, and must not be freed more than once.
+#[cfg(all(target_os = "ios", feature = "push-sync"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn wavesync_string_free(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    drop(unsafe { std::ffi::CString::from_raw(s) });
+}
+
+/// Resolve an iOS App Group container directory by group id, via the Swift
+/// `wavesync_app_group_container` `@_cdecl` helper
+/// (`WaveSyncPushBridge.swift`).
+///
+/// Lets an app point its [`WaveSyncDbBuilder`](crate::WaveSyncDbBuilder) and
+/// its Notification Service Extension at the same shared directory without
+/// duplicating `FileManager.containerURL(forSecurityApplicationGroupIdentifier:)`
+/// logic in Rust, which has no access to Foundation. Resolved via `dlsym`,
+/// mirroring `notify_display`'s pattern for calling into the already-loaded
+/// WaveSyncPush framework.
+///
+/// Returns `None` if the symbol can't be resolved (host app hasn't linked
+/// WaveSyncPush, or linked a version predating this helper), the group id
+/// isn't valid UTF-8 with no interior NUL, or the app has no entitlement for
+/// `group_id` / the container doesn't exist.
+#[cfg(target_os = "ios")]
+pub fn wavesync_app_group_container(group_id: &str) -> Option<String> {
+    use std::os::raw::c_void;
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+    }
+    const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
+    type ContainerFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+
+    let group_id_c = std::ffi::CString::new(group_id).ok()?;
+    unsafe {
+        let sym = dlsym(RTLD_DEFAULT, c"wavesync_app_group_container".as_ptr());
+        if sym.is_null() {
+            tracing::warn!(
+                "wavesync_app_group_container: symbol not found (WaveSyncPush not linked?)"
+            );
+            return None;
+        }
+        let f: ContainerFn = std::mem::transmute(sym);
+        let ptr = f(group_id_c.as_ptr());
+        if ptr.is_null() {
+            return None;
+        }
+        // Swift `strdup`'d this — free with the C allocator, never
+        // `CString::from_raw` (that assumes a Rust allocation).
+        let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        free(ptr as *mut c_void);
+        Some(s)
+    }
+}
+
+#[cfg(test)]
+mod nse_tests {
+    use super::*;
+
+    #[test]
+    fn parses_topic_and_peer_addrs() {
+        let json = r#"{"topic":"wavesync2-abc","peer_addrs":"[\"/ip4/1.2.3.4/tcp/1\"]"}"#;
+        let (topic, addrs) = parse_push_payload(json).expect("should parse");
+        assert_eq!(topic, "wavesync2-abc");
+        assert_eq!(addrs, vec!["/ip4/1.2.3.4/tcp/1".to_string()]);
+    }
+
+    #[test]
+    fn missing_peer_addrs_yields_empty_vec_not_none() {
+        let json = r#"{"topic":"wavesync2-abc"}"#;
+        let (topic, addrs) = parse_push_payload(json).expect("topic alone should parse");
+        assert_eq!(topic, "wavesync2-abc");
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn malformed_peer_addrs_degrades_to_empty_vec() {
+        let json = r#"{"topic":"wavesync2-abc","peer_addrs":"not json"}"#;
+        let (topic, addrs) = parse_push_payload(json).expect("topic alone should parse");
+        assert_eq!(topic, "wavesync2-abc");
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn missing_topic_returns_none() {
+        let json = r#"{"peer_addrs":"[]"}"#;
+        assert!(parse_push_payload(json).is_none());
+    }
+
+    #[test]
+    fn topic_not_a_string_returns_none() {
+        let json = r#"{"topic":42}"#;
+        assert!(parse_push_payload(json).is_none());
+    }
+
+    #[test]
+    fn invalid_json_returns_none_not_panic() {
+        assert!(parse_push_payload("not json {{{").is_none());
+    }
+
+    #[test]
+    fn empty_object_returns_none() {
+        assert!(parse_push_payload("{}").is_none());
+    }
+
+    #[test]
+    fn result_json_shape_synced_with_notification() {
+        let json = nse_result_json(
+            true,
+            Some("Ana added milk".to_string()),
+            Some("groceries".to_string()),
+        );
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["synced"], true);
+        assert_eq!(value["title"], "Ana added milk");
+        assert_eq!(value["body"], "groceries");
+    }
+
+    #[test]
+    fn result_json_shape_no_notification() {
+        let json = nse_result_json(false, None, None);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["synced"], false);
+        assert!(value["title"].is_null());
+        assert!(value["body"].is_null());
+    }
 }

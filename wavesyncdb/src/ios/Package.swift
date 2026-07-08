@@ -49,6 +49,13 @@ let package = Package(
             name: "WaveSyncPush",
             dependencies: ["WaveSyncPushObjC"],
             path: "Sources/WaveSyncPush",
+            // `WaveSyncNotificationService.swift` is a TEMPLATE for a
+            // Notification Service Extension — its own `.appex` target that
+            // apps create in Xcode, not a file this framework ships
+            // compiled. Excluded so SwiftPM doesn't fold NSE-only code (and
+            // UNNotificationServiceExtension's availability requirements)
+            // into the main app framework. See that file's header comment.
+            exclude: ["WaveSyncNotificationService.swift"],
             // Rust's C-ABI exports (e.g. `wavesync_background_sync_with_peers`)
             // live in the main executable, not in any library this target
             // links against. Tell ld to accept them as undefined and let
