@@ -1766,8 +1766,14 @@ impl WaveSyncDbBuilder {
     #[allow(unused_mut)]
     pub async fn build(mut self) -> Result<WaveSyncDb, DbErr> {
         // Auto-read FCM token from file written by WaveSyncInitProvider / WaveSyncService.
-        // The ContentProvider writes the token on a background thread at app startup,
-        // so we retry a few times with a short delay to handle the race.
+        // Single non-blocking read: the common case is a file left by a previous
+        // launch. If it isn't there, do NOT wait — build() sits on the app's
+        // readiness path (the UI can't show data until it returns), and the
+        // engine re-reads the file mid-run anyway (`maybe_register_push_token`,
+        // on relay connect and every reconcile tick), registering as soon as it
+        // appears. Push registration is inherently asynchronous; polling here
+        // bought nothing but seconds of loading screen whenever the file was
+        // missing or written to a different directory.
         // Only runs on Android — desktop has no FCM service to write the token file.
         //
         // This is intentionally NOT gated on `fcm_credentials.is_some()`. The
@@ -1780,17 +1786,12 @@ impl WaveSyncDbBuilder {
         // (which reads its APNs token unconditionally, below) worked fine.
         #[cfg(all(feature = "push-sync", target_os = "android"))]
         if self.push_token.is_none() {
-            for attempt in 0..5 {
-                if let Some(token) = crate::push::read_token_file(&self.database_url) {
-                    self.push_token = Some(("Fcm".to_string(), token));
-                    break;
-                }
-                if attempt < 4 {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            }
-            if self.push_token.is_none() {
-                tracing::info!("No FCM token file found — push will be registered on next launch");
+            match crate::push::read_token_file(&self.database_url) {
+                Some(token) => self.push_token = Some(("Fcm".to_string(), token)),
+                None => tracing::info!(
+                    "No FCM token file found at startup — push registers mid-run \
+                     once the token file appears"
+                ),
             }
         }
 
@@ -1806,26 +1807,21 @@ impl WaveSyncDbBuilder {
         // We dlopen it here, early in `build()`, so the observer registers
         // before `UIApplicationDidFinishLaunchingNotification` fires.
         //
-        // Then poll briefly for a token file left by a previous run.
-        // First-ever launch produces no file; Swift will write it on the
-        // *next* launch once APNs responds, and we pick it up then.
+        // Then a single non-blocking read of a token file left by a previous
+        // run — same contract as Android above: never block build() on the
+        // token; `maybe_register_push_token` re-reads it mid-run and registers
+        // as soon as it appears. First-ever launch produces no file; Swift
+        // writes it once APNs responds.
         #[cfg(all(feature = "push-sync", target_os = "ios"))]
         {
             crate::push::load_ios_push_framework();
             if self.push_token.is_none() {
-                for attempt in 0..5 {
-                    if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
-                        self.push_token = Some(("Apns".to_string(), token));
-                        break;
-                    }
-                    if attempt < 4 {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-                if self.push_token.is_none() {
-                    tracing::info!(
-                        "No APNs token file found — push will be registered on next launch"
-                    );
+                match crate::push::read_apns_token_file(&self.database_url) {
+                    Some(token) => self.push_token = Some(("Apns".to_string(), token)),
+                    None => tracing::info!(
+                        "No APNs token file found at startup — push registers \
+                         mid-run once the token file appears"
+                    ),
                 }
             }
         }
