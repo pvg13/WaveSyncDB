@@ -105,6 +105,11 @@ const RAW_DOCS: &[RawDoc] = &[
         title: "API reference",
         markdown: include_str!("../content/docs/16-api-reference.md"),
     },
+    RawDoc {
+        slug: "ios-deployment",
+        title: "iOS deployment",
+        markdown: include_str!("../content/docs/17-ios-deployment.md"),
+    },
 ];
 
 fn render_markdown(input: &str) -> String {

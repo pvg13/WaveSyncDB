@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		Relay-only deployment: this template intentionally OMITS the three
+		keys a LAN-discovery (mDNS/Bonjour) build would need:
+
+		  - NSLocalNetworkUsageDescription
+		  - NSBonjourServices
+		  - the com.apple.developer.networking.multicast entitlement (see
+		    Entitlements.template.plist)
+
+		WAN sync goes through the circuit-relay + rendezvous server (see the
+		"iOS deployment" website doc), which never touches the local network
+		APIs those keys gate. Adding them anyway would only cost you an
+		unnecessary permission prompt on first launch, for a discovery path
+		(mDNS) that is inert on-device without the multicast entitlement.
+
+		Add NSLocalNetworkUsageDescription + NSBonjourServices back ONLY if
+		you deploy a build that also does same-Wi-Fi LAN discovery (i.e. you
+		went and got the multicast entitlement approved by Apple) — see the
+		dioxus_fcm_sync example's info.plist for the LAN-enabled variant of
+		this file, keyed on libp2p's `_p2p._udp` mDNS service type.
+
+		dx (Dioxus CLI) 0.7+ merges this file with its generated Info.plist
+		via the `ios_info_plist = "info.plist"` key in Dioxus.toml.
+	-->
+
+	<!--
+		Background execution for server-initiated sync. `remote-notification`
+		is what lets a silent APNs push (`content-available: 1`) wake a
+		backgrounded app so it can reconnect and run a catch-up sync — the
+		entire cold-/background-sync path depends on it.
+
+		This is declared EXPLICITLY here (not left solely to dx's
+		`[background] remote-notifications = true` mapping) as belt-and-braces:
+		if the generated Info.plist ever ships without this key, iOS silently
+		never delivers the wake push to a backgrounded app and background sync
+		fails with no error and no log — the hardest failure to diagnose. dx
+		merges this file with its generated plist, so an explicit entry
+		guarantees the mode is present. Confirm on-device with:
+		`/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes' <App>.app/Info.plist`
+
+		`processing` / `fetch` are intentionally OMITTED: iOS does not
+		guarantee opportunistic background windows, so the design relies on the
+		silent-push wake, not BGTaskScheduler. Add them only if a best-effort
+		BGProcessingTask top-up is introduced.
+	-->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
+</dict>
+</plist>

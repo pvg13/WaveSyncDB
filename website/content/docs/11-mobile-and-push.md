@@ -90,3 +90,4 @@ If a phase consistently takes much longer than this in your deployment, watch th
 
 - [Relay deployment](/docs/relay-deployment) — host the relay yourself with one Docker Compose file.
 - [Networking & discovery](/docs/networking) — the discovery layers a phone tries on wake.
+- [iOS deployment](/docs/ios-deployment) — entitlements, APNs `.p8` setup, and the background-execution timeout knob specific to iOS.

@@ -175,6 +175,25 @@ impl PushStore {
         .execute(&pool)
         .await?;
 
+        // Per-(token, topic) wake-coalescing window. Stamps the wall-clock time
+        // of the last wake actually sent to a device for a topic. A burst of
+        // writes must cost that device ONE wake, not one per write — the daily
+        // budget above caps sustained rate, this caps burst rate on top of it.
+        // Composes with (doesn't replace) the topic-keyed notifier debounce:
+        // the debounce coalesces across all devices within ~1s, this coalesces
+        // a single device's wakes across a much longer (minutes) window. Old
+        // rows are pruned lazily, alongside the budget ledger's own prune.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS push_wakes (
+                token         TEXT NOT NULL,
+                topic         TEXT NOT NULL,
+                last_wake_at  INTEGER NOT NULL,
+                PRIMARY KEY (token, topic)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self { pool })
     }
 
@@ -272,11 +291,86 @@ impl PushStore {
         Ok(count <= MAX_PUSHES_PER_TOKEN_PER_DAY)
     }
 
+    /// Atomically check and stamp the per-(token, topic) wake-coalescing window.
+    ///
+    /// Returns `true` if this wake is allowed (either no prior wake is on record,
+    /// or the last one is at least `window_secs` old) and stamps `now_secs` as
+    /// the new `last_wake_at`. Returns `false` if a wake for this `(token,
+    /// topic)` fired less than `window_secs` ago — the caller must skip the
+    /// send. A suppressed check does NOT reset the stamp: the window is
+    /// anchored to the last *allowed* wake, not to the last attempt, so a
+    /// steady stream of writes still costs only one wake per window rather
+    /// than sliding forever.
+    ///
+    /// `window_secs == 0` disables coalescing entirely: always returns `true`
+    /// and writes no row (mirrors "no state" rather than a zero-width window).
+    pub async fn check_and_stamp_wake(
+        &self,
+        token: &str,
+        topic: &str,
+        now_secs: i64,
+        window_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        if window_secs == 0 {
+            return Ok(true);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let last_wake_at: Option<i64> = sqlx::query_scalar(
+            "SELECT last_wake_at FROM push_wakes WHERE token = ?1 AND topic = ?2",
+        )
+        .bind(token)
+        .bind(topic)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let allow = !matches!(last_wake_at, Some(last) if now_secs - last < window_secs);
+
+        if allow {
+            sqlx::query(
+                "INSERT INTO push_wakes (token, topic, last_wake_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(token, topic) DO UPDATE SET last_wake_at = excluded.last_wake_at",
+            )
+            .bind(token)
+            .bind(topic)
+            .bind(now_secs)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Prune stale wake rows on every check (allowed or suppressed), mirroring
+        // charge_daily_budget's amortized sweep so the table stays bounded without
+        // a separate background task.
+        sqlx::query("DELETE FROM push_wakes WHERE last_wake_at < ?1")
+            .bind(now_secs - 2 * 86_400)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(allow)
+    }
+
     /// Unregister a specific token from a topic.
     pub async fn unregister_token(&self, topic: &str, token: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM push_tokens WHERE topic = ?1 AND token = ?2")
             .bind(topic)
             .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove the per-(token, topic) wake stamp, allowing a new wake immediately.
+    ///
+    /// Called when a wake was stamped but subsequently denied by the daily budget
+    /// or another gate. Absence of a stamp means "no recent wake", so deletion
+    /// (rather than restoring a previous value) correctly signals that the next
+    /// notify is allowed. A tiny refund-too-much window is harmless — the daily
+    /// budget still provides a hard cap.
+    pub async fn unstamp_wake(&self, token: &str, topic: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM push_wakes WHERE token = ?1 AND topic = ?2")
+            .bind(token)
+            .bind(topic)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -611,6 +705,183 @@ mod tests {
         assert!(store.charge_daily_budget("tok", day + 1).await.unwrap());
         // A different token has its own budget.
         assert!(store.charge_daily_budget("tok2", day).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wake_within_window_suppressed() {
+        let store = mem_store().await;
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // 100s later, well inside the 900s window — suppressed.
+        assert!(
+            !store
+                .check_and_stamp_wake("tok", "topic1", 1100, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_after_window_allowed() {
+        let store = mem_store().await;
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // Exactly the window width later — no longer suppressed.
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1900, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_window_zero_always_allows_and_writes_nothing() {
+        let store = mem_store().await;
+        for _ in 0..3 {
+            assert!(
+                store
+                    .check_and_stamp_wake("tok", "topic1", 1000, 0)
+                    .await
+                    .unwrap()
+            );
+        }
+        // Disabled coalescing must leave no row behind: a subsequent call with a
+        // real window at the exact same instant still behaves like a first-ever
+        // wake (allowed), proving nothing was stamped while window_secs was 0.
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_per_token_independent() {
+        let store = mem_store().await;
+        assert!(
+            store
+                .check_and_stamp_wake("tok-a", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // A different token on the same topic has its own window.
+        assert!(
+            store
+                .check_and_stamp_wake("tok-b", "topic1", 1050, 900)
+                .await
+                .unwrap()
+        );
+        // tok-a is still inside its own window.
+        assert!(
+            !store
+                .check_and_stamp_wake("tok-a", "topic1", 1050, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_per_topic_independent() {
+        let store = mem_store().await;
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // The same token on a different topic has its own window.
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic2", 1050, 900)
+                .await
+                .unwrap()
+        );
+        // topic1 is still inside its own window.
+        assert!(
+            !store
+                .check_and_stamp_wake("tok", "topic1", 1050, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_prune_drops_stale_rows() {
+        let store = mem_store().await;
+        assert!(
+            store
+                .check_and_stamp_wake("tok-old", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_wakes")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // A later check for an unrelated (token, topic), far enough past the
+        // 2-day retention window, sweeps the stale row as a side effect.
+        let far_future = 1000 + 2 * 86_400 + 10;
+        store
+            .check_and_stamp_wake("tok-new", "topic2", far_future, 900)
+            .await
+            .unwrap();
+
+        let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_wakes")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        // Only tok-new's fresh row remains; tok-old's stale row was pruned.
+        assert_eq!(count_after, 1);
+    }
+
+    #[tokio::test]
+    async fn unstamp_allows_immediate_rewake() {
+        let store = mem_store().await;
+        // Stamp a wake at time 1000.
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1000, 900)
+                .await
+                .unwrap()
+        );
+        // Without unstamp, a wake at 1100 (100s later, within 900s window) is suppressed.
+        assert!(
+            !store
+                .check_and_stamp_wake("tok", "topic1", 1100, 900)
+                .await
+                .unwrap()
+        );
+
+        // Unstamp the original wake, clearing the (tok, topic1) entry.
+        store.unstamp_wake("tok", "topic1").await.unwrap();
+
+        // Now the same timestamp 1100 is allowed again (no prior record).
+        assert!(
+            store
+                .check_and_stamp_wake("tok", "topic1", 1100, 900)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unstamp_nonexistent_row_is_ok() {
+        let store = mem_store().await;
+        // Unstamping a (token, topic) that was never stamped succeeds (no-op).
+        store.unstamp_wake("tok", "nonexistent").await.unwrap();
+        // No panic; operation completes successfully.
     }
 
     #[tokio::test]

@@ -57,6 +57,17 @@ public enum WaveSyncPushHandler {
     /// Name of the sync config file Rust writes at `WaveSyncDbBuilder::build()`.
     public static let configFilename = ".wavesync_config.json"
 
+    /// Timeout (seconds) passed to the Rust background-sync FFI call in
+    /// `handleRemoteNotification`. Host apps may tune this after measuring
+    /// their actual granted background-execution window (varies by device,
+    /// OS version, and background-modes entitlement — see the on-device A/B
+    /// verdict process in docs/ios-device-protocol). Default of 25s assumes
+    /// iOS's typical ~30s grant, leaving headroom for tokio shutdown and the
+    /// UIKit completion handshake; Rust's internal timers
+    /// (`background_sync`'s fallback/completion-grace windows) scale to
+    /// whatever value is passed here.
+    public static var backgroundSyncTimeoutSecs: UInt64 = 25
+
     // MARK: - Device token
 
     /// Hex-encode the APNs device token and persist it next to the database.
@@ -67,12 +78,31 @@ public enum WaveSyncPushHandler {
     /// the next `WaveSyncDbBuilder::build()` call via the retry loop in
     /// `wavesyncdb/src/connection.rs`.
     public static func writeDeviceToken(_ data: Data) {
+        writeDeviceToken(data, attempt: 0)
+    }
+
+    /// On a fresh install the APNs token typically arrives BEFORE the app's
+    /// first `build()` finishes writing `.wavesync_config.json`, so the
+    /// target directory does not exist yet. Retry every 2s (up to 2 minutes)
+    /// until the config appears instead of deferring to the next launch —
+    /// push must work from the very first install.
+    private static func writeDeviceToken(_ data: Data, attempt: Int) {
         let hex = data.map { String(format: "%02x", $0) }.joined()
 
         guard let dir = findTokenDirectory() else {
-            NSLog("[WaveSync] APNs token received but no .wavesync_config.json "
-                  + "found yet — nothing to pair the token with. Will be picked "
-                  + "up on next app launch once the config file exists.")
+            if attempt == 0 {
+                NSLog("[WaveSync] APNs token received before .wavesync_config.json "
+                      + "exists (fresh install) — waiting for the first build() to "
+                      + "write it, retrying every 2s…")
+            }
+            if attempt < 60 {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+                    writeDeviceToken(data, attempt: attempt + 1)
+                }
+            } else {
+                NSLog("[WaveSync] Gave up waiting for .wavesync_config.json after "
+                      + "2 minutes — token will be written on next app launch.")
+            }
             return
         }
 
@@ -93,8 +123,11 @@ public enum WaveSyncPushHandler {
     // MARK: - Remote notification dispatch
 
     /// Parse the APNs payload, locate the database, and run background sync.
-    /// iOS grants roughly 30 s of background execution; the FFI uses a 25 s
-    /// timeout to leave headroom for tokio shutdown and the UIKit handshake.
+    /// iOS grants roughly 30 s of background execution; the FFI call below
+    /// uses `backgroundSyncTimeoutSecs` (25s default) to leave headroom for
+    /// tokio shutdown and the UIKit handshake. The grant varies in practice
+    /// (device, OS version, background-modes entitlement) — tune the static
+    /// var after measuring on real hardware; see docs/ios-device-protocol.
     public static func handleRemoteNotification(
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
@@ -119,7 +152,8 @@ public enum WaveSyncPushHandler {
             let rc: Int32 = dbUrl.withCString { urlPtr in
                 withOptionalCString(peerAddrsJson) { peersPtr in
                     withOptionalCString(topic) { topicPtr in
-                        wavesync_background_sync_targeted(urlPtr, 25, peersPtr, topicPtr)
+                        wavesync_background_sync_targeted(
+                            urlPtr, UInt32(backgroundSyncTimeoutSecs), peersPtr, topicPtr)
                     }
                 }
             }

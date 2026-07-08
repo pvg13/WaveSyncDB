@@ -768,6 +768,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn push_sent_coalesced_outcome_renders() {
+        // Dedicated coverage for the wake-coalescing outcome value (relay push
+        // coalescing) — a distinct label value on the same `pushes_sent_total`
+        // family already exercised above, not a new metric.
+        let mut reg = prometheus_client::registry::Registry::default();
+        let m = RelayMetrics::new(&mut reg);
+        m.push_sent("apns", "coalesced");
+        let text = registry_text(&reg);
+
+        assert!(
+            text.contains("\nrelay_pushes_sent_total{"),
+            "missing pushes_sent family in:\n{text}"
+        );
+        assert!(text.contains("outcome=\"coalesced\""));
+        assert!(
+            !text.contains("_total_total"),
+            "doubled _total suffix:\n{text}"
+        );
+    }
+
     #[tokio::test]
     async fn endpoint_serves_openmetrics_and_health() {
         let mut reg = prometheus_client::registry::Registry::default();

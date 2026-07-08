@@ -534,12 +534,34 @@ impl EngineRunner {
     /// to call both on relay-connect and whenever a new group is joined.
     pub(super) fn maybe_register_push_token(&mut self, relay_peer_id: libp2p::PeerId) {
         if self.push_token.is_none() {
-            tracing::info!(
-                "maybe_register_push_token skipped: no push_token set — \
-                 either the platform isn't mobile, push-sync feature is off, \
-                 or the FCM/APNs token file wasn't written by the OS service \
-                 in time. Push notifications won't be delivered."
-            );
+            // Fresh-install race: the OS may deliver the push token AFTER the
+            // engine started (the token file appears once the platform service
+            // writes it). Re-read here so registration succeeds mid-run
+            // instead of waiting for the next app launch.
+            #[cfg(all(feature = "push-sync", target_os = "ios"))]
+            if let Some(token) = crate::push::read_apns_token_file(&self.database_url) {
+                tracing::info!("APNs token file appeared mid-run — registering push token");
+                self.push_token = Some(("Apns".to_string(), token));
+            }
+            #[cfg(all(feature = "push-sync", target_os = "android"))]
+            if let Some(token) = crate::push::read_token_file(&self.database_url) {
+                tracing::info!("FCM token file appeared mid-run — registering push token");
+                self.push_token = Some(("Fcm".to_string(), token));
+            }
+        }
+        if self.push_token.is_none() {
+            if self.push_token_skip_logged {
+                tracing::debug!("maybe_register_push_token skipped: no push_token set");
+            } else {
+                self.push_token_skip_logged = true;
+                tracing::info!(
+                    "maybe_register_push_token skipped: no push_token set — \
+                     either the platform isn't mobile, push-sync feature is off, \
+                     or the FCM/APNs token file wasn't written by the OS service \
+                     in time. Retrying quietly; push registers as soon as the \
+                     token file appears."
+                );
+            }
             return;
         }
         // Register every topic not yet covered on this connection.

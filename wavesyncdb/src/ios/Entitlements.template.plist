@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		Replace TEAMID and com.example.yourapp with your own values (Apple
+		Developer account team id + your app's bundle id). Both must match
+		the provisioning profile Xcode signs the build with.
+	-->
+	<key>application-identifier</key>
+	<string>TEAMID.com.example.yourapp</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TEAMID</string>
+
+	<!--
+		"development" talks to APNs' sandbox gateway (api.sandbox.push.apple.com);
+		"production" talks to the live gateway. This must match the environment
+		the relay's APNS_SANDBOX flag targets (see website docs) — a token
+		registered against the wrong environment gets InvalidProviderToken /
+		BadDeviceToken back from Apple and the device never wakes for sync.
+		Xcode also derives this from the provisioning profile at archive time,
+		so a mismatch here is usually caught at submission, not at runtime —
+		but keep it explicit for local/TestFlight builds.
+	-->
+	<key>aps-environment</key>
+	<string>development</string>
+
+	<key>get-task-allow</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TEAMID.com.example.yourapp</string>
+	</array>
+
+	<!--
+		Deliberately NOT requesting com.apple.developer.networking.multicast.
+
+		That entitlement is required for a raw multicast/broadcast responder
+		(which is what libp2p's mDNS discovery is) to work on a physical iOS
+		device — it works in the Simulator without it, which is a trap: a
+		build that "works" in Simulator testing can still fail silently on
+		every real device. Apple grants it case-by-case on request, it is not
+		self-service, and approval is not guaranteed.
+
+		This template is the relay-only deployment: WAN sync goes through the
+		circuit-relay + rendezvous server (see website docs, "Relay
+		deployment"), which needs no local-network access at all. Only add
+		this entitlement — after requesting and receiving it from Apple — if
+		you also add NSLocalNetworkUsageDescription/NSBonjourServices below
+		for same-Wi-Fi LAN discovery. Until then, mDNS discovery is inert on
+		iOS regardless of what the Rust engine is configured to try.
+	-->
+</dict>
+</plist>
