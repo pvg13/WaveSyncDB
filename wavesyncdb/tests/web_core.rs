@@ -1110,6 +1110,32 @@ async fn derive_emits_descriptor() {
 }
 
 #[tokio::test]
+async fn scoped_config_filters_by_kind() {
+    // desc_house (Task 3) is Groups("household")
+    let cfg = wavesyncdb::web_sync_core::scoped_web_config(false, Some("household"));
+    assert!(cfg.tables.contains_key("desc_house"));
+    assert_eq!(cfg.pk_column_of("desc_house").as_deref(), Some("id"));
+    let cfg2 = wavesyncdb::web_sync_core::scoped_web_config(false, Some("team"));
+    assert!(!cfg2.tables.contains_key("desc_house"));
+    let cfg3 = wavesyncdb::web_sync_core::scoped_web_config(true, None);
+    assert!(!cfg3.tables.contains_key("desc_house")); // Groups never matches default
+}
+
+#[tokio::test]
+async fn merge_config_explicit_wins() {
+    use wavesyncdb::web_sync_core::{WebTableConfig, merge_config, scoped_web_config};
+    let explicit = wavesyncdb::web_sync_core::WebSyncConfig::default().with_table(
+        "desc_house",
+        WebTableConfig {
+            delete_policy: wavesyncdb::DeletePolicy::AddWins,
+            primary_key_column: Some("custom".into()),
+        },
+    );
+    let merged = merge_config(explicit, scoped_web_config(false, Some("household")));
+    assert_eq!(merged.pk_column_of("desc_house").as_deref(), Some("custom"));
+}
+
+#[tokio::test]
 async fn gc_keeps_unstamped_tombstones() {
     // deleted_ts == None (defensive: pre-4.0.0 row) never ages, matching
     // the exclusion rule — reaping it would diverge from what sync serves.

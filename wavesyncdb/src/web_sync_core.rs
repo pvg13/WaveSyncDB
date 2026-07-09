@@ -157,6 +157,54 @@ impl WebSyncConfig {
     }
 }
 
+/// Build a [`WebSyncConfig`] from every inventory-collected
+/// [`crate::SyncEntityDescriptor`] whose scope admits `(is_default, kind)`
+/// (see [`crate::EntityScope::matches`]).
+///
+/// This is the browser-side counterpart of the native registration path:
+/// native builds one `TableRegistry` per group by walking the same
+/// inventory and filtering on scope at group-join time; the browser has no
+/// registry, so this produces the equivalent `WebSyncConfig` for a given
+/// group directly. Each admitted descriptor contributes its `delete_policy`
+/// and `pk_column` verbatim — this is the *scoped base*, not the final
+/// config. A consuming app's explicit per-table overrides (delete policy,
+/// custom PK column) must still win; combine the two with [`merge_config`].
+pub fn scoped_web_config(is_default: bool, kind: Option<&str>) -> WebSyncConfig {
+    let mut cfg = WebSyncConfig::default();
+    for d in inventory::iter::<crate::SyncEntityDescriptor>() {
+        if d.scope.matches(is_default, kind) {
+            cfg.tables.insert(
+                d.table_name.to_string(),
+                WebTableConfig {
+                    delete_policy: d.delete_policy.clone(),
+                    primary_key_column: Some(d.pk_column.to_string()),
+                },
+            );
+        }
+    }
+    cfg
+}
+
+/// Merge an app-supplied `explicit` config on top of an inventory-derived
+/// `scoped` config (typically from [`scoped_web_config`]).
+///
+/// Contract: start from `scoped`, then overwrite with every table entry
+/// present in `explicit` (explicit config always wins per table, even if
+/// the inventory also described that table), and take
+/// `explicit.tombstone_retention_secs` only when it is `Some` — an
+/// unset explicit retention leaves the scoped value (or the built-in
+/// default) in place rather than clobbering it with `None`.
+pub fn merge_config(explicit: WebSyncConfig, scoped: WebSyncConfig) -> WebSyncConfig {
+    let mut out = scoped;
+    for (table, cfg) in explicit.tables {
+        out.tables.insert(table, cfg);
+    }
+    if explicit.tombstone_retention_secs.is_some() {
+        out.tombstone_retention_secs = explicit.tombstone_retention_secs;
+    }
+    out
+}
+
 /// True when a tombstone row is still live under `cutoff` (aged = absent).
 fn tombstone_live(row_deleted_ts: Option<u64>, cutoff: Option<u64>) -> bool {
     match (row_deleted_ts, cutoff) {
