@@ -176,6 +176,8 @@ pub struct WebSyncClient {
 /// - `relay_peer_id` is set once at startup if the client was built
 ///   via `connect_via_relay`.
 /// - `local_ready` is `true` from the first emitted snapshot.
+/// - `relay_reconnect_attempts` increments each time the auto-reconnect
+///   loop schedules a relay redial.
 #[derive(Debug, Clone, Default)]
 pub struct WebSyncStatus {
     /// `true` once the IndexedDB store is open and persistent identity
@@ -1124,8 +1126,9 @@ struct EngineState {
     /// non-relay clients (no reconnect machinery runs).
     relay_addr: Option<Multiaddr>,
     /// Watch channel sender for live debug status. Engine pushes a
-    /// fresh `WebSyncStatus` after every connection lifecycle event;
-    /// UIs read it via [`WebSyncClient::subscribe_status`].
+    /// fresh `WebSyncStatus` after every connection lifecycle event and
+    /// whenever the auto-reconnect loop schedules a relay redial; UIs
+    /// read it via [`WebSyncClient::subscribe_status`].
     status_tx: watch::Sender<WebSyncStatus>,
 }
 
