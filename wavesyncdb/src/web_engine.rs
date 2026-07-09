@@ -185,6 +185,10 @@ pub struct WebSyncStatus {
     pub local_peer_id: String,
     pub relay_peer_id: Option<String>,
     pub relay_connected: bool,
+    /// Cumulative relay redial attempts made by the auto-reconnect loop
+    /// this page-lifetime. Increments on each scheduled redial; a stable
+    /// value + `relay_connected == true` means the link is healthy.
+    pub relay_reconnect_attempts: u32,
     pub connected_peer_ids: Vec<String>,
 }
 
@@ -610,6 +614,7 @@ impl WebSyncClient {
             local_peer_id: local_peer_id.to_string(),
             relay_peer_id: relay_peer_id.map(|p| p.to_string()),
             relay_connected: false,
+            relay_reconnect_attempts: 0,
             connected_peer_ids: Vec::new(),
         });
 
@@ -635,6 +640,11 @@ impl WebSyncClient {
             store: store.clone(),
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
+            // When a relay peer-id is set, the multiaddr we just dialed
+            // (`target`) *is* the relay — remember it so the reconnect
+            // loop has a redial target. `None` for the single-peer
+            // constructors, which get no auto-reconnect machinery.
+            relay_addr: relay_peer_id.as_ref().map(|_| target.clone()),
             relay_peer_id,
             cached_peer_addrs,
             status_tx,
@@ -914,6 +924,7 @@ impl WebSyncClient {
             local_peer_id: format!("loopback-{:02x?}", &site_id.0[..4]),
             relay_peer_id: None,
             relay_connected: false,
+            relay_reconnect_attempts: 0,
             connected_peer_ids: Vec::new(),
         });
 
@@ -939,6 +950,7 @@ impl WebSyncClient {
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
             relay_peer_id: None, // loopback transport has no notion of a relay
+            relay_addr: None,    // no relay → no auto-reconnect loop
             cached_peer_addrs: Vec::new(),
             status_tx,
         };
@@ -1107,6 +1119,10 @@ struct EngineState {
     /// `connect_loopback` clients that aren't using relay-mediated
     /// discovery.
     relay_peer_id: Option<LibPeerId>,
+    /// The relay multiaddr we originally dialed (`connect_via_relay`).
+    /// Redial target for the auto-reconnect backoff loop; `None` for
+    /// non-relay clients (no reconnect machinery runs).
+    relay_addr: Option<Multiaddr>,
     /// Watch channel sender for live debug status. Engine pushes a
     /// fresh `WebSyncStatus` after every connection lifecycle event;
     /// UIs read it via [`WebSyncClient::subscribe_status`].
@@ -1131,12 +1147,13 @@ fn push_status(state: &EngineState, connected: &HashSet<LibPeerId>, relay_connec
     // Snapshot all immutable / carry-forward fields before send_replace
     // — holding the read guard across the write attempt races with the
     // watch's internal lock (see send_replace docs).
-    let (local_peer_id, relay_peer_id, local_ready) = {
+    let (local_peer_id, relay_peer_id, local_ready, relay_reconnect_attempts) = {
         let snap = state.status_tx.borrow();
         (
             snap.local_peer_id.clone(),
             snap.relay_peer_id.clone(),
             snap.local_ready,
+            snap.relay_reconnect_attempts,
         )
     };
     // `send_replace` doesn't error on no-subscribers (unlike
@@ -1149,8 +1166,44 @@ fn push_status(state: &EngineState, connected: &HashSet<LibPeerId>, relay_connec
         local_peer_id,
         relay_peer_id,
         relay_connected,
+        // Carried forward — only `bump_reconnect_attempts` advances it.
+        relay_reconnect_attempts,
         connected_peer_ids,
     });
+}
+
+/// Increment the page-lifetime relay-redial counter on the status
+/// snapshot, carrying every other field forward. Called each time the
+/// reconnect loop schedules a redial (see `schedule_relay_reconnect`).
+/// Kept separate from `push_status` because a redial schedule doesn't
+/// change the connected-peer set — only this one counter moves.
+fn bump_reconnect_attempts(state: &EngineState) {
+    let mut next = state.status_tx.borrow().clone();
+    next.relay_reconnect_attempts = next.relay_reconnect_attempts.saturating_add(1);
+    state.status_tx.send_replace(next);
+}
+
+/// Arm the reconnect timer with exponential backoff + jitter: 1s, 2s,
+/// 4s, … capped at 30s, ±25% jitter. Increments both the local backoff
+/// exponent (`attempts`) and the status counter so a healthy link shows
+/// a stable value. `Math::random` is fine here — jitter only needs to
+/// de-correlate reconnect storms across tabs, not cryptographic strength.
+fn schedule_relay_reconnect(
+    state: &EngineState,
+    timer: &mut Option<std::pin::Pin<Box<gloo_timers::future::TimeoutFuture>>>,
+    attempts: &mut u32,
+) {
+    *attempts = attempts.saturating_add(1);
+    bump_reconnect_attempts(state);
+    // 1000 * 2^(attempts-1), exponent capped at 5 (2^5 = 32) and the
+    // whole delay capped at 30s.
+    let base_ms = 1_000u64
+        .saturating_mul(1u64 << attempts.saturating_sub(1).min(5))
+        .min(30_000);
+    let jitter = 0.75 + 0.5 * js_sys::Math::random(); // 0.75..1.25
+    let delay_ms = (base_ms as f64 * jitter) as u32;
+    tracing::info!("WebSyncClient: relay reconnect scheduled in {delay_ms}ms (attempt {attempts})");
+    *timer = Some(Box::pin(gloo_timers::future::TimeoutFuture::new(delay_ms)));
 }
 
 /// Loopback variant of [`run_swarm`]. No libp2p — `SyncRequest`s flow
@@ -1657,6 +1710,14 @@ async fn run_swarm(
     // a sync peer), so we track its link state on the side. The UI
     // status panel reads this through `WebSyncStatus.relay_connected`.
     let mut relay_connected = false;
+    // Relay auto-reconnect (#30): a relay disconnect (idle timeout, wifi
+    // blip, server restart) previously left the engine offline for the
+    // page's lifetime. Exponential backoff 1s → 30s cap, ±25% jitter,
+    // single in-flight dial, counter reset on ConnectionEstablished.
+    // Only armed for relay clients (`state.relay_addr.is_some()`).
+    let mut relay_dial_pending = false;
+    let mut relay_reconnect_attempts: u32 = 0;
+    let mut reconnect_timer: Option<std::pin::Pin<Box<gloo_timers::future::TimeoutFuture>>> = None;
     // Peers (currently only the relay) we want to send `AnnouncePresence`
     // to but couldn't synchronously inside the `ConnectionEstablished`
     // handler — see the comment in `handle_event` for the reentrancy
@@ -1736,11 +1797,41 @@ async fn run_swarm(
                     send_version_vector_swarm(peer, &state, &mut swarm).await;
                 }
             }
+            // Relay backoff timer fired: dial the relay if we're still
+            // disconnected and no dial is already in flight. The guard
+            // disables this arm (so `.unwrap()` never runs on `None`)
+            // whenever no timer is armed.
+            _ = async { reconnect_timer.as_mut().unwrap().await }, if reconnect_timer.is_some() => {
+                reconnect_timer = None;
+                if !relay_connected
+                    && !relay_dial_pending
+                    && let Some(addr) = state.relay_addr.clone()
+                {
+                    relay_dial_pending = true;
+                    tracing::info!(
+                        "WebSyncClient: redialing relay (attempt {relay_reconnect_attempts})"
+                    );
+                    if let Err(e) = swarm.dial(addr) {
+                        tracing::warn!(
+                            "WebSyncClient: relay redial failed synchronously: {e}"
+                        );
+                        relay_dial_pending = false;
+                        schedule_relay_reconnect(
+                            &state,
+                            &mut reconnect_timer,
+                            &mut relay_reconnect_attempts,
+                        );
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 handle_event(
                     event,
                     &mut connected,
                     &mut relay_connected,
+                    &mut relay_dial_pending,
+                    &mut relay_reconnect_attempts,
+                    &mut reconnect_timer,
                     &mut pending_announces,
                     &mut pending_version_vectors,
                     &mut rejected_peers,
@@ -2043,6 +2134,10 @@ async fn handle_event(
     event: SwarmEvent<WebBehaviourEvent>,
     connected: &mut HashSet<LibPeerId>,
     relay_connected: &mut bool,
+    // Relay auto-reconnect state (#30) — see `run_swarm` locals.
+    relay_dial_pending: &mut bool,
+    relay_reconnect_attempts: &mut u32,
+    reconnect_timer: &mut Option<std::pin::Pin<Box<gloo_timers::future::TimeoutFuture>>>,
     pending_announces: &mut Vec<LibPeerId>,
     pending_version_vectors: &mut Vec<LibPeerId>,
     rejected_peers: &mut HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
@@ -2077,6 +2172,18 @@ async fn handle_event(
                     endpoint.get_remote_address()
                 );
                 *relay_connected = true;
+                // Relay link is healthy again: clear the in-flight dial
+                // guard, reset the backoff exponent, and disarm any
+                // pending timer. Resync is already handled below — the
+                // deferred `pending_announces.push` re-announces our
+                // topic (the relay's PeerList response re-dials peers),
+                // and each reconnecting peer's `ConnectionEstablished`
+                // queues a `pending_version_vectors` catch-up. The
+                // status counter is intentionally NOT reset: it's a
+                // cumulative page-lifetime health signal.
+                *relay_dial_pending = false;
+                *relay_reconnect_attempts = 0;
+                *reconnect_timer = None;
                 pending_announces.push(peer_id);
             } else {
                 connected.insert(peer_id);
@@ -2125,6 +2232,12 @@ async fn handle_event(
                     "WebSyncClient: disconnected from relay {peer_id} (cause={cause:?})"
                 );
                 *relay_connected = false;
+                // Kick off the backoff redial loop. Only relay clients
+                // have a `relay_addr`; single-peer/loopback clients skip
+                // this and stay on their existing (dial-once) behavior.
+                if state.relay_addr.is_some() {
+                    schedule_relay_reconnect(state, reconnect_timer, relay_reconnect_attempts);
+                }
             } else {
                 connected.remove(&peer_id);
                 tracing::info!(
@@ -2152,6 +2265,14 @@ async fn handle_event(
                         tracing::debug!("WebSyncClient: peer_addrs record_failure failed: {e}");
                     }
                 });
+            }
+            // A failed relay redial: release the in-flight guard and back
+            // off before the next attempt (grows the delay so a down relay
+            // isn't hammered). The peer-addr bookkeeping above deliberately
+            // skips the relay — the relay has its own reconnect state.
+            if peer_id == state.relay_peer_id && state.relay_addr.is_some() {
+                *relay_dial_pending = false;
+                schedule_relay_reconnect(state, reconnect_timer, relay_reconnect_attempts);
             }
         }
         SwarmEvent::Behaviour(WebBehaviourEvent::Snapshot(ev)) => {
