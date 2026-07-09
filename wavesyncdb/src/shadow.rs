@@ -34,12 +34,19 @@ pub async fn create_meta_table(db: &impl ConnectionTrait) -> Result<ExecResult, 
     .await
 }
 
+/// Name of the per-column clock shadow table for a user table. The single
+/// source of truth for the `_wavesync_{table}_clock` spelling so callers never
+/// re-derive it.
+pub(crate) fn shadow_table_name(table_name: &str) -> String {
+    format!("_wavesync_{}_clock", table_name)
+}
+
 /// Create the shadow clock table for a specific user table.
 pub async fn create_shadow_table(
     db: &impl ConnectionTrait,
     table_name: &str,
 ) -> Result<ExecResult, DbErr> {
-    let shadow_name = format!("_wavesync_{}_clock", table_name);
+    let shadow_name = shadow_table_name(table_name);
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS \"{}\" (
             pk          TEXT NOT NULL,
@@ -935,7 +942,11 @@ pub async fn heal_lost_tombstones(
     Ok(healed)
 }
 
-/// Check if a shadow table exists for the given table name.
+/// Check if a shadow table exists for the given table name. Used at
+/// registration time to tell a returning (previously-synced) table apart from
+/// a first-ever registration — `register_table` is the sole creator of the
+/// shadow table, so its prior existence means the table synced in an earlier
+/// run.
 pub async fn shadow_table_exists(
     db: &impl ConnectionTrait,
     table_name: &str,
@@ -945,7 +956,7 @@ pub async fn shadow_table_exists(
         cnt: i64,
     }
 
-    let shadow_name = format!("_wavesync_{}_clock", table_name);
+    let shadow_name = shadow_table_name(table_name);
     let row = CountRow::find_by_statement(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='table' AND name=$1",

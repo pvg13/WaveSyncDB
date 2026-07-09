@@ -111,6 +111,26 @@ fn trigger_prefix(table: &str) -> String {
     format!("_wavesync_tr_{table}_")
 }
 
+/// True iff `name` is one of THIS table's capture triggers:
+/// `{prefix}(i|u|d)_{8 lowercase hex}`. The stale scan's LIKE pattern is a
+/// raw prefix match, so for table `meal` it also returns sibling tables'
+/// triggers (`_wavesync_tr_meal_plan_i_…`) — classifying those as stale
+/// dropped them and silently killed the sibling's capture (#96). Only
+/// names passing this exact-shape check may ever be dropped.
+fn is_own_trigger(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((kind, fp)) = rest.split_once('_') else {
+        return false;
+    };
+    matches!(kind, "i" | "u" | "d")
+        && fp.len() == 8
+        && fp
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 /// The three `(name, CREATE TRIGGER ...)` pairs for a table. Errors on
 /// `_wavesync*` tables — internal tables must never be captured (capturing a
 /// shadow write would re-enter the write path and loop).
@@ -158,25 +178,78 @@ pub(crate) fn trigger_sql(meta: &TableMeta) -> Result<[(String, String); 3], DbE
     Ok([(i_name, i_sql), (u_name, u_sql), (d_name, d_sql)])
 }
 
+/// SQL that gives every row of `meta.table_name` currently *without* any clock
+/// entry a fresh full-row capture, so the (re)created triggers cover it. Used
+/// to heal a database whose capture triggers were removed while the table was
+/// live (the #96 sibling-prefix bug, or the documented downgrade escape hatch):
+/// rows written during that gap have no shadow coverage and would never sync.
+///
+/// The user table is **never touched**: the statement *synthesizes* the exact
+/// `'I'` capture rows the `AFTER INSERT` trigger would have written, straight
+/// into `_wavesync_changes` (`json_row_expr` over the base row, table-qualified,
+/// renders byte-for-byte what the `NEW`-prefixed trigger body produces). The
+/// earlier `INSERT OR REPLACE INTO "t" SELECT *` idiom re-inserted each row as
+/// itself, but with SQLite's default `foreign_keys=ON` the REPLACE conflict
+/// resolution runs an implicit DELETE of the pre-existing row, which fires
+/// `ON DELETE CASCADE`/`SET NULL` on child tables (silently deleting/corrupting
+/// children — captured and replicated mesh-wide) and hard-fails under
+/// `RESTRICT`. Synthesizing the capture rows directly sidesteps every FK and
+/// trigger side effect: zero user-table mutation.
+///
+/// A row with ANY clock entry — including a tombstone (`cid = '__deleted'`) — is
+/// excluded, so a deleted row is never resurrected, and an already-covered row
+/// is left untouched (idempotent). The statement writes to the internal
+/// `_wavesync_changes` table, which has no capture trigger of its own
+/// (`trigger_sql` refuses `_wavesync*`); the drain then reads these rows, and
+/// `plan_logical_ops` keys the `_wavesync` skip on the captured *table name* in
+/// the `tbl` column (here the user table), so the synthesized ops are planned
+/// normally and the drain records a full per-column clock entry for each.
+pub(crate) fn repair_uncovered_rows_sql(meta: &TableMeta) -> String {
+    let t = &meta.table_name;
+    let p = &meta.primary_key_column;
+    let clock = crate::shadow::shadow_table_name(t);
+    // Table-qualified column refs so the JSON payload binds unambiguously to
+    // the outer table (never the clock subquery), matching the trigger's
+    // `NEW.`-qualified spelling.
+    let src = format!("\"{t}\"");
+    let new_row = json_row_expr(&src, meta);
+    format!(
+        "INSERT INTO {CAPTURE_TABLE} (tbl, op, pk, new_row) \
+         SELECT '{t}', 'I', CAST(\"{t}\".\"{p}\" AS TEXT), {new_row} \
+         FROM \"{t}\" \
+         WHERE CAST(\"{t}\".\"{p}\" AS TEXT) NOT IN (SELECT pk FROM \"{clock}\")"
+    )
+}
+
 /// Create (or recreate after schema change) the capture triggers for a table.
 /// Idempotent: the schema fingerprint in each trigger's name makes "current"
 /// detectable by existence alone; any `_wavesync_tr_{t}_*` trigger with a
 /// different fingerprint is dropped first.
+///
+/// Returns whether ANY of this table's own-shape capture triggers existed
+/// *before* this call (regardless of fingerprint). A previously-synced table
+/// with zero surviving own triggers is the trigger-loss damage signature the
+/// caller uses to decide whether a repair re-touch is needed.
 pub(crate) async fn ensure_triggers(
     db: &impl ConnectionTrait,
     meta: &TableMeta,
-) -> Result<(), DbErr> {
+) -> Result<bool, DbErr> {
     ensure_capture_tables(db).await?;
     let triggers = trigger_sql(meta)?;
+    let prefix = trigger_prefix(&meta.table_name);
 
     #[derive(FromQueryResult)]
     struct NameRow {
         name: String,
     }
+    // The LIKE pattern is a raw prefix match: for table `meal` it also
+    // returns sibling tables whose name starts with "meal" (`meal_plan`'s
+    // triggers, `_wavesync_tr_meal_plan_i_...`). `is_own_trigger` below is
+    // the exact-shape post-filter that keeps those out of the drop set.
     let existing: Vec<String> = NameRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
         "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE $1",
-        [format!("{}%", trigger_prefix(&meta.table_name)).into()],
+        [format!("{prefix}%").into()],
     ))
     .all(db)
     .await?
@@ -184,8 +257,13 @@ pub(crate) async fn ensure_triggers(
     .map(|r| r.name)
     .collect();
 
+    let own_triggers_pre_existed = existing.iter().any(|n| is_own_trigger(n, &prefix));
+
     let wanted: Vec<&str> = triggers.iter().map(|(n, _)| n.as_str()).collect();
-    for stale in existing.iter().filter(|n| !wanted.contains(&n.as_str())) {
+    for stale in existing
+        .iter()
+        .filter(|n| is_own_trigger(n, &prefix) && !wanted.contains(&n.as_str()))
+    {
         db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS \"{stale}\""))
             .await?;
     }
@@ -194,7 +272,7 @@ pub(crate) async fn ensure_triggers(
             db.execute_unprepared(sql).await?;
         }
     }
-    Ok(())
+    Ok(own_triggers_pre_existed)
 }
 
 /// Flip the capture-suppression flag. Called inside the remote-apply
@@ -531,6 +609,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repair_synthesizes_trigger_identical_capture_row() {
+        let db = setup_db().await;
+        // The clock table must exist for the repair's NOT-IN subquery; it is
+        // empty, so every base row is uncovered.
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
+
+        // A normal insert: the AFTER INSERT trigger writes the reference
+        // capture row (full type matrix incl. a BLOB).
+        db.execute_unprepared(
+            "INSERT INTO tasks (id, title, done, score, data) VALUES ('t1', 'hello', 1, 2.5, X'DEADBEEF')",
+        )
+        .await
+        .unwrap();
+        let trigger_new = {
+            let rows = capture_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].op, "I");
+            rows[0].new_row.clone().unwrap()
+        };
+
+        // Clear the capture table so only the synthesized row is left to
+        // inspect. The base row still has no clock coverage, so repair re-emits
+        // it — and must produce a byte-identical `new_row`.
+        db.execute_unprepared("DELETE FROM _wavesync_changes")
+            .await
+            .unwrap();
+        db.execute_unprepared(&repair_uncovered_rows_sql(&tasks_meta()))
+            .await
+            .unwrap();
+
+        let synth = capture_rows(&db).await;
+        assert_eq!(
+            synth.len(),
+            1,
+            "one uncovered row → one synthesized capture"
+        );
+        assert_eq!(synth[0].op, "I");
+        assert_eq!(synth[0].tbl, "tasks");
+        assert_eq!(synth[0].pk, "t1");
+        assert!(synth[0].old_row.is_none());
+        assert_eq!(
+            synth[0].new_row.as_deref(),
+            Some(trigger_new.as_str()),
+            "synthesized new_row must byte-match the real INSERT trigger's payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repair_skips_covered_and_tombstoned_rows() {
+        let db = setup_db().await;
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
+        // Seed a live clock entry for 'covered' and a tombstone for 'gone'.
+        db.execute_unprepared(
+            "INSERT INTO _wavesync_tasks_clock (pk, cid, col_version, db_version, site_id) \
+             VALUES ('covered', 'title', 1, 1, X'00'), ('gone', '__deleted', 1, 1, X'00')",
+        )
+        .await
+        .unwrap();
+        // Three base rows: one covered, one tombstoned, one uncovered.
+        db.execute_unprepared(
+            "INSERT INTO tasks (id, title) VALUES ('covered', 'a'), ('gone', 'b'), ('fresh', 'c')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("DELETE FROM _wavesync_changes")
+            .await
+            .unwrap();
+
+        db.execute_unprepared(&repair_uncovered_rows_sql(&tasks_meta()))
+            .await
+            .unwrap();
+        let synth = capture_rows(&db).await;
+        assert_eq!(synth.len(), 1, "only the uncovered row is synthesized");
+        assert_eq!(synth[0].pk, "fresh");
+    }
+
+    #[tokio::test]
     async fn test_refuses_internal_tables() {
         let m = meta("_wavesync_meta", "key", &["key", "value"]);
         assert!(trigger_sql(&m).is_err());
@@ -578,6 +737,88 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row.cnt, 3);
+    }
+
+    /// Multiple base tables in one DB, for exercising the stale-trigger scan
+    /// across sibling table names (e.g. `meal` vs `meal_plan`).
+    async fn setup_multi_db(tables: &[(&str, &[&str])]) -> sea_orm::DatabaseConnection {
+        let path =
+            std::env::temp_dir().join(format!("wavesync_capture_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        for (table, cols) in tables {
+            let col_defs: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 0 {
+                        format!("\"{c}\" TEXT PRIMARY KEY")
+                    } else {
+                        format!("\"{c}\" TEXT")
+                    }
+                })
+                .collect();
+            db.execute_unprepared(&format!(
+                "CREATE TABLE \"{table}\" ({})",
+                col_defs.join(", ")
+            ))
+            .await
+            .unwrap();
+        }
+        ensure_capture_tables(&db).await.unwrap();
+        db
+    }
+
+    async fn count_triggers_like(db: &sea_orm::DatabaseConnection, pattern: &str) -> i64 {
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            cnt: i64,
+        }
+        CountRow::find_by_statement(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='trigger' AND name LIKE $1",
+            [pattern.into()],
+        ))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+        .cnt
+    }
+
+    // Regression for #96: the stale-trigger scan used a raw `LIKE
+    // '{prefix}%'` match, so registering `meal` after `meal_plan` classified
+    // `meal_plan`'s own triggers (`_wavesync_tr_meal_plan_i_...`) as stale
+    // `meal` triggers and dropped them — silently killing `meal_plan`'s
+    // capture if it registered first.
+    #[tokio::test]
+    async fn ensure_triggers_does_not_drop_prefix_sibling() {
+        let meal_plan = meta("meal_plan", "id", &["id", "name"]);
+        let meal = meta("meal", "id", &["id", "name"]);
+        let db = setup_multi_db(&[("meal_plan", &["id", "name"]), ("meal", &["id", "name"])]).await;
+
+        ensure_triggers(&db, &meal_plan).await.unwrap();
+        ensure_triggers(&db, &meal).await.unwrap(); // must NOT drop meal_plan's
+
+        let n = count_triggers_like(&db, "_wavesync_tr_meal_plan_%").await;
+        assert_eq!(
+            n, 3,
+            "meal_plan's capture triggers must survive meal's registration"
+        );
+    }
+
+    #[test]
+    fn own_trigger_shape_truth_table() {
+        let p = trigger_prefix("meal");
+        assert!(is_own_trigger(&format!("{p}i_deadbeef"), &p));
+        assert!(is_own_trigger(&format!("{p}u_01234567"), &p));
+        assert!(is_own_trigger(&format!("{p}d_89abcdef"), &p));
+        assert!(!is_own_trigger("_wavesync_tr_meal_plan_i_deadbeef", &p)); // sibling
+        assert!(!is_own_trigger(&format!("{p}i_deadbee"), &p)); // 7 hex
+        assert!(!is_own_trigger(&format!("{p}i_deadbeef0"), &p)); // 9 hex
+        assert!(!is_own_trigger(&format!("{p}x_deadbeef"), &p)); // bad kind
+        assert!(!is_own_trigger(&format!("{p}i_DEADBEEF"), &p)); // fp is lowercase hex
     }
 
     #[tokio::test]

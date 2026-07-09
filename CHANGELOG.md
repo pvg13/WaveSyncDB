@@ -3,6 +3,23 @@
 ## Unreleased
 
 ### Fixed
+- **Capture trigger stale-scan could drop a sibling table's triggers, silently stopping its
+  sync (#96).** `ensure_triggers`'s cleanup pass matched existing triggers with a `LIKE
+  '_wavesync_tr_{table}_%'` prefix scan, which also matches a different table whose name starts
+  with the same prefix plus `_` (e.g. registering `meal` could classify `meal_plan`'s own
+  triggers as stale and drop them) — every subsequent write to the victim table then produced no
+  capture rows at all, with no error anywhere. Which table lost coverage depended only on
+  build-time `inventory` registration order. Fixed with an exact-shape predicate
+  (`is_own_trigger`) that only ever matches a table's own trigger names, never a sibling's; the
+  drop set can now only shrink, never grow. `register_table` also detects the resulting damage
+  signature (shadow clock present, zero own triggers survived) on a table's next registration and
+  repairs it by synthesizing capture rows for every row with no clock coverage — tombstones and
+  already-covered rows are left untouched, and the user table itself is never mutated (an earlier
+  `INSERT OR REPLACE`-based repair was rejected because it cascades `ON DELETE` actions onto
+  child rows under `foreign_keys=ON`). The same repair also self-heals the documented
+  `DROP TRIGGER` downgrade escape hatch. Known limitation: only a *complete* trigger loss is
+  detected/repaired — a row updated (not inserted) during the gap keeps a stale-but-present clock
+  entry and isn't recovered.
 - **Browser peers advertise `/wavesync/snapshot/4.0.0` again (shared wire codecs; web<->native
   sync over the network was broken since the 4.0.0 cutover).** The wasm32 browser engine kept
   a hand-copied snapshot/push codec that still hardcoded the old `3.0.0` protocol id, so a
