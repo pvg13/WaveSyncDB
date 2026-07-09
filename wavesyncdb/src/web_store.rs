@@ -612,9 +612,9 @@ impl BrowserStore {
     /// Called once per group join/create so a reload can restore the
     /// derived key and topic without re-running the KDF against a
     /// re-typed passphrase. `put` is upsert-by-key, matching the shadow
-    /// store's `INSERT OR REPLACE` convention (Section 2.3 of the repo
-    /// guidelines) — re-joining the same `user_topic` replaces the prior
-    /// record instead of accumulating duplicates.
+    /// store's `INSERT OR REPLACE` convention — re-joining the same
+    /// `user_topic` replaces the prior record instead of accumulating
+    /// duplicates.
     pub async fn record_joined_group(&self, rec: &JoinedGroupRecord) -> Result<(), StoreError> {
         let tx = self
             .db
