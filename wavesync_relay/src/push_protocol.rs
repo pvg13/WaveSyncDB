@@ -42,7 +42,7 @@ pub enum PushRequest {
         sender_site_id: String,
         /// Whether this changeset touched at least one table with a
         /// registered `SyncNotify` policy — see the mirrored doc comment
-        /// on `wavesyncdb/src/engine/push_protocol.rs`. `#[serde(default)]`
+        /// on `wavesyncdb/src/wire/push_protocol.rs`. `#[serde(default)]`
         /// keeps an old sender's un-tagged message wire-compatible.
         #[serde(default)]
         visible: bool,
