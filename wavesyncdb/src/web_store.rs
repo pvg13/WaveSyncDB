@@ -24,6 +24,11 @@
 //!   as the relay is reachable, in parallel with the
 //!   AnnouncePresence → PeerList round-trip — usually saving 1–10s on
 //!   cellular when the cached addrs are still live.
+//! - **`joined_groups`** (schema v3, multi-group #93) — one
+//!   [`JoinedGroupRecord`] per joined group, keyed by `user_topic`. Each
+//!   non-default group also gets its own IndexedDB database, named via
+//!   [`group_store_name`] — isolating one group's shadow/meta/peer state
+//!   from another's.
 //!
 //! Key encoding choices follow the same conventions as the native shadow
 //! tables: composite keys are joined with `'|'` (table/pk/cid components
@@ -45,6 +50,7 @@ const STORE_META: &str = "meta";
 const STORE_SHADOW: &str = "shadow";
 const STORE_PEER_VERSIONS: &str = "peer_versions";
 const STORE_PEER_ADDRS: &str = "peer_addrs";
+const STORE_JOINED_GROUPS: &str = "joined_groups";
 
 const META_SITE_ID: &str = "site_id";
 const META_DB_VERSION: &str = "db_version";
@@ -53,7 +59,14 @@ const META_KEYPAIR: &str = "keypair";
 /// IndexedDB schema version. Bump when adding object stores; the
 /// `on_upgrade_needed` callback in [`BrowserStore::open`] creates any
 /// missing stores so older databases migrate forward without losing data.
-const SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (multi-group #93) added `joined_groups`, keyed by `user_topic` — the
+/// browser-side record of which groups this tab has joined, so a reload can
+/// re-derive `effective_topic`/`derived_key` without re-running the (slow,
+/// intentionally so — see `auth.rs`) Argon2id KDF against a re-typed
+/// passphrase. Purely additive: existing v2 databases gain the new store
+/// with their `meta`/`shadow`/`peer_versions`/`peer_addrs` data untouched.
+const SCHEMA_VERSION: u32 = 3;
 
 // The error and shadow-row types are defined in the target-independent
 // `web_sync_core` (so the sync logic is testable on native) and re-exported
@@ -105,6 +118,7 @@ impl BrowserStore {
                 STORE_SHADOW,
                 STORE_PEER_VERSIONS,
                 STORE_PEER_ADDRS,
+                STORE_JOINED_GROUPS,
             ] {
                 if !existing.contains(&name.to_string()) {
                     let params = ObjectStoreParams::new();
@@ -591,6 +605,61 @@ impl BrowserStore {
         }
     }
 
+    // ── joined groups ────────────────────────────────────────────────────
+
+    /// Upsert a joined-group record, keyed by `user_topic`.
+    ///
+    /// Called once per group join/create so a reload can restore the
+    /// derived key and topic without re-running the KDF against a
+    /// re-typed passphrase. `put` is upsert-by-key, matching the shadow
+    /// store's `INSERT OR REPLACE` convention (Section 2.3 of the repo
+    /// guidelines) — re-joining the same `user_topic` replaces the prior
+    /// record instead of accumulating duplicates.
+    pub async fn record_joined_group(&self, rec: &JoinedGroupRecord) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_JOINED_GROUPS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_JOINED_GROUPS)?;
+        let js_val =
+            serde_wasm_bindgen::to_value(rec).map_err(|e| StoreError::Serde(e.to_string()))?;
+        store
+            .put(&js_val, Some(&JsValue::from_str(&rec.user_topic)))?
+            .await?;
+        tx.commit()?.await?;
+        Ok(())
+    }
+
+    /// Load every joined-group record, in no particular order.
+    pub async fn load_joined_groups(&self) -> Result<Vec<JoinedGroupRecord>, StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_JOINED_GROUPS], TransactionMode::ReadOnly)?;
+        let store = tx.object_store(STORE_JOINED_GROUPS)?;
+        let values: Vec<JsValue> = store.get_all(None, None)?.await?;
+        tx.commit()?.await?;
+        let mut out = Vec::with_capacity(values.len());
+        for v in values {
+            let rec: JoinedGroupRecord =
+                serde_wasm_bindgen::from_value(v).map_err(|e| StoreError::Serde(e.to_string()))?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// Remove the joined-group record for `user_topic`, if any. Called on
+    /// "leave group".
+    pub async fn remove_joined_group(&self, user_topic: &str) -> Result<(), StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_JOINED_GROUPS], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_JOINED_GROUPS)?;
+        store
+            .delete(Query::from(JsValue::from_str(user_topic)))?
+            .await?;
+        tx.commit()?.await?;
+        Ok(())
+    }
+
     // ── peer addresses ───────────────────────────────────────────────────
 
     /// Record a successful dial to `(peer_id, multiaddr)`. Resets
@@ -815,6 +884,30 @@ pub struct CachedPeerAddr {
     /// threshold the entry is excluded from `load_recent_peer_addresses`
     /// and dropped by the next `gc_peer_addresses`.
     pub fail_count: u32,
+}
+
+/// A browser client's record of one joined group — enough to restore
+/// `effective_topic`/`derived_key` on reload without re-running the KDF.
+///
+/// `kind` mirrors the native `GroupConfig::kind` used for scope filtering
+/// (issue #62); `None` means the default/private scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinedGroupRecord {
+    pub user_topic: String,
+    pub effective_topic: String,
+    pub derived_key: [u8; 32],
+    pub kind: Option<String>,
+}
+
+/// DB name for a joined group's per-group IndexedDB store.
+///
+/// The default group keeps the bare `store_name` — existing single-group
+/// databases must keep opening the same IndexedDB database name after this
+/// change ships, or every current user loses their local state on upgrade.
+/// A joined (non-default) group gets its own isolated database, namespaced
+/// by its `effective_topic` so two groups never share shadow/meta state.
+pub fn group_store_name(store_name: &str, effective_topic: &str) -> String {
+    format!("{store_name}__{effective_topic}")
 }
 
 fn shadow_key(table: &str, pk: &str, cid: &str) -> String {

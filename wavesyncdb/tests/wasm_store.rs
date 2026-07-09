@@ -104,6 +104,46 @@ async fn tombstone_reaper_respects_cutoff() {
 }
 
 #[wasm_bindgen_test]
+async fn joined_groups_roundtrip_and_v3_upgrade() {
+    // opening is itself the v2->v3 upgrade path (idb machinery is additive)
+    let store = BrowserStore::open("wasmtest-groups").await.unwrap();
+    let rec = wavesyncdb::web_store::JoinedGroupRecord {
+        user_topic: "house".into(),
+        effective_topic: "wavesync2-abc".into(),
+        derived_key: [7u8; 32],
+        kind: Some("household".into()),
+    };
+    store.record_joined_group(&rec).await.unwrap();
+    // upsert: same user_topic replaces, not duplicates
+    store.record_joined_group(&rec).await.unwrap();
+    let loaded = store.load_joined_groups().await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].derived_key, [7u8; 32]);
+    assert_eq!(loaded[0].kind.as_deref(), Some("household"));
+    store.remove_joined_group("house").await.unwrap();
+    assert!(store.load_joined_groups().await.unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn group_store_names_are_isolated() {
+    use wavesyncdb::web_store::group_store_name;
+    let a = BrowserStore::open(&group_store_name("iso", "wavesync2-aaa"))
+        .await
+        .unwrap();
+    let b = BrowserStore::open(&group_store_name("iso", "wavesync2-bbb"))
+        .await
+        .unwrap();
+    // write a shadow row in a; assert absent in b
+    let mut batch = WriteBatch::default();
+    batch
+        .shadow_puts
+        .push(("t".into(), "p".into(), "c".into(), row(None, 1)));
+    a.apply_batch(batch).await.unwrap();
+    assert!(a.get_shadow("t", "p", "c").await.unwrap().is_some());
+    assert!(b.get_shadow("t", "p", "c").await.unwrap().is_none());
+}
+
+#[wasm_bindgen_test]
 async fn peer_addr_roundtrip() {
     let store = BrowserStore::open("wasmtest-addrs").await.unwrap();
     store
