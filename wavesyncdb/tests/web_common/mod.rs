@@ -164,6 +164,15 @@ impl ShadowStore for MemoryStore {
         }
         Ok(())
     }
+
+    async fn gc_aged_tombstones(&self, cutoff: u64) -> Result<u64, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.shadow.len();
+        inner.shadow.retain(|(_, _, cid), row| {
+            !(cid == "__deleted" && row.deleted_ts.is_some_and(|ts| ts < cutoff))
+        });
+        Ok((before - inner.shadow.len()) as u64)
+    }
 }
 
 impl MemoryStore {

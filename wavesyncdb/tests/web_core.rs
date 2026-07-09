@@ -942,3 +942,143 @@ async fn tombstoned_row_exposes_only_its_tombstone() {
     assert!(visible.iter().all(|c| c.cid.0 != DELETED_COLUMN));
     assert_eq!(visible.len(), 2, "title + done visible again");
 }
+
+// ── tombstone GC (target-independent core) ────────────────────────────────
+
+use wavesyncdb::web_sync_core::{ShadowRow, WriteBatch, gc_aged_tombstones_core};
+
+async fn put_tombstone(store: &MemoryStore, table: &str, pk: &str, deleted_ts: u64) {
+    store
+        .apply_batch(WriteBatch {
+            shadow_puts: vec![(
+                table.to_string(),
+                pk.to_string(),
+                DELETED_COLUMN.to_string(),
+                ShadowRow {
+                    val: None,
+                    site_id: SITE_A.0,
+                    col_version: 1,
+                    cl: 1,
+                    seq: 0,
+                    db_version: 1,
+                    deleted_ts: Some(deleted_ts),
+                },
+            )],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+async fn put_tombstone_unstamped(store: &MemoryStore, table: &str, pk: &str) {
+    store
+        .apply_batch(WriteBatch {
+            shadow_puts: vec![(
+                table.to_string(),
+                pk.to_string(),
+                DELETED_COLUMN.to_string(),
+                ShadowRow {
+                    val: None,
+                    site_id: SITE_A.0,
+                    col_version: 1,
+                    cl: 1,
+                    seq: 0,
+                    db_version: 1,
+                    deleted_ts: None,
+                },
+            )],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+async fn put_cell(store: &MemoryStore, table: &str, pk: &str, cid: &str, val: &str) {
+    store
+        .apply_batch(WriteBatch {
+            shadow_puts: vec![(
+                table.to_string(),
+                pk.to_string(),
+                cid.to_string(),
+                ShadowRow {
+                    val: Some(serde_json::json!(val)),
+                    site_id: SITE_A.0,
+                    col_version: 1,
+                    cl: 1,
+                    seq: 0,
+                    db_version: 1,
+                    deleted_ts: None,
+                },
+            )],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn gc_reaps_only_aged_tombstones() {
+    let store = MemoryStore::new();
+    let config = WebSyncConfig::default(); // 7-day default retention
+    let now = 1_000_000_u64;
+    // aged tombstone: deleted 8 days ago
+    put_tombstone(&store, "todos", "aged", now - 8 * 86_400).await;
+    // live tombstone: deleted 1 hour ago
+    put_tombstone(&store, "todos", "fresh", now - 3_600).await;
+    // live data row must never be touched
+    put_cell(&store, "todos", "row1", "title", "keep").await;
+
+    let n = gc_aged_tombstones_core(&config, &store, now).await.unwrap();
+    assert_eq!(n, 1);
+    assert!(
+        store
+            .get_shadow("todos", "aged", "__deleted")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_shadow("todos", "fresh", "__deleted")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get_shadow("todos", "row1", "title")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn gc_disabled_reaps_nothing() {
+    let store = MemoryStore::new();
+    let config = WebSyncConfig::default().without_tombstone_gc();
+    let now = 1_000_000_u64;
+    put_tombstone(&store, "todos", "ancient", 0).await;
+    let n = gc_aged_tombstones_core(&config, &store, now).await.unwrap();
+    assert_eq!(n, 0);
+    assert!(
+        store
+            .get_shadow("todos", "ancient", "__deleted")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn gc_keeps_unstamped_tombstones() {
+    // deleted_ts == None (defensive: pre-4.0.0 row) never ages, matching
+    // the exclusion rule — reaping it would diverge from what sync serves.
+    let store = MemoryStore::new();
+    let config = WebSyncConfig::default();
+    put_tombstone_unstamped(&store, "todos", "legacy").await;
+    let n = gc_aged_tombstones_core(&config, &store, u64::MAX / 2)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}

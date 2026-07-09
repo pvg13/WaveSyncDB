@@ -505,6 +505,51 @@ impl BrowserStore {
         Ok(out)
     }
 
+    /// Physically delete every `(table, pk, "__deleted")` entry whose
+    /// `deleted_ts` is present and `< cutoff`, returning how many were
+    /// reaped. `tombstone_cutoff`/`tombstone_live` already hide these rows
+    /// from every sync/reconcile surface once aged — this only reclaims
+    /// storage. Entries with no `deleted_ts` stamp are kept (never age).
+    ///
+    /// Same full-scan tradeoff as [`Self::get_changes_since`] — no index
+    /// on the value payload, so every shadow entry is read once per GC
+    /// pass. Fine at demo scale; a production app with a large shadow
+    /// table would want a dedicated `__deleted`-keyed index.
+    pub async fn gc_aged_tombstones(&self, cutoff: u64) -> Result<u64, StoreError> {
+        let tx = self
+            .db
+            .transaction(&[STORE_SHADOW], TransactionMode::ReadWrite)?;
+        let store = tx.object_store(STORE_SHADOW)?;
+        let keys: Vec<JsValue> = store.get_all_keys(None, None)?.await?;
+        let values: Vec<JsValue> = store.get_all(None, None)?.await?;
+
+        if keys.len() != values.len() {
+            return Err(StoreError::Idb(format!(
+                "shadow scan returned {} keys but {} values",
+                keys.len(),
+                values.len()
+            )));
+        }
+
+        let mut reaped = 0u64;
+        for (k_js, v_js) in keys.into_iter().zip(values.into_iter()) {
+            let is_tombstone = k_js
+                .as_string()
+                .is_some_and(|k| k.ends_with(&format!("|{DELETED_COLUMN}")));
+            if !is_tombstone {
+                continue;
+            }
+            let row: ShadowRow = serde_wasm_bindgen::from_value(v_js)
+                .map_err(|e| StoreError::Serde(e.to_string()))?;
+            if row.deleted_ts.is_some_and(|ts| ts < cutoff) {
+                store.delete(Query::from(k_js))?.await?;
+                reaped += 1;
+            }
+        }
+        tx.commit()?.await?;
+        Ok(reaped)
+    }
+
     // ── peer versions ────────────────────────────────────────────────────
 
     /// Record the highest `db_version` seen from `peer_id`.
@@ -744,6 +789,10 @@ impl ShadowStore for BrowserStore {
 
     async fn apply_batch(&self, batch: WriteBatch) -> Result<(), StoreError> {
         BrowserStore::batch(self, batch).await
+    }
+
+    async fn gc_aged_tombstones(&self, cutoff: u64) -> Result<u64, StoreError> {
+        BrowserStore::gc_aged_tombstones(self, cutoff).await
     }
 }
 
