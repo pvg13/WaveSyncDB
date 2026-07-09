@@ -618,6 +618,14 @@ impl WebSyncClient {
             store.is_some()
         );
 
+        // Single funnel point for both persistent constructors
+        // (`connect_persistent_with_config` and `connect_via_relay_with_config`
+        // both call through here) — `store` is `Some` only for those, `None`
+        // for the ephemeral `connect`/`connect_with_config` path. Clone the
+        // config now, before it's moved into `EngineState` below, so the
+        // startup GC sweep has its own copy.
+        let gc_config = config.clone();
+
         let state = EngineState {
             site_id,
             db_version: Arc::new(Mutex::new(db_version)),
@@ -633,6 +641,29 @@ impl WebSyncClient {
         };
 
         wasm_bindgen_futures::spawn_local(run_swarm(swarm, cmd_rx, state));
+
+        // Physically collect aged tombstones off the startup path. Exclusion
+        // already hides them from every sync surface; this only reclaims
+        // IndexedDB storage, so a failure costs nothing but bytes. Runs once
+        // here (not per-constructor) since both persistent constructors
+        // funnel through this single `start()`; ephemeral clients have no
+        // `store` and get nothing.
+        if let Some(gc_store) = store.clone() {
+            wasm_bindgen_futures::spawn_local(async move {
+                let now = crate::web_store::now_secs();
+                match crate::web_sync_core::gc_aged_tombstones_core(&gc_config, &*gc_store, now)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("WebSyncClient: tombstone GC reaped {n} aged tombstone(s)")
+                    }
+                    Err(e) => {
+                        tracing::warn!("WebSyncClient: tombstone GC failed (non-fatal): {e}")
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             cmd_tx,
@@ -891,6 +922,12 @@ impl WebSyncClient {
             &site_id.0[..4]
         );
 
+        // This path opens its own BrowserStore and never calls `start()`
+        // (no swarm — loopback demo transport), so it needs its own copy
+        // of the startup GC sweep. Clone the config before it moves into
+        // `EngineState` below.
+        let gc_config = config.clone();
+
         let store_arc = Arc::new(store);
         let state = EngineState {
             site_id,
@@ -907,6 +944,28 @@ impl WebSyncClient {
         };
 
         wasm_bindgen_futures::spawn_local(run_loopback(end, cmd_rx, state));
+
+        // Physically collect aged tombstones off the startup path. Exclusion
+        // already hides them from every sync surface; this only reclaims
+        // IndexedDB storage, so a failure costs nothing but bytes. See the
+        // matching sweep in `start()` for the real (non-loopback) paths.
+        {
+            let gc_store = store_arc.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let now = crate::web_store::now_secs();
+                match crate::web_sync_core::gc_aged_tombstones_core(&gc_config, &*gc_store, now)
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("WebSyncClient: tombstone GC reaped {n} aged tombstone(s)")
+                    }
+                    Err(e) => {
+                        tracing::warn!("WebSyncClient: tombstone GC failed (non-fatal): {e}")
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             cmd_tx,
