@@ -46,6 +46,7 @@ pub mod network_status;
 pub mod protocol;
 pub mod reconcile;
 pub mod registry;
+pub(crate) mod rejection;
 pub mod synced_model;
 pub mod synced_table;
 
