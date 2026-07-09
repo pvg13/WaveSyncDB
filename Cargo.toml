@@ -10,6 +10,7 @@ members = [
 exclude = [
     "examples/dioxus_app",
     "examples/dioxus_dynamic",
+    "tests-e2e/web/page",
 ]
 resolver = "3"
 

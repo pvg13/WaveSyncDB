@@ -1,0 +1,20 @@
+# Standalone (non-workspace) crate: it is `exclude`d from the root
+# workspace, and the empty `[workspace]` table below makes it its own root
+# so `wasm-pack` / `cargo metadata` don't treat it as a stray member.
+[workspace]
+
+[package]
+name = "wavesync-e2e-page"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wavesyncdb = { path = "../../../wavesyncdb", features = ["web"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde_json = "1"
+js-sys = "0.3"

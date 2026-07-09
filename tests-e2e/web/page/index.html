@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>wavesync e2e</title>
+  </head>
+  <body>
+    <script type="module">
+      import init, * as api from './pkg/wavesync_e2e_page.js';
+      await init();
+      // Namespace object plus flat aliases: the puppeteer driver calls
+      // window.e2e_init / e2e_status / etc. directly.
+      window.wavesyncE2E = api;
+      window.e2e_init = api.e2e_init;
+      window.e2e_submit = api.e2e_submit;
+      window.e2e_rows = api.e2e_rows;
+      window.e2e_status = api.e2e_status;
+      window.e2eReady = true;
+    </script>
+  </body>
+</html>
