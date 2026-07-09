@@ -7,7 +7,12 @@
 //!
 //! Run with: `cargo test -p wavesyncdb --test web_core --features web`
 
-#![cfg(feature = "web")]
+// `#[tokio::test]` below needs the native-only tokio runtime (tokio is
+// `not(wasm32)`-gated in Cargo.toml). `wasm-pack test` runs `cargo build
+// --tests`, which builds every integration test binary in the crate
+// regardless of which one is named to run, so this file must be excluded
+// from wasm32 test builds even though `web_sync_core` itself compiles there.
+#![cfg(all(feature = "web", not(target_arch = "wasm32")))]
 
 mod web_common;
 

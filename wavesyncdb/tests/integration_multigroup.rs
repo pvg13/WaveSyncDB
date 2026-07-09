@@ -4,6 +4,12 @@
 //! Node ID seeds: 240–259 (see CLAUDE.md §6). Run single-threaded (Rule 2.13):
 //!   cargo test -p wavesyncdb --test integration_multigroup -- --test-threads=1
 
+// Native-only (real engine, SQLite, libp2p). `wasm-pack test` runs `cargo
+// build --tests`, which builds every integration test binary in the crate
+// regardless of which one is named to run — without this gate, this file's
+// native-only imports would fail a wasm32 test build.
+#![cfg(not(target_arch = "wasm32"))]
+
 mod common;
 
 use std::time::Duration;

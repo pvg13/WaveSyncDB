@@ -1,0 +1,13 @@
+{
+  "name": "wavesync-web-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser<->native sync e2e harness: relay + native peer + static page + puppeteer.",
+  "scripts": {
+    "test": "node serve_and_test.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.42.0"
+  }
+}

@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "test-peer"
 path = "src/bin/test_peer.rs"
 
+[[bin]]
+name = "web_e2e_peer"
+path = "src/bin/web_e2e_peer.rs"
+
 [dependencies]
 wavesyncdb = { workspace = true, features = ["derive"] }
 wavesyncdb_derive = { path = "../wavesyncdb_derive" }

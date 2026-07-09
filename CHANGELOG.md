@@ -152,6 +152,8 @@
   dial/sync/fan-out while the window is open, and re-admitted on a later
   successful verify. Traffic on a topic that matches none of our groups is
   still silently ignored, never rejected — unchanged from before.
+- **Browser e2e CI (puppeteer vs in-repo relay + native peer) and
+  wasm-bindgen-test coverage for the IndexedDB store.**
 
 ### Changed
 - **Sync protocol 4.0.0.** The `deleted_ts` field is covered by message

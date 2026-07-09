@@ -1,0 +1,8 @@
+# Node dependencies (restored via `npm install`)
+node_modules/
+
+# wasm-pack build output (regenerated via `wasm-pack build page --target web --dev`)
+page/pkg/
+
+# Standalone-crate build dir
+page/target/

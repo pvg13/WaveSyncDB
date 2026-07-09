@@ -22,7 +22,11 @@
 //! Run single-threaded (a real engine instance runs mDNS):
 //! `cargo test -p wavesyncdb --test web_native_convergence --features web -- --test-threads=1`
 
-#![cfg(feature = "web")]
+// Native-only (real WaveSyncDb: sea-orm, SQLite, tokio runtime). `wasm-pack
+// test` runs `cargo build --tests`, which builds every integration test
+// binary in the crate regardless of which one is named to run, so this
+// file must be excluded from wasm32 test builds.
+#![cfg(all(feature = "web", not(target_arch = "wasm32")))]
 
 #[allow(dead_code)]
 mod common;
