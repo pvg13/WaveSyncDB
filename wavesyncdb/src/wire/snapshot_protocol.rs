@@ -142,7 +142,12 @@ async fn write_length_prefixed<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -
     Ok(())
 }
 
-#[cfg(test)]
+// These round-trip tests use `#[tokio::test]`, which needs the native-only
+// tokio runtime (tokio is `not(wasm32)`-gated in Cargo.toml) even though
+// `wire` itself is a cross-platform module — `wasm-pack test` builds this
+// crate's own lib unit tests via `cargo build --tests` alongside whatever
+// integration test was named, so this module must not compile under wasm32.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::protocol::{SyncRequest, SyncResponse};

@@ -118,6 +118,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # the `derive` feature on the main crate.
 wavesyncdb_derive = { path = "../wavesyncdb_derive", version = "0.3.0" }
 
+# `BrowserStore` (IndexedDB) only exists on wasm32 — this drives
+# `tests/wasm_store.rs` under `wasm-pack test --headless --chrome`, the
+# first executed (not just `cargo check`ed) coverage of the wasm storage
+# layer.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 # Browser-sync-core tests run on native against an in-memory store; they need
 # the `web` feature to compile `web_sync_core`, so gate the binaries on it
 # instead of failing when the default feature set is tested.

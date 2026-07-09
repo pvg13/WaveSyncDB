@@ -1,4 +1,8 @@
-#![cfg(feature = "dioxus")]
+// Native-only (real engine, SQLite, libp2p). `wasm-pack test` runs `cargo
+// build --tests`, which builds every integration test binary in the crate
+// regardless of which one is named to run — without this gate, this file's
+// native-only imports would fail a wasm32 test build.
+#![cfg(all(feature = "dioxus", not(target_arch = "wasm32")))]
 
 mod common;
 

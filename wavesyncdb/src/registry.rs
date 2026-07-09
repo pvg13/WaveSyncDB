@@ -260,7 +260,12 @@ impl NotificationGate {
     }
 }
 
-#[cfg(test)]
+// `EntityScope`/`TableMeta`/`TableRegistry` are native-only (see the
+// `not(wasm32)` gates above) — `wasm-pack test` always runs `cargo build
+// --tests`, which builds this crate's own lib unit tests alongside whatever
+// integration test was named, so this module must not compile under a
+// wasm32 `cfg(test)` build or it fails to resolve the gated-out types.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::messages::DeletePolicy;

@@ -34,3 +34,14 @@ jobs:
       run: cargo check -p wavesyncdb --features web --target wasm32-unknown-unknown
     - name: Run web sync-core and web/native convergence tests
       run: cargo test -p wavesyncdb --features web --test web_core --test web_native_convergence -- --test-threads=1
+
+  wasm-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Install wasm-pack
+      run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+    - name: Run browser-store tests (headless Chrome)
+      run: cd wavesyncdb && wasm-pack test --headless --chrome --features web --test wasm_store
