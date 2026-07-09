@@ -159,3 +159,24 @@ async fn peer_addr_roundtrip() {
     assert_eq!(loaded[0].multiaddr, "/dns4/x/tcp/443/wss");
     assert_eq!(loaded[0].fail_count, 0);
 }
+
+/// Multi-group (#93): a loopback client cannot host a second group — the
+/// single-pair demo transport has no swarm, so `join_group` must fail fast
+/// with `Unsupported`. This is the cheapest real-engine assertion available
+/// without standing up a relay in the browser test; full join coverage is
+/// the node e2e suite (Task 11).
+#[wasm_bindgen_test]
+async fn loopback_join_group_is_unsupported() {
+    let pair = wavesyncdb::LoopbackPair::new();
+    let client =
+        wavesyncdb::WebSyncClient::connect_loopback(pair.a, "topic-x", None, "wasmtest-lb-join")
+            .await
+            .unwrap();
+    // `WebGroupHandle` intentionally has no `Debug` (it holds a `Box<dyn Any>`
+    // table cache), so match the `Result` directly rather than `unwrap_err`.
+    let result = client.join_group("other-group", "pw", None).await;
+    assert!(
+        matches!(result, Err(wavesyncdb::WebSyncError::Unsupported)),
+        "loopback join_group must be Unsupported"
+    );
+}

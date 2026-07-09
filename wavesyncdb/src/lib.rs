@@ -120,7 +120,8 @@ pub mod web_entity;
 pub mod web_store;
 #[cfg(target_arch = "wasm32")]
 pub use web_engine::{
-    LoopbackEnd, LoopbackLink, LoopbackPair, WebSyncClient, WebSyncError, WebSyncStatus,
+    LoopbackEnd, LoopbackLink, LoopbackPair, WebGroupHandle, WebSyncClient, WebSyncError,
+    WebSyncStatus,
 };
 #[cfg(target_arch = "wasm32")]
 pub use web_entity::BrowserEntity;

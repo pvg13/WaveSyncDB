@@ -65,10 +65,11 @@ use crate::auth::GroupKey;
 use crate::messages::{ColumnChange, NodeId, SyncChangeset};
 use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
-use crate::web_store::BrowserStore;
+use crate::web_store::{BrowserStore, group_store_name};
 use crate::web_sync_core::{
     EphemeralStore, WebSyncConfig, apply_remote_changeset_core, changes_since_core,
-    compute_store_digest, reconcile_range_step, submit_local_delete_core, submit_local_write_core,
+    compute_store_digest, merge_config, reconcile_range_step, scoped_web_config,
+    submit_local_delete_core, submit_local_write_core,
 };
 
 use crate::wire::push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
@@ -89,6 +90,23 @@ pub enum WebSyncError {
     Store(String),
     #[error("identity decode failed: {0}")]
     Identity(String),
+    /// A topic-scoped write (`submit_local_write` / `submit_local_delete`)
+    /// targeted a group this client hasn't joined. Returned instead of the
+    /// misleading `NotRunning` so callers can distinguish "engine dead" from
+    /// "you routed a write to a group you left / never joined".
+    #[error("no such joined group for this topic")]
+    GroupNotJoined,
+    /// [`WebSyncClient::leave_group`] was called on the default group. The
+    /// default group is the client's primary sync scope and is torn down
+    /// only when the client itself is dropped — it cannot be left.
+    #[error("the default group cannot be left")]
+    DefaultGroup,
+    /// A multi-group operation ([`WebSyncClient::join_group`] et al.) was
+    /// invoked on a transport that cannot host more than one group. Loopback
+    /// is a single-pair in-process demo transport with no swarm, no relay,
+    /// and no peer discovery, so it can only ever run the one default group.
+    #[error("multi-group is not supported on this transport")]
+    Unsupported,
 }
 
 #[derive(NetworkBehaviour)]
@@ -128,6 +146,23 @@ enum Command {
         topic: String,
         ack: oneshot::Sender<Result<u64, WebSyncError>>,
     },
+    /// Register a fully-prepared additional sync group on the shared swarm
+    /// (multi-group #93). The [`WebGroupInit`] is built entirely
+    /// constructor-side (key derived, store opened, `site_id`/`db_version`
+    /// loaded, channels created) so the engine only has to insert it into
+    /// its `groups` map, trigger a late-join announce when the relay is
+    /// already up, and spawn the group's tombstone GC sweep. `ack` reports
+    /// success (idempotent: a re-join of an already-present effective topic
+    /// acks `Ok`). Boxed because `WebGroupInit` is large relative to the
+    /// other command variants.
+    JoinGroup(Box<WebGroupInit>, oneshot::Sender<Result<(), WebSyncError>>),
+    /// Remove a previously-joined group from the shared swarm. Refuses the
+    /// default group (`Err(WebSyncError::DefaultGroup)`); the group's
+    /// IndexedDB data is left intact so a later re-join restores it.
+    LeaveGroup {
+        effective_topic: String,
+        ack: oneshot::Sender<Result<(), WebSyncError>>,
+    },
 }
 
 /// Browser-side sync client.
@@ -142,6 +177,24 @@ pub struct WebSyncClient {
     /// command so the engine routes topic-less client calls to the right
     /// group. Set once at construction; the public client API is unchanged.
     default_topic: String,
+    /// User-facing topic of the default group (pre key-derivation). Held so
+    /// [`Self::default_group`] can surface it and so a `join_group` for the
+    /// default topic short-circuits to the default handle.
+    default_user_topic: String,
+    /// IndexedDB base store name, when this client is persistent. Joined
+    /// groups open their own store at `group_store_name(store_name, topic)`;
+    /// ephemeral clients carry `None` and give joined groups no store.
+    store_name: Option<String>,
+    /// `true` for loopback clients — the single-pair demo transport can host
+    /// only the default group, so `join_group*` fail fast with
+    /// [`WebSyncError::Unsupported`].
+    loopback: bool,
+    /// Registry of joined (non-default) groups, keyed by **user topic**, for
+    /// idempotent joins: a repeat `join_group` with the same user topic
+    /// returns the live handle without re-running the KDF. `Rc<RefCell<…>>`
+    /// (not `Arc`) because the browser engine is single-threaded and the
+    /// client is already `!Send` via its `Box<dyn Any>` table cache.
+    group_registry: std::rc::Rc<std::cell::RefCell<HashMap<String, WebGroupHandle>>>,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
     /// `None` for ephemeral clients — keeps the public type uniform.
@@ -204,6 +257,11 @@ pub struct WebSyncStatus {
     /// value + `relay_connected == true` means the link is healthy.
     pub relay_reconnect_attempts: u32,
     pub connected_peer_ids: Vec<String>,
+    /// User-facing topics this client currently holds a group for, **default
+    /// group first**. Grows on [`WebSyncClient::join_group`] and shrinks on
+    /// [`WebSyncClient::leave_group`]. UIs can render a group switcher from
+    /// this without tracking joins themselves.
+    pub joined_topics: Vec<String>,
 }
 
 impl WebSyncClient {
@@ -244,6 +302,7 @@ impl WebSyncClient {
             site_id,
             0,
             None,
+            None,       // ephemeral — no base store name for joined groups
             None,       // not relay-mediated discovery
             Vec::new(), // ephemeral — no persistent peer-addr cache
         )
@@ -336,6 +395,7 @@ impl WebSyncClient {
             site_id,
             db_version,
             Some(Arc::new(store)),
+            Some(store_name.to_string()),
             None, // not relay-mediated discovery
             // Single-peer dial: caller already gave us the exact target
             // multiaddr, so the cache wouldn't add anything. The cache
@@ -500,6 +560,7 @@ impl WebSyncClient {
             site_id,
             db_version,
             Some(Arc::new(store)),
+            Some(store_name.to_string()),
             Some(relay_peer_id),
             cached_peer_addrs,
         )
@@ -515,6 +576,9 @@ impl WebSyncClient {
         site_id: NodeId,
         db_version: u64,
         store: Option<Arc<BrowserStore>>,
+        // IndexedDB base name for persistent clients, so joined groups can
+        // open their own per-group store; `None` for ephemeral clients.
+        store_name: Option<String>,
         // When `Some`, treat the dialed multiaddr as a relay rather
         // than a sync peer: send AnnouncePresence on connect, accept
         // PeerJoined inbounds from this peer-id only, and exclude this
@@ -630,6 +694,9 @@ impl WebSyncClient {
             relay_connected: false,
             relay_reconnect_attempts: 0,
             connected_peer_ids: Vec::new(),
+            // The default group is present from construction; join/leave
+            // grow and shrink this list.
+            joined_topics: vec![user_topic.to_string()],
         });
 
         tracing::info!(
@@ -702,6 +769,10 @@ impl WebSyncClient {
         Ok(Self {
             cmd_tx,
             default_topic: effective_topic,
+            default_user_topic: user_topic.to_string(),
+            store_name,
+            loopback: false,
+            group_registry: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             inbound_tx,
             resolved_tx,
             store,
@@ -742,17 +813,9 @@ impl WebSyncClient {
         pk: &str,
         columns: Vec<(String, serde_json::Value)>,
     ) -> Result<u64, WebSyncError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::SubmitLocal {
-                table: table.to_string(),
-                pk: pk.to_string(),
-                columns,
-                topic: self.default_topic.clone(),
-                ack: tx,
-            })
-            .map_err(|_| WebSyncError::NotRunning)?;
-        rx.await.map_err(|_| WebSyncError::NotRunning)?
+        self.default_group()
+            .submit_local_write(table, pk, columns)
+            .await
     }
 
     /// High-level local row deletion.
@@ -767,16 +830,7 @@ impl WebSyncClient {
     ///
     /// Returns the new `db_version`.
     pub async fn submit_local_delete(&self, table: &str, pk: &str) -> Result<u64, WebSyncError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(Command::SubmitLocalDelete {
-                table: table.to_string(),
-                pk: pk.to_string(),
-                topic: self.default_topic.clone(),
-                ack: tx,
-            })
-            .map_err(|_| WebSyncError::NotRunning)?;
-        rx.await.map_err(|_| WebSyncError::NotRunning)?
+        self.default_group().submit_local_delete(table, pk).await
     }
 
     /// Type-safe wrapper around [`Self::submit_local_write`].
@@ -793,9 +847,7 @@ impl WebSyncClient {
         table: &str,
         entity: &E,
     ) -> Result<u64, WebSyncError> {
-        let pk = entity.pk();
-        let columns = entity.to_columns();
-        self.submit_local_write(table, &pk, columns).await
+        self.default_group().submit(table, entity).await
     }
 
     /// Subscribe to **raw** incoming changesets from peers.
@@ -830,25 +882,212 @@ impl WebSyncClient {
     ///
     /// `None` when the client was constructed via [`Self::connect`]
     /// (ephemeral). The store is what application UIs use to materialize
-    /// initial state on mount via `list_table_rows`.
+    /// initial state on mount via `list_table_rows`. This is the **default
+    /// group's** store; per-group stores are reached via
+    /// [`WebGroupHandle::store`].
     pub fn store(&self) -> Option<Arc<BrowserStore>> {
         self.store.clone()
     }
 
+    /// Read a cached value from the **default group's** per-handle
+    /// [`TypeId`] cache (delegates to [`WebGroupHandle::get_table_cache`]).
     pub fn get_table_cache<T: Clone + 'static>(&self) -> Option<T> {
-        self.table_cache
-            .read()
-            .unwrap()
-            .get(&TypeId::of::<T>())
-            .and_then(|b| b.downcast_ref::<T>())
-            .cloned()
+        self.default_group().get_table_cache::<T>()
     }
 
+    /// Store a value in the **default group's** per-handle [`TypeId`] cache
+    /// (delegates to [`WebGroupHandle::set_table_cache`]).
     pub fn set_table_cache<T: 'static>(&self, data: T) {
-        self.table_cache
-            .write()
-            .unwrap()
-            .insert(TypeId::of::<T>(), Box::new(data));
+        self.default_group().set_table_cache(data)
+    }
+
+    /// Handle to the default group — the group this client was constructed
+    /// with. Cheap: clones a handful of `Arc`s / channel senders. The
+    /// returned handle aliases the same channels, store, and per-handle
+    /// table cache the client's own delegating methods use, so writes and
+    /// subscriptions through it are indistinguishable from the client's.
+    pub fn default_group(&self) -> WebGroupHandle {
+        WebGroupHandle {
+            user_topic: self.default_user_topic.clone(),
+            effective_topic: self.default_topic.clone(),
+            kind: None,
+            inbound_tx: self.inbound_tx.clone(),
+            resolved_tx: self.resolved_tx.clone(),
+            store: self.store.clone(),
+            cmd_tx: self.cmd_tx.clone(),
+            table_cache: self.table_cache.clone(),
+        }
+    }
+
+    /// Join an additional sync group by passphrase (multi-group #93).
+    ///
+    /// Derives the group key with Argon2id (**slow** — seconds on wasm; run
+    /// off the interaction hot path), opens the group's own IndexedDB store
+    /// when this client is persistent, and registers the group on the shared
+    /// swarm. Idempotent per `user_topic`: a repeat join returns the live
+    /// handle without re-deriving. When the relay is already connected the
+    /// engine announces the new group immediately.
+    ///
+    /// Returns [`WebSyncError::Unsupported`] on loopback clients — the
+    /// single-pair demo transport has no swarm and can host only the default
+    /// group.
+    pub async fn join_group(
+        &self,
+        user_topic: &str,
+        passphrase: &str,
+        kind: Option<&str>,
+    ) -> Result<WebGroupHandle, WebSyncError> {
+        self.join_group_inner(user_topic, GroupKeyMaterial::Passphrase(passphrase), kind)
+            .await
+    }
+
+    /// Join an additional sync group with a pre-derived 32-byte group key
+    /// (multi-group #93), skipping the Argon2id stretch. Use when the key
+    /// was derived off-thread (e.g. a Web Worker running the KDF) to avoid
+    /// blocking the main thread. Same idempotency, store, and transport
+    /// rules as [`Self::join_group`].
+    pub async fn join_group_with_key(
+        &self,
+        user_topic: &str,
+        key: &[u8; 32],
+        kind: Option<&str>,
+    ) -> Result<WebGroupHandle, WebSyncError> {
+        self.join_group_inner(user_topic, GroupKeyMaterial::Raw(key), kind)
+            .await
+    }
+
+    async fn join_group_inner(
+        &self,
+        user_topic: &str,
+        material: GroupKeyMaterial<'_>,
+        kind: Option<&str>,
+    ) -> Result<WebGroupHandle, WebSyncError> {
+        // Loopback can't host a second group — fail before the KDF so the
+        // caller pays nothing.
+        if self.loopback {
+            return Err(WebSyncError::Unsupported);
+        }
+        // Joining the default topic just aliases the default handle — no
+        // engine command, no second store.
+        if user_topic == self.default_user_topic {
+            return Ok(self.default_group());
+        }
+        // Idempotent: return the live handle for an already-joined topic
+        // without re-running the multi-second KDF.
+        if let Some(existing) = self.group_registry.borrow().get(user_topic).cloned() {
+            return Ok(existing);
+        }
+
+        // Derive the group key (slow for the passphrase path) and effective
+        // topic. This runs off the registry fast-path above.
+        let group_key = match material {
+            GroupKeyMaterial::Passphrase(p) => GroupKey::from_passphrase(p, user_topic),
+            GroupKeyMaterial::Raw(k) => GroupKey::from_raw(*k),
+        };
+        let effective_topic = group_key.derive_topic(user_topic);
+
+        // Per-group scoped config: inventory-derived base (non-default scope)
+        // with no explicit overrides layered on top.
+        let config = merge_config(WebSyncConfig::default(), scoped_web_config(false, kind));
+
+        // Open the group's own store when this client is persistent, and
+        // load/init its identity exactly like `start()` does for the default
+        // group. Ephemeral clients get no store (`None`).
+        let (store, site_id, db_version): (Option<Arc<BrowserStore>>, NodeId, u64) =
+            match &self.store_name {
+                Some(base) => {
+                    let db_name = group_store_name(base, &effective_topic);
+                    let store = BrowserStore::open(&db_name)
+                        .await
+                        .map_err(|e| WebSyncError::Store(e.to_string()))?;
+                    let site_id = match store
+                        .get_site_id()
+                        .await
+                        .map_err(|e| WebSyncError::Store(e.to_string()))?
+                    {
+                        Some(id) => id,
+                        None => {
+                            let id = NodeId(rand_site_id());
+                            store
+                                .put_site_id(&id)
+                                .await
+                                .map_err(|e| WebSyncError::Store(e.to_string()))?;
+                            id
+                        }
+                    };
+                    let db_version = store
+                        .get_db_version()
+                        .await
+                        .map_err(|e| WebSyncError::Store(e.to_string()))?;
+                    (Some(Arc::new(store)), site_id, db_version)
+                }
+                None => (None, NodeId(rand_site_id()), 0),
+            };
+
+        // Channels the engine and the returned handle SHARE — the handle
+        // holds these exact senders so its subscribers see the group's
+        // traffic.
+        let (inbound_tx, _) = broadcast::channel(64);
+        let (resolved_tx, _) = broadcast::channel(256);
+
+        let init = WebGroupInit {
+            user_topic: user_topic.to_string(),
+            topic: effective_topic.clone(),
+            kind: kind.map(|k| k.to_string()),
+            group_key: Some(group_key),
+            config,
+            store: store.clone(),
+            site_id,
+            db_version,
+            inbound_tx: inbound_tx.clone(),
+            resolved_tx: resolved_tx.clone(),
+        };
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::JoinGroup(Box::new(init), ack_tx))
+            .map_err(|_| WebSyncError::NotRunning)?;
+        ack_rx.await.map_err(|_| WebSyncError::NotRunning)??;
+
+        let handle = WebGroupHandle {
+            user_topic: user_topic.to_string(),
+            effective_topic,
+            kind: kind.map(|k| k.to_string()),
+            inbound_tx,
+            resolved_tx,
+            store,
+            cmd_tx: self.cmd_tx.clone(),
+            table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        };
+        // Register under the USER topic for idempotent re-joins.
+        self.group_registry
+            .borrow_mut()
+            .insert(user_topic.to_string(), handle.clone());
+        Ok(handle)
+    }
+
+    /// Leave a previously-joined group (multi-group #93). The engine drops
+    /// the group from its `groups` map (no more fan-out / catch-up / apply
+    /// for its topic) and the client forgets the handle. The group's
+    /// IndexedDB data is preserved, so a later [`Self::join_group`] with the
+    /// same passphrase restores it.
+    ///
+    /// Returns [`WebSyncError::DefaultGroup`] if `handle` is the default
+    /// group — the default group is torn down only with the client itself.
+    pub async fn leave_group(&self, handle: &WebGroupHandle) -> Result<(), WebSyncError> {
+        if handle.effective_topic == self.default_topic {
+            return Err(WebSyncError::DefaultGroup);
+        }
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::LeaveGroup {
+                effective_topic: handle.effective_topic.clone(),
+                ack: ack_tx,
+            })
+            .map_err(|_| WebSyncError::NotRunning)?;
+        ack_rx.await.map_err(|_| WebSyncError::NotRunning)??;
+        self.group_registry.borrow_mut().remove(&handle.user_topic);
+        Ok(())
     }
 
     /// Connect via an in-process loopback channel. **Demo/test path only.**
@@ -956,6 +1195,7 @@ impl WebSyncClient {
             relay_connected: false,
             relay_reconnect_attempts: 0,
             connected_peer_ids: Vec::new(),
+            joined_topics: vec![user_topic.to_string()],
         });
 
         tracing::info!(
@@ -1022,6 +1262,10 @@ impl WebSyncClient {
         Ok(Self {
             cmd_tx,
             default_topic: effective_topic,
+            default_user_topic: user_topic.to_string(),
+            store_name: Some(store_name.to_string()),
+            loopback: true,
+            group_registry: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             inbound_tx,
             resolved_tx,
             store: Some(store_arc),
@@ -1037,6 +1281,169 @@ impl WebSyncClient {
     /// `Signal<WebSyncStatus>` driven by this receiver.
     pub fn subscribe_status(&self) -> watch::Receiver<WebSyncStatus> {
         self.status_rx.clone()
+    }
+}
+
+/// Which flavour of key material a join was given — a passphrase to stretch
+/// with Argon2id, or an already-derived 32-byte key to wrap verbatim.
+/// Internal glue so `join_group` / `join_group_with_key` share one body.
+enum GroupKeyMaterial<'a> {
+    Passphrase(&'a str),
+    Raw(&'a [u8; 32]),
+}
+
+/// Fully-prepared blueprint for a new group, built entirely client-side and
+/// handed to the engine via [`Command::JoinGroup`]. Everything expensive or
+/// async (KDF, IndexedDB open, identity load) is already done, so the engine
+/// only inserts a [`WebGroupState`] built from these fields — it never awaits
+/// a store open inside the swarm loop.
+pub struct WebGroupInit {
+    user_topic: String,
+    /// Effective (derived) wire topic == key in the engine's `groups` map.
+    topic: String,
+    kind: Option<String>,
+    group_key: Option<GroupKey>,
+    config: WebSyncConfig,
+    store: Option<Arc<BrowserStore>>,
+    site_id: NodeId,
+    db_version: u64,
+    inbound_tx: broadcast::Sender<SyncChangeset>,
+    resolved_tx: broadcast::Sender<ColumnChange>,
+}
+
+/// Handle to one sync group on a [`WebSyncClient`] (multi-group #93).
+///
+/// Cheap to clone — a bundle of channel senders, `Arc`s, and topic strings.
+/// Obtained from [`WebSyncClient::join_group`] / [`WebSyncClient::default_group`].
+/// Writes through a handle are routed to that group's effective topic; the
+/// client's own top-level `submit_local_write` / `subscribe` / `store` etc.
+/// are thin delegations to the default group's handle, so a single-group app
+/// never has to touch this type.
+#[derive(Clone)]
+pub struct WebGroupHandle {
+    user_topic: String,
+    effective_topic: String,
+    kind: Option<String>,
+    inbound_tx: broadcast::Sender<SyncChangeset>,
+    resolved_tx: broadcast::Sender<ColumnChange>,
+    store: Option<Arc<BrowserStore>>,
+    /// The owning client's command channel. Handle writes stamp this group's
+    /// effective topic so the engine routes them to the right group.
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Per-group [`TypeId`] cache. The default group's handle aliases the
+    /// client's cache (so client-level accessors and `default_group()` see
+    /// the same entries); joined groups get their own.
+    table_cache: Arc<std::sync::RwLock<HashMap<TypeId, Box<dyn Any>>>>,
+}
+
+impl WebGroupHandle {
+    /// The user-facing topic string passed to `join_group` (pre KDF).
+    pub fn user_topic(&self) -> &str {
+        &self.user_topic
+    }
+
+    /// The effective (derived) wire topic this group syncs under.
+    pub fn effective_topic(&self) -> &str {
+        &self.effective_topic
+    }
+
+    /// The scope marker this group was joined with (`None` for the default
+    /// / private scope).
+    pub fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+
+    /// High-level local write into this group. Same semantics as
+    /// [`WebSyncClient::submit_local_write`], scoped to this group's topic.
+    pub async fn submit_local_write(
+        &self,
+        table: &str,
+        pk: &str,
+        columns: Vec<(String, serde_json::Value)>,
+    ) -> Result<u64, WebSyncError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::SubmitLocal {
+                table: table.to_string(),
+                pk: pk.to_string(),
+                columns,
+                topic: self.effective_topic.clone(),
+                ack: tx,
+            })
+            .map_err(|_| WebSyncError::NotRunning)?;
+        rx.await.map_err(|_| WebSyncError::NotRunning)?
+    }
+
+    /// Local row deletion into this group. Same semantics as
+    /// [`WebSyncClient::submit_local_delete`], scoped to this group's topic.
+    pub async fn submit_local_delete(&self, table: &str, pk: &str) -> Result<u64, WebSyncError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::SubmitLocalDelete {
+                table: table.to_string(),
+                pk: pk.to_string(),
+                topic: self.effective_topic.clone(),
+                ack: tx,
+            })
+            .map_err(|_| WebSyncError::NotRunning)?;
+        rx.await.map_err(|_| WebSyncError::NotRunning)?
+    }
+
+    /// Type-safe wrapper around [`Self::submit_local_write`] for a
+    /// [`BrowserEntity`], scoped to this group.
+    pub async fn submit<E: BrowserEntity>(
+        &self,
+        table: &str,
+        entity: &E,
+    ) -> Result<u64, WebSyncError> {
+        let pk = entity.pk();
+        let columns = entity.to_columns();
+        self.submit_local_write(table, &pk, columns).await
+    }
+
+    /// Broadcast a caller-built changeset to this group's peers. Fire-and-
+    /// forget: if the engine task is gone the changeset is silently dropped
+    /// (mirrors the client's low-level publish semantics).
+    pub fn publish(&self, changeset: SyncChangeset) {
+        let _ = self.cmd_tx.send(Command::Publish {
+            changeset,
+            topic: self.effective_topic.clone(),
+        });
+    }
+
+    /// Subscribe to **raw** incoming changesets for this group (before
+    /// conflict resolution).
+    pub fn subscribe(&self) -> broadcast::Receiver<SyncChangeset> {
+        self.inbound_tx.subscribe()
+    }
+
+    /// Subscribe to per-column changes this group has committed to its
+    /// shadow store (local echoes + remote winners).
+    pub fn subscribe_resolved(&self) -> broadcast::Receiver<ColumnChange> {
+        self.resolved_tx.subscribe()
+    }
+
+    /// This group's [`BrowserStore`], or `None` for an ephemeral client.
+    pub fn store(&self) -> Option<Arc<BrowserStore>> {
+        self.store.clone()
+    }
+
+    /// Read a value from this group's per-handle [`TypeId`] cache.
+    pub fn get_table_cache<T: Clone + 'static>(&self) -> Option<T> {
+        self.table_cache
+            .read()
+            .unwrap()
+            .get(&TypeId::of::<T>())
+            .and_then(|b| b.downcast_ref::<T>())
+            .cloned()
+    }
+
+    /// Store a value in this group's per-handle [`TypeId`] cache.
+    pub fn set_table_cache<T: 'static>(&self, data: T) {
+        self.table_cache
+            .write()
+            .unwrap()
+            .insert(TypeId::of::<T>(), Box::new(data));
     }
 }
 
@@ -1137,17 +1544,15 @@ impl LoopbackPair {
 /// so multiple groups can share one swarm later without touching the
 /// message paths.
 struct WebGroupState {
-    /// The user-facing topic string passed to the constructor (before
-    /// key derivation). Retained for future re-announce / join APIs.
-    #[allow(dead_code)]
+    /// The user-facing topic string passed to the constructor (before key
+    /// derivation). Surfaced in `WebSyncStatus.joined_topics`.
     user_topic: String,
     /// Effective (derived) topic — `BLAKE3(user_topic + group_key)` when a
     /// passphrase is set, else the raw `user_topic`. This is the wire
     /// topic and the key this group is stored under in the `groups` map.
     topic: String,
-    /// Group kind marker for future scoped-group APIs; `None` for the
-    /// default group.
-    #[allow(dead_code)]
+    /// Group scope marker (issue #62 scope filtering); `None` for the
+    /// default group. Logged at join and carried for future scope reads.
     kind: Option<String>,
     group_key: Option<GroupKey>,
     /// Per-table delete policies + PK column names. Defaults are correct
@@ -1200,11 +1605,10 @@ struct EngineState {
     /// whenever the auto-reconnect loop schedules a relay redial; UIs
     /// read it via [`WebSyncClient::subscribe_status`].
     status_tx: watch::Sender<WebSyncStatus>,
-    /// Effective topic of the default group — the `groups` map key used
-    /// to route topic-less legacy paths (e.g. peer-address bookkeeping,
-    /// which uses the default group's store). Always present; equals the
-    /// single group's topic in this build.
-    #[allow(dead_code)]
+    /// Effective topic of the default group — the `groups` map key used to
+    /// route topic-less legacy paths (peer-address bookkeeping uses the
+    /// default group's store) and to keep the default group first in
+    /// `joined_topics` / refuse `leave_group` on it.
     default_topic: String,
 }
 
@@ -1238,13 +1642,14 @@ fn push_status(state: &EngineState, connected: &HashSet<LibPeerId>, relay_connec
     // Snapshot all immutable / carry-forward fields before send_replace
     // — holding the read guard across the write attempt races with the
     // watch's internal lock (see send_replace docs).
-    let (local_peer_id, relay_peer_id, local_ready, relay_reconnect_attempts) = {
+    let (local_peer_id, relay_peer_id, local_ready, relay_reconnect_attempts, joined_topics) = {
         let snap = state.status_tx.borrow();
         (
             snap.local_peer_id.clone(),
             snap.relay_peer_id.clone(),
             snap.local_ready,
             snap.relay_reconnect_attempts,
+            snap.joined_topics.clone(),
         )
     };
     // `send_replace` doesn't error on no-subscribers (unlike
@@ -1260,6 +1665,8 @@ fn push_status(state: &EngineState, connected: &HashSet<LibPeerId>, relay_connec
         // Carried forward — only `bump_reconnect_attempts` advances it.
         relay_reconnect_attempts,
         connected_peer_ids,
+        // Carried forward — only join/leave (`update_joined_topics`) moves it.
+        joined_topics,
     });
 }
 
@@ -1272,6 +1679,47 @@ fn bump_reconnect_attempts(state: &EngineState) {
     let mut next = state.status_tx.borrow().clone();
     next.relay_reconnect_attempts = next.relay_reconnect_attempts.saturating_add(1);
     state.status_tx.send_replace(next);
+}
+
+/// Recompute `WebSyncStatus.joined_topics` from the live `groups` map,
+/// default group first, and publish it (every other status field carried
+/// forward). Called on join/leave — the only two events that change group
+/// membership. Kept separate from `push_status` because a connection event
+/// never changes the joined set, and `push_status` has no `groups` handle.
+fn update_joined_topics(state: &EngineState, groups: &HashMap<String, WebGroupState>) {
+    let mut topics: Vec<String> = Vec::with_capacity(groups.len());
+    // Default first (deterministic ordering the UI can rely on).
+    if let Some(def) = groups.get(&state.default_topic) {
+        topics.push(def.user_topic.clone());
+    }
+    for (topic, group) in groups.iter() {
+        if topic != &state.default_topic {
+            topics.push(group.user_topic.clone());
+        }
+    }
+    let mut next = state.status_tx.borrow().clone();
+    next.joined_topics = topics;
+    state.status_tx.send_replace(next);
+}
+
+/// Spawn the one-shot startup tombstone GC sweep for a group's store,
+/// mirroring the block in `start()`. Aged tombstones are already excluded
+/// from every sync surface; this only reclaims IndexedDB bytes, so any
+/// failure is logged and swallowed. No-op for stores-less (ephemeral)
+/// groups.
+fn spawn_group_gc_sweep(store: Option<Arc<BrowserStore>>, config: WebSyncConfig) {
+    if let Some(gc_store) = store {
+        wasm_bindgen_futures::spawn_local(async move {
+            let now = crate::web_store::now_secs();
+            match crate::web_sync_core::gc_aged_tombstones_core(&config, &*gc_store, now).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!("WebSyncClient: tombstone GC reaped {n} aged tombstone(s)")
+                }
+                Err(e) => tracing::warn!("WebSyncClient: tombstone GC failed (non-fatal): {e}"),
+            }
+        });
+    }
 }
 
 /// Arm the reconnect timer with exponential backoff + jitter: 1s, 2s,
@@ -1401,6 +1849,15 @@ async fn run_loopback(
                             Err(e) => Err(e),
                         };
                         let _ = ack.send(result);
+                    }
+                    Some(Command::JoinGroup(_, ack)) => {
+                        // Loopback hosts only the default group. The client
+                        // rejects join_group before sending, so this is a
+                        // defensive fail-closed for the shared command enum.
+                        let _ = ack.send(Err(WebSyncError::Unsupported));
+                    }
+                    Some(Command::LeaveGroup { ack, .. }) => {
+                        let _ = ack.send(Err(WebSyncError::Unsupported));
                     }
                     None => {
                         tracing::info!("WebSyncClient (loopback): command channel closed");
@@ -1899,16 +2356,89 @@ async fn run_swarm(
                     Some(Command::SubmitLocal { table, pk, columns, topic, ack }) => {
                         let result = match group_for_topic(&mut groups, &topic) {
                             Some(group) => handle_submit_local(group, &mut swarm, &connected, table, pk, columns).await,
-                            None => Err(WebSyncError::NotRunning),
+                            None => Err(WebSyncError::GroupNotJoined),
                         };
                         let _ = ack.send(result);
                     }
                     Some(Command::SubmitLocalDelete { table, pk, topic, ack }) => {
                         let result = match group_for_topic(&mut groups, &topic) {
                             Some(group) => handle_submit_local_delete(group, &mut swarm, &connected, table, pk).await,
-                            None => Err(WebSyncError::NotRunning),
+                            None => Err(WebSyncError::GroupNotJoined),
                         };
                         let _ = ack.send(result);
+                    }
+                    Some(Command::JoinGroup(init, ack)) => {
+                        // Idempotent: an already-present effective topic just
+                        // acks Ok (the client returns its live handle).
+                        if groups.contains_key(&init.topic) {
+                            let _ = ack.send(Ok(()));
+                        } else {
+                            let WebGroupInit {
+                                user_topic,
+                                topic,
+                                kind,
+                                group_key,
+                                config,
+                                store,
+                                site_id,
+                                db_version,
+                                inbound_tx,
+                                resolved_tx,
+                            } = *init;
+                            let gc_store = store.clone();
+                            let gc_config = config.clone();
+                            let group = WebGroupState {
+                                user_topic,
+                                topic: topic.clone(),
+                                kind,
+                                group_key,
+                                config,
+                                store,
+                                site_id,
+                                db_version: Arc::new(Mutex::new(db_version)),
+                                inbound_tx,
+                                resolved_tx,
+                                rejected_peers: HashMap::new(),
+                                // Not yet announced on the current relay
+                                // connection — the drain below (or the next
+                                // relay reconnect) sends its AnnouncePresence.
+                                announced: false,
+                            };
+                            groups.insert(topic.clone(), group);
+                            tracing::info!(
+                                topic = %topic,
+                                kind = ?groups.get(&topic).and_then(|g| g.kind.as_deref()),
+                                "WebSyncClient: joined group"
+                            );
+                            // Late-join announce: if the relay is already
+                            // connected, queue it so the loop-head drain sends
+                            // AnnouncePresence for this (announced=false) group.
+                            // Existing groups stay announced=true and are
+                            // skipped, so only the new group announces.
+                            if relay_connected && let Some(relay) = state.relay_peer_id {
+                                pending_announces.push(relay);
+                            }
+                            // Reclaim aged tombstone bytes for the new store,
+                            // mirroring the constructor's startup sweep.
+                            spawn_group_gc_sweep(gc_store, gc_config);
+                            update_joined_topics(&state, &groups);
+                            let _ = ack.send(Ok(()));
+                        }
+                    }
+                    Some(Command::LeaveGroup { effective_topic, ack }) => {
+                        if effective_topic == state.default_topic {
+                            // The default group is torn down only with the
+                            // client — refuse to leave it.
+                            let _ = ack.send(Err(WebSyncError::DefaultGroup));
+                        } else {
+                            groups.remove(&effective_topic);
+                            tracing::info!(
+                                topic = %effective_topic,
+                                "WebSyncClient: left group"
+                            );
+                            update_joined_topics(&state, &groups);
+                            let _ = ack.send(Ok(()));
+                        }
                     }
                     None => {
                         tracing::info!("WebSyncClient: command channel closed, exiting");
