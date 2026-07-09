@@ -148,9 +148,11 @@ impl std::fmt::Debug for GroupKey {
 // and browser-side KDF (wasm / `web` feature): lets a call site skip Argon2id
 // entirely when a previously derived key was cached or computed off-thread,
 // and lets it persist a freshly derived one. Gated on iOS (on-disk cache) +
-// test (cache contract verification) + web feature (browser KDF stall
-// mitigation — issue #94); see `connection::group_key_for_dir`'s docs.
-#[cfg(any(target_os = "ios", test, feature = "web"))]
+// test (cache contract verification) + the browser targets (KDF stall
+// mitigation — issue #94). wasm32 is included alongside the `web` feature
+// because the browser modules compile on bare wasm32 too (same split as
+// `web_sync_core`'s gate); see `connection::group_key_for_dir`'s docs.
+#[cfg(any(target_os = "ios", test, feature = "web", target_arch = "wasm32"))]
 impl GroupKey {
     /// Wrap a full-entropy 32-byte group key without deriving.
     ///
