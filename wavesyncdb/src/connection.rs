@@ -694,11 +694,37 @@ impl WaveSyncDb {
     ///
     /// Installs the change-capture triggers for the table before adding it to
     /// the registry — a registered table must never have a capture gap, or
-    /// its writes are silently never synced. The table (and its shadow table)
-    /// must already exist; use [`SchemaBuilder`](Self::schema) or
-    /// [`sync_entity`](Self::sync_entity) for the full create-and-register
-    /// flow.
+    /// its writes are silently never synced. The base table must already
+    /// exist; the shadow (clock) table must NOT be pre-created — this method
+    /// is its sole creator and uses the shadow table's prior existence to tell
+    /// a returning, trigger-loss-damaged table apart from a first-ever
+    /// registration. Pre-creating the shadow table would make a first
+    /// registration's rows look like uncovered repair candidates. Use
+    /// [`SchemaBuilder`](Self::schema) or [`sync_entity`](Self::sync_entity)
+    /// for the full create-and-register flow.
     pub async fn register_table(&self, meta: TableMeta) -> Result<(), DbErr> {
+        // Direct-call / single-table path: detect, register, and run the
+        // repair inline. The inline drain is safe here for the same reason the
+        // pre-existing per-call `drain_and_dispatch` is: a caller registering
+        // one table at a time already drains after each registration, so this
+        // adds no new not-yet-registered-table backlog hazard.
+        if let Some((table_name, sql)) = self.register_table_detect(meta).await? {
+            self.run_capture_repair(&table_name, &sql).await?;
+        }
+        Ok(())
+    }
+
+    /// Detect trigger-loss damage, create the shadow table, install triggers,
+    /// and add the table to the registry. Returns `Some((table_name, sql))`
+    /// with the repair statement to run **after** the caller has registered
+    /// every table it intends to — deferring lets a multi-table registration
+    /// loop finish before any drain fires, so the repair's drain never purges
+    /// a not-yet-registered table's crash-window backlog. Returns `None` when
+    /// no repair is needed.
+    async fn register_table_detect(
+        &self,
+        meta: TableMeta,
+    ) -> Result<Option<(String, String)>, DbErr> {
         // Trigger-loss damage detection (#96). Capture whether this table
         // already synced in a previous run — its shadow table's prior
         // existence — BEFORE we (idempotently) create it below. This is the
@@ -720,31 +746,36 @@ impl WaveSyncDb {
         // triggers were ALL missing means the triggers were removed while the
         // table was live (the #96 sibling-prefix bug, or the documented
         // downgrade escape hatch). Rows written during that gap have no clock
-        // coverage and would never sync (push or catch-up); re-touch them so
-        // the just-recreated triggers record them. Build the statement before
-        // registering (it needs the pk/column list), run it after registering
-        // so the drain's planner recognises the table.
+        // coverage and would never sync (push or catch-up); the repair
+        // synthesizes their capture rows so the drain records them. Build the
+        // statement before registering (it needs the pk/column list); the
+        // caller runs it after registering so the drain's planner recognises
+        // the table.
         let repair_sql = (clock_pre_existed && !own_triggers_pre_existed)
             .then(|| crate::capture::repair_uncovered_rows_sql(&meta));
         let table_name = meta.table_name.clone();
         self.inner.registry.register(meta);
+        Ok(repair_sql.map(|sql| (table_name, sql)))
+    }
 
-        if let Some(sql) = repair_sql {
-            // Runs through the wrapper (capture ON, a normal LOCAL write — never
-            // inside the remote-apply suppression bracket): the post-statement
-            // drain gives the re-touched rows clock coverage immediately, and
-            // the coverage is committed durably in the drain transaction even
-            // if the engine is not yet consuming changesets, so these rows are
-            // never lost (they catch up via the version-vector path either way).
-            let res = self.execute_unprepared(&sql).await?;
-            let n = res.rows_affected();
-            if n > 0 {
-                tracing::info!(
-                    table = %table_name,
-                    repaired = n,
-                    "capture repair: re-touched rows missing clock coverage"
-                );
-            }
+    /// Execute a capture-repair statement built by [`register_table_detect`].
+    /// Runs through the wrapper (capture ON, a normal LOCAL write — never
+    /// inside the remote-apply suppression bracket): the statement synthesizes
+    /// `'I'` capture rows into `_wavesync_changes` (the user table is untouched,
+    /// so no FK/`ON DELETE` side effect fires), and the post-statement drain
+    /// gives those rows clock coverage. The coverage is committed durably in
+    /// the drain transaction even if the engine is not yet consuming
+    /// changesets, so the repaired rows are never lost (they catch up via the
+    /// version-vector path either way).
+    async fn run_capture_repair(&self, table_name: &str, sql: &str) -> Result<(), DbErr> {
+        let res = self.execute_unprepared(sql).await?;
+        let n = res.rows_affected();
+        if n > 0 {
+            tracing::info!(
+                table = %table_name,
+                repaired = n,
+                "capture repair: synthesized capture rows for rows missing clock coverage"
+            );
         }
         Ok(())
     }
@@ -1326,6 +1357,12 @@ impl<'a> SchemaBuilder<'a> {
 
     /// Create all registered tables and register synced ones for P2P replication.
     pub async fn sync(self) -> Result<(), DbErr> {
+        // Collect any trigger-loss repair statements and defer running them
+        // until every table is registered (below). Running a repair mid-loop
+        // would drain `_wavesync_changes` while later tables are still
+        // unregistered, purging their crash-window / separate-process backlog
+        // that the end-of-sync startup drain exists to recover.
+        let mut pending_repairs: Vec<(String, String)> = Vec::new();
         for entry in &self.entries {
             self.db
                 .inner
@@ -1333,13 +1370,21 @@ impl<'a> SchemaBuilder<'a> {
                 .execute_unprepared(&entry.create_sql)
                 .await?;
             if entry.synced {
-                // register_table creates the shadow table and installs the
-                // capture triggers before registration — a registered table
-                // must never have a capture gap. It is the sole creator of the
-                // shadow table so its trigger-loss damage detection can tell a
-                // returning table apart from a first registration.
-                self.db.register_table(entry.meta.clone()).await?;
+                // Creates the shadow table and installs the capture triggers
+                // before registration — a registered table must never have a
+                // capture gap. Sole creator of the shadow table, so its
+                // trigger-loss damage detection can tell a returning table
+                // apart from a first registration. The repair (if any) is
+                // deferred to after the loop.
+                if let Some(repair) = self.db.register_table_detect(entry.meta.clone()).await? {
+                    pending_repairs.push(repair);
+                }
             }
+        }
+        // Every table is registered now, so a repair's drain can no longer
+        // purge a not-yet-registered table's backlog.
+        for (table_name, sql) in &pending_repairs {
+            self.db.run_capture_repair(table_name, sql).await?;
         }
         // Drain anything already captured: crash-window leftovers (a user
         // write committed but its bookkeeping never ran), writes from a

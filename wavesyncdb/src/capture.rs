@@ -184,23 +184,40 @@ pub(crate) fn trigger_sql(meta: &TableMeta) -> Result<[(String, String); 3], DbE
 /// live (the #96 sibling-prefix bug, or the documented downgrade escape hatch):
 /// rows written during that gap have no shadow coverage and would never sync.
 ///
-/// `INSERT OR REPLACE … SELECT *` re-inserts each uncovered row as itself,
-/// firing only the `AFTER INSERT` trigger (recursive_triggers is OFF, so the
-/// implicit delete fires nothing and no other row is displaced), which the
-/// drain turns into a full per-column clock entry — a plain `SET pk = pk`
-/// no-op UPDATE would be dropped by the drain's no-op filter and cover
-/// nothing. A row with ANY clock entry — including a tombstone (`cid =
-/// '__deleted'`) — is excluded, so a deleted row is never resurrected, and an
-/// already-covered row is left untouched (idempotent). The subquery only
-/// *reads* the internal clock table; the write targets the user table, so the
-/// capture trigger fires for the user table alone.
+/// The user table is **never touched**: the statement *synthesizes* the exact
+/// `'I'` capture rows the `AFTER INSERT` trigger would have written, straight
+/// into `_wavesync_changes` (`json_row_expr` over the base row, table-qualified,
+/// renders byte-for-byte what the `NEW`-prefixed trigger body produces). The
+/// earlier `INSERT OR REPLACE INTO "t" SELECT *` idiom re-inserted each row as
+/// itself, but with SQLite's default `foreign_keys=ON` the REPLACE conflict
+/// resolution runs an implicit DELETE of the pre-existing row, which fires
+/// `ON DELETE CASCADE`/`SET NULL` on child tables (silently deleting/corrupting
+/// children — captured and replicated mesh-wide) and hard-fails under
+/// `RESTRICT`. Synthesizing the capture rows directly sidesteps every FK and
+/// trigger side effect: zero user-table mutation.
+///
+/// A row with ANY clock entry — including a tombstone (`cid = '__deleted'`) — is
+/// excluded, so a deleted row is never resurrected, and an already-covered row
+/// is left untouched (idempotent). The statement writes to the internal
+/// `_wavesync_changes` table, which has no capture trigger of its own
+/// (`trigger_sql` refuses `_wavesync*`); the drain then reads these rows, and
+/// `plan_logical_ops` keys the `_wavesync` skip on the captured *table name* in
+/// the `tbl` column (here the user table), so the synthesized ops are planned
+/// normally and the drain records a full per-column clock entry for each.
 pub(crate) fn repair_uncovered_rows_sql(meta: &TableMeta) -> String {
     let t = &meta.table_name;
     let p = &meta.primary_key_column;
     let clock = crate::shadow::shadow_table_name(t);
+    // Table-qualified column refs so the JSON payload binds unambiguously to
+    // the outer table (never the clock subquery), matching the trigger's
+    // `NEW.`-qualified spelling.
+    let src = format!("\"{t}\"");
+    let new_row = json_row_expr(&src, meta);
     format!(
-        "INSERT OR REPLACE INTO \"{t}\" SELECT * FROM \"{t}\" \
-         WHERE CAST(\"{p}\" AS TEXT) NOT IN (SELECT pk FROM \"{clock}\")"
+        "INSERT INTO {CAPTURE_TABLE} (tbl, op, pk, new_row) \
+         SELECT '{t}', 'I', CAST(\"{t}\".\"{p}\" AS TEXT), {new_row} \
+         FROM \"{t}\" \
+         WHERE CAST(\"{t}\".\"{p}\" AS TEXT) NOT IN (SELECT pk FROM \"{clock}\")"
     )
 }
 
@@ -589,6 +606,87 @@ mod tests {
         let new: serde_json::Value =
             serde_json::from_str(rows[1].new_row.as_deref().unwrap()).unwrap();
         assert_eq!(new["title"], json!("b"));
+    }
+
+    #[tokio::test]
+    async fn test_repair_synthesizes_trigger_identical_capture_row() {
+        let db = setup_db().await;
+        // The clock table must exist for the repair's NOT-IN subquery; it is
+        // empty, so every base row is uncovered.
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
+
+        // A normal insert: the AFTER INSERT trigger writes the reference
+        // capture row (full type matrix incl. a BLOB).
+        db.execute_unprepared(
+            "INSERT INTO tasks (id, title, done, score, data) VALUES ('t1', 'hello', 1, 2.5, X'DEADBEEF')",
+        )
+        .await
+        .unwrap();
+        let trigger_new = {
+            let rows = capture_rows(&db).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].op, "I");
+            rows[0].new_row.clone().unwrap()
+        };
+
+        // Clear the capture table so only the synthesized row is left to
+        // inspect. The base row still has no clock coverage, so repair re-emits
+        // it — and must produce a byte-identical `new_row`.
+        db.execute_unprepared("DELETE FROM _wavesync_changes")
+            .await
+            .unwrap();
+        db.execute_unprepared(&repair_uncovered_rows_sql(&tasks_meta()))
+            .await
+            .unwrap();
+
+        let synth = capture_rows(&db).await;
+        assert_eq!(
+            synth.len(),
+            1,
+            "one uncovered row → one synthesized capture"
+        );
+        assert_eq!(synth[0].op, "I");
+        assert_eq!(synth[0].tbl, "tasks");
+        assert_eq!(synth[0].pk, "t1");
+        assert!(synth[0].old_row.is_none());
+        assert_eq!(
+            synth[0].new_row.as_deref(),
+            Some(trigger_new.as_str()),
+            "synthesized new_row must byte-match the real INSERT trigger's payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repair_skips_covered_and_tombstoned_rows() {
+        let db = setup_db().await;
+        crate::shadow::create_shadow_table(&db, "tasks")
+            .await
+            .unwrap();
+        // Seed a live clock entry for 'covered' and a tombstone for 'gone'.
+        db.execute_unprepared(
+            "INSERT INTO _wavesync_tasks_clock (pk, cid, col_version, db_version, site_id) \
+             VALUES ('covered', 'title', 1, 1, X'00'), ('gone', '__deleted', 1, 1, X'00')",
+        )
+        .await
+        .unwrap();
+        // Three base rows: one covered, one tombstoned, one uncovered.
+        db.execute_unprepared(
+            "INSERT INTO tasks (id, title) VALUES ('covered', 'a'), ('gone', 'b'), ('fresh', 'c')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("DELETE FROM _wavesync_changes")
+            .await
+            .unwrap();
+
+        db.execute_unprepared(&repair_uncovered_rows_sql(&tasks_meta()))
+            .await
+            .unwrap();
+        let synth = capture_rows(&db).await;
+        assert_eq!(synth.len(), 1, "only the uncovered row is synthesized");
+        assert_eq!(synth[0].pk, "fresh");
     }
 
     #[tokio::test]

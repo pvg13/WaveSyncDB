@@ -1796,7 +1796,7 @@ async fn make_meal_peer(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::Wave
 }
 
 // Seeds 13-14: free slot verified by grepping every make_node_id(..) call
-// under wavesyncdb/tests/ (see CLAUDE.md §6 seed table for the documented
+// under wavesyncdb/tests/ (see the project's seed registry for the documented
 // ranges plus this addition).
 #[tokio::test]
 async fn test_prefix_sibling_tables_both_sync_96() {
@@ -1845,7 +1845,8 @@ async fn test_prefix_sibling_tables_both_sync_96() {
 // be resurrected.
 //
 // Seeds 15-16 (repair) and 17 (adoption): free slots verified by grepping every
-// make_node_id(..) call under wavesyncdb/tests/; documented in CLAUDE.md §6.
+// make_node_id(..) call under wavesyncdb/tests/; documented in the project's
+// seed registry.
 // ---------------------------------------------------------------------------
 
 #[derive(FromQueryResult)]
@@ -2035,4 +2036,180 @@ async fn test_first_registration_does_not_adopt_preexisting_rows() {
         0,
         "first registration must not adopt pre-existing rows into the clock table"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #96 auto-repair must NOT mutate the user table. With SQLite's default
+// `foreign_keys=ON` (sqlx's default, never overridden here), the earlier
+// `INSERT OR REPLACE INTO "t" SELECT *` repair idiom ran an implicit DELETE of
+// each replaced row, which fired `ON DELETE CASCADE` on child tables — silently
+// deleting the children (and replicating those deletes mesh-wide). The repair
+// now synthesizes capture rows directly and never touches the user table, so no
+// FK action fires. This test damages a parent table with a live CASCADE child
+// and asserts the child survives the repair (and both converge to a peer).
+//
+// Seeds 18-19: free slots verified by grepping every make_node_id(..) call
+// under wavesyncdb/tests/; documented in the project's seed registry.
+// ---------------------------------------------------------------------------
+mod fk_parent_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "fk_parent")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+mod fk_child_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "fk_child")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub parent_id: String,
+        pub note: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Count of NON-tombstone clock entries for a given pk in an arbitrary table.
+async fn live_clock_entries(db: &sea_orm::DatabaseConnection, table: &str, pk: &str) -> i64 {
+    let clock = format!("_wavesync_{table}_clock");
+    ClockCntRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        format!("SELECT COUNT(*) AS cnt FROM \"{clock}\" WHERE pk = $1 AND cid != '__deleted'"),
+        [pk.into()],
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap()
+    .cnt
+}
+
+/// Peer with a parent table and a child table whose FK is `ON DELETE CASCADE`.
+/// The tables are pre-created with the real FK (SeaORM's `create_table_from_entity`
+/// is `IF NOT EXISTS`, so `sync()` keeps this definition). The FK is
+/// `DEFERRABLE INITIALLY DEFERRED` only so a remote peer applying both rows in
+/// one transaction is order-independent — deferral affects *when* the
+/// constraint is checked, never whether `ON DELETE CASCADE` fires.
+async fn make_fk_peer(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+    let peer = WaveSyncDbBuilder::new(db_url, topic)
+        .with_node_id(common::make_node_id(seed))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create peer");
+    peer.inner()
+        .execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS fk_parent (id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await
+        .unwrap();
+    peer.inner()
+        .execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS fk_child (\
+               id TEXT PRIMARY KEY, \
+               parent_id TEXT NOT NULL, \
+               note TEXT NOT NULL, \
+               FOREIGN KEY (parent_id) REFERENCES fk_parent(id) \
+               ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        )
+        .await
+        .unwrap();
+    peer.schema()
+        .register(fk_parent_row::Entity)
+        .register(fk_child_row::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema");
+    peer
+}
+
+#[tokio::test]
+async fn test_capture_repair_does_not_cascade_delete_children_96() {
+    common::init_test_tracing();
+    let topic = format!("test-cap-repair-fk-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+    let url_a = mem_db("cap_repair_fk_a");
+
+    // Peer A registers parent + child (FK ON DELETE CASCADE), triggers active.
+    let a = make_fk_peer(&url_a, &topic, 18).await;
+
+    // Damage the PARENT table only: drop its capture triggers, then write an
+    // uncovered parent row p1 and a child c1 referencing it, straight to the
+    // inner connection (parent write is unrecorded; child write is captured by
+    // the still-live child trigger).
+    drop_capture_triggers(a.inner(), "fk_parent").await;
+    a.inner()
+        .execute_unprepared("INSERT INTO fk_parent (id, name) VALUES ('p1', 'parent one')")
+        .await
+        .unwrap();
+    a.inner()
+        .execute_unprepared(
+            "INSERT INTO fk_child (id, parent_id, note) VALUES ('c1', 'p1', 'child one')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live_clock_entries(a.inner(), "fk_parent", "p1").await,
+        0,
+        "precondition: parent p1 has no clock coverage after the trigger-loss gap write"
+    );
+
+    // Reopen the same DB file: re-registration detects the parent's trigger
+    // loss and repairs it. The OLD `INSERT OR REPLACE INTO fk_parent SELECT *`
+    // idiom would REPLACE p1, whose implicit delete cascades and deletes c1.
+    // Synthesizing capture rows never touches fk_parent, so c1 survives.
+    a.shutdown().await;
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let a2 = make_fk_peer(&url_a, &topic, 18).await;
+
+    assert!(
+        live_clock_entries(a2.inner(), "fk_parent", "p1").await > 0,
+        "repair must give the uncovered parent row clock coverage"
+    );
+    assert!(
+        fk_child_row::Entity::find_by_id("c1")
+            .one(&a2)
+            .await
+            .unwrap()
+            .is_some(),
+        "repair must not cascade-delete the child row"
+    );
+
+    // Both parent and child converge to a second peer (proves they sync).
+    let b = make_fk_peer(&mem_db("cap_repair_fk_b"), &topic, 19).await;
+    assert_eventually("B receives parent p1 and child c1", timeout, || async {
+        let p = fk_parent_row::Entity::find_by_id("p1")
+            .one(&b)
+            .await
+            .unwrap();
+        let c = fk_child_row::Entity::find_by_id("c1")
+            .one(&b)
+            .await
+            .unwrap();
+        p.is_some_and(|m| m.name == "parent one") && c.is_some_and(|m| m.note == "child one")
+    })
+    .await;
 }
