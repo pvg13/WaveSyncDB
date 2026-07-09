@@ -1726,3 +1726,110 @@ async fn test_trigger_capture_insert_or_replace_syncs() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// #96 regression: `ensure_triggers`'s stale-trigger scan used a raw
+// `LIKE '{prefix}%'` match against `sqlite_master`. For table `meal` that
+// pattern (`_wavesync_tr_meal_%`) also matches sibling table `meal_plan`'s
+// own triggers (`_wavesync_tr_meal_plan_i_...`). If `meal_plan` registers
+// first, registering `meal` afterward classified `meal_plan`'s triggers as
+// "stale" and dropped them — every subsequent write to `meal_plan` produced
+// no capture rows and silently never synced. Registration order here
+// mirrors the victim scenario: `meal_plan` is registered before `meal` in
+// the same `.schema()...sync()` pass, which registers entries in call
+// order (see `SchemaBuilder::sync`).
+// ---------------------------------------------------------------------------
+mod meal_plan_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "meal_plan")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+mod meal_row {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "meal")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub name: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Registers `meal_plan` BEFORE `meal` — the victim-first order that
+/// reproduces #96 on unfixed code.
+async fn make_meal_peer(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+    let peer = WaveSyncDbBuilder::new(db_url, topic)
+        .with_node_id(common::make_node_id(seed))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create peer");
+    peer.schema()
+        .register(meal_plan_row::Entity)
+        .register(meal_row::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema");
+    peer
+}
+
+// Seeds 13-14: free slot verified by grepping every make_node_id(..) call
+// under wavesyncdb/tests/ (see CLAUDE.md §6 seed table for the documented
+// ranges plus this addition).
+#[tokio::test]
+async fn test_prefix_sibling_tables_both_sync_96() {
+    common::init_test_tracing();
+    let topic = format!("test-cap-96-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+
+    let a = make_meal_peer(&mem_db("cap_96_a"), &topic, 13).await;
+    let b = make_meal_peer(&mem_db("cap_96_b"), &topic, 14).await;
+
+    meal_plan_row::ActiveModel {
+        id: Set("mp1".into()),
+        name: Set("weekly plan".into()),
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    meal_row::ActiveModel {
+        id: Set("m1".into()),
+        name: Set("breakfast".into()),
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+
+    assert_eventually("B has both meal_plan and meal rows", timeout, || async {
+        let plan = meal_plan_row::Entity::find_by_id("mp1")
+            .one(&b)
+            .await
+            .unwrap();
+        let meal = meal_row::Entity::find_by_id("m1").one(&b).await.unwrap();
+        plan.is_some_and(|m| m.name == "weekly plan") && meal.is_some_and(|m| m.name == "breakfast")
+    })
+    .await;
+}

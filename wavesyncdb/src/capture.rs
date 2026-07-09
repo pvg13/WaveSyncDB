@@ -111,6 +111,26 @@ fn trigger_prefix(table: &str) -> String {
     format!("_wavesync_tr_{table}_")
 }
 
+/// True iff `name` is one of THIS table's capture triggers:
+/// `{prefix}(i|u|d)_{8 lowercase hex}`. The stale scan's LIKE pattern is a
+/// raw prefix match, so for table `meal` it also returns sibling tables'
+/// triggers (`_wavesync_tr_meal_plan_i_…`) — classifying those as stale
+/// dropped them and silently killed the sibling's capture (#96). Only
+/// names passing this exact-shape check may ever be dropped.
+fn is_own_trigger(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((kind, fp)) = rest.split_once('_') else {
+        return false;
+    };
+    matches!(kind, "i" | "u" | "d")
+        && fp.len() == 8
+        && fp
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 /// The three `(name, CREATE TRIGGER ...)` pairs for a table. Errors on
 /// `_wavesync*` tables — internal tables must never be captured (capturing a
 /// shadow write would re-enter the write path and loop).
@@ -168,15 +188,20 @@ pub(crate) async fn ensure_triggers(
 ) -> Result<(), DbErr> {
     ensure_capture_tables(db).await?;
     let triggers = trigger_sql(meta)?;
+    let prefix = trigger_prefix(&meta.table_name);
 
     #[derive(FromQueryResult)]
     struct NameRow {
         name: String,
     }
+    // The LIKE pattern is a raw prefix match: for table `meal` it also
+    // returns sibling tables whose name starts with "meal" (`meal_plan`'s
+    // triggers, `_wavesync_tr_meal_plan_i_...`). `is_own_trigger` below is
+    // the exact-shape post-filter that keeps those out of the drop set.
     let existing: Vec<String> = NameRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
         "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE $1",
-        [format!("{}%", trigger_prefix(&meta.table_name)).into()],
+        [format!("{prefix}%").into()],
     ))
     .all(db)
     .await?
@@ -185,7 +210,10 @@ pub(crate) async fn ensure_triggers(
     .collect();
 
     let wanted: Vec<&str> = triggers.iter().map(|(n, _)| n.as_str()).collect();
-    for stale in existing.iter().filter(|n| !wanted.contains(&n.as_str())) {
+    for stale in existing
+        .iter()
+        .filter(|n| is_own_trigger(n, &prefix) && !wanted.contains(&n.as_str()))
+    {
         db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS \"{stale}\""))
             .await?;
     }
@@ -578,6 +606,88 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(row.cnt, 3);
+    }
+
+    /// Multiple base tables in one DB, for exercising the stale-trigger scan
+    /// across sibling table names (e.g. `meal` vs `meal_plan`).
+    async fn setup_multi_db(tables: &[(&str, &[&str])]) -> sea_orm::DatabaseConnection {
+        let path =
+            std::env::temp_dir().join(format!("wavesync_capture_{}.db", uuid::Uuid::new_v4()));
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        for (table, cols) in tables {
+            let col_defs: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 0 {
+                        format!("\"{c}\" TEXT PRIMARY KEY")
+                    } else {
+                        format!("\"{c}\" TEXT")
+                    }
+                })
+                .collect();
+            db.execute_unprepared(&format!(
+                "CREATE TABLE \"{table}\" ({})",
+                col_defs.join(", ")
+            ))
+            .await
+            .unwrap();
+        }
+        ensure_capture_tables(&db).await.unwrap();
+        db
+    }
+
+    async fn count_triggers_like(db: &sea_orm::DatabaseConnection, pattern: &str) -> i64 {
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            cnt: i64,
+        }
+        CountRow::find_by_statement(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) as cnt FROM sqlite_master WHERE type='trigger' AND name LIKE $1",
+            [pattern.into()],
+        ))
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+        .cnt
+    }
+
+    // Regression for #96: the stale-trigger scan used a raw `LIKE
+    // '{prefix}%'` match, so registering `meal` after `meal_plan` classified
+    // `meal_plan`'s own triggers (`_wavesync_tr_meal_plan_i_...`) as stale
+    // `meal` triggers and dropped them — silently killing `meal_plan`'s
+    // capture if it registered first.
+    #[tokio::test]
+    async fn ensure_triggers_does_not_drop_prefix_sibling() {
+        let meal_plan = meta("meal_plan", "id", &["id", "name"]);
+        let meal = meta("meal", "id", &["id", "name"]);
+        let db = setup_multi_db(&[("meal_plan", &["id", "name"]), ("meal", &["id", "name"])]).await;
+
+        ensure_triggers(&db, &meal_plan).await.unwrap();
+        ensure_triggers(&db, &meal).await.unwrap(); // must NOT drop meal_plan's
+
+        let n = count_triggers_like(&db, "_wavesync_tr_meal_plan_%").await;
+        assert_eq!(
+            n, 3,
+            "meal_plan's capture triggers must survive meal's registration"
+        );
+    }
+
+    #[test]
+    fn own_trigger_shape_truth_table() {
+        let p = trigger_prefix("meal");
+        assert!(is_own_trigger(&format!("{p}i_deadbeef"), &p));
+        assert!(is_own_trigger(&format!("{p}u_01234567"), &p));
+        assert!(is_own_trigger(&format!("{p}d_89abcdef"), &p));
+        assert!(!is_own_trigger("_wavesync_tr_meal_plan_i_deadbeef", &p)); // sibling
+        assert!(!is_own_trigger(&format!("{p}i_deadbee"), &p)); // 7 hex
+        assert!(!is_own_trigger(&format!("{p}i_deadbeef0"), &p)); // 9 hex
+        assert!(!is_own_trigger(&format!("{p}x_deadbeef"), &p)); // bad kind
+        assert!(!is_own_trigger(&format!("{p}i_DEADBEEF"), &p)); // fp is lowercase hex
     }
 
     #[tokio::test]
