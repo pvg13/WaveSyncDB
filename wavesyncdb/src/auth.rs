@@ -144,19 +144,33 @@ impl std::fmt::Debug for GroupKey {
     }
 }
 
-// Raw-bytes escape hatch for the on-disk group-key cache (`key_cache` module):
-// lets a call site skip Argon2id entirely when a previously derived key was
-// cached, and lets it persist a freshly derived one. Only `connection.rs`'s
-// iOS branch of `group_key_for_dir` ever calls these in production — gated
-// the same way (plus `test`, so the load-only cache contract is
-// host-testable — see `connection::group_key_for_dir`'s docs) so every other
-// production target doesn't carry (or warn about) unused raw-key plumbing.
-#[cfg(any(target_os = "ios", test))]
+// Raw-bytes escape hatch for the on-disk group-key cache (`key_cache` module)
+// and browser-side KDF (wasm / `web` feature): lets a call site skip Argon2id
+// entirely when a previously derived key was cached or computed off-thread,
+// and lets it persist a freshly derived one. Gated on iOS (on-disk cache) +
+// test (cache contract verification) + web feature (browser KDF stall
+// mitigation — issue #94); see `connection::group_key_for_dir`'s docs.
+#[cfg(any(target_os = "ios", test, feature = "web"))]
 impl GroupKey {
-    /// Wrap raw key bytes without deriving. The caller is responsible for the
-    /// bytes actually being a valid derivation of `(passphrase, user_topic)`
-    /// for some peer in the group — this constructor does no verification.
-    pub(crate) fn from_raw(key: [u8; 32]) -> Self {
+    /// Wrap a full-entropy 32-byte group key without deriving.
+    ///
+    /// Use this when you already hold a cryptographically-secure key derived
+    /// from `(passphrase, user_topic)` outside this library — for example,
+    /// an app-side KDF output or browser-side PBKDF2 in JavaScript that
+    /// avoids blocking the main thread with Argon2id.
+    ///
+    /// **WARNING:** This constructor skips the Argon2id memory-hard stretch
+    /// entirely. Feeding a low-entropy password directly here forfeits that
+    /// protection against dictionary attacks. Use `GroupKey::from_passphrase`
+    /// for passphrases instead; reserve `from_raw` for keys you know are
+    /// already derived or sufficiently random (e.g., from `getrandom`).
+    ///
+    /// The caller is responsible for the bytes being a valid derivation of
+    /// `(passphrase, user_topic)` for some peer in the group — this constructor
+    /// does no verification.
+    ///
+    /// This addresses the raw-key half of issue #94 (browser main-thread KDF stall).
+    pub fn from_raw(key: [u8; 32]) -> Self {
         Self { key }
     }
 
@@ -234,5 +248,31 @@ mod tests {
         let data = b"hello world";
         let tag = k1.mac(data);
         assert!(!k2.verify(data, &tag));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "ios", test, feature = "web"))]
+    fn test_from_raw_topic_derivation() {
+        // Raw-key initialization produces valid topic derivation.
+        let k = GroupKey::from_raw([1u8; 32]);
+        let t = k.derive_topic("example-app");
+        assert!(
+            t.starts_with("wavesync2-"),
+            "Topic should be namespaced with wavesync2- prefix, got: {}",
+            t
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "ios", test, feature = "web"))]
+    fn test_from_raw_different_keys_different_topics() {
+        // Two different raw keys derive different topics for the same user topic.
+        let k1 = GroupKey::from_raw([1u8; 32]);
+        let k2 = GroupKey::from_raw([2u8; 32]);
+        let t1 = k1.derive_topic("shared-app");
+        let t2 = k2.derive_topic("shared-app");
+        assert_ne!(t1, t2, "Different raw keys should yield different topics");
+        assert!(t1.starts_with("wavesync2-"));
+        assert!(t2.starts_with("wavesync2-"));
     }
 }
