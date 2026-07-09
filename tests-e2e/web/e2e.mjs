@@ -94,7 +94,7 @@ export async function scenarioRoundTrip(page, cfg) {
 // orchestrator; `nativeCtl` = { restart() } as a fallback if the native peer
 // does not re-announce on the restarted relay within the sync budget. The page
 // is already connected from scenario A (same page — reconnect must happen with
-// NO reload). `cfg` is unused here but kept for signature symmetry.
+// NO reload).
 export async function scenarioRelayRestart(page, relayCtl, nativeCtl) {
   const before = (await status(page)).reconnectAttempts;
   process.stdout.write(`[scenarioB] reconnectAttempts before kill = ${before}\n`);
