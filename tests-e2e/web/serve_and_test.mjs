@@ -2,7 +2,7 @@
 //
 // Boots the whole stack from scratch and runs the "boot" smoke scenario:
 //   1. relay (TCP + WebSocket listeners)
-//   2. native peer (dials the relay's TCP addr, seeds `from-native`)
+//   2. native peer (dials the relay's QUIC addr, seeds `from-native`)
 //   3. static HTTP server for the wasm page
 //   4. headless Chrome via puppeteer-core: load page -> e2e_init ->
 //      poll e2e_status() until relayConnected.

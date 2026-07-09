@@ -9,7 +9,7 @@
 //!
 //! | Var | Required | Description |
 //! |---|---|---|
-//! | `RELAY_ADDR`  | yes | libp2p multiaddr of the relay's TCP listener |
+//! | `RELAY_ADDR`  | yes | libp2p multiaddr of the relay (QUIC listener) |
 //! | `TOPIC`       | yes | user topic (must match the browser) |
 //! | `PASSPHRASE`  | yes | shared passphrase (HMAC + topic derivation) |
 //! | `DB_PATH`     | yes | filesystem path for the SQLite database |
