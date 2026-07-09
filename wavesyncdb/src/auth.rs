@@ -177,6 +177,14 @@ impl GroupKey {
     }
 
     /// Raw key bytes, for persisting to the on-disk cache after derivation.
+    /// The only caller (`connection::group_key_for_dir`) is compiled under
+    /// `cfg(not(wasm32))` + `cfg(any(target_os = "ios", test))`, so it has a
+    /// live caller only on a native ios-or-test build. Silence dead-code in
+    /// every other config (plain linux/web, and all wasm32 builds).
+    #[cfg_attr(
+        any(target_arch = "wasm32", not(any(target_os = "ios", test))),
+        allow(dead_code)
+    )]
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.key
     }

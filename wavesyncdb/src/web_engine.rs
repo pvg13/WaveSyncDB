@@ -102,22 +102,30 @@ struct WebBehaviour {
 
 enum Command {
     /// Caller-built changeset — fan-out as-is. Used by apps that want to
-    /// build their own `SyncChangeset` (e.g. tombstones).
-    Publish(SyncChangeset),
+    /// build their own `SyncChangeset` (e.g. tombstones). `topic` is the
+    /// EFFECTIVE (derived) topic selecting the target group.
+    Publish {
+        changeset: SyncChangeset,
+        topic: String,
+    },
     /// High-level local write — engine bumps `db_version` and per-column
     /// `col_version`, persists to shadow, then broadcasts. The new
-    /// `db_version` is delivered back via `ack`.
+    /// `db_version` is delivered back via `ack`. `topic` is the EFFECTIVE
+    /// (derived) topic selecting the target group.
     SubmitLocal {
         table: String,
         pk: String,
         columns: Vec<(String, serde_json::Value)>,
+        topic: String,
         ack: oneshot::Sender<Result<u64, WebSyncError>>,
     },
     /// High-level local row deletion — engine writes a `__deleted`
     /// tombstone (native-parity causal length), persists, then broadcasts.
+    /// `topic` is the EFFECTIVE (derived) topic selecting the target group.
     SubmitLocalDelete {
         table: String,
         pk: String,
+        topic: String,
         ack: oneshot::Sender<Result<u64, WebSyncError>>,
     },
 }
@@ -130,6 +138,10 @@ enum Command {
 #[derive(Clone)]
 pub struct WebSyncClient {
     cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Effective (derived) topic of the default group. Stamped onto every
+    /// command so the engine routes topic-less client calls to the right
+    /// group. Set once at construction; the public client API is unchanged.
+    default_topic: String,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
     /// `None` for ephemeral clients — keeps the public type uniform.
@@ -633,15 +645,24 @@ impl WebSyncClient {
         // startup GC sweep has its own copy.
         let gc_config = config.clone();
 
-        let state = EngineState {
-            site_id,
-            db_version: Arc::new(Mutex::new(db_version)),
-            topic: effective_topic,
+        // The one default group. `run_swarm` keys it in its `groups` map by
+        // its effective topic; `EngineState.default_topic` holds that key.
+        let default_group = WebGroupState {
+            user_topic: user_topic.to_string(),
+            topic: effective_topic.clone(),
+            kind: None,
             group_key,
             config,
             store: store.clone(),
+            site_id,
+            db_version: Arc::new(Mutex::new(db_version)),
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
+            rejected_peers: HashMap::new(),
+            announced: false,
+        };
+
+        let state = EngineState {
             // When a relay peer-id is set, the multiaddr we just dialed
             // (`target`) *is* the relay — remember it so the reconnect
             // loop has a redial target. `None` for the single-peer
@@ -650,9 +671,10 @@ impl WebSyncClient {
             relay_peer_id,
             cached_peer_addrs,
             status_tx,
+            default_topic: effective_topic.clone(),
         };
 
-        wasm_bindgen_futures::spawn_local(run_swarm(swarm, cmd_rx, state));
+        wasm_bindgen_futures::spawn_local(run_swarm(swarm, cmd_rx, state, default_group));
 
         // Physically collect aged tombstones off the startup path. Exclusion
         // already hides them from every sync surface; this only reclaims
@@ -679,6 +701,7 @@ impl WebSyncClient {
 
         Ok(Self {
             cmd_tx,
+            default_topic: effective_topic,
             inbound_tx,
             resolved_tx,
             store,
@@ -694,7 +717,10 @@ impl WebSyncClient {
     /// regular inserts and updates use [`Self::submit_local_write`].
     pub fn publish(&self, changeset: SyncChangeset) -> Result<(), WebSyncError> {
         self.cmd_tx
-            .send(Command::Publish(changeset))
+            .send(Command::Publish {
+                changeset,
+                topic: self.default_topic.clone(),
+            })
             .map_err(|_| WebSyncError::NotRunning)
     }
 
@@ -722,6 +748,7 @@ impl WebSyncClient {
                 table: table.to_string(),
                 pk: pk.to_string(),
                 columns,
+                topic: self.default_topic.clone(),
                 ack: tx,
             })
             .map_err(|_| WebSyncError::NotRunning)?;
@@ -745,6 +772,7 @@ impl WebSyncClient {
             .send(Command::SubmitLocalDelete {
                 table: table.to_string(),
                 pk: pk.to_string(),
+                topic: self.default_topic.clone(),
                 ack: tx,
             })
             .map_err(|_| WebSyncError::NotRunning)?;
@@ -942,22 +970,32 @@ impl WebSyncClient {
         let gc_config = config.clone();
 
         let store_arc = Arc::new(store);
-        let state = EngineState {
-            site_id,
-            db_version: Arc::new(Mutex::new(db_version)),
-            topic: effective_topic,
+        // Loopback runs a single group directly (no `groups` map — one peer,
+        // one topic). The slimmed `EngineState` only carries the status_tx
+        // sender alive for the task's lifetime here.
+        let group = WebGroupState {
+            user_topic: user_topic.to_string(),
+            topic: effective_topic.clone(),
+            kind: None,
             group_key,
             config,
             store: Some(store_arc.clone()),
+            site_id,
+            db_version: Arc::new(Mutex::new(db_version)),
             inbound_tx: inbound_tx.clone(),
             resolved_tx: resolved_tx.clone(),
+            rejected_peers: HashMap::new(),
+            announced: false,
+        };
+        let state = EngineState {
             relay_peer_id: None, // loopback transport has no notion of a relay
             relay_addr: None,    // no relay → no auto-reconnect loop
             cached_peer_addrs: Vec::new(),
             status_tx,
+            default_topic: effective_topic.clone(),
         };
 
-        wasm_bindgen_futures::spawn_local(run_loopback(end, cmd_rx, state));
+        wasm_bindgen_futures::spawn_local(run_loopback(end, cmd_rx, group, state));
 
         // Physically collect aged tombstones off the startup path. Exclusion
         // already hides them from every sync surface; this only reclaims
@@ -983,6 +1021,7 @@ impl WebSyncClient {
 
         Ok(Self {
             cmd_tx,
+            default_topic: effective_topic,
             inbound_tx,
             resolved_tx,
             store: Some(store_arc),
@@ -1090,10 +1129,26 @@ impl LoopbackPair {
     }
 }
 
-struct EngineState {
-    site_id: NodeId,
-    db_version: Arc<Mutex<u64>>,
+/// Per-group engine state. Each sync group (identified by its effective
+/// topic) owns its identity, CRDT store, subscriber channels, and
+/// HMAC-rejection backoff map. In the current single-group build exactly
+/// one of these exists — the default group — but the engine dispatches
+/// inbound traffic by topic through a `HashMap<String, WebGroupState>`
+/// so multiple groups can share one swarm later without touching the
+/// message paths.
+struct WebGroupState {
+    /// The user-facing topic string passed to the constructor (before
+    /// key derivation). Retained for future re-announce / join APIs.
+    #[allow(dead_code)]
+    user_topic: String,
+    /// Effective (derived) topic — `BLAKE3(user_topic + group_key)` when a
+    /// passphrase is set, else the raw `user_topic`. This is the wire
+    /// topic and the key this group is stored under in the `groups` map.
     topic: String,
+    /// Group kind marker for future scoped-group APIs; `None` for the
+    /// default group.
+    #[allow(dead_code)]
+    kind: Option<String>,
     group_key: Option<GroupKey>,
     /// Per-table delete policies + PK column names. Defaults are correct
     /// for tables that only ever insert/update; tables with deletes (or
@@ -1101,8 +1156,23 @@ struct EngineState {
     /// `*_with_config` constructors to match the native registry.
     config: WebSyncConfig,
     store: Option<Arc<BrowserStore>>,
+    site_id: NodeId,
+    db_version: Arc<Mutex<u64>>,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
+    /// Peers rejected for a bad/missing HMAC on THIS group's topic,
+    /// skipped while their backoff window is open (Rule 2.8). Scope is
+    /// per-(group, peer): a rejection in one group never touches another,
+    /// and an unknown topic is silently ignored long before this map is
+    /// consulted (never reject an unknown topic).
+    rejected_peers: HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
+    /// Whether this group has sent its `AnnouncePresence` on the current
+    /// relay connection. Reset to `false` on relay `ConnectionClosed`, so
+    /// a reconnect re-announces every group.
+    announced: bool,
+}
+
+struct EngineState {
     /// Pre-loaded cache of recently-working peer multiaddrs from
     /// IndexedDB. `run_swarm` dials these as soon as the relay is
     /// reachable (circuit-relay addrs need the relay first), in
@@ -1130,6 +1200,24 @@ struct EngineState {
     /// whenever the auto-reconnect loop schedules a relay redial; UIs
     /// read it via [`WebSyncClient::subscribe_status`].
     status_tx: watch::Sender<WebSyncStatus>,
+    /// Effective topic of the default group — the `groups` map key used
+    /// to route topic-less legacy paths (e.g. peer-address bookkeeping,
+    /// which uses the default group's store). Always present; equals the
+    /// single group's topic in this build.
+    #[allow(dead_code)]
+    default_topic: String,
+}
+
+/// Resolve the group that owns `topic` (the effective/derived topic
+/// carried on the wire). `None` means we hold no such group — the caller
+/// MUST silently ignore the message (Rule 2.8: never reject an unknown
+/// topic; it may belong to a group another peer holds, and it never
+/// touches `rejected_peers`).
+fn group_for_topic<'a>(
+    groups: &'a mut HashMap<String, WebGroupState>,
+    topic: &str,
+) -> Option<&'a mut WebGroupState> {
+    groups.get_mut(topic)
 }
 
 /// Recompute the watch-channel snapshot from the current connected
@@ -1234,7 +1322,11 @@ const LOOPBACK_PEER_KEY: &str = "loopback-peer";
 async fn run_loopback(
     mut end: LoopbackEnd,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
-    state: EngineState,
+    group: WebGroupState,
+    // Slimmed engine state — loopback has no swarm, no relay, no peer
+    // discovery, so nothing here is read. Held only to keep the status
+    // watch sender alive for the task's lifetime.
+    _state: EngineState,
 ) {
     let mut pending_out: VecDeque<SyncRequest> = VecDeque::new();
     let link = end.link.clone();
@@ -1262,24 +1354,24 @@ async fn run_loopback(
                     return;
                 }
             }
-            send_version_vector(&state, &end.out_tx).await;
+            send_version_vector(&group, &end.out_tx).await;
         }
         was_online = now_online;
 
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(Command::Publish(changeset)) => {
-                        let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
+                    Some(Command::Publish { changeset, .. }) => {
+                        let req = build_push_request(&group.topic, group.group_key.as_ref(), changeset);
                         if link.is_online() {
                             let _ = end.out_tx.send(req);
                         } else {
                             pending_out.push_back(req);
                         }
                     }
-                    Some(Command::SubmitLocal { table, pk, columns, ack }) => {
+                    Some(Command::SubmitLocal { table, pk, columns, ack, .. }) => {
                         let result = handle_submit_local_loopback(
-                            &state,
+                            &group,
                             &mut end,
                             &link,
                             &mut pending_out,
@@ -1290,13 +1382,13 @@ async fn run_loopback(
                         .await;
                         let _ = ack.send(result);
                     }
-                    Some(Command::SubmitLocalDelete { table, pk, ack }) => {
-                        let result = match submit_local_delete_inner(&state, &table, &pk).await {
+                    Some(Command::SubmitLocalDelete { table, pk, ack, .. }) => {
+                        let result = match submit_local_delete_inner(&group, &table, &pk).await {
                             Ok(changeset) => {
                                 let dv = changeset.db_version;
                                 let req = build_push_request(
-                                    &state.topic,
-                                    state.group_key.as_ref(),
+                                    &group.topic,
+                                    group.group_key.as_ref(),
                                     changeset,
                                 );
                                 if link.is_online() {
@@ -1320,7 +1412,7 @@ async fn run_loopback(
                 match incoming {
                     Some(req) => {
                         if link.is_online() {
-                            handle_loopback_request(req, &state, &end.out_tx).await;
+                            handle_loopback_request(req, &group, &end.out_tx).await;
                         } else {
                             // Honest to a real network: messages destined
                             // for an offline peer are dropped on the floor.
@@ -1337,7 +1429,7 @@ async fn run_loopback(
             }
             _ = sync_interval.next() => {
                 if link.is_online() {
-                    send_version_vector(&state, &end.out_tx).await;
+                    send_version_vector(&group, &end.out_tx).await;
                 }
             }
             _ = link.notify.notified() => {
@@ -1353,8 +1445,8 @@ async fn run_loopback(
 /// last `db_version` we recorded from our peer. The peer responds via
 /// [`handle_loopback_request`] with a `Push` containing every shadow
 /// change strictly newer than that.
-async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender<SyncRequest>) {
-    let store = match &state.store {
+async fn send_version_vector(group: &WebGroupState, out_tx: &mpsc::UnboundedSender<SyncRequest>) {
+    let store = match &group.store {
         Some(s) => s,
         None => return, // ephemeral clients don't track peer versions
     };
@@ -1365,15 +1457,15 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
             0
         }
     };
-    let my_db_version = *state.db_version.lock().await;
+    let my_db_version = *group.db_version.lock().await;
     let mut req = SyncRequest::VersionVector {
         my_db_version,
         your_last_db_version: last_seen,
-        site_id: state.site_id,
-        topic: state.topic.clone(),
+        site_id: group.site_id,
+        topic: group.topic.clone(),
         hmac: None,
     };
-    if let Some(gk) = &state.group_key {
+    if let Some(gk) = &group.group_key {
         if let Ok(bytes) = serde_json::to_vec(&req) {
             let tag = gk.mac(&bytes);
             if let SyncRequest::VersionVector { ref mut hmac, .. } = req {
@@ -1412,10 +1504,10 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
 /// change it.
 async fn send_version_vector_swarm(
     peer: LibPeerId,
-    state: &EngineState,
+    group: &WebGroupState,
     swarm: &mut Swarm<WebBehaviour>,
 ) {
-    let store = match &state.store {
+    let store = match &group.store {
         Some(s) => s,
         None => return, // ephemeral clients don't track peer versions
     };
@@ -1427,15 +1519,15 @@ async fn send_version_vector_swarm(
             0
         }
     };
-    let my_db_version = *state.db_version.lock().await;
+    let my_db_version = *group.db_version.lock().await;
     let mut req = SyncRequest::VersionVector {
         my_db_version,
         your_last_db_version: last_seen,
-        site_id: state.site_id,
-        topic: state.topic.clone(),
+        site_id: group.site_id,
+        topic: group.topic.clone(),
         hmac: None,
     };
-    if let Some(gk) = &state.group_key {
+    if let Some(gk) = &group.group_key {
         if let Ok(bytes) = serde_json::to_vec(&req) {
             let tag = gk.mac(&bytes);
             if let SyncRequest::VersionVector { ref mut hmac, .. } = req {
@@ -1450,7 +1542,7 @@ async fn send_version_vector_swarm(
 }
 
 async fn handle_submit_local_loopback(
-    state: &EngineState,
+    group: &WebGroupState,
     end: &mut LoopbackEnd,
     link: &LoopbackLink,
     pending_out: &mut VecDeque<SyncRequest>,
@@ -1461,10 +1553,10 @@ async fn handle_submit_local_loopback(
     // Mirrors handle_submit_local — same shared core, the only difference
     // is the out-of-engine transport: a channel send instead of
     // swarm.send_request.
-    let changeset = submit_local_inner(state, &table, &pk, columns).await?;
+    let changeset = submit_local_inner(group, &table, &pk, columns).await?;
     let new_db_version = changeset.db_version;
 
-    let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
+    let req = build_push_request(&group.topic, group.group_key.as_ref(), changeset);
     if link.is_online() {
         let _ = end.out_tx.send(req);
     } else {
@@ -1488,7 +1580,7 @@ async fn handle_submit_local_loopback(
 /// merge logic is identical either way, courtesy of CRDT.
 async fn handle_loopback_request(
     req: SyncRequest,
-    state: &EngineState,
+    group: &WebGroupState,
     out_tx: &mpsc::UnboundedSender<SyncRequest>,
 ) {
     match req {
@@ -1497,11 +1589,11 @@ async fn handle_loopback_request(
             topic,
             hmac,
         } => {
-            if topic != state.topic {
+            if topic != group.topic {
                 tracing::debug!("loopback: dropping Push — topic mismatch");
                 return;
             }
-            if let Some(gk) = &state.group_key {
+            if let Some(gk) = &group.group_key {
                 let verify = SyncRequest::Push {
                     changeset: changeset.clone(),
                     topic: topic.clone(),
@@ -1525,8 +1617,8 @@ async fn handle_loopback_request(
             }
             // The Lamport max-bump happens inside the apply (committed
             // atomically with the data) — no separate persist here.
-            let _ = state.inbound_tx.send(changeset.clone());
-            apply_remote_changeset_loopback(state, LOOPBACK_PEER_KEY, &changeset).await;
+            let _ = group.inbound_tx.send(changeset.clone());
+            apply_remote_changeset_loopback(group, LOOPBACK_PEER_KEY, &changeset).await;
         }
         SyncRequest::VersionVector {
             my_db_version: peer_db_version,
@@ -1535,11 +1627,11 @@ async fn handle_loopback_request(
             topic,
             hmac,
         } => {
-            if topic != state.topic {
+            if topic != group.topic {
                 tracing::debug!("loopback: dropping VersionVector — topic mismatch");
                 return;
             }
-            if let Some(gk) = &state.group_key {
+            if let Some(gk) = &group.group_key {
                 let verify = SyncRequest::VersionVector {
                     my_db_version: peer_db_version,
                     your_last_db_version: since,
@@ -1566,13 +1658,13 @@ async fn handle_loopback_request(
 
             // Build catch-up changeset from local shadow (tombstoned rows
             // expose only their tombstone, mirroring native's JOIN view).
-            let store = match &state.store {
+            let store = match &group.store {
                 Some(s) => s,
                 None => return, // ephemeral clients have nothing to send
             };
             let changes = match changes_since_core(
                 store.as_ref(),
-                &state.config,
+                &group.config,
                 since,
                 crate::web_store::now_secs(),
             )
@@ -1589,13 +1681,13 @@ async fn handle_loopback_request(
                 changes.len()
             );
             if !changes.is_empty() {
-                let my_db_version = *state.db_version.lock().await;
+                let my_db_version = *group.db_version.lock().await;
                 let changeset = SyncChangeset {
-                    site_id: state.site_id,
+                    site_id: group.site_id,
                     db_version: my_db_version,
                     changes,
                 };
-                let push = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
+                let push = build_push_request(&group.topic, group.group_key.as_ref(), changeset);
                 let _ = out_tx.send(push);
             }
         }
@@ -1616,11 +1708,11 @@ async fn handle_loopback_request(
 /// Loopback alias for [`apply_remote_changeset_inner`] (loopback peers are
 /// identified by a string key, not a `libp2p::PeerId`).
 async fn apply_remote_changeset_loopback(
-    state: &EngineState,
+    group: &WebGroupState,
     peer: &str,
     changeset: &SyncChangeset,
 ) {
-    apply_remote_changeset_inner(state, Some(peer), changeset).await;
+    apply_remote_changeset_inner(group, Some(peer), changeset).await;
 }
 
 /// Apply an incoming changeset through the shared sync core
@@ -1642,7 +1734,7 @@ async fn apply_remote_changeset_loopback(
 /// cursor — used for reconcile-transferred cells, whose changeset carries
 /// the originator's clocks rather than the sending peer's `db_version`.
 async fn apply_remote_changeset_inner(
-    state: &EngineState,
+    group: &WebGroupState,
     peer_key: Option<&str>,
     changeset: &SyncChangeset,
 ) {
@@ -1651,17 +1743,17 @@ async fn apply_remote_changeset_inner(
     // batch as the data (previously the max-bump was a separate
     // transaction — one more partial-persistence window).
     let (prev_db_version, next_db_version) = {
-        let mut dv = state.db_version.lock().await;
+        let mut dv = group.db_version.lock().await;
         let prev = *dv;
         *dv = prev.max(changeset.db_version) + 1;
         (prev, *dv)
     };
 
-    let result = match &state.store {
+    let result = match &group.store {
         Some(store) => {
             apply_remote_changeset_core(
                 store.as_ref(),
-                &state.config,
+                &group.config,
                 changeset,
                 next_db_version,
                 peer_key,
@@ -1674,7 +1766,7 @@ async fn apply_remote_changeset_inner(
         None => {
             apply_remote_changeset_core(
                 &EphemeralStore,
-                &state.config,
+                &group.config,
                 changeset,
                 next_db_version,
                 None,
@@ -1687,7 +1779,7 @@ async fn apply_remote_changeset_inner(
     match result {
         Ok(applied) => {
             for change in applied {
-                let _ = state.resolved_tx.send(change);
+                let _ = group.resolved_tx.send(change);
             }
         }
         Err(e) => {
@@ -1695,7 +1787,7 @@ async fn apply_remote_changeset_inner(
                 "WebSyncClient: changeset apply failed — nothing persisted, \
                  peer cursor unchanged, will re-request on next catch-up: {e}"
             );
-            let mut dv = state.db_version.lock().await;
+            let mut dv = group.db_version.lock().await;
             if *dv == next_db_version {
                 *dv = prev_db_version;
             }
@@ -1707,7 +1799,16 @@ async fn run_swarm(
     mut swarm: Swarm<WebBehaviour>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     state: EngineState,
+    default_group: WebGroupState,
 ) {
+    // All sync groups sharing this swarm, keyed by effective (derived)
+    // topic — the wire topic carried on every message. Exactly one entry
+    // (the default group) in this build; inbound dispatch resolves the
+    // owning group by topic via `group_for_topic`. Per-group HMAC
+    // rejection lives inside each `WebGroupState.rejected_peers`.
+    let mut groups: HashMap<String, WebGroupState> = HashMap::new();
+    groups.insert(default_group.topic.clone(), default_group);
+
     let mut connected: HashSet<LibPeerId> = HashSet::new();
     // The relay peer-id is *not* inserted into `connected` (it isn't
     // a sync peer), so we track its link state on the side. The UI
@@ -1740,50 +1841,73 @@ async fn run_swarm(
     // entries.
     let mut cached_predial_done = false;
     let mut sync_interval = IntervalStream::new(30_000);
-    // Peers rejected for a bad HMAC on OUR topic, skipped while their
-    // backoff window is open. Page-lifetime (mirrors native's
-    // engine-lifetime scope). A topic we don't hold is silently ignored
-    // long before this map is consulted — unknown-topic traffic must
-    // never reject a peer.
-    let mut rejected_peers: HashMap<LibPeerId, crate::rejection::RejectionState<f64>> =
-        HashMap::new();
 
     loop {
+        // Announce every not-yet-announced group to the relay the moment
+        // it connects (relay peer-ids arrive via `pending_announces`).
+        // One `AnnouncePresence` per group; the flag dedups within a
+        // connection and is reset to `false` on relay `ConnectionClosed`
+        // so a reconnect re-announces all groups. Deferred (not sent from
+        // inside the connection handler) to avoid the wasm_bindgen_futures
+        // executor-reentrancy hazard.
         for peer in pending_announces.drain(..) {
-            tracing::info!("WebSyncClient: sending deferred AnnouncePresence to {peer}");
-            let req = PushRequest::AnnouncePresence {
-                topic: state.topic.clone(),
-            };
-            let _ = swarm.behaviour_mut().push.send_request(&peer, req);
+            for group in groups.values_mut() {
+                if group.announced {
+                    continue;
+                }
+                tracing::info!(
+                    "WebSyncClient: sending deferred AnnouncePresence to {peer} (topic={})",
+                    group.topic
+                );
+                let req = PushRequest::AnnouncePresence {
+                    topic: group.topic.clone(),
+                };
+                let _ = swarm.behaviour_mut().push.send_request(&peer, req);
+                group.announced = true;
+            }
         }
         for peer in pending_version_vectors.drain(..).collect::<Vec<_>>() {
-            // We collect-then-iterate so the borrow of
-            // `pending_version_vectors` released before
-            // `send_version_vector_swarm` takes &mut swarm.
-            if is_rejected(&rejected_peers, &peer) {
-                continue;
+            // One catch-up VersionVector per (group, peer). We
+            // collect-then-iterate so the borrow of
+            // `pending_version_vectors` is released before
+            // `send_version_vector_swarm` takes &mut swarm. Skip groups
+            // that have this peer in an active HMAC-rejection window.
+            for group in groups.values() {
+                if is_rejected(&group.rejected_peers, &peer) {
+                    continue;
+                }
+                send_version_vector_swarm(peer, group, &mut swarm).await;
             }
-            send_version_vector_swarm(peer, &state, &mut swarm).await;
         }
 
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(Command::Publish(changeset)) => {
-                        let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
-                        for peer in connected.iter().copied().collect::<Vec<_>>() {
-                            if is_rejected(&rejected_peers, &peer) {
-                                continue;
+                    Some(Command::Publish { changeset, topic }) => {
+                        if let Some(group) = group_for_topic(&mut groups, &topic) {
+                            let req = build_push_request(&group.topic, group.group_key.as_ref(), changeset);
+                            for peer in connected.iter().copied().collect::<Vec<_>>() {
+                                if is_rejected(&group.rejected_peers, &peer) {
+                                    continue;
+                                }
+                                swarm.behaviour_mut().snapshot.send_request(&peer, req.clone());
                             }
-                            swarm.behaviour_mut().snapshot.send_request(&peer, req.clone());
+                        } else {
+                            tracing::debug!("WebSyncClient: Publish for unknown topic {topic}, ignoring");
                         }
                     }
-                    Some(Command::SubmitLocal { table, pk, columns, ack }) => {
-                        let result = handle_submit_local(&state, &mut swarm, &connected, &rejected_peers, table, pk, columns).await;
+                    Some(Command::SubmitLocal { table, pk, columns, topic, ack }) => {
+                        let result = match group_for_topic(&mut groups, &topic) {
+                            Some(group) => handle_submit_local(group, &mut swarm, &connected, table, pk, columns).await,
+                            None => Err(WebSyncError::NotRunning),
+                        };
                         let _ = ack.send(result);
                     }
-                    Some(Command::SubmitLocalDelete { table, pk, ack }) => {
-                        let result = handle_submit_local_delete(&state, &mut swarm, &connected, &rejected_peers, table, pk).await;
+                    Some(Command::SubmitLocalDelete { table, pk, topic, ack }) => {
+                        let result = match group_for_topic(&mut groups, &topic) {
+                            Some(group) => handle_submit_local_delete(group, &mut swarm, &connected, table, pk).await,
+                            None => Err(WebSyncError::NotRunning),
+                        };
                         let _ = ack.send(result);
                     }
                     None => {
@@ -1794,10 +1918,12 @@ async fn run_swarm(
             }
             _ = sync_interval.next() => {
                 for peer in connected.iter().copied().collect::<Vec<_>>() {
-                    if is_rejected(&rejected_peers, &peer) {
-                        continue;
+                    for group in groups.values() {
+                        if is_rejected(&group.rejected_peers, &peer) {
+                            continue;
+                        }
+                        send_version_vector_swarm(peer, group, &mut swarm).await;
                     }
-                    send_version_vector_swarm(peer, &state, &mut swarm).await;
                 }
             }
             // Relay backoff timer fired: dial the relay if we're still
@@ -1837,7 +1963,7 @@ async fn run_swarm(
                     &mut reconnect_timer,
                     &mut pending_announces,
                     &mut pending_version_vectors,
-                    &mut rejected_peers,
+                    &mut groups,
                     &state,
                     &mut swarm,
                 ).await;
@@ -1892,7 +2018,7 @@ async fn run_swarm(
 /// store error persists nothing, broadcasts nothing, rolls the in-memory
 /// counter back, and surfaces the error to the caller.
 async fn submit_local_inner(
-    state: &EngineState,
+    group: &WebGroupState,
     table: &str,
     pk: &str,
     columns: Vec<(String, serde_json::Value)>,
@@ -1900,17 +2026,17 @@ async fn submit_local_inner(
     // Bump db_version once for the whole batch — matches native semantics
     // (every local write is exactly one `db_version` step).
     let next_db_version = {
-        let mut dv = state.db_version.lock().await;
+        let mut dv = group.db_version.lock().await;
         *dv += 1;
         *dv
     };
 
-    let written = match &state.store {
+    let written = match &group.store {
         Some(store) => {
             submit_local_write_core(
                 store.as_ref(),
-                &state.config,
-                &state.site_id,
+                &group.config,
+                &group.site_id,
                 table,
                 pk,
                 columns,
@@ -1922,8 +2048,8 @@ async fn submit_local_inner(
         None => {
             submit_local_write_core(
                 &EphemeralStore,
-                &state.config,
-                &state.site_id,
+                &group.config,
+                &group.site_id,
                 table,
                 pk,
                 columns,
@@ -1936,7 +2062,7 @@ async fn submit_local_inner(
     let changes = match written {
         Ok(c) => c,
         Err(e) => {
-            let mut dv = state.db_version.lock().await;
+            let mut dv = group.db_version.lock().await;
             if *dv == next_db_version {
                 *dv -= 1;
             }
@@ -1948,11 +2074,11 @@ async fn submit_local_inner(
     // for local edits the same way they do for remote ones. The batch is
     // already durably committed; this is purely a wake-up for listeners.
     for ch in &changes {
-        let _ = state.resolved_tx.send(ch.clone());
+        let _ = group.resolved_tx.send(ch.clone());
     }
 
     Ok(SyncChangeset {
-        site_id: state.site_id,
+        site_id: group.site_id,
         db_version: next_db_version,
         changes,
     })
@@ -1962,22 +2088,22 @@ async fn submit_local_inner(
 /// fail-closed shape as [`submit_local_inner`], producing the single
 /// `__deleted` tombstone change.
 async fn submit_local_delete_inner(
-    state: &EngineState,
+    group: &WebGroupState,
     table: &str,
     pk: &str,
 ) -> Result<SyncChangeset, WebSyncError> {
     let next_db_version = {
-        let mut dv = state.db_version.lock().await;
+        let mut dv = group.db_version.lock().await;
         *dv += 1;
         *dv
     };
 
-    let written = match &state.store {
+    let written = match &group.store {
         Some(store) => {
             submit_local_delete_core(
                 store.as_ref(),
-                &state.config,
-                &state.site_id,
+                &group.config,
+                &group.site_id,
                 table,
                 pk,
                 next_db_version,
@@ -1988,8 +2114,8 @@ async fn submit_local_delete_inner(
         None => {
             submit_local_delete_core(
                 &EphemeralStore,
-                &state.config,
-                &state.site_id,
+                &group.config,
+                &group.site_id,
                 table,
                 pk,
                 next_db_version,
@@ -2001,7 +2127,7 @@ async fn submit_local_delete_inner(
     let changes = match written {
         Ok(c) => c,
         Err(e) => {
-            let mut dv = state.db_version.lock().await;
+            let mut dv = group.db_version.lock().await;
             if *dv == next_db_version {
                 *dv -= 1;
             }
@@ -2010,51 +2136,37 @@ async fn submit_local_delete_inner(
     };
 
     for ch in &changes {
-        let _ = state.resolved_tx.send(ch.clone());
+        let _ = group.resolved_tx.send(ch.clone());
     }
 
     Ok(SyncChangeset {
-        site_id: state.site_id,
+        site_id: group.site_id,
         db_version: next_db_version,
         changes,
     })
 }
 
 async fn handle_submit_local(
-    state: &EngineState,
+    group: &WebGroupState,
     swarm: &mut Swarm<WebBehaviour>,
     connected: &HashSet<LibPeerId>,
-    rejected_peers: &HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
     table: String,
     pk: String,
     columns: Vec<(String, serde_json::Value)>,
 ) -> Result<u64, WebSyncError> {
-    let changeset = submit_local_inner(state, &table, &pk, columns).await?;
-    Ok(fan_out_push(
-        state,
-        swarm,
-        connected,
-        rejected_peers,
-        changeset,
-    ))
+    let changeset = submit_local_inner(group, &table, &pk, columns).await?;
+    Ok(fan_out_push(group, swarm, connected, changeset))
 }
 
 async fn handle_submit_local_delete(
-    state: &EngineState,
+    group: &WebGroupState,
     swarm: &mut Swarm<WebBehaviour>,
     connected: &HashSet<LibPeerId>,
-    rejected_peers: &HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
     table: String,
     pk: String,
 ) -> Result<u64, WebSyncError> {
-    let changeset = submit_local_delete_inner(state, &table, &pk).await?;
-    Ok(fan_out_push(
-        state,
-        swarm,
-        connected,
-        rejected_peers,
-        changeset,
-    ))
+    let changeset = submit_local_delete_inner(group, &table, &pk).await?;
+    Ok(fan_out_push(group, swarm, connected, changeset))
 }
 
 /// Broadcast an already-committed changeset to every connected sync peer,
@@ -2062,18 +2174,17 @@ async fn handle_submit_local_delete(
 /// mirrors native's fan-out filter in `engine/mod.rs`). Returns its
 /// `db_version` for the submit ack.
 fn fan_out_push(
-    state: &EngineState,
+    group: &WebGroupState,
     swarm: &mut Swarm<WebBehaviour>,
     connected: &HashSet<LibPeerId>,
-    rejected_peers: &HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
     changeset: SyncChangeset,
 ) -> u64 {
     let new_db_version = changeset.db_version;
-    let req = build_push_request(&state.topic, state.group_key.as_ref(), changeset);
+    let req = build_push_request(&group.topic, group.group_key.as_ref(), changeset);
     let peers: Vec<LibPeerId> = connected
         .iter()
         .copied()
-        .filter(|p| !is_rejected(rejected_peers, p))
+        .filter(|p| !is_rejected(&group.rejected_peers, p))
         .collect();
     tracing::info!(
         "WebSyncClient: pushing changeset (db_v={new_db_version}) to {} peer(s): {:?}",
@@ -2143,10 +2254,16 @@ async fn handle_event(
     reconnect_timer: &mut Option<std::pin::Pin<Box<gloo_timers::future::TimeoutFuture>>>,
     pending_announces: &mut Vec<LibPeerId>,
     pending_version_vectors: &mut Vec<LibPeerId>,
-    rejected_peers: &mut HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
+    groups: &mut HashMap<String, WebGroupState>,
     state: &EngineState,
     swarm: &mut Swarm<WebBehaviour>,
 ) {
+    // Peer-address bookkeeping (record success/failure) is a swarm-wide
+    // concern, but the store lives per-group — use the default group's
+    // store, matching the single-group behavior before this refactor.
+    let default_store = groups
+        .get(&state.default_topic)
+        .and_then(|g| g.store.clone());
     match event {
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
@@ -2207,7 +2324,7 @@ async fn handle_event(
                 // start can pre-dial it as soon as the relay is
                 // reachable. Mirrors the native side's record_success
                 // call in `engine/mod.rs` on `ConnectionEstablished`.
-                if let Some(store) = state.store.clone() {
+                if let Some(store) = default_store.clone() {
                     let peer_str = peer_id.to_string();
                     let addr_str = endpoint.get_remote_address().to_string();
                     wasm_bindgen_futures::spawn_local(async move {
@@ -2235,6 +2352,12 @@ async fn handle_event(
                     "WebSyncClient: disconnected from relay {peer_id} (cause={cause:?})"
                 );
                 *relay_connected = false;
+                // Every group must re-announce on the next relay
+                // connection — clear the per-group announced flags so the
+                // reconnect's `pending_announces` drain re-sends them.
+                for group in groups.values_mut() {
+                    group.announced = false;
+                }
                 // Kick off the backoff redial loop. Only relay clients
                 // have a `relay_addr`; single-peer/loopback clients skip
                 // this and stay on their existing (dial-once) behavior.
@@ -2259,7 +2382,7 @@ async fn handle_event(
             // matches `peer_addrs::record_failure_for_peer` on native.
             // Skip when the peer was the relay (relay reconnects have
             // their own state machine) or unknown.
-            if let (Some(store), Some(pid)) = (state.store.clone(), peer_id)
+            if let (Some(store), Some(pid)) = (default_store.clone(), peer_id)
                 && Some(pid) != state.relay_peer_id
             {
                 let peer_str = pid.to_string();
@@ -2279,10 +2402,10 @@ async fn handle_event(
             }
         }
         SwarmEvent::Behaviour(WebBehaviourEvent::Snapshot(ev)) => {
-            handle_snapshot_event(ev, rejected_peers, state, swarm).await;
+            handle_snapshot_event(ev, groups, swarm).await;
         }
         SwarmEvent::Behaviour(WebBehaviourEvent::Push(ev)) => {
-            handle_push_event(ev, state, swarm);
+            handle_push_event(ev, groups, state, swarm);
         }
         SwarmEvent::Behaviour(WebBehaviourEvent::Ping(_)) => {}
         SwarmEvent::Behaviour(WebBehaviourEvent::Identify(_)) => {}
@@ -2305,6 +2428,7 @@ async fn handle_event(
 ///   connected peer could trick us into dialing arbitrary addresses.
 fn handle_push_event(
     event: request_response::Event<PushRequest, PushResponse>,
+    groups: &HashMap<String, WebGroupState>,
     state: &EngineState,
     swarm: &mut Swarm<WebBehaviour>,
 ) {
@@ -2330,10 +2454,9 @@ fn handle_push_event(
                     );
                     return;
                 }
-                if topic != state.topic {
+                if !groups.contains_key(&topic) {
                     tracing::debug!(
-                        "WebSyncClient: dropping PeerJoined — topic mismatch ({topic} vs {})",
-                        state.topic
+                        "WebSyncClient: dropping PeerJoined — no local group for topic {topic}"
                     );
                     let _ = swarm
                         .behaviour_mut()
@@ -2516,8 +2639,7 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<LibPeerId> {
 
 async fn handle_snapshot_event(
     event: request_response::Event<SyncRequest, SyncResponse>,
-    rejected_peers: &mut HashMap<LibPeerId, crate::rejection::RejectionState<f64>>,
-    state: &EngineState,
+    groups: &mut HashMap<String, WebGroupState>,
     swarm: &mut Swarm<WebBehaviour>,
 ) {
     use request_response::{Event, Message};
@@ -2529,30 +2651,30 @@ async fn handle_snapshot_event(
             },
             ..
         } => {
-            // Cheap drop before any topic/HMAC work: a peer in an active
-            // rejection backoff window (Rule 2.8) is skipped outright.
-            // Placed first — after the topic check would redo work for
-            // nothing, and an unknown-topic peer never got inserted into
-            // this map in the first place (silent-ignore, never reject).
-            if is_rejected(rejected_peers, &peer) {
-                tracing::debug!(
-                    "WebSyncClient: dropping request from {peer} — active rejection backoff"
-                );
-                return;
-            }
+            // Dispatch is per-message-topic: each variant resolves the
+            // owning group first. An unknown topic is silently ignored
+            // (Rule 2.8 — never reject; it may belong to another peer's
+            // group). The active-rejection cheap-drop and HMAC-rejection
+            // bookkeeping run against THAT group's `rejected_peers`.
             match request {
                 SyncRequest::Push {
                     changeset,
                     topic,
                     hmac,
                 } => {
-                    if topic != state.topic {
+                    let Some(group) = group_for_topic(groups, &topic) else {
                         tracing::debug!(
-                            "WebSyncClient: dropping Push from {peer} — topic mismatch"
+                            "WebSyncClient: dropping Push from {peer} — unknown topic, ignoring"
+                        );
+                        return;
+                    };
+                    if is_rejected(&group.rejected_peers, &peer) {
+                        tracing::debug!(
+                            "WebSyncClient: dropping Push from {peer} — active rejection backoff"
                         );
                         return;
                     }
-                    if let Some(gk) = &state.group_key {
+                    if let Some(gk) = &group.group_key {
                         let verify = SyncRequest::Push {
                             changeset: changeset.clone(),
                             topic: topic.clone(),
@@ -2568,20 +2690,28 @@ async fn handle_snapshot_event(
                                 tracing::debug!(
                                     "WebSyncClient: dropping Push from {peer} — missing HMAC"
                                 );
-                                record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                                record_hmac_rejection(
+                                    &mut group.rejected_peers,
+                                    peer,
+                                    "hmac_verify_failed",
+                                );
                                 return;
                             }
                         };
                         if !gk.verify(&bytes, &tag) {
                             tracing::debug!("WebSyncClient: dropping Push from {peer} — bad HMAC");
-                            record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                            record_hmac_rejection(
+                                &mut group.rejected_peers,
+                                peer,
+                                "hmac_verify_failed",
+                            );
                             return;
                         }
-                        rejected_peers.remove(&peer);
+                        group.rejected_peers.remove(&peer);
                     }
 
-                    let _ = state.inbound_tx.send(changeset.clone());
-                    apply_remote_changeset(state, &peer, &changeset).await;
+                    let _ = group.inbound_tx.send(changeset.clone());
+                    apply_remote_changeset(group, &peer, &changeset).await;
 
                     let _ = swarm
                         .behaviour_mut()
@@ -2601,13 +2731,19 @@ async fn handle_snapshot_event(
                     topic: req_topic,
                     hmac,
                 } => {
-                    if req_topic != state.topic {
+                    let Some(group) = group_for_topic(groups, &req_topic) else {
                         tracing::debug!(
-                            "WebSyncClient: dropping VersionVector from {peer} — topic mismatch"
+                            "WebSyncClient: dropping VersionVector from {peer} — unknown topic, ignoring"
+                        );
+                        return;
+                    };
+                    if is_rejected(&group.rejected_peers, &peer) {
+                        tracing::debug!(
+                            "WebSyncClient: dropping VersionVector from {peer} — active rejection backoff"
                         );
                         return;
                     }
-                    if let Some(gk) = &state.group_key {
+                    if let Some(gk) = &group.group_key {
                         let verify = SyncRequest::VersionVector {
                             my_db_version: peer_db_version,
                             your_last_db_version: since,
@@ -2625,7 +2761,11 @@ async fn handle_snapshot_event(
                                 tracing::debug!(
                                     "WebSyncClient: dropping VersionVector from {peer} — missing HMAC"
                                 );
-                                record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                                record_hmac_rejection(
+                                    &mut group.rejected_peers,
+                                    peer,
+                                    "hmac_verify_failed",
+                                );
                                 return;
                             }
                         };
@@ -2633,18 +2773,22 @@ async fn handle_snapshot_event(
                             tracing::debug!(
                                 "WebSyncClient: dropping VersionVector from {peer} — bad HMAC"
                             );
-                            record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                            record_hmac_rejection(
+                                &mut group.rejected_peers,
+                                peer,
+                                "hmac_verify_failed",
+                            );
                             return;
                         }
-                        rejected_peers.remove(&peer);
+                        group.rejected_peers.remove(&peer);
                     }
 
                     // Tombstoned rows expose only their tombstone — same view a
                     // native peer's user-table JOIN produces.
-                    let changes: Vec<ColumnChange> = match &state.store {
+                    let changes: Vec<ColumnChange> = match &group.store {
                         Some(store) => match changes_since_core(
                             store.as_ref(),
-                            &state.config,
+                            &group.config,
                             since,
                             crate::web_store::now_secs(),
                         )
@@ -2658,16 +2802,16 @@ async fn handle_snapshot_event(
                         },
                         None => Vec::new(),
                     };
-                    let my_db_version = *state.db_version.lock().await;
+                    let my_db_version = *group.db_version.lock().await;
                     let mut resp = SyncResponse::ChangesetResponse {
                         changes,
                         my_db_version,
                         your_last_db_version: peer_db_version,
-                        site_id: state.site_id,
-                        topic: state.topic.clone(),
+                        site_id: group.site_id,
+                        topic: group.topic.clone(),
                         hmac: None,
                     };
-                    if let Some(gk) = &state.group_key {
+                    if let Some(gk) = &group.group_key {
                         let unsigned = match &resp {
                             SyncResponse::ChangesetResponse {
                                 changes,
@@ -2712,13 +2856,19 @@ async fn handle_snapshot_event(
                     // *proven identical* with the native peer — which then
                     // marks this client reconcile-capable and stops both the
                     // periodic digest chatter and the redundant version-vector.
-                    if req_topic != state.topic {
+                    let Some(group) = group_for_topic(groups, &req_topic) else {
                         tracing::debug!(
-                            "WebSyncClient: dropping ReconcileDigest from {peer} — topic mismatch"
+                            "WebSyncClient: dropping ReconcileDigest from {peer} — unknown topic, ignoring"
+                        );
+                        return;
+                    };
+                    if is_rejected(&group.rejected_peers, &peer) {
+                        tracing::debug!(
+                            "WebSyncClient: dropping ReconcileDigest from {peer} — active rejection backoff"
                         );
                         return;
                     }
-                    if let Some(gk) = &state.group_key {
+                    if let Some(gk) = &group.group_key {
                         let verify = SyncRequest::ReconcileDigest {
                             digest: remote_digest,
                             topic: req_topic.clone(),
@@ -2734,7 +2884,11 @@ async fn handle_snapshot_event(
                                 tracing::debug!(
                                     "WebSyncClient: dropping ReconcileDigest from {peer} — missing HMAC"
                                 );
-                                record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                                record_hmac_rejection(
+                                    &mut group.rejected_peers,
+                                    peer,
+                                    "hmac_verify_failed",
+                                );
                                 return;
                             }
                         };
@@ -2742,17 +2896,21 @@ async fn handle_snapshot_event(
                             tracing::debug!(
                                 "WebSyncClient: dropping ReconcileDigest from {peer} — bad HMAC"
                             );
-                            record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                            record_hmac_rejection(
+                                &mut group.rejected_peers,
+                                peer,
+                                "hmac_verify_failed",
+                            );
                             return;
                         }
-                        rejected_peers.remove(&peer);
+                        group.rejected_peers.remove(&peer);
                     }
 
-                    let local_digest = match &state.store {
+                    let local_digest = match &group.store {
                         Some(store) => {
                             match compute_store_digest(
                                 store.as_ref(),
-                                &state.config,
+                                &group.config,
                                 crate::web_store::now_secs(),
                             )
                             .await
@@ -2766,7 +2924,7 @@ async fn handle_snapshot_event(
                         }
                         None => compute_store_digest(
                             &EphemeralStore,
-                            &state.config,
+                            &group.config,
                             crate::web_store::now_secs(),
                         )
                         .await
@@ -2779,10 +2937,10 @@ async fn handle_snapshot_event(
                     let mut resp = SyncResponse::ReconcileResult {
                         converged,
                         digest: local_digest,
-                        topic: state.topic.clone(),
+                        topic: group.topic.clone(),
                         hmac: None,
                     };
-                    if let Some(gk) = &state.group_key
+                    if let Some(gk) = &group.group_key
                         && let Ok(bytes) = serde_json::to_vec(&resp)
                     {
                         let tag = gk.mac(&bytes);
@@ -2801,13 +2959,19 @@ async fn handle_snapshot_event(
                     // Recursive range reconciliation (#82): drop converged
                     // ranges, split/itemize mismatching ones, apply cells the
                     // peer transferred — all via the shared `reconcile` core.
-                    if req_topic != state.topic {
+                    let Some(group) = group_for_topic(groups, &req_topic) else {
                         tracing::debug!(
-                            "WebSyncClient: dropping ReconcileRange from {peer} — topic mismatch"
+                            "WebSyncClient: dropping ReconcileRange from {peer} — unknown topic, ignoring"
+                        );
+                        return;
+                    };
+                    if is_rejected(&group.rejected_peers, &peer) {
+                        tracing::debug!(
+                            "WebSyncClient: dropping ReconcileRange from {peer} — active rejection backoff"
                         );
                         return;
                     }
-                    if let Some(gk) = &state.group_key {
+                    if let Some(gk) = &group.group_key {
                         let verify = SyncRequest::ReconcileRange {
                             entries: entries.clone(),
                             site_id: remote_site,
@@ -2824,7 +2988,11 @@ async fn handle_snapshot_event(
                                 tracing::debug!(
                                     "WebSyncClient: dropping ReconcileRange from {peer} — missing HMAC"
                                 );
-                                record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                                record_hmac_rejection(
+                                    &mut group.rejected_peers,
+                                    peer,
+                                    "hmac_verify_failed",
+                                );
                                 return;
                             }
                         };
@@ -2832,17 +3000,21 @@ async fn handle_snapshot_event(
                             tracing::debug!(
                                 "WebSyncClient: dropping ReconcileRange from {peer} — bad HMAC"
                             );
-                            record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                            record_hmac_rejection(
+                                &mut group.rejected_peers,
+                                peer,
+                                "hmac_verify_failed",
+                            );
                             return;
                         }
-                        rejected_peers.remove(&peer);
+                        group.rejected_peers.remove(&peer);
                     }
 
-                    let step = match &state.store {
+                    let step = match &group.store {
                         Some(store) => {
                             reconcile_range_step(
                                 store.as_ref(),
-                                &state.config,
+                                &group.config,
                                 &entries,
                                 crate::web_store::now_secs(),
                             )
@@ -2851,7 +3023,7 @@ async fn handle_snapshot_event(
                         None => {
                             reconcile_range_step(
                                 &EphemeralStore,
-                                &state.config,
+                                &group.config,
                                 &entries,
                                 crate::web_store::now_secs(),
                             )
@@ -2874,15 +3046,15 @@ async fn handle_snapshot_event(
                             db_version: 0,
                             changes: to_apply,
                         };
-                        apply_remote_changeset_inner(state, None, &cs).await;
+                        apply_remote_changeset_inner(group, None, &cs).await;
                     }
                     let mut resp = SyncResponse::ReconcileRangeResult {
                         entries: reply,
-                        site_id: state.site_id,
-                        topic: state.topic.clone(),
+                        site_id: group.site_id,
+                        topic: group.topic.clone(),
                         hmac: None,
                     };
-                    if let Some(gk) = &state.group_key
+                    if let Some(gk) = &group.group_key
                         && let Ok(bytes) = serde_json::to_vec(&resp)
                     {
                         let tag = gk.mac(&bytes);
@@ -2920,13 +3092,19 @@ async fn handle_snapshot_event(
                 topic: peer_topic,
                 hmac,
             } => {
-                if peer_topic != state.topic {
+                let Some(group) = group_for_topic(groups, &peer_topic) else {
                     tracing::debug!(
-                        "WebSyncClient: dropping ChangesetResponse from {peer} — topic mismatch"
+                        "WebSyncClient: dropping ChangesetResponse from {peer} — unknown topic, ignoring"
+                    );
+                    return;
+                };
+                if is_rejected(&group.rejected_peers, &peer) {
+                    tracing::debug!(
+                        "WebSyncClient: dropping ChangesetResponse from {peer} — active rejection backoff"
                     );
                     return;
                 }
-                if let Some(gk) = &state.group_key {
+                if let Some(gk) = &group.group_key {
                     let verify = SyncResponse::ChangesetResponse {
                         changes: changes.clone(),
                         my_db_version,
@@ -2945,7 +3123,11 @@ async fn handle_snapshot_event(
                             tracing::debug!(
                                 "WebSyncClient: dropping ChangesetResponse from {peer} — missing HMAC"
                             );
-                            record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                            record_hmac_rejection(
+                                &mut group.rejected_peers,
+                                peer,
+                                "hmac_verify_failed",
+                            );
                             return;
                         }
                     };
@@ -2953,10 +3135,14 @@ async fn handle_snapshot_event(
                         tracing::debug!(
                             "WebSyncClient: dropping ChangesetResponse from {peer} — bad HMAC"
                         );
-                        record_hmac_rejection(rejected_peers, peer, "hmac_verify_failed");
+                        record_hmac_rejection(
+                            &mut group.rejected_peers,
+                            peer,
+                            "hmac_verify_failed",
+                        );
                         return;
                     }
-                    rejected_peers.remove(&peer);
+                    group.rejected_peers.remove(&peer);
                 }
                 tracing::info!(
                     "WebSyncClient: received ChangesetResponse from {peer} with {} changes (their db_version={my_db_version})",
@@ -2970,8 +3156,8 @@ async fn handle_snapshot_event(
                     db_version: my_db_version,
                     changes,
                 };
-                let _ = state.inbound_tx.send(changeset.clone());
-                apply_remote_changeset(state, &peer, &changeset).await;
+                let _ = group.inbound_tx.send(changeset.clone());
+                apply_remote_changeset(group, &peer, &changeset).await;
             }
             SyncResponse::PushAck
             | SyncResponse::IdentityAck
@@ -3000,8 +3186,12 @@ async fn handle_snapshot_event(
 /// On ephemeral clients (no store), every change is treated as a winner
 /// and emitted unchanged, since there is no local state to compare.
 /// Swarm alias for [`apply_remote_changeset_inner`].
-async fn apply_remote_changeset(state: &EngineState, peer: &LibPeerId, changeset: &SyncChangeset) {
-    apply_remote_changeset_inner(state, Some(&peer.to_string()), changeset).await;
+async fn apply_remote_changeset(
+    group: &WebGroupState,
+    peer: &LibPeerId,
+    changeset: &SyncChangeset,
+) {
+    apply_remote_changeset_inner(group, Some(&peer.to_string()), changeset).await;
 }
 
 fn build_push_request(
