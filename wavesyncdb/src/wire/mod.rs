@@ -12,7 +12,7 @@
 //! prefix + serde_json. (The native-only auth handshake uses little-endian
 //! and stays in `engine/auth_protocol.rs`.)
 
-// pub mod push_protocol; // Task 2
+pub mod push_protocol;
 pub mod snapshot_protocol;
 
 /// Identify protocol/agent version string, advertised by both the native

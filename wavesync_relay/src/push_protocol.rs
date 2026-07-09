@@ -1,7 +1,10 @@
 //! libp2p request-response codec for push notification protocol.
 //!
-//! Mirrors `wavesyncdb/src/engine/push_protocol.rs` — kept separate to avoid
+//! Mirrors `wavesyncdb/src/wire/push_protocol.rs` — kept separate to avoid
 //! coupling the relay binary to the full `wavesyncdb` crate.
+//!
+//! Kept in lockstep with wavesyncdb/src/wire/push_protocol.rs (single source
+//! there for both wavesyncdb targets).
 
 use std::io;
 
