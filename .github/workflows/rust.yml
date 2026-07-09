@@ -45,3 +45,32 @@ jobs:
       run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
     - name: Run browser-store tests (headless Chrome)
       run: cd wavesyncdb && wasm-pack test --headless --chrome --features web --test wasm_store
+
+  web-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Install wasm-pack
+      run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+    - name: Build wasm page
+      run: wasm-pack build tests-e2e/web/page --target web --dev
+    - name: Build relay and native peer
+      # Two invocations, not one `-p wavesync_relay -p wavesyncdb-e2e --bin
+      # web_e2e_peer`: cargo's `--bin` filter restricts target selection to
+      # that one binary name across ALL selected packages, so a combined
+      # command silently builds only `web_e2e_peer` and skips `wavesync_relay`
+      # entirely (no error, exit 0) since it has no target with that name.
+      # Verified locally: the combined form leaves target/release/wavesync-relay
+      # missing while reporting success.
+      run: |
+        cargo build -p wavesync_relay --release
+        cargo build -p wavesyncdb-e2e --bin web_e2e_peer --release
+    - name: Install puppeteer deps
+      run: cd tests-e2e/web && npm ci
+    - name: Run browser e2e
+      env:
+        PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
+      run: node tests-e2e/web/serve_and_test.mjs
