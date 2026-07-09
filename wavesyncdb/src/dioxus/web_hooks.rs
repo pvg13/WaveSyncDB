@@ -8,7 +8,7 @@
 //! [`super::use_synced_table`] instead** — it takes a
 //! [`SyncHandle`](super::SyncHandle) and works identically on native
 //! and wasm32. The hook below is the web-only escape hatch for code
-//! that already holds a `Signal<Option<WebSyncClient>>` directly.
+//! that already holds a `Signal<Option<WebGroupHandle>>` directly.
 //!
 //! [`use_synced_table_client::<E>(client, table)`] returns a
 //! `Signal<Vec<E>>` that:
@@ -16,42 +16,44 @@
 //! 1. On the first render where `client` is `Some`, materializes the
 //!    full table from [`BrowserStore::list_table_rows`] — so reload
 //!    starts with whatever is persisted.
-//! 2. Subscribes to [`WebSyncClient::subscribe_resolved`] and folds
+//! 2. Subscribes to [`WebGroupHandle::subscribe_resolved`] and folds
 //!    each `ColumnChange` into the in-memory `Vec<E>`. The engine
 //!    echoes local writes onto the same channel after `submit_local_write`
 //!    persists them, so a single subscription drives both local and
 //!    remote updates without the component needing optimistic-merge code.
-//! 3. Filters by table name so a single client can power multiple
-//!    independent table hooks.
+//! 3. Filters by table name — sufficient because a group handle's
+//!    `subscribe_resolved` stream is already scoped to that one group
+//!    (multi-group #93): a single group can still hold multiple synced
+//!    tables, so the filter still guards against cross-table noise, it
+//!    just no longer also has to guard against cross-group noise.
 //!
-//! The companion [`WebSyncClient::submit`](crate::WebSyncClient::submit)
+//! The companion [`WebGroupHandle::submit`](crate::WebGroupHandle::submit)
 //! is the writer: it takes a `&E`, serializes via
 //! [`BrowserEntity::to_columns`], and goes through `submit_local_write`.
-//! Components call `client.submit(&task).await` and get reactivity for
-//! free.
+//! Components call `group.submit(table, &task).await` and get
+//! reactivity for free.
 
 use std::collections::HashMap;
 
 use dioxus::prelude::*;
 
-use crate::messages::ColumnChange;
-use crate::web_engine::WebSyncClient;
+use crate::web_engine::WebGroupHandle;
 use crate::web_entity::BrowserEntity;
 
 /// Reactive `Vec<E>` materialized from a synced table.
 ///
-/// `client` is a `Signal<Option<WebSyncClient>>` rather than a
-/// `WebSyncClient` directly because the typical setup is to construct
-/// the client async and store it in a parent signal — `None` until the
-/// initial connect resolves. The hook waits internally for the first
-/// `Some`, then materializes from [`BrowserStore::list_table_rows`] and
-/// stays subscribed to changes for the rest of the component's
-/// lifetime.
+/// `client` is a `Signal<Option<WebGroupHandle>>` rather than a
+/// `WebGroupHandle` directly because the typical setup is to construct
+/// the client/group async and store it in a parent signal — `None`
+/// until the initial connect (or join) resolves. The hook waits
+/// internally for the first `Some`, then materializes from
+/// [`BrowserStore::list_table_rows`] and stays subscribed to changes
+/// for the rest of the component's lifetime.
 ///
 /// `table` is captured by value (`String`) so the hook can use it from
 /// the spawned subscription task without lifetime gymnastics.
 pub fn use_synced_table_client<E: BrowserEntity>(
-    client: Signal<Option<WebSyncClient>>,
+    client: Signal<Option<WebGroupHandle>>,
     table: &'static str,
 ) -> Signal<Vec<E>> {
     let entities = use_signal(Vec::<E>::new);

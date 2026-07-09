@@ -90,6 +90,12 @@ pub fn App() -> Element {
         });
     });
 
+    // `SyncHandle::new` is a Dioxus hook (use_signal/use_effect internally)
+    // and must run unconditionally on every render, so it's called here in
+    // the component body rather than inside the `if client().is_some()`
+    // branch below.
+    let handle = SyncHandle::new(client);
+
     rsx! {
         style { {STYLE} }
         div { class: "app",
@@ -111,7 +117,7 @@ pub fn App() -> Element {
             if client().is_some() {
                 PairingPanel { client: client, topic: topic(), pass: pass() }
                 DebugPanel { client: client }
-                TaskList { handle: SyncHandle::new(client) }
+                TaskList { handle }
             } else {
                 div { class: "panel",
                     h2 { "Pair a phone" }

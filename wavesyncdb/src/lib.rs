@@ -120,7 +120,8 @@ pub mod web_entity;
 pub mod web_store;
 #[cfg(target_arch = "wasm32")]
 pub use web_engine::{
-    LoopbackEnd, LoopbackLink, LoopbackPair, WebSyncClient, WebSyncError, WebSyncStatus,
+    LoopbackEnd, LoopbackLink, LoopbackPair, WebGroupHandle, WebSyncClient, WebSyncError,
+    WebSyncStatus,
 };
 #[cfg(target_arch = "wasm32")]
 pub use web_entity::BrowserEntity;
@@ -139,11 +140,10 @@ pub use messages::{
 pub use network_status::{NatStatus, NetworkEvent, NetworkStatus, PeerId, PeerInfo, RelayStatus};
 #[cfg(not(target_arch = "wasm32"))]
 pub use notify::{Notification, NotifyEntityInfo, SyncEvent, SyncNotify};
-#[cfg(not(target_arch = "wasm32"))]
 pub use registry::EntityScope;
 #[cfg(not(target_arch = "wasm32"))]
 pub use registry::SyncEntityInfo;
-pub use registry::{TableMeta, TableRegistry};
+pub use registry::{SyncEntityDescriptor, TableMeta, TableRegistry};
 pub use synced_model::{SyncedModel, lenient_from_value};
 pub use synced_table::SyncedTableEntity;
 
@@ -219,6 +219,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-export for use by the #[derive(SyncEntity)] macro
 pub use inventory::submit as register_sync_entity;
+
+// Sibling re-export for the target-independent `SyncEntityDescriptor`
+// submission (see `registry.rs`). Same shape as `register_sync_entity`
+// above — both are aliases of `inventory::submit!` — kept as a separate
+// name so derive-generated code reads as "submitting a descriptor" at the
+// call site, ungated so it works on wasm32 too.
+pub use inventory::submit as register_sync_entity_descriptor;
 
 // Re-export sea-orm for users of the library. sea-orm is not available on
 // wasm32 (sqlx-sqlite pulls in libsqlite3-sys, a C library), so this

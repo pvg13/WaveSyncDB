@@ -25,7 +25,7 @@ use crate::synced_table::SyncedTableEntity;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::WaveSyncDb;
 #[cfg(target_arch = "wasm32")]
-use crate::WebSyncClient;
+use crate::{WebGroupHandle, WebSyncClient};
 
 /// Target-specific transport wrapper. Construct with `SyncHandle::new`
 /// passing whichever backend is compiled in.
@@ -43,8 +43,15 @@ use crate::WebSyncClient;
 pub struct SyncHandle {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) db: WaveSyncDb,
+    /// One group's transport (multi-group #93): each `SyncHandle` binds
+    /// to a single [`WebGroupHandle`], not the whole [`WebSyncClient`].
+    /// [`Self::new`] binds the client's default group (so every
+    /// pre-existing call site that constructs a handle from a client
+    /// signal keeps working unchanged); [`Self::from_group`] binds an
+    /// arbitrary joined group for apps that want a hook scoped to a
+    /// non-default group.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) client: Signal<Option<WebSyncClient>>,
+    pub(crate) group: Signal<Option<WebGroupHandle>>,
 }
 
 /// Always equal. Dioxus's `#[component]` macro derives a prop-equality
@@ -69,13 +76,41 @@ impl SyncHandle {
         Self { db }
     }
 
-    /// Wrap a web [`WebSyncClient`] signal. The signal pattern matches
-    /// the typical browser setup where the client is constructed async
-    /// during a `use_hook` and lives in a `Signal<Option<WebSyncClient>>`
-    /// until the initial connect resolves.
+    /// Wrap a web [`WebSyncClient`] signal, bound to that client's
+    /// **default group**. The signal pattern matches the typical
+    /// browser setup where the client is constructed async during a
+    /// `use_hook` and lives in a `Signal<Option<WebSyncClient>>` until
+    /// the initial connect resolves.
+    ///
+    /// This is the pre-multi-group (#93) entry point and every existing
+    /// call site keeps compiling unchanged: internally the handle is
+    /// re-derived as `client.default_group()` each time the client
+    /// signal changes (`None` while still connecting, `Some` once
+    /// resolved), so single-group apps see identical behavior to before
+    /// `WebGroupHandle` existed.
+    ///
+    /// This constructor is itself a Dioxus hook (it calls `use_signal` and
+    /// `use_effect` internally), so — like any hook — it must be called
+    /// unconditionally in the component body, never inside an `if`/`match`
+    /// branch of the returned `rsx!`.
     #[cfg(target_arch = "wasm32")]
     pub fn new(client: Signal<Option<WebSyncClient>>) -> Self {
-        Self { client }
+        let mut group =
+            use_signal(move || client.read().as_ref().map(WebSyncClient::default_group));
+        use_effect(move || {
+            group.set(client.read().as_ref().map(WebSyncClient::default_group));
+        });
+        Self { group }
+    }
+
+    /// Wrap an already-joined [`WebGroupHandle`] (multi-group #93) —
+    /// e.g. the result of `client.join_group(...).await`. Unlike
+    /// [`Self::new`] there's no connecting/`None` state: the handle is
+    /// only ever constructed once the join has already succeeded.
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_group(handle: WebGroupHandle) -> Self {
+        let group = use_signal(move || Some(handle));
+        Self { group }
     }
 
     /// Escape hatch: borrow the underlying native database for SeaORM
@@ -86,12 +121,13 @@ impl SyncHandle {
         &self.db
     }
 
-    /// Escape hatch: borrow the underlying web client signal for
-    /// browser-only operations (peer status, presence pings, etc.).
-    /// Code that uses this is non-portable to native targets.
+    /// Escape hatch: borrow the underlying group handle signal for
+    /// browser-only operations (peer status, presence pings, etc.) not
+    /// covered by the unified API. Code that uses this is non-portable
+    /// to native targets.
     #[cfg(target_arch = "wasm32")]
-    pub fn client(&self) -> Signal<Option<WebSyncClient>> {
-        self.client
+    pub fn group(&self) -> Signal<Option<WebGroupHandle>> {
+        self.group
     }
 
     /// Persist a row.
@@ -101,10 +137,12 @@ impl SyncHandle {
     /// `WaveSyncDb` interception layer and broadcasts a
     /// `ChangeNotification` to subscribers.
     ///
-    /// On wasm32, dispatches to [`WebSyncClient::submit`] with the
-    /// table name resolved from `E::table_name()`. The browser engine
-    /// persists to the IndexedDB shadow table and broadcasts a
-    /// `ColumnChange` to subscribers.
+    /// On wasm32, dispatches to [`WebGroupHandle::submit`] (the group
+    /// this handle was bound to — the client's default group via
+    /// [`Self::new`], or an explicit joined group via
+    /// [`Self::from_group`]) with the table name resolved from
+    /// `E::table_name()`. The browser engine persists to the IndexedDB
+    /// shadow table and broadcasts a `ColumnChange` to subscribers.
     ///
     /// Either path is no-op-safe to spawn from a Dioxus event handler;
     /// `submit` is async and intended to be called inside a `spawn`.
@@ -124,10 +162,10 @@ impl SyncHandle {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let Some(client) = self.client.read().clone() else {
+            let Some(group) = self.group.read().clone() else {
                 return Err(SyncSubmitError::NotConnected);
             };
-            client.submit::<E>(E::table_name(), entity).await?;
+            group.submit::<E>(E::table_name(), entity).await?;
             Ok(())
         }
     }
@@ -150,8 +188,9 @@ pub enum SyncSubmitError {
     /// Browser sync engine returned an error — usually IndexedDB
     /// persistence or shadow-table write failure.
     Web(crate::WebSyncError),
-    /// The web client signal is still `None` — connect hasn't resolved
-    /// yet. UI code can retry once the connect future completes.
+    /// The group signal is still `None` — the client hasn't connected
+    /// (or the group hasn't finished joining) yet. UI code can retry
+    /// once the connect/join future completes.
     NotConnected,
 }
 
@@ -216,5 +255,5 @@ where
 
 #[cfg(target_arch = "wasm32")]
 pub fn use_synced_table<E: SyncedTableEntity>(handle: SyncHandle) -> Signal<Vec<E>> {
-    super::use_synced_table_client::<E>(handle.client, E::table_name())
+    super::use_synced_table_client::<E>(handle.group, E::table_name())
 }

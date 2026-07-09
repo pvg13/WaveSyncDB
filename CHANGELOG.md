@@ -154,6 +154,38 @@
   still silently ignored, never rejected — unchanged from before.
 - **Browser e2e CI (puppeteer vs in-repo relay + native peer) and
   wasm-bindgen-test coverage for the IndexedDB store.**
+- **Web multi-group sync (#93).** A browser `WebSyncClient` can now join and
+  serve more than one sync group over its single swarm, mirroring the
+  native `WaveSyncNode::join_group` model: `join_group(user_topic,
+  passphrase, kind)` / `join_group_with_key(user_topic, key, kind)` /
+  `leave_group(handle)` / `default_group()` / `group(user_topic)` return a
+  `WebGroupHandle` — a per-group scope for submitting writes, subscribing to
+  changes, and reading its own IndexedDB-backed store, independent of every
+  other joined group. Each group gets its own IndexedDB database (no shared
+  table namespace across groups), and entity registration on wasm is now
+  scope-aware: `#[wavesync(scope = ...)]` (carried on the target-independent
+  `SyncEntityDescriptor` the derive macro now emits) decides which groups an
+  entity's rows replicate to, the same as on native. Joined groups persist
+  their derived key across a reload and rejoin automatically without
+  re-prompting for the passphrase (surfaced via `WebSyncStatus.joined_topics`,
+  default group first). Idempotent per `user_topic`: a repeat join returns
+  the live handle instead of re-deriving.
+- **`WebSyncClient::force_resync()`.** Fire-and-forget "resync now" UI
+  affordance: requests a full version-vector catch-up
+  (`your_last_db_version: 0`, Rule 2.5) from every connected peer across
+  every joined group, nudges relay re-announce, and kicks an immediate relay
+  reconnect attempt if the link is currently down. Bandwidth-expensive by
+  design; safe because CRDT apply is idempotent and persisted per-peer
+  cursors are only ever advanced, never cleared.
+- **`GroupKey::from_raw` is now public (#94, partial).** Wraps an
+  already-derived (or otherwise sufficiently random) 32-byte key without
+  running Argon2id — the raw-key half of #94's browser main-thread KDF
+  stall. Pairs with the new `GroupKey::to_bytes()` accessor, which is what
+  lets a joined group's derived key be persisted (e.g. for the reload
+  auto-rejoin above) and rebuilt later via `from_raw` with no re-derivation.
+  The main-thread stall itself (deriving fresh from a passphrase still blocks
+  the calling thread for seconds on wasm) remains open — `from_raw` /
+  `join_group_with_key` only help when the key was derived off-thread.
 
 ### Changed
 - **Sync protocol 4.0.0.** The `deleted_ts` field is covered by message

@@ -19,7 +19,12 @@ import { dirname, join, extname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync } from 'node:fs';
 import puppeteer from 'puppeteer-core';
-import { scenarioRoundTrip, scenarioRelayRestart } from './e2e.mjs';
+import {
+  scenarioRoundTrip,
+  scenarioRelayRestart,
+  scenarioMultiGroup,
+  scenarioReloadRejoin,
+} from './e2e.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..');
@@ -32,6 +37,10 @@ const HTTP_PORT = 41199;
 const TOPIC = 'wavesync-e2e';
 const PASSPHRASE = 'e2e-pass';
 const STORE_NAME = 'e2e-browser';
+// Second sync group (multi-group #93) for scenarios C/D. The native peer joins
+// it (kind="e2e") when these are in its env; the browser joins it at runtime.
+const GROUP2_TOPIC = 'wavesync-e2e-g2';
+const GROUP2_PASS = 'e2e-g2-pass';
 
 // Persistent relay identity: the relay generates-and-persists its keypair to
 // this file on first boot and reloads it on every restart, so the PeerId is
@@ -282,6 +291,10 @@ function makeNativeController(relayDialAddr) {
         TOPIC,
         PASSPHRASE,
         DB_PATH: dbPath,
+        // Second group: the native peer joins it (kind="e2e") and seeds/echoes
+        // `e2e_group_items` for scenarios C/D.
+        GROUP2_TOPIC,
+        GROUP2_PASS,
         RUST_LOG: process.env.RUST_LOG || 'info',
       },
     });
@@ -427,6 +440,47 @@ async function runScenarios(relayCtl, nativeCtl) {
   return durations;
 }
 
+// Scenarios C + D share one browser page (a fresh persistent store distinct
+// from A/B's): scenario C initializes the default group and joins group2;
+// scenario D reloads the SAME page and asserts group2 auto-rejoins. A separate
+// page from A/B keeps the multi-group state isolated from the relay-restart run.
+async function runScenariosCD(relayCtl) {
+  const browser = await launchBrowser();
+  const durations = {};
+  try {
+    const page = await openPage(browser);
+    const cfg = {
+      relayAddr: relayCtl.browserAddr,
+      topic: TOPIC,
+      passphrase: PASSPHRASE,
+      store: 'e2e-store-cd',
+      group2Topic: GROUP2_TOPIC,
+      group2Pass: GROUP2_PASS,
+      defaultTable: 'e2e_items',
+      group2Table: 'e2e_group_items',
+    };
+
+    process.stdout.write('[orch] running scenario C (multi-group isolation)...\n');
+    let t0 = Date.now();
+    await scenarioMultiGroup(page, cfg);
+    durations.multiGroup = Date.now() - t0;
+    process.stdout.write(
+      `[orch] scenario C passed in ${(durations.multiGroup / 1000).toFixed(1)}s\n`,
+    );
+
+    process.stdout.write('[orch] running scenario D (reload auto-rejoin + force_resync)...\n');
+    t0 = Date.now();
+    await scenarioReloadRejoin(page, cfg);
+    durations.reloadRejoin = Date.now() - t0;
+    process.stdout.write(
+      `[orch] scenario D passed in ${(durations.reloadRejoin / 1000).toFixed(1)}s\n`,
+    );
+  } finally {
+    await browser.close();
+  }
+  return durations;
+}
+
 async function main() {
   let server;
   const relayCtl = makeRelayController();
@@ -447,10 +501,13 @@ async function main() {
     process.stdout.write('[orch] boot scenario passed\n');
 
     const durations = await runScenarios(relayCtl, nativeCtl);
+    const cdDurations = await runScenariosCD(relayCtl);
     process.stdout.write(
       `[orch] all scenarios passed — durations(s): ` +
         `roundTrip=${(durations.roundTrip / 1000).toFixed(1)} ` +
-        `relayRestart=${(durations.relayRestart / 1000).toFixed(1)}\n`,
+        `relayRestart=${(durations.relayRestart / 1000).toFixed(1)} ` +
+        `multiGroup=${(cdDurations.multiGroup / 1000).toFixed(1)} ` +
+        `reloadRejoin=${(cdDurations.reloadRejoin / 1000).toFixed(1)}\n`,
     );
   } finally {
     if (server) server.close();

@@ -104,6 +104,46 @@ async fn tombstone_reaper_respects_cutoff() {
 }
 
 #[wasm_bindgen_test]
+async fn joined_groups_roundtrip_and_v3_upgrade() {
+    // opening is itself the v2->v3 upgrade path (idb machinery is additive)
+    let store = BrowserStore::open("wasmtest-groups").await.unwrap();
+    let rec = wavesyncdb::web_store::JoinedGroupRecord {
+        user_topic: "house".into(),
+        effective_topic: "wavesync2-abc".into(),
+        derived_key: [7u8; 32],
+        kind: Some("household".into()),
+    };
+    store.record_joined_group(&rec).await.unwrap();
+    // upsert: same user_topic replaces, not duplicates
+    store.record_joined_group(&rec).await.unwrap();
+    let loaded = store.load_joined_groups().await.unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].derived_key, [7u8; 32]);
+    assert_eq!(loaded[0].kind.as_deref(), Some("household"));
+    store.remove_joined_group("house").await.unwrap();
+    assert!(store.load_joined_groups().await.unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn group_store_names_are_isolated() {
+    use wavesyncdb::web_store::group_store_name;
+    let a = BrowserStore::open(&group_store_name("iso", "wavesync2-aaa"))
+        .await
+        .unwrap();
+    let b = BrowserStore::open(&group_store_name("iso", "wavesync2-bbb"))
+        .await
+        .unwrap();
+    // write a shadow row in a; assert absent in b
+    let mut batch = WriteBatch::default();
+    batch
+        .shadow_puts
+        .push(("t".into(), "p".into(), "c".into(), row(None, 1)));
+    a.apply_batch(batch).await.unwrap();
+    assert!(a.get_shadow("t", "p", "c").await.unwrap().is_some());
+    assert!(b.get_shadow("t", "p", "c").await.unwrap().is_none());
+}
+
+#[wasm_bindgen_test]
 async fn peer_addr_roundtrip() {
     let store = BrowserStore::open("wasmtest-addrs").await.unwrap();
     store
@@ -118,4 +158,54 @@ async fn peer_addr_roundtrip() {
     assert_eq!(loaded[0].peer_id, "12D3KooWpeer");
     assert_eq!(loaded[0].multiaddr, "/dns4/x/tcp/443/wss");
     assert_eq!(loaded[0].fail_count, 0);
+}
+
+/// Multi-group #93 / issue-linked persistence: round-trip a `JoinedGroupRecord`
+/// and rebuild the `GroupKey` from its stored bytes — proves the persisted
+/// record reconstructs the SAME effective topic, which is the rejoin
+/// invariant `web_engine::connect_persistent_with_config`'s rejoin path
+/// depends on. Uses `GroupKey::from_raw` (not `from_passphrase`) as the
+/// source key: a real Argon2id derivation costs seconds in a browser test,
+/// and `from_raw` exercises the identical `to_bytes`/`derive_topic` round
+/// trip without paying it.
+#[wasm_bindgen_test]
+async fn joined_group_record_shape_supports_rejoin() {
+    let key = wavesyncdb::GroupKey::from_raw([9u8; 32]);
+    let effective = key.derive_topic("house");
+    let store = BrowserStore::open("wasmtest-rejoin").await.unwrap();
+    store
+        .record_joined_group(&wavesyncdb::web_store::JoinedGroupRecord {
+            user_topic: "house".into(),
+            effective_topic: effective.clone(),
+            derived_key: key.to_bytes(),
+            kind: None,
+        })
+        .await
+        .unwrap();
+    let loaded = store.load_joined_groups().await.unwrap();
+    let rec = &loaded[0];
+    let rebuilt = wavesyncdb::GroupKey::from_raw(rec.derived_key);
+    assert_eq!(rebuilt.derive_topic(&rec.user_topic), rec.effective_topic);
+    assert_eq!(rec.effective_topic, effective);
+}
+
+/// Multi-group (#93): a loopback client cannot host a second group — the
+/// single-pair demo transport has no swarm, so `join_group` must fail fast
+/// with `Unsupported`. This is the cheapest real-engine assertion available
+/// without standing up a relay in the browser test; full join coverage is
+/// the node e2e suite (Task 11).
+#[wasm_bindgen_test]
+async fn loopback_join_group_is_unsupported() {
+    let pair = wavesyncdb::LoopbackPair::new();
+    let client =
+        wavesyncdb::WebSyncClient::connect_loopback(pair.a, "topic-x", None, "wasmtest-lb-join")
+            .await
+            .unwrap();
+    // `WebGroupHandle` intentionally has no `Debug` (it holds a `Box<dyn Any>`
+    // table cache), so match the `Result` directly rather than `unwrap_err`.
+    let result = client.join_group("other-group", "pw", None).await;
+    assert!(
+        matches!(result, Err(wavesyncdb::WebSyncError::Unsupported)),
+        "loopback join_group must be Unsupported"
+    );
 }
