@@ -19,7 +19,8 @@
 //! - [`use_synced_row_loaded`] — like `use_synced_row`, but distinguishes
 //!   "still loading" (`None`) from "loaded, row absent" (`Some(None)`).
 //! - [`SyncHandle`] — opaque transport wrapper (`WaveSyncDb` on native,
-//!   `Signal<Option<WebSyncClient>>` on wasm32) with a unified
+//!   `Signal<Option<WebGroupHandle>>` on wasm32 — one group per handle,
+//!   `SyncHandle::new` binds a client's default group) with a unified
 //!   [`SyncHandle::submit`] for writes.
 //!
 //! ## Example
@@ -53,7 +54,8 @@
 // `sea_orm` types and a tokio multi-thread runtime, so they cannot
 // compile to wasm32. Browser apps get a parallel `web_hooks` module
 // below that exposes a similarly-shaped reactive API over
-// [`crate::WebSyncClient`] and [`crate::BrowserStore`].
+// [`crate::WebGroupHandle`] (one group's transport; multi-group #93)
+// and [`crate::BrowserStore`].
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hooks;
 #[cfg(not(target_arch = "wasm32"))]
