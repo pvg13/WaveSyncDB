@@ -65,7 +65,7 @@ use crate::auth::GroupKey;
 use crate::messages::{ColumnChange, NodeId, SyncChangeset};
 use crate::protocol::{SyncRequest, SyncResponse};
 use crate::web_entity::BrowserEntity;
-use crate::web_store::{BrowserStore, group_store_name};
+use crate::web_store::{BrowserStore, JoinedGroupRecord, group_store_name};
 use crate::web_sync_core::{
     EphemeralStore, WebSyncConfig, apply_remote_changeset_core, changes_since_core,
     compute_store_digest, merge_config, reconcile_range_step, scoped_web_config,
@@ -305,6 +305,7 @@ impl WebSyncClient {
             None,       // ephemeral — no base store name for joined groups
             None,       // not relay-mediated discovery
             Vec::new(), // ephemeral — no persistent peer-addr cache
+            Vec::new(), // ephemeral — no default store, nothing to rejoin
         )
     }
 
@@ -386,6 +387,11 @@ impl WebSyncClient {
             .await
             .map_err(|e| WebSyncError::Store(e.to_string()))?;
 
+        // Auto-rejoin (#93 persistence): restore any groups joined in a
+        // previous session before `store` is wrapped in the `Arc` below.
+        // Best-effort per record — see `load_rejoin_inits`.
+        let rejoin_inits = load_rejoin_inits(&store, store_name).await;
+
         Self::start(
             peer_multiaddr,
             user_topic,
@@ -402,6 +408,7 @@ impl WebSyncClient {
             // is for relay-mediated topologies where we don't know the
             // peer set ahead of time.
             Vec::new(),
+            rejoin_inits,
         )
     }
 
@@ -551,6 +558,11 @@ impl WebSyncClient {
             );
         }
 
+        // Auto-rejoin (#93 persistence): restore any groups joined in a
+        // previous session before `store` is wrapped in the `Arc` below.
+        // Best-effort per record — see `load_rejoin_inits`.
+        let rejoin_inits = load_rejoin_inits(&store, store_name).await;
+
         Self::start(
             relay_addr,
             user_topic,
@@ -563,6 +575,7 @@ impl WebSyncClient {
             Some(store_name.to_string()),
             Some(relay_peer_id),
             cached_peer_addrs,
+            rejoin_inits,
         )
     }
 
@@ -592,6 +605,14 @@ impl WebSyncClient {
         // start before the AnnouncePresence/PeerList round-trip
         // completes.
         cached_peer_addrs: Vec<crate::web_store::CachedPeerAddr>,
+        // Groups restored from a previous session's persisted joins
+        // (`load_rejoin_inits`, called by the two persistent constructors
+        // before this function). Empty for ephemeral clients (no default
+        // store to load from) and for the plain `connect`/`connect_with_config`
+        // path. Seeded into the engine's `groups` map and the client's
+        // `group_registry` alongside the default group, before `run_swarm`
+        // starts — so the first relay-connect announce drain covers them too.
+        rejoin_inits: Vec<WebGroupInit>,
     ) -> Result<Self, WebSyncError> {
         let group_key = passphrase.map(|p| GroupKey::from_passphrase(p, user_topic));
         let effective_topic = group_key
@@ -683,6 +704,71 @@ impl WebSyncClient {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (inbound_tx, _) = broadcast::channel(64);
         let (resolved_tx, _) = broadcast::channel(256);
+
+        // Auto-rejoin (#93 persistence): turn each restored `WebGroupInit`
+        // into both the engine-side `WebGroupState` (pre-seeded into
+        // `run_swarm`'s `groups` map below, alongside the default group —
+        // NOT sent as a `Command::JoinGroup`, since the swarm task hasn't
+        // been spawned yet) and the client-side `WebGroupHandle` (seeded
+        // into `group_registry` so a later `join_group`/`join_group_with_key`
+        // call for the same user_topic is a registry hit, returning the
+        // live handle instead of re-deriving or re-registering). Building
+        // both from the one `WebGroupInit` here — rather than replaying
+        // `Command::JoinGroup` after spawn — means the very first
+        // relay-connect announce drain (which walks `announced == false`
+        // groups) already covers every rejoined group, with no separate
+        // late-join path to keep in sync.
+        let mut extra_groups: Vec<WebGroupState> = Vec::with_capacity(rejoin_inits.len());
+        let mut extra_registry: HashMap<String, WebGroupHandle> =
+            HashMap::with_capacity(rejoin_inits.len());
+        for init in rejoin_inits {
+            let WebGroupInit {
+                user_topic: g_user_topic,
+                topic: g_topic,
+                kind: g_kind,
+                group_key: g_group_key,
+                config: g_config,
+                store: g_store,
+                site_id: g_site_id,
+                db_version: g_db_version,
+                inbound_tx: g_inbound_tx,
+                resolved_tx: g_resolved_tx,
+            } = init;
+            let handle = WebGroupHandle {
+                user_topic: g_user_topic.clone(),
+                effective_topic: g_topic.clone(),
+                kind: g_kind.clone(),
+                inbound_tx: g_inbound_tx.clone(),
+                resolved_tx: g_resolved_tx.clone(),
+                store: g_store.clone(),
+                cmd_tx: cmd_tx.clone(),
+                table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            };
+            extra_registry.insert(g_user_topic.clone(), handle);
+            extra_groups.push(WebGroupState {
+                user_topic: g_user_topic,
+                topic: g_topic,
+                kind: g_kind,
+                group_key: g_group_key,
+                config: g_config,
+                store: g_store,
+                site_id: g_site_id,
+                db_version: Arc::new(Mutex::new(g_db_version)),
+                inbound_tx: g_inbound_tx,
+                resolved_tx: g_resolved_tx,
+                rejected_peers: HashMap::new(),
+                // Not yet announced this connection — covered by the same
+                // loop-head drain that announces the default group.
+                announced: false,
+            });
+        }
+        if !extra_groups.is_empty() {
+            tracing::info!(
+                "WebSyncClient: auto-rejoined {} group(s) from a previous session",
+                extra_groups.len()
+            );
+        }
+
         let (status_tx, status_rx) = watch::channel(WebSyncStatus {
             // True from the first snapshot: by the time `start()` is
             // called, the constructors above have already opened
@@ -695,8 +781,12 @@ impl WebSyncClient {
             relay_reconnect_attempts: 0,
             connected_peer_ids: Vec::new(),
             // The default group is present from construction; join/leave
-            // grow and shrink this list.
-            joined_topics: vec![user_topic.to_string()],
+            // grow and shrink this list. Auto-rejoined groups are included
+            // from the first snapshot — default first, matching the
+            // documented "default group first" ordering.
+            joined_topics: std::iter::once(user_topic.to_string())
+                .chain(extra_groups.iter().map(|g| g.user_topic.clone()))
+                .collect(),
         });
 
         tracing::info!(
@@ -741,7 +831,13 @@ impl WebSyncClient {
             default_topic: effective_topic.clone(),
         };
 
-        wasm_bindgen_futures::spawn_local(run_swarm(swarm, cmd_rx, state, default_group));
+        wasm_bindgen_futures::spawn_local(run_swarm(
+            swarm,
+            cmd_rx,
+            state,
+            default_group,
+            extra_groups,
+        ));
 
         // Physically collect aged tombstones off the startup path. Exclusion
         // already hides them from every sync surface; this only reclaims
@@ -772,7 +868,7 @@ impl WebSyncClient {
             default_user_topic: user_topic.to_string(),
             store_name,
             loopback: false,
-            group_registry: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            group_registry: std::rc::Rc::new(std::cell::RefCell::new(extra_registry)),
             inbound_tx,
             resolved_tx,
             store,
@@ -1030,6 +1126,10 @@ impl WebSyncClient {
         let (inbound_tx, _) = broadcast::channel(64);
         let (resolved_tx, _) = broadcast::channel(256);
 
+        // Captured before `group_key` moves into `init` below — this is the
+        // only value the join-persistence record needs out of the key.
+        let derived_key = group_key.to_bytes();
+
         let init = WebGroupInit {
             user_topic: user_topic.to_string(),
             topic: effective_topic.clone(),
@@ -1048,6 +1148,29 @@ impl WebSyncClient {
             .send(Command::JoinGroup(Box::new(init), ack_tx))
             .map_err(|_| WebSyncError::NotRunning)?;
         ack_rx.await.map_err(|_| WebSyncError::NotRunning)??;
+
+        // Persist the join to the DEFAULT store (not the group's own store)
+        // so a reload's rejoin scan (`start()`) can find it before it opens
+        // any group store. Best-effort: the join has already succeeded from
+        // the engine's perspective by this point, so a store failure here
+        // costs only "this group won't auto-rejoin next load" (the app can
+        // still `join_group` again with the passphrase), never the join
+        // itself. Ephemeral clients (`self.store == None`) persist nothing,
+        // which is the correct no-op — there is nothing to reload.
+        if let Some(default_store) = &self.store {
+            let record = JoinedGroupRecord {
+                user_topic: user_topic.to_string(),
+                effective_topic: effective_topic.clone(),
+                derived_key,
+                kind: kind.map(|k| k.to_string()),
+            };
+            if let Err(e) = default_store.record_joined_group(&record).await {
+                tracing::warn!(
+                    user_topic = %user_topic,
+                    "WebSyncClient: failed to persist joined group (won't auto-rejoin on reload): {e}"
+                );
+            }
+        }
 
         let handle = WebGroupHandle {
             user_topic: user_topic.to_string(),
@@ -1086,6 +1209,19 @@ impl WebSyncClient {
             })
             .map_err(|_| WebSyncError::NotRunning)?;
         ack_rx.await.map_err(|_| WebSyncError::NotRunning)??;
+        // Mirror the join-time persistence: remove the record from the
+        // DEFAULT store so a future reload doesn't try to auto-rejoin a
+        // group this client explicitly left. Best-effort — the leave has
+        // already succeeded engine-side, so a store failure here is a
+        // stale-record cleanup gap, not a leave failure.
+        if let Some(default_store) = &self.store {
+            if let Err(e) = default_store.remove_joined_group(&handle.user_topic).await {
+                tracing::warn!(
+                    user_topic = %handle.user_topic,
+                    "WebSyncClient: failed to remove persisted joined-group record: {e}"
+                );
+            }
+        }
         self.group_registry.borrow_mut().remove(&handle.user_topic);
         Ok(())
     }
@@ -1309,6 +1445,105 @@ pub struct WebGroupInit {
     db_version: u64,
     inbound_tx: broadcast::Sender<SyncChangeset>,
     resolved_tx: broadcast::Sender<ColumnChange>,
+}
+
+/// Load every persisted joined-group record from the DEFAULT store and
+/// rebuild a [`WebGroupInit`] for each, so a reload can auto-rejoin without
+/// the user re-entering a passphrase or the app re-running the KDF.
+///
+/// Per-record failures (this group's store failing to open, a corrupted
+/// record) are logged with `tracing::warn!` and that record is skipped —
+/// never fatal to client startup or to any other group's rejoin. Called only
+/// from the two persistent constructors, before `start()`; ephemeral clients
+/// have no default store and never reach this function.
+async fn load_rejoin_inits(default_store: &BrowserStore, store_name: &str) -> Vec<WebGroupInit> {
+    let records = match default_store.load_joined_groups().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "WebSyncClient: failed to load joined-group records (auto-rejoin skipped): {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let mut inits = Vec::with_capacity(records.len());
+    for rec in records {
+        let user_topic = rec.user_topic.clone();
+        match build_rejoin_init(rec, store_name).await {
+            Ok(init) => inits.push(init),
+            Err(e) => tracing::warn!(
+                user_topic = %user_topic,
+                "WebSyncClient: auto-rejoin failed for group (skipped): {e}"
+            ),
+        }
+    }
+    inits
+}
+
+/// Rebuild one group's [`WebGroupInit`] from its persisted record.
+///
+/// Mirrors `join_group_with_key`'s non-default-group setup exactly —
+/// `GroupKey::from_raw` (never re-derives via Argon2id), the same scoped
+/// config, and the same group-store-open + site_id/db_version-load sequence
+/// — so a rejoined group is indistinguishable engine-side from one joined
+/// fresh this session.
+async fn build_rejoin_init(
+    rec: JoinedGroupRecord,
+    store_name: &str,
+) -> Result<WebGroupInit, WebSyncError> {
+    let group_key = GroupKey::from_raw(rec.derived_key);
+    let effective_topic = group_key.derive_topic(&rec.user_topic);
+    // Defense in depth: a hand-edited or corrupted record whose stored
+    // `effective_topic` no longer agrees with what the key derives would
+    // otherwise rejoin the group under the wrong wire topic. Refuse rather
+    // than silently sync under a mismatched topic.
+    if effective_topic != rec.effective_topic {
+        return Err(WebSyncError::Store(format!(
+            "joined-group record topic mismatch for user_topic={}",
+            rec.user_topic
+        )));
+    }
+    let config = merge_config(
+        WebSyncConfig::default(),
+        scoped_web_config(false, rec.kind.as_deref()),
+    );
+    let db_name = group_store_name(store_name, &effective_topic);
+    let group_store = BrowserStore::open(&db_name)
+        .await
+        .map_err(|e| WebSyncError::Store(e.to_string()))?;
+    let site_id = match group_store
+        .get_site_id()
+        .await
+        .map_err(|e| WebSyncError::Store(e.to_string()))?
+    {
+        Some(id) => id,
+        None => {
+            let id = NodeId(rand_site_id());
+            group_store
+                .put_site_id(&id)
+                .await
+                .map_err(|e| WebSyncError::Store(e.to_string()))?;
+            id
+        }
+    };
+    let db_version = group_store
+        .get_db_version()
+        .await
+        .map_err(|e| WebSyncError::Store(e.to_string()))?;
+    let (inbound_tx, _) = broadcast::channel(64);
+    let (resolved_tx, _) = broadcast::channel(256);
+    Ok(WebGroupInit {
+        user_topic: rec.user_topic,
+        topic: effective_topic,
+        kind: rec.kind,
+        group_key: Some(group_key),
+        config,
+        store: Some(Arc::new(group_store)),
+        site_id,
+        db_version,
+        inbound_tx,
+        resolved_tx,
+    })
 }
 
 /// Handle to one sync group on a [`WebSyncClient`] (multi-group #93).
@@ -2257,14 +2492,26 @@ async fn run_swarm(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     state: EngineState,
     default_group: WebGroupState,
+    // Groups restored from a previous session's persisted joins
+    // (auto-rejoin, #93 persistence). Pre-seeded into `groups` here —
+    // before the event loop starts — rather than replayed as
+    // `Command::JoinGroup`s, so the very first relay-connect announce
+    // drain (which walks every `announced == false` group) already
+    // covers them. Empty for ephemeral clients and fresh persistent
+    // clients with no prior joins.
+    extra_groups: Vec<WebGroupState>,
 ) {
     // All sync groups sharing this swarm, keyed by effective (derived)
     // topic — the wire topic carried on every message. Exactly one entry
-    // (the default group) in this build; inbound dispatch resolves the
-    // owning group by topic via `group_for_topic`. Per-group HMAC
+    // (the default group) in the single-group build; multi-group clients
+    // add one entry per joined/rejoined group. Inbound dispatch resolves
+    // the owning group by topic via `group_for_topic`. Per-group HMAC
     // rejection lives inside each `WebGroupState.rejected_peers`.
     let mut groups: HashMap<String, WebGroupState> = HashMap::new();
     groups.insert(default_group.topic.clone(), default_group);
+    for group in extra_groups {
+        groups.insert(group.topic.clone(), group);
+    }
 
     let mut connected: HashSet<LibPeerId> = HashSet::new();
     // The relay peer-id is *not* inserted into `connected` (it isn't

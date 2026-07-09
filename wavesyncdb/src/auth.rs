@@ -188,6 +188,14 @@ impl GroupKey {
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.key
     }
+
+    /// Raw key bytes, for persisting a joined group's derived key to the
+    /// browser's IndexedDB store (`JoinedGroupRecord::derived_key`) so a
+    /// reload can rebuild the same `GroupKey` via `from_raw` without
+    /// re-running the KDF or re-prompting for the passphrase.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.key
+    }
 }
 
 #[cfg(test)]

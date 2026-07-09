@@ -160,6 +160,35 @@ async fn peer_addr_roundtrip() {
     assert_eq!(loaded[0].fail_count, 0);
 }
 
+/// Multi-group #93 / issue-linked persistence: round-trip a `JoinedGroupRecord`
+/// and rebuild the `GroupKey` from its stored bytes — proves the persisted
+/// record reconstructs the SAME effective topic, which is the rejoin
+/// invariant `web_engine::connect_persistent_with_config`'s rejoin path
+/// depends on. Uses `GroupKey::from_raw` (not `from_passphrase`) as the
+/// source key: a real Argon2id derivation costs seconds in a browser test,
+/// and `from_raw` exercises the identical `to_bytes`/`derive_topic` round
+/// trip without paying it.
+#[wasm_bindgen_test]
+async fn joined_group_record_shape_supports_rejoin() {
+    let key = wavesyncdb::GroupKey::from_raw([9u8; 32]);
+    let effective = key.derive_topic("house");
+    let store = BrowserStore::open("wasmtest-rejoin").await.unwrap();
+    store
+        .record_joined_group(&wavesyncdb::web_store::JoinedGroupRecord {
+            user_topic: "house".into(),
+            effective_topic: effective.clone(),
+            derived_key: key.to_bytes(),
+            kind: None,
+        })
+        .await
+        .unwrap();
+    let loaded = store.load_joined_groups().await.unwrap();
+    let rec = &loaded[0];
+    let rebuilt = wavesyncdb::GroupKey::from_raw(rec.derived_key);
+    assert_eq!(rebuilt.derive_topic(&rec.user_topic), rec.effective_topic);
+    assert_eq!(rec.effective_topic, effective);
+}
+
 /// Multi-group (#93): a loopback client cannot host a second group — the
 /// single-pair demo transport has no swarm, so `join_group` must fail fast
 /// with `Unsupported`. This is the cheapest real-engine assertion available
