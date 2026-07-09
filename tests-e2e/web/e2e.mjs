@@ -39,8 +39,26 @@ async function rows(page, table) {
   return JSON.parse(await page.evaluate((t) => window.e2e_rows(t), table));
 }
 
+// Parsed rows of `table` in the joined group `topic` (page crate's
+// `e2e_group_rows`). Same `{ pk, columns }` shape.
+async function groupRows(page, topic, table) {
+  return JSON.parse(
+    await page.evaluate((t, tbl) => window.e2e_group_rows(t, tbl), topic, table),
+  );
+}
+
 function hasPk(list, pk) {
   return list.some((r) => r.pk === pk);
+}
+
+// Reject `promise` if it hasn't settled within `ms`. Used to bound the
+// Argon2id-bearing `e2e_join_group` (page.evaluate itself has no timeout).
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
 // Scenario A — browser<->native round-trip through the relay.
@@ -168,4 +186,203 @@ export async function scenarioRelayRestart(page, relayCtl, nativeCtl) {
     }\n`,
   );
   return { nativeRestarted };
+}
+
+// Scenario C — multi-group isolation (#93).
+//
+// `cfg` = { relayAddr, topic, passphrase, store, group2Topic, group2Pass,
+// defaultTable, group2Table }. This scenario owns the page's `e2e_init` (fresh
+// persistent store, distinct from A/B's) so it can be reloaded in scenario D.
+//
+// The browser holds the DEFAULT group (topic/passphrase, table `e2e_items`)
+// AND joins a SECOND group (group2Topic/group2Pass, kind="e2e", table
+// `e2e_group_items`) over the same client. The native peer seeds and echoes in
+// both. We prove a real changeset crosses in the second group BOTH directions,
+// then assert neither group's data leaks into the other.
+export async function scenarioMultiGroup(page, cfg) {
+  process.stdout.write('[scenarioC] init browser client (default group)\n');
+  await page.evaluate(
+    (addr, topic, pass, store) => window.e2e_init(addr, topic, pass, store),
+    cfg.relayAddr,
+    cfg.topic,
+    cfg.passphrase,
+    cfg.store,
+  );
+  await until(async () => (await status(page)).relayConnected, 30_000, 500, 'relay connect');
+
+  // Default group must be live (native seed reaches the browser) before we
+  // reason about isolation — otherwise "no leakage" is vacuous.
+  await until(
+    async () => hasPk(await rows(page, cfg.defaultTable), 'from-native'),
+    60_000,
+    1_000,
+    'native default seed reaches browser',
+  );
+  process.stdout.write('[scenarioC] default group synced\n');
+
+  // Join the second group. Runs Argon2id on the wasm thread — bounded at 30s.
+  process.stdout.write('[scenarioC] joining group2 (Argon2id)...\n');
+  await withTimeout(
+    page.evaluate(
+      (t, p, k) => window.e2e_join_group(t, p, k),
+      cfg.group2Topic,
+      cfg.group2Pass,
+      'e2e',
+    ),
+    30_000,
+    'join group2 (KDF)',
+  );
+  await until(
+    async () => (await status(page)).joinedTopics.includes(cfg.group2Topic),
+    30_000,
+    500,
+    'joinedTopics includes group2',
+  );
+  process.stdout.write('[scenarioC] joined group2\n');
+
+  // native -> browser (group2): the peer seeded `g2-from-native` in its group2.
+  await until(
+    async () => hasPk(await groupRows(page, cfg.group2Topic, cfg.group2Table), 'g2-from-native'),
+    60_000,
+    1_000,
+    'native group2 seed reaches browser',
+  );
+  process.stdout.write('[scenarioC] native group2 seed reached browser\n');
+
+  // browser -> native (group2): write, then wait for the native echo.
+  await page.evaluate(
+    (t, tbl, pk, cols) => window.e2e_group_submit(t, tbl, pk, cols),
+    cfg.group2Topic,
+    cfg.group2Table,
+    'g2-from-browser',
+    JSON.stringify([['body', 'hello g2']]),
+  );
+  await until(
+    async () =>
+      hasPk(
+        await groupRows(page, cfg.group2Topic, cfg.group2Table),
+        'g2-native-saw-g2-from-browser',
+      ),
+    60_000,
+    1_000,
+    'group2 browser write echoed by native',
+  );
+  process.stdout.write('[scenarioC] group2 browser write echoed by native\n');
+
+  // Isolation, both directions: no g2-* pk leaks into the default group, and no
+  // default-group pk (from-native / from-browser / native-saw-*) leaks into
+  // group2. The two groups even use different tables and different IndexedDB
+  // stores, so any leak would be a real cross-group routing bug.
+  const defaultRows = await rows(page, cfg.defaultTable);
+  const g2Rows = await groupRows(page, cfg.group2Topic, cfg.group2Table);
+  const leakedIntoDefault = defaultRows.filter((r) => r.pk.startsWith('g2-'));
+  if (leakedIntoDefault.length > 0) {
+    throw new Error(
+      `isolation breach: default group contains g2 pks: ${leakedIntoDefault
+        .map((r) => r.pk)
+        .join(', ')}`,
+    );
+  }
+  const leakedIntoGroup2 = g2Rows.filter(
+    (r) => r.pk === 'from-native' || r.pk === 'from-browser' || r.pk.startsWith('native-saw-'),
+  );
+  if (leakedIntoGroup2.length > 0) {
+    throw new Error(
+      `isolation breach: group2 contains default pks: ${leakedIntoGroup2
+        .map((r) => r.pk)
+        .join(', ')}`,
+    );
+  }
+  process.stdout.write('[scenarioC] cross-group isolation holds (both directions) — PASS\n');
+}
+
+// Scenario D — reload auto-rejoin + force_resync smoke (#93).
+//
+// Reuses the SAME page (and therefore the SAME persistent store) scenario C
+// left joined to group2. A reload wipes all in-memory state; re-`e2e_init` with
+// the same store must auto-rejoin group2 from its persisted join record WITHOUT
+// the app calling `e2e_join_group` again — proving sync resumes on its own. We
+// then write into the rejoined group and require a native echo, and finally
+// exercise `e2e_force_resync` and require another echo, proving the engine
+// survived the manual resync.
+export async function scenarioReloadRejoin(page, cfg) {
+  process.stdout.write('[scenarioD] reloading page (drops all in-memory state)...\n');
+  await page.reload({ waitUntil: 'load' });
+  await page.waitForFunction('window.e2eReady === true', { timeout: 30_000 });
+
+  // Re-init the DEFAULT group with the SAME store: this is what triggers the
+  // auto-rejoin of persisted groups. We deliberately do NOT call e2e_join_group.
+  await page.evaluate(
+    (addr, topic, pass, store) => window.e2e_init(addr, topic, pass, store),
+    cfg.relayAddr,
+    cfg.topic,
+    cfg.passphrase,
+    cfg.store,
+  );
+  await until(
+    async () => (await status(page)).relayConnected,
+    30_000,
+    500,
+    'relay reconnect after reload',
+  );
+
+  // Auto-rejoin: group2 appears in joinedTopics without an explicit join call.
+  await until(
+    async () => (await status(page)).joinedTopics.includes(cfg.group2Topic),
+    30_000,
+    500,
+    'group2 auto-rejoined after reload',
+  );
+  // And its data survived the reload (group2's own IndexedDB store persists).
+  await until(
+    async () => hasPk(await groupRows(page, cfg.group2Topic, cfg.group2Table), 'g2-from-native'),
+    30_000,
+    1_000,
+    'group2 rows survive reload',
+  );
+  process.stdout.write('[scenarioD] group2 auto-rejoined and rows survived reload\n');
+
+  // A fresh write into the rejoined group must still be echoed by the native
+  // peer — proving the rejoined group is fully live, not just present.
+  await page.evaluate(
+    (t, tbl, pk, cols) => window.e2e_group_submit(t, tbl, pk, cols),
+    cfg.group2Topic,
+    cfg.group2Table,
+    'g2-post-reload',
+    JSON.stringify([['body', 'after reload']]),
+  );
+  await until(
+    async () =>
+      hasPk(
+        await groupRows(page, cfg.group2Topic, cfg.group2Table),
+        'g2-native-saw-g2-post-reload',
+      ),
+    60_000,
+    1_000,
+    'post-reload write echoed by native',
+  );
+  process.stdout.write('[scenarioD] post-reload write echoed by native\n');
+
+  // force_resync smoke: fire the manual resync, then prove the engine survived
+  // by writing once more and requiring another native echo.
+  process.stdout.write('[scenarioD] force_resync smoke...\n');
+  await page.evaluate(() => window.e2e_force_resync());
+  await page.evaluate(
+    (t, tbl, pk, cols) => window.e2e_group_submit(t, tbl, pk, cols),
+    cfg.group2Topic,
+    cfg.group2Table,
+    'g2-post-resync',
+    JSON.stringify([['body', 'after resync']]),
+  );
+  await until(
+    async () =>
+      hasPk(
+        await groupRows(page, cfg.group2Topic, cfg.group2Table),
+        'g2-native-saw-g2-post-resync',
+      ),
+    60_000,
+    1_000,
+    'post-resync write echoed by native',
+  );
+  process.stdout.write('[scenarioD] force_resync survived — PASS\n');
 }

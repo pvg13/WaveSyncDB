@@ -1043,6 +1043,21 @@ impl WebSyncClient {
         }
     }
 
+    /// Handle to an already-joined non-default group by its user topic, or
+    /// `None` if this client has no such group.
+    ///
+    /// Returns a live handle for any group present in the registry — one this
+    /// session joined via [`Self::join_group`]/[`Self::join_group_with_key`],
+    /// **or one auto-rejoined from a previous session's persisted joins** on
+    /// construction (#93 persistence). This is the accessor an app uses after a
+    /// reload to reach a group that resumed syncing automatically, without
+    /// re-supplying its passphrase (and without paying the Argon2id stretch a
+    /// fresh `join_group` fast-paths past anyway). The default group is reached
+    /// via [`Self::default_group`], not here.
+    pub fn group(&self, user_topic: &str) -> Option<WebGroupHandle> {
+        self.group_registry.borrow().get(user_topic).cloned()
+    }
+
     /// Join an additional sync group by passphrase (multi-group #93).
     ///
     /// Derives the group key with Argon2id (**slow** — seconds on wasm; run
