@@ -635,3 +635,99 @@ async fn aged_tombstones_stay_convergent_across_gc_timing() {
     assert_eq!(collected, 1, "native physically collected the tombstone");
     exchange_and_prove(&native, &mut web, "retention: asymmetric physical GC").await;
 }
+
+/// Post-GC: unlike the asymmetric case above (native reaps, web only
+/// excludes), here BOTH sides physically reap the aged tombstone —
+/// native via `shadow::gc_aged_tombstones`, web via
+/// `web_sync_core::gc_aged_tombstones_core` (the browser-core GC path).
+/// Exclusion already hides an aged tombstone from every surface before
+/// either side reaps; this proves that actually reclaiming its storage —
+/// on one side, the other, or both — changes nothing a peer can observe.
+/// Same node ID seeds as the retention scenario above (178–179):
+/// reusing them here is safe (each test builds its own unique topic /
+/// mem_db, matching the reuse pattern already established elsewhere in
+/// this file), and no new libp2p exchange is involved — this suite stays
+/// function-level.
+#[tokio::test]
+async fn post_gc_digests_stay_equal() {
+    common::init_test_tracing();
+    let native = make_peer(&mem_db("conv_gc"), &unique_topic("gc"), 178).await;
+    let mut web = WebPeer::new(179, DeletePolicy::DeleteWins);
+
+    // Same retention window on both sides.
+    wavesyncdb::shadow::set_tombstone_retention(
+        native.inner(),
+        Some(std::time::Duration::from_secs(100)),
+    )
+    .await
+    .unwrap();
+    web.cfg.tombstone_retention_secs = Some(100);
+
+    // Insert + delete on native, then propagate so both replicas hold the
+    // (live) tombstone.
+    task::ActiveModel {
+        id: Set("gc1".into()),
+        title: Set("will be gc'd".into()),
+        completed: Set(false),
+    }
+    .insert(&native)
+    .await
+    .unwrap();
+    exchange_and_prove(&native, &mut web, "post-gc: row propagated").await;
+
+    task::Entity::delete_by_id("gc1")
+        .exec(&native)
+        .await
+        .unwrap();
+    exchange_and_prove(&native, &mut web, "post-gc: delete propagated").await;
+    assert!(
+        web.state()
+            .await
+            .iter()
+            .any(|c| c.cid.0 == DELETED_COLUMN && c.pk.0 == "gc1"),
+        "web must hold the live tombstone before aging"
+    );
+
+    // Age the SAME tombstone on both sides — injected, never slept, exactly
+    // like the retention scenario above.
+    let aged = web_common::test_now() - 1000;
+    native
+        .inner()
+        .execute_unprepared(&format!(
+            "UPDATE \"_wavesync_tasks_clock\" SET deleted_ts = {aged} \
+             WHERE pk = 'gc1' AND cid = '__deleted'"
+        ))
+        .await
+        .unwrap();
+    web.store.age_tombstone("tasks", "gc1", aged);
+
+    // Both exclude it — digests equal before either side has physically
+    // reaped anything (sanity: exclusion, not GC timing, drives this).
+    exchange_and_prove(&native, &mut web, "post-gc: aged out on both").await;
+
+    // Now physically reap on BOTH sides.
+    let native_collected =
+        wavesyncdb::shadow::gc_aged_tombstones(native.inner(), native.registry())
+            .await
+            .unwrap();
+    assert_eq!(
+        native_collected, 1,
+        "native must physically collect the tombstone"
+    );
+
+    let web_collected = wavesyncdb::web_sync_core::gc_aged_tombstones_core(
+        &web.cfg,
+        &web.store,
+        web_common::test_now(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        web_collected > 0,
+        "web must physically reap the aged tombstone"
+    );
+
+    // Post-GC: digests must still match — physical reaping, on either side
+    // or both, is a local storage concern invisible to convergence.
+    exchange_and_prove(&native, &mut web, "post-gc: physical GC on both").await;
+}

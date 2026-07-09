@@ -134,6 +134,15 @@ impl WebSyncConfig {
             .and_then(|t| t.primary_key_column.clone())
     }
 
+    /// Disable tombstone garbage collection AND aging entirely: tombstones
+    /// are kept (and synced) forever. Storage grows with all-time deletes.
+    /// Mirrors the native builder's equivalent option; must match the
+    /// native peers' setting or digests drift.
+    pub fn without_tombstone_gc(mut self) -> Self {
+        self.tombstone_retention_secs = Some(0);
+        self
+    }
+
     /// The retention exclusion cutoff for a given `now`: tombstones with
     /// `deleted_ts < cutoff` are treated as nonexistent on EVERY surface,
     /// identical to native's rule.
@@ -219,6 +228,13 @@ pub trait ShadowStore {
 
     /// Apply `batch` atomically (see [`WriteBatch`]).
     async fn apply_batch(&self, batch: WriteBatch) -> Result<(), StoreError>;
+
+    /// Physically delete every `(table, pk, "__deleted")` entry whose
+    /// `deleted_ts` is present and `< cutoff`, returning how many were
+    /// reaped. Exclusion already hides these rows from every sync /
+    /// reconcile / conflict surface, so this only reclaims storage.
+    /// Entries with no `deleted_ts` stamp are kept (they never age).
+    async fn gc_aged_tombstones(&self, cutoff: u64) -> Result<u64, StoreError>;
 }
 
 /// No-op store for **ephemeral** clients (no IndexedDB). Conflict
@@ -251,6 +267,10 @@ impl ShadowStore for EphemeralStore {
 
     async fn apply_batch(&self, _batch: WriteBatch) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    async fn gc_aged_tombstones(&self, _cutoff: u64) -> Result<u64, StoreError> {
+        Ok(0)
     }
 }
 
@@ -620,6 +640,20 @@ pub async fn changes_since_core<S: ShadowStore>(
         })
         .cloned()
         .collect())
+}
+
+/// Reap aged tombstones per `config`'s retention window. `Ok(0)` and no
+/// scan when GC is disabled (`without_tombstone_gc`). Best-effort caller
+/// contract: failures must never block startup or sync.
+pub async fn gc_aged_tombstones_core<S: ShadowStore>(
+    config: &WebSyncConfig,
+    store: &S,
+    now_secs: u64,
+) -> Result<u64, StoreError> {
+    match config.tombstone_cutoff(now_secs) {
+        None => Ok(0),
+        Some(cutoff) => store.gc_aged_tombstones(cutoff).await,
+    }
 }
 
 // ── reconciliation (#82) ───────────────────────────────────────────────────

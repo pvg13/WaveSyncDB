@@ -57,6 +57,7 @@ use crate::messages::{ChangeNotification, ColumnChange, NodeId, SyncChangeset, W
 use crate::peer_tracker;
 use crate::protocol::SyncRequest;
 use crate::registry::TableRegistry;
+pub(crate) use crate::rejection::{RejectionState, rejection_backoff};
 use crate::shadow;
 
 /// A remote changeset queued for sequential application in the main event loop.
@@ -948,7 +949,8 @@ pub(crate) struct GroupState {
     /// exponential backoff rather than permanent (Rule 2.8 anti-storm intent),
     /// and removed when the peer later passes verification (recovery, N6). A
     /// peer rejected here may still be a valid member of another group.
-    pub(crate) rejected_peers: std::collections::HashMap<libp2p::PeerId, RejectionState>,
+    pub(crate) rejected_peers:
+        std::collections::HashMap<libp2p::PeerId, RejectionState<tokio::time::Instant>>,
     /// Peers verified via successful HMAC exchange for THIS group.
     pub(crate) verified_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers with an in-flight sync request for THIS group, each stamped with
@@ -987,17 +989,6 @@ pub(crate) struct PendingPush {
 /// catch-up still carries it), it just stops getting the fast-path retry.
 pub(crate) const MAX_PENDING_PUSHES: usize = 256;
 
-/// Per-(group, peer) rejection backoff state. See [`GroupState::rejected_peers`].
-#[derive(Debug, Clone)]
-pub(crate) struct RejectionState {
-    /// Consecutive rejections for this peer (1-based).
-    pub(crate) attempts: u32,
-    /// The peer is skipped (dialing / sync) until this instant. After it, the
-    /// peer is eligible for one re-evaluation: a continued mismatch extends the
-    /// backoff, a successful verify removes the entry.
-    pub(crate) until: tokio::time::Instant,
-}
-
 /// Shorten a derived topic / rendezvous namespace for spans and log lines.
 /// The current form is `wavesync2-<64 hex>` (post-KDF-cutover); keeping the
 /// prefix plus the first 10 hex chars stays scannable while still
@@ -1014,18 +1005,6 @@ pub(crate) fn short_topic(s: &str) -> String {
         Some(hex) if hex.len() > 10 => format!("wavesync-{}…", &hex[..10]),
         _ => s.to_string(),
     }
-}
-
-/// Exponential rejection backoff: 30s, 60s, 120s, … capped at 1 hour. Bounds
-/// how often a persistently-mismatching (e.g. spoofed-topic) peer is
-/// re-evaluated — the Rule 2.8 anti-storm guarantee — while still letting a
-/// transiently-misconfigured peer recover on a later attempt.
-fn rejection_backoff(attempts: u32) -> Duration {
-    const BASE_SECS: u64 = 30;
-    const MAX_SECS: u64 = 3600;
-    let shift = attempts.saturating_sub(1).min(20);
-    let secs = BASE_SECS.saturating_mul(1u64 << shift).min(MAX_SECS);
-    Duration::from_secs(secs)
 }
 
 /// Per-peer dial backoff schedule, lifted from go-libp2p's swarm: a peer is
@@ -1069,7 +1048,7 @@ impl GroupState {
     pub(crate) fn is_rejected(&self, peer: &libp2p::PeerId) -> bool {
         self.rejected_peers
             .get(peer)
-            .is_some_and(|r| r.until > tokio::time::Instant::now())
+            .is_some_and(|r| r.is_active(tokio::time::Instant::now()))
     }
 }
 
@@ -3384,28 +3363,6 @@ fn group_bootstrap_addrs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejection_backoff_grows_exponentially_and_caps() {
-        // 1-based attempts double from 30s and cap at 1 hour (Rule 2.8
-        // anti-storm: a persistently-mismatching peer is re-evaluated ever less
-        // often, never faster than the base and never more than hourly).
-        assert_eq!(rejection_backoff(1), Duration::from_secs(30));
-        assert_eq!(rejection_backoff(2), Duration::from_secs(60));
-        assert_eq!(rejection_backoff(3), Duration::from_secs(120));
-        assert_eq!(rejection_backoff(4), Duration::from_secs(240));
-        assert_eq!(rejection_backoff(7), Duration::from_secs(1920));
-        // Caps at 1 hour and never overflows for large attempt counts.
-        assert_eq!(rejection_backoff(8), Duration::from_secs(3600));
-        assert_eq!(rejection_backoff(1000), Duration::from_secs(3600));
-        // Non-decreasing.
-        let mut prev = Duration::ZERO;
-        for a in 1..=12 {
-            let d = rejection_backoff(a);
-            assert!(d >= prev, "backoff must be non-decreasing");
-            prev = d;
-        }
-    }
 
     #[test]
     fn addr_is_lan_classifies_local_vs_public() {

@@ -125,6 +125,33 @@
   cold key cache, no App Group), the operator's placeholder banner is shown
   as-is and the data still syncs on the next catch-up — the extension is
   purely a content upgrade, never a sync dependency.
+- **Web relay auto-reconnect (#30).** The browser engine no longer stops
+  syncing for the rest of the page's lifetime after its first relay
+  disconnect: it now redials with exponential backoff (1s, capped at 30s,
+  ±25% jitter per attempt), one dial in flight at a time, and resets fully
+  on a successful reconnect. The attempt counter is exposed as
+  `WebSyncStatus.relay_reconnect_attempts` (lives on the web status type,
+  not `diagnostics::Counters`, which is native-gated).
+- **Web physical tombstone GC.** Aged tombstones were already excluded from
+  every web sync/reconcile surface but were never physically deleted, so
+  the browser's `__deleted` rows grew without bound. `ShadowStore` gained
+  `gc_aged_tombstones` (implemented for `MemoryStore` and the IndexedDB
+  `BrowserStore`; no-op for `EphemeralStore`) built on the same
+  target-independent `gc_aged_tombstones_core` free function the native
+  side shares, so eligibility matches the exclusion logic exactly. The
+  browser engine runs a reap pass over IndexedDB at startup, honoring
+  `WebSyncConfig::tombstone_retention_secs` / the new
+  `WebSyncConfig::without_tombstone_gc()` escape hatch. A post-GC
+  digest-equality test (`web_native_convergence.rs`) confirms native and
+  web stores still converge to the same digest after each side collects on
+  its own schedule.
+- **Web HMAC rejection backoff (mirrors Rule 2.8).** The browser engine now
+  shares the native engine's rejection module: a peer that fails a group's
+  HMAC for a topic we hold is rejected for that group with the same
+  time-boxed exponential backoff (30s → 60s → … capped at 1h), skipped for
+  dial/sync/fan-out while the window is open, and re-admitted on a later
+  successful verify. Traffic on a topic that matches none of our groups is
+  still silently ignored, never rejected — unchanged from before.
 
 ### Changed
 - **Sync protocol 4.0.0.** The `deleted_ts` field is covered by message
