@@ -1,7 +1,10 @@
 //! libp2p request-response codec for push notification protocol.
 //!
-//! Mirrors `wavesyncdb/src/engine/push_protocol.rs` — kept separate to avoid
+//! Mirrors `wavesyncdb/src/wire/push_protocol.rs` — kept separate to avoid
 //! coupling the relay binary to the full `wavesyncdb` crate.
+//!
+//! Kept in lockstep with wavesyncdb/src/wire/push_protocol.rs (single source
+//! there for both wavesyncdb targets).
 
 use std::io;
 
@@ -39,7 +42,7 @@ pub enum PushRequest {
         sender_site_id: String,
         /// Whether this changeset touched at least one table with a
         /// registered `SyncNotify` policy — see the mirrored doc comment
-        /// on `wavesyncdb/src/engine/push_protocol.rs`. `#[serde(default)]`
+        /// on `wavesyncdb/src/wire/push_protocol.rs`. `#[serde(default)]`
         /// keeps an old sender's un-tagged message wire-compatible.
         #[serde(default)]
         visible: bool,

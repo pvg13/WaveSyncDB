@@ -49,6 +49,12 @@ pub mod registry;
 pub mod synced_model;
 pub mod synced_table;
 
+// Wire-level libp2p codecs (snapshot / push). Target-independent so the
+// native engine and the browser engine share ONE definition of each
+// protocol id and framing — see wire/mod.rs for why this must not live
+// under the wasm-gated engine/ tree.
+pub mod wire;
+
 // Target-independent core of the browser sync engine: conflict application,
 // delete semantics, and digest enumeration over a small store trait. Compiled
 // on native under `--features web` so its semantics are testable (and proven

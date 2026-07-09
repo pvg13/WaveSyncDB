@@ -42,16 +42,19 @@ impl WaveSyncBehaviour {
         keep_alive_interval: Duration,
     ) -> Self {
         let identify_behaviour = identify::Behaviour::new(
-            identify::Config::new("/wavesync/2.0.0".into(), key.public())
-                // Push identify updates to peers when our listen addresses
-                // change (network switch, AutoNAT confirms a new external,
-                // circuit-relay reservation succeeds). Without this, the
-                // relay's `peer_addresses` snapshot for this peer is whatever
-                // identify happened to send at first connection — and stays
-                // stale until reconnect. With it on, network changes propagate
-                // within seconds, so FCM payloads always contain the peer's
-                // current reachable set.
-                .with_push_listen_addr_updates(true),
+            identify::Config::new(
+                crate::wire::IDENTIFY_PROTOCOL_VERSION.to_string(),
+                key.public(),
+            )
+            // Push identify updates to peers when our listen addresses
+            // change (network switch, AutoNAT confirms a new external,
+            // circuit-relay reservation succeeds). Without this, the
+            // relay's `peer_addresses` snapshot for this peer is whatever
+            // identify happened to send at first connection — and stays
+            // stale until reconnect. With it on, network changes propagate
+            // within seconds, so FCM payloads always contain the peer's
+            // current reachable set.
+            .with_push_listen_addr_updates(true),
         );
 
         let ping_behaviour =

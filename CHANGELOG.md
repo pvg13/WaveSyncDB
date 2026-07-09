@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+- **Browser peers advertise `/wavesync/snapshot/4.0.0` again (shared wire codecs; web<->native
+  sync over the network was broken since the 4.0.0 cutover).** The wasm32 browser engine kept
+  a hand-copied snapshot/push codec that still hardcoded the old `3.0.0` protocol id, so a
+  browser peer and a native peer shared no common libp2p stream protocol and negotiation
+  failed outright — silently, since browser↔browser and native↔native sync each worked fine on
+  their own. Both engines now import one codec definition from a new target-independent
+  `wavesyncdb::wire` module, so the id string cannot drift apart again.
+
 ### Changed
 - **Logging emits `tracing` natively (#69).** `wavesyncdb` and `wavesync_relay` now emit
   `tracing` events directly instead of going through the `log` facade (~500 call sites migrated).

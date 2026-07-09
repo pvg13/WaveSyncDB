@@ -332,7 +332,7 @@ A: apply_remote_changeset(changes)
 A: _wavesync_peer_versions[B] = <span class="num">50</span>"##;
 
 const CODE_PROTOCOLS: &str = r##"<span class="cmt">// Protocol identifier strings (used in libp2p negotiation)</span>
-<span class="str">"/wavesync/snapshot/3.0.0"</span>  <span class="cmt">// Version vector sync</span>
+<span class="str">"/wavesync/snapshot/4.0.0"</span>  <span class="cmt">// Version vector sync</span>
 <span class="str">"/wavesync/push/1.0.0"</span>      <span class="cmt">// Real-time changeset fan-out</span>
 <span class="str">"/wavesync/auth/challenge/1.0.0"</span>  <span class="cmt">// Auth challenge-response</span>
 
