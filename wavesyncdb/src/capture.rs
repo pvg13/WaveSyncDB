@@ -178,14 +178,45 @@ pub(crate) fn trigger_sql(meta: &TableMeta) -> Result<[(String, String); 3], DbE
     Ok([(i_name, i_sql), (u_name, u_sql), (d_name, d_sql)])
 }
 
+/// SQL that gives every row of `meta.table_name` currently *without* any clock
+/// entry a fresh full-row capture, so the (re)created triggers cover it. Used
+/// to heal a database whose capture triggers were removed while the table was
+/// live (the #96 sibling-prefix bug, or the documented downgrade escape hatch):
+/// rows written during that gap have no shadow coverage and would never sync.
+///
+/// `INSERT OR REPLACE … SELECT *` re-inserts each uncovered row as itself,
+/// firing only the `AFTER INSERT` trigger (recursive_triggers is OFF, so the
+/// implicit delete fires nothing and no other row is displaced), which the
+/// drain turns into a full per-column clock entry — a plain `SET pk = pk`
+/// no-op UPDATE would be dropped by the drain's no-op filter and cover
+/// nothing. A row with ANY clock entry — including a tombstone (`cid =
+/// '__deleted'`) — is excluded, so a deleted row is never resurrected, and an
+/// already-covered row is left untouched (idempotent). The subquery only
+/// *reads* the internal clock table; the write targets the user table, so the
+/// capture trigger fires for the user table alone.
+pub(crate) fn repair_uncovered_rows_sql(meta: &TableMeta) -> String {
+    let t = &meta.table_name;
+    let p = &meta.primary_key_column;
+    let clock = crate::shadow::shadow_table_name(t);
+    format!(
+        "INSERT OR REPLACE INTO \"{t}\" SELECT * FROM \"{t}\" \
+         WHERE CAST(\"{p}\" AS TEXT) NOT IN (SELECT pk FROM \"{clock}\")"
+    )
+}
+
 /// Create (or recreate after schema change) the capture triggers for a table.
 /// Idempotent: the schema fingerprint in each trigger's name makes "current"
 /// detectable by existence alone; any `_wavesync_tr_{t}_*` trigger with a
 /// different fingerprint is dropped first.
+///
+/// Returns whether ANY of this table's own-shape capture triggers existed
+/// *before* this call (regardless of fingerprint). A previously-synced table
+/// with zero surviving own triggers is the trigger-loss damage signature the
+/// caller uses to decide whether a repair re-touch is needed.
 pub(crate) async fn ensure_triggers(
     db: &impl ConnectionTrait,
     meta: &TableMeta,
-) -> Result<(), DbErr> {
+) -> Result<bool, DbErr> {
     ensure_capture_tables(db).await?;
     let triggers = trigger_sql(meta)?;
     let prefix = trigger_prefix(&meta.table_name);
@@ -209,6 +240,8 @@ pub(crate) async fn ensure_triggers(
     .map(|r| r.name)
     .collect();
 
+    let own_triggers_pre_existed = existing.iter().any(|n| is_own_trigger(n, &prefix));
+
     let wanted: Vec<&str> = triggers.iter().map(|(n, _)| n.as_str()).collect();
     for stale in existing
         .iter()
@@ -222,7 +255,7 @@ pub(crate) async fn ensure_triggers(
             db.execute_unprepared(sql).await?;
         }
     }
-    Ok(())
+    Ok(own_triggers_pre_existed)
 }
 
 /// Flip the capture-suppression flag. Called inside the remote-apply

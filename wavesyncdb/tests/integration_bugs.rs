@@ -1833,3 +1833,206 @@ async fn test_prefix_sibling_tables_both_sync_96() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// #96 auto-repair: a table whose capture triggers were removed while it was
+// live (the sibling-prefix bug this issue also fixes, or the documented
+// downgrade escape hatch) heals on re-registration. Rows written during the
+// trigger-loss gap have no shadow/clock coverage and would never sync; the
+// registration chokepoint detects the damage (clock table already exists, yet
+// zero own triggers survive) and re-touches the uncovered rows so the recreated
+// triggers record them. Tombstoned rows are excluded — a deleted row must not
+// be resurrected.
+//
+// Seeds 15-16 (repair) and 17 (adoption): free slots verified by grepping every
+// make_node_id(..) call under wavesyncdb/tests/; documented in CLAUDE.md §6.
+// ---------------------------------------------------------------------------
+
+#[derive(FromQueryResult)]
+struct ClockCntRow {
+    cnt: i64,
+}
+
+/// Count of NON-tombstone clock entries for a given `tasks` pk.
+async fn tasks_live_clock_entries(db: &sea_orm::DatabaseConnection, pk: &str) -> i64 {
+    ClockCntRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT COUNT(*) AS cnt FROM _wavesync_tasks_clock WHERE pk = $1 AND cid != '__deleted'",
+        [pk.into()],
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap()
+    .cnt
+}
+
+/// Total number of rows in the `tasks` clock table.
+async fn tasks_total_clock_entries(db: &sea_orm::DatabaseConnection) -> i64 {
+    ClockCntRow::find_by_statement(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT COUNT(*) AS cnt FROM _wavesync_tasks_clock".to_string(),
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap()
+    .cnt
+}
+
+/// Remove every capture trigger for `table` — simulates the trigger-loss the
+/// #96 prefix bug (or the downgrade escape hatch) leaves behind.
+async fn drop_capture_triggers(db: &sea_orm::DatabaseConnection, table: &str) {
+    #[derive(FromQueryResult)]
+    struct NameRow {
+        name: String,
+    }
+    let names = NameRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE $1",
+        [format!("_wavesync_tr_{table}_%").into()],
+    ))
+    .all(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        names.len(),
+        3,
+        "expected exactly three capture triggers to drop"
+    );
+    for n in names {
+        db.execute_unprepared(&format!("DROP TRIGGER IF EXISTS \"{}\"", n.name))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_capture_repair_after_trigger_loss_96() {
+    common::init_test_tracing();
+    let topic = format!("test-cap-repair-{}", Uuid::new_v4());
+    let timeout = Duration::from_secs(15);
+    let url_a = mem_db("cap_repair_a");
+
+    // Peer A registers `tasks` and does three normal (captured) writes:
+    //   r1 stays covered, r3 is inserted then deleted (leaves a tombstone).
+    let a = make_peer(&url_a, &topic, 15).await;
+    for id in ["r1", "r3"] {
+        task::ActiveModel {
+            id: Set(id.into()),
+            title: Set(format!("t-{id}")),
+            completed: Set(false),
+            ..Default::default()
+        }
+        .insert(&a)
+        .await
+        .unwrap();
+    }
+    // Delete r3 normally BEFORE the damage: leaves a tombstone in the clock so
+    // the repair has a covered-but-deleted row to (correctly) skip.
+    task::Entity::delete_by_id("r3").exec(&a).await.unwrap();
+
+    // Simulate the damage: remove the capture triggers, then write r2 straight
+    // to the inner connection so nothing captures it — no clock coverage.
+    drop_capture_triggers(a.inner(), "tasks").await;
+    a.inner()
+        .execute_unprepared(
+            "INSERT INTO tasks (id, title, completed) VALUES ('r2', 'gap write', 0)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks_live_clock_entries(a.inner(), "r2").await,
+        0,
+        "precondition: r2 has no clock coverage after the trigger-loss gap write"
+    );
+
+    // Shut A down and reopen the SAME database file (same seed → same PeerId):
+    // re-registration must detect the trigger loss and re-touch r2.
+    a.shutdown().await;
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let a2 = make_peer(&url_a, &topic, 15).await;
+    assert!(
+        tasks_live_clock_entries(a2.inner(), "r2").await > 0,
+        "repair must give r2 clock coverage on re-registration"
+    );
+    assert!(
+        tasks_live_clock_entries(a2.inner(), "r1").await > 0,
+        "the already-covered row r1 must keep its coverage"
+    );
+    assert!(
+        task::Entity::find_by_id("r3")
+            .one(&a2)
+            .await
+            .unwrap()
+            .is_none(),
+        "repair must not resurrect the deleted row r3"
+    );
+
+    // A second peer must converge on the repaired row r2 (proves it actually
+    // syncs now), and must never receive the deleted r3.
+    let b = make_peer(&mem_db("cap_repair_b"), &topic, 16).await;
+    assert_eventually("B receives the repaired row r2", timeout, || async {
+        task::Entity::find_by_id("r2")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.title == "gap write")
+    })
+    .await;
+    // Let catch-up settle, then confirm r3 stayed deleted everywhere.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        task::Entity::find_by_id("r3")
+            .one(&b)
+            .await
+            .unwrap()
+            .is_none(),
+        "the deleted row must not appear on the peer"
+    );
+}
+
+#[tokio::test]
+async fn test_first_registration_does_not_adopt_preexisting_rows() {
+    common::init_test_tracing();
+    let topic = format!("test-cap-noadopt-{}", Uuid::new_v4());
+    let url = mem_db("cap_noadopt");
+
+    // Build a peer WITHOUT registering anything, then pre-populate a raw
+    // `tasks` table straight on the inner connection — no triggers, no clock.
+    let db = WaveSyncDbBuilder::new(&url, &topic)
+        .with_node_id(common::make_node_id(17))
+        .build()
+        .await
+        .expect("Failed to create peer");
+    db.inner()
+        .execute_unprepared(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, completed INTEGER NOT NULL DEFAULT 0)",
+        )
+        .await
+        .unwrap();
+    db.inner()
+        .execute_unprepared(
+            "INSERT INTO tasks (id, title, completed) VALUES ('pre1', 'a', 0), ('pre2', 'b', 0)",
+        )
+        .await
+        .unwrap();
+
+    // First-ever registration of `tasks`. The clock table is created HERE, so
+    // repair must NOT fire — the pre-existing rows stay uncovered. Adoption is
+    // a deliberate non-goal; repair only heals trigger loss. This guard pins
+    // it so a future refactor can't silently turn repair into adoption.
+    db.schema()
+        .register(task::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync schema");
+
+    assert_eq!(
+        tasks_total_clock_entries(db.inner()).await,
+        0,
+        "first registration must not adopt pre-existing rows into the clock table"
+    );
+}

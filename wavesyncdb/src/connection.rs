@@ -699,13 +699,53 @@ impl WaveSyncDb {
     /// [`sync_entity`](Self::sync_entity) for the full create-and-register
     /// flow.
     pub async fn register_table(&self, meta: TableMeta) -> Result<(), DbErr> {
+        // Trigger-loss damage detection (#96). Capture whether this table
+        // already synced in a previous run — its shadow table's prior
+        // existence — BEFORE we (idempotently) create it below. This is the
+        // sole creator of the shadow table, so on a first-ever registration
+        // it does not yet exist and repair can never fire (repair heals a
+        // damaged DB; it must never adopt pre-existing rows).
+        let clock_pre_existed =
+            crate::shadow::shadow_table_exists(&self.inner.inner, &meta.table_name).await?;
+
         // Ensure the shadow schema exists AND is current (idempotent create
         // + in-place migration) — a manually created shadow table from an
         // older layout would otherwise break the retention predicates on
         // first use.
         crate::shadow::create_shadow_table(&self.inner.inner, &meta.table_name).await?;
-        crate::capture::ensure_triggers(&self.inner.inner, &meta).await?;
+        let own_triggers_pre_existed =
+            crate::capture::ensure_triggers(&self.inner.inner, &meta).await?;
+
+        // A shadow table that predates this registration but whose capture
+        // triggers were ALL missing means the triggers were removed while the
+        // table was live (the #96 sibling-prefix bug, or the documented
+        // downgrade escape hatch). Rows written during that gap have no clock
+        // coverage and would never sync (push or catch-up); re-touch them so
+        // the just-recreated triggers record them. Build the statement before
+        // registering (it needs the pk/column list), run it after registering
+        // so the drain's planner recognises the table.
+        let repair_sql = (clock_pre_existed && !own_triggers_pre_existed)
+            .then(|| crate::capture::repair_uncovered_rows_sql(&meta));
+        let table_name = meta.table_name.clone();
         self.inner.registry.register(meta);
+
+        if let Some(sql) = repair_sql {
+            // Runs through the wrapper (capture ON, a normal LOCAL write — never
+            // inside the remote-apply suppression bracket): the post-statement
+            // drain gives the re-touched rows clock coverage immediately, and
+            // the coverage is committed durably in the drain transaction even
+            // if the engine is not yet consuming changesets, so these rows are
+            // never lost (they catch up via the version-vector path either way).
+            let res = self.execute_unprepared(&sql).await?;
+            let n = res.rows_affected();
+            if n > 0 {
+                tracing::info!(
+                    table = %table_name,
+                    repaired = n,
+                    "capture repair: re-touched rows missing clock coverage"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -818,12 +858,11 @@ impl WaveSyncDb {
             })
             .unwrap_or_default();
 
-        // Create shadow table
-        crate::shadow::create_shadow_table(&self.inner.inner, &table_name).await?;
-
-        // register_table installs (or refreshes after schema change) the
-        // capture triggers — from here on every write to this table is
-        // recorded for the drain.
+        // register_table creates the shadow table and installs (or refreshes
+        // after schema change) the capture triggers — from here on every write
+        // to this table is recorded for the drain. It is the sole creator of
+        // the shadow table so its trigger-loss damage detection can tell a
+        // returning table apart from a first registration.
         self.register_table(TableMeta {
             table_name,
             primary_key_column,
@@ -1294,12 +1333,11 @@ impl<'a> SchemaBuilder<'a> {
                 .execute_unprepared(&entry.create_sql)
                 .await?;
             if entry.synced {
-                // Create shadow table for synced entities
-                crate::shadow::create_shadow_table(&self.db.inner.inner, &entry.meta.table_name)
-                    .await?;
-                // register_table installs the capture triggers before
-                // registration — a registered table must never have a
-                // capture gap.
+                // register_table creates the shadow table and installs the
+                // capture triggers before registration — a registered table
+                // must never have a capture gap. It is the sole creator of the
+                // shadow table so its trigger-loss damage detection can tell a
+                // returning table apart from a first registration.
                 self.db.register_table(entry.meta.clone()).await?;
             }
         }
