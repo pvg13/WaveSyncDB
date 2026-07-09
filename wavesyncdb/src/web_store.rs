@@ -891,12 +891,26 @@ pub struct CachedPeerAddr {
 ///
 /// `kind` mirrors the native `GroupConfig::kind` used for scope filtering
 /// (issue #62); `None` means the default/private scope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JoinedGroupRecord {
     pub user_topic: String,
     pub effective_topic: String,
     pub derived_key: [u8; 32],
     pub kind: Option<String>,
+}
+
+// Manual Debug: `derived_key` is key material and must never land in logs.
+// user_topic/effective_topic/kind stay visible — they're not secret and are
+// useful for diagnosing group-membership issues.
+impl std::fmt::Debug for JoinedGroupRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinedGroupRecord")
+            .field("user_topic", &self.user_topic)
+            .field("effective_topic", &self.effective_topic)
+            .field("derived_key", &"[REDACTED]")
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 /// DB name for a joined group's per-group IndexedDB store.

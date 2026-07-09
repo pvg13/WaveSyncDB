@@ -88,6 +88,11 @@ impl SyncHandle {
     /// signal changes (`None` while still connecting, `Some` once
     /// resolved), so single-group apps see identical behavior to before
     /// `WebGroupHandle` existed.
+    ///
+    /// This constructor is itself a Dioxus hook (it calls `use_signal` and
+    /// `use_effect` internally), so — like any hook — it must be called
+    /// unconditionally in the component body, never inside an `if`/`match`
+    /// branch of the returned `rsx!`.
     #[cfg(target_arch = "wasm32")]
     pub fn new(client: Signal<Option<WebSyncClient>>) -> Self {
         let mut group =
