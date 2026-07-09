@@ -163,6 +163,12 @@ enum Command {
         effective_topic: String,
         ack: oneshot::Sender<Result<(), WebSyncError>>,
     },
+    /// Manual "resync now" UI affordance (#93 companion ask). No payload —
+    /// applies to every joined group. Fire-and-forget, like `Publish`: there
+    /// is nothing meaningful to ack (the actual data arrives asynchronously
+    /// as `ChangesetResponse`/`Push` traffic and is applied through the
+    /// normal CRDT path).
+    ForceResync,
 }
 
 /// Browser-side sync client.
@@ -889,6 +895,28 @@ impl WebSyncClient {
                 topic: self.default_topic.clone(),
             })
             .map_err(|_| WebSyncError::NotRunning)
+    }
+
+    /// Manually request a full catch-up resync of every joined group right
+    /// now, instead of waiting for the next periodic version-vector tick or
+    /// peer-discovery event. This is **bandwidth-expensive**: it asks every
+    /// currently connected peer (per group) for a `VersionVector` catch-up
+    /// with `your_last_db_version: 0`, i.e. "give me everything you have"
+    /// (Rule 2.5) — not just the delta since the last-seen cursor. Applying
+    /// already-seen changes again is a no-op (CRDT apply is idempotent), so
+    /// over-fetching is safe; the persisted per-peer cursors are never
+    /// cleared, only re-advanced by the responses that come back.
+    ///
+    /// Also nudges relay re-announce (all groups) and, if the relay link is
+    /// currently down, an immediate reconnect attempt.
+    ///
+    /// Fire-and-forget, like [`Self::publish`]: this is a UI "resync now"
+    /// recovery affordance (#93 companion ask), not a request with a
+    /// meaningful synchronous result — the actual data lands asynchronously
+    /// through the normal sync paths. Silently does nothing if the engine
+    /// task is gone.
+    pub fn force_resync(&self) {
+        let _ = self.cmd_tx.send(Command::ForceResync);
     }
 
     /// High-level local write.
@@ -1980,6 +2008,22 @@ fn schedule_relay_reconnect(
     *timer = Some(Box::pin(gloo_timers::future::TimeoutFuture::new(delay_ms)));
 }
 
+/// `force_resync`'s relay nudge: arm the reconnect timer for the very next
+/// loop tick (0ms) instead of going through [`schedule_relay_reconnect`]'s
+/// exponential backoff. Deliberately does NOT touch `attempts` or the
+/// status counter — this is a manual one-off nudge, not a backoff step, so
+/// it must not perturb the backoff sequence a real disconnect is already
+/// running. Still funnels through the same `relay_dial_pending` guard at
+/// fire time (the `reconnect_timer` arm in `run_swarm`'s event loop), so a
+/// dial already in flight is unaffected — this only ever makes the next
+/// check happen sooner, never bypasses it.
+fn arm_immediate_relay_reconnect(
+    timer: &mut Option<std::pin::Pin<Box<gloo_timers::future::TimeoutFuture>>>,
+) {
+    tracing::info!("WebSyncClient: force_resync nudging relay reconnect");
+    *timer = Some(Box::pin(gloo_timers::future::TimeoutFuture::new(0)));
+}
+
 /// Loopback variant of [`run_swarm`]. No libp2p — `SyncRequest`s flow
 /// through the `LoopbackEnd` channels directly. Used by the website
 /// demo to show two independent engines syncing inside a single page.
@@ -2037,7 +2081,7 @@ async fn run_loopback(
                     return;
                 }
             }
-            send_version_vector(&group, &end.out_tx).await;
+            send_version_vector(&group, &end.out_tx, None).await;
         }
         was_online = now_online;
 
@@ -2094,6 +2138,25 @@ async fn run_loopback(
                     Some(Command::LeaveGroup { ack, .. }) => {
                         let _ = ack.send(Err(WebSyncError::Unsupported));
                     }
+                    Some(Command::ForceResync) => {
+                        // Loopback has no swarm/relay/peer-discovery, and the
+                        // single-pair link already re-syncs via the same
+                        // `send_version_vector` path on every online
+                        // transition and every 30s tick — so a manual
+                        // "resync now" just fires that same request early,
+                        // same as the swarm path's per-peer VV send. If the
+                        // link is offline there's no one to ask; the request
+                        // is dropped (documented no-op) and the normal
+                        // online-transition catch-up covers it once the demo
+                        // link is toggled back on.
+                        if link.is_online() {
+                            send_version_vector(&group, &end.out_tx, Some(0)).await;
+                        } else {
+                            tracing::debug!(
+                                "WebSyncClient (loopback): force_resync requested while offline, no-op until reconnect"
+                            );
+                        }
+                    }
                     None => {
                         tracing::info!("WebSyncClient (loopback): command channel closed");
                         return;
@@ -2121,7 +2184,7 @@ async fn run_loopback(
             }
             _ = sync_interval.next() => {
                 if link.is_online() {
-                    send_version_vector(&group, &end.out_tx).await;
+                    send_version_vector(&group, &end.out_tx, None).await;
                 }
             }
             _ = link.notify.notified() => {
@@ -2137,17 +2200,29 @@ async fn run_loopback(
 /// last `db_version` we recorded from our peer. The peer responds via
 /// [`handle_loopback_request`] with a `Push` containing every shadow
 /// change strictly newer than that.
-async fn send_version_vector(group: &WebGroupState, out_tx: &mpsc::UnboundedSender<SyncRequest>) {
+///
+/// `since_override`: when `Some(v)`, use `v` as `your_last_db_version`
+/// instead of reading the persisted peer cursor — used by `force_resync`
+/// to request `Some(0)` ("give me everything", Rule 2.5) without touching
+/// the persisted cursor itself (it only re-advances from the response).
+async fn send_version_vector(
+    group: &WebGroupState,
+    out_tx: &mpsc::UnboundedSender<SyncRequest>,
+    since_override: Option<u64>,
+) {
     let store = match &group.store {
         Some(s) => s,
         None => return, // ephemeral clients don't track peer versions
     };
-    let last_seen = match store.get_peer_version(LOOPBACK_PEER_KEY).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("loopback: peer_version read failed: {e}");
-            0
-        }
+    let last_seen = match since_override {
+        Some(v) => v,
+        None => match store.get_peer_version(LOOPBACK_PEER_KEY).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("loopback: peer_version read failed: {e}");
+                0
+            }
+        },
     };
     let my_db_version = *group.db_version.lock().await;
     let mut req = SyncRequest::VersionVector {
@@ -2194,22 +2269,31 @@ async fn send_version_vector(group: &WebGroupState, out_tx: &mpsc::UnboundedSend
 /// seen before, `get_peer_version` returns 0 and the peer replies with
 /// the full history. This is the new-peer onboarding signal — do not
 /// change it.
+///
+/// `since_override`: when `Some(v)`, use `v` as `your_last_db_version`
+/// instead of reading the persisted per-peer cursor — used by
+/// `force_resync` to send `Some(0)` (full catch-up) on demand without
+/// clearing the persisted cursor itself (the response re-advances it).
 async fn send_version_vector_swarm(
     peer: LibPeerId,
     group: &WebGroupState,
     swarm: &mut Swarm<WebBehaviour>,
+    since_override: Option<u64>,
 ) {
     let store = match &group.store {
         Some(s) => s,
         None => return, // ephemeral clients don't track peer versions
     };
     let peer_key = peer.to_string();
-    let last_seen = match store.get_peer_version(&peer_key).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("swarm: peer_version read for {peer_key} failed: {e}");
-            0
-        }
+    let last_seen = match since_override {
+        Some(v) => v,
+        None => match store.get_peer_version(&peer_key).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("swarm: peer_version read for {peer_key} failed: {e}");
+                0
+            }
+        },
     };
     let my_db_version = *group.db_version.lock().await;
     let mut req = SyncRequest::VersionVector {
@@ -2580,7 +2664,7 @@ async fn run_swarm(
                 if is_rejected(&group.rejected_peers, &peer) {
                     continue;
                 }
-                send_version_vector_swarm(peer, group, &mut swarm).await;
+                send_version_vector_swarm(peer, group, &mut swarm, None).await;
             }
         }
 
@@ -2687,6 +2771,46 @@ async fn run_swarm(
                             let _ = ack.send(Ok(()));
                         }
                     }
+                    Some(Command::ForceResync) => {
+                        tracing::info!("WebSyncClient: force_resync requested");
+                        // 1. Every group re-announces on the next relay
+                        // connection drain (mirrors the JoinGroup late-join
+                        // trigger above): flip every group back to
+                        // `announced = false`, then queue the relay peer
+                        // once so the loop-head drain re-sends
+                        // AnnouncePresence for every topic.
+                        for group in groups.values_mut() {
+                            group.announced = false;
+                        }
+                        if relay_connected && let Some(relay) = state.relay_peer_id {
+                            pending_announces.push(relay);
+                        }
+                        // 2. Ask every connected, non-rejected peer for a
+                        // full catch-up per group: `your_last_db_version: 0`
+                        // is the "give me everything" signal (Rule 2.5).
+                        // This does not clear the persisted per-peer
+                        // cursor — the `ChangesetResponse` that comes back
+                        // re-advances it, and re-applying already-seen
+                        // changes is a safe no-op (CRDT idempotence).
+                        for peer in connected.iter().copied().collect::<Vec<_>>() {
+                            for group in groups.values() {
+                                if is_rejected(&group.rejected_peers, &peer) {
+                                    continue;
+                                }
+                                send_version_vector_swarm(peer, group, &mut swarm, Some(0)).await;
+                            }
+                        }
+                        // 3. Nudge a stalled relay link. Arms the reconnect
+                        // timer for the next tick instead of dialing
+                        // directly, so the existing `relay_dial_pending`
+                        // guard (the arm that fires on `reconnect_timer`
+                        // below) still decides whether a dial actually
+                        // happens — a dial already in flight is
+                        // unaffected, just a wasted timer tick.
+                        if !relay_connected && state.relay_addr.is_some() {
+                            arm_immediate_relay_reconnect(&mut reconnect_timer);
+                        }
+                    }
                     None => {
                         tracing::info!("WebSyncClient: command channel closed, exiting");
                         return;
@@ -2699,7 +2823,7 @@ async fn run_swarm(
                         if is_rejected(&group.rejected_peers, &peer) {
                             continue;
                         }
-                        send_version_vector_swarm(peer, group, &mut swarm).await;
+                        send_version_vector_swarm(peer, group, &mut swarm, None).await;
                     }
                 }
             }
