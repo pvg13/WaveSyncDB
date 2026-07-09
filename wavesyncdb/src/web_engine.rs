@@ -3,8 +3,9 @@
 //!
 //! This is a parallel, browser-only sibling to [`crate::engine`]. It shares
 //! the same wire format ([`SyncRequest::Push`] / [`SyncResponse::PushAck`],
-//! protocol id `/wavesync/snapshot/3.0.0`, length-prefixed serde_json) so a
-//! browser peer can talk to a native peer without protocol changes.
+//! length-prefixed serde_json) via the shared `crate::wire` codecs (single
+//! definition for both targets) so a browser peer can talk to a native peer
+//! without protocol changes.
 //!
 //! ## Two flavours
 //!
@@ -70,264 +71,8 @@ use crate::web_sync_core::{
     compute_store_digest, reconcile_range_step, submit_local_delete_core, submit_local_write_core,
 };
 
-// Re-use the native engine's snapshot codec — same wire format, same
-// protocol id. Cargo gates engine/* away from wasm32, so we cannot pull
-// the codec from there. The codec is small (~80 LoC) and pure
-// `futures::AsyncRead/Write`, so we duplicate it here behind the wasm32
-// gate. Keeping the byte-for-byte protocol id `/wavesync/snapshot/3.0.0`
-// is what guarantees a browser client can talk to a native peer.
-mod snapshot_codec {
-    use std::io;
-
-    use async_trait::async_trait;
-    use futures::prelude::*;
-    use libp2p::StreamProtocol;
-    use libp2p::request_response;
-
-    use crate::protocol::{SyncRequest, SyncResponse};
-
-    pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/snapshot/3.0.0");
-
-    #[derive(Debug, Clone, Default)]
-    pub struct SnapshotCodec;
-
-    #[async_trait]
-    impl request_response::Codec for SnapshotCodec {
-        type Protocol = StreamProtocol;
-        type Request = SyncRequest;
-        type Response = SyncResponse;
-
-        async fn read_request<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-        ) -> io::Result<Self::Request>
-        where
-            T: AsyncRead + Unpin + Send,
-        {
-            let bytes = read_lp(io).await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }
-
-        async fn read_response<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-        ) -> io::Result<Self::Response>
-        where
-            T: AsyncRead + Unpin + Send,
-        {
-            let bytes = read_lp(io).await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }
-
-        async fn write_request<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-            req: Self::Request,
-        ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
-        {
-            let bytes = serde_json::to_vec(&req)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            write_lp(io, &bytes).await
-        }
-
-        async fn write_response<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-            res: Self::Response,
-        ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
-        {
-            let bytes = serde_json::to_vec(&res)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            write_lp(io, &bytes).await
-        }
-    }
-
-    async fn read_lp<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 64 * 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("payload too large: {len}"),
-            ));
-        }
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(buf)
-    }
-
-    async fn write_lp<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -> io::Result<()> {
-        io.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        io.write_all(data).await?;
-        io.flush().await
-    }
-}
-
-use snapshot_codec::{SNAPSHOT_PROTOCOL, SnapshotCodec};
-
-// Inline copy of `engine/push_protocol.rs` — needed here because
-// `engine/*` is gated to `not(target_arch = "wasm32")`. Wire shape MUST
-// stay byte-for-byte identical to the native version: protocol id
-// `/wavesync/push/1.0.0`, length-prefixed serde_json with a 1 MiB cap.
-// If `engine/push_protocol.rs` ever changes the wire format, this copy
-// must move in lockstep.
-mod push_codec {
-    use std::io;
-
-    use async_trait::async_trait;
-    use futures::prelude::*;
-    use libp2p::StreamProtocol;
-    use libp2p::request_response;
-    use serde::{Deserialize, Serialize};
-
-    pub const PUSH_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/push/1.0.0");
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    pub enum PushPlatform {
-        Fcm,
-        Apns,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum PushRequest {
-        RegisterToken {
-            topic: String,
-            platform: PushPlatform,
-            token: String,
-        },
-        UnregisterToken {
-            topic: String,
-            token: String,
-        },
-        NotifyTopic {
-            topic: String,
-            sender_site_id: String,
-            /// Whether this changeset touched at least one table with a
-            /// registered `SyncNotify` policy. Computed sender-side per
-            /// changeset — metadata only, never user-facing text. Drives the
-            /// relay's choice between an unbudgeted ALERT-class APNs send (a
-            /// realtime banner) and today's silent background wake.
-            /// `#[serde(default)]` keeps an old sender's un-tagged message
-            /// wire-compatible: it deserializes to `false`, i.e. today's
-            /// silent behavior exactly.
-            #[serde(default)]
-            visible: bool,
-        },
-        AnnouncePresence {
-            topic: String,
-        },
-        PeerJoined {
-            topic: String,
-            peer_addrs: Vec<String>,
-        },
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum PushResponse {
-        Ok,
-        Error { message: String },
-        PeerList { peers: Vec<String> },
-    }
-
-    #[derive(Debug, Clone, Default)]
-    pub struct PushCodec;
-
-    #[async_trait]
-    impl request_response::Codec for PushCodec {
-        type Protocol = StreamProtocol;
-        type Request = PushRequest;
-        type Response = PushResponse;
-
-        async fn read_request<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-        ) -> io::Result<Self::Request>
-        where
-            T: AsyncRead + Unpin + Send,
-        {
-            let bytes = read_lp(io).await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }
-
-        async fn read_response<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-        ) -> io::Result<Self::Response>
-        where
-            T: AsyncRead + Unpin + Send,
-        {
-            let bytes = read_lp(io).await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-        }
-
-        async fn write_request<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-            req: Self::Request,
-        ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
-        {
-            let bytes = serde_json::to_vec(&req)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            write_lp(io, &bytes).await
-        }
-
-        async fn write_response<T>(
-            &mut self,
-            _p: &Self::Protocol,
-            io: &mut T,
-            res: Self::Response,
-        ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
-        {
-            let bytes = serde_json::to_vec(&res)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            write_lp(io, &bytes).await
-        }
-    }
-
-    async fn read_lp<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        // Push messages are small — 1 MiB cap matches native.
-        if len > 1024 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("push payload too large: {len}"),
-            ));
-        }
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(buf)
-    }
-
-    async fn write_lp<T: AsyncWrite + Unpin>(io: &mut T, data: &[u8]) -> io::Result<()> {
-        io.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        io.write_all(data).await?;
-        io.flush().await
-    }
-}
-
-use push_codec::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
+use crate::wire::push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
+use crate::wire::snapshot_protocol::{SNAPSHOT_PROTOCOLS, SnapshotCodec};
 
 /// Errors surfaced from the browser sync client.
 #[derive(Debug, thiserror::Error)]
@@ -811,7 +556,12 @@ impl WebSyncClient {
             .map_err(|e| WebSyncError::Setup(format!("relay client: {e}")))?
             .with_behaviour(|key, relay_client| WebBehaviour {
                 snapshot: request_response::Behaviour::new(
-                    [(SNAPSHOT_PROTOCOL, request_response::ProtocolSupport::Full)],
+                    // Advertise the whole ladder (newest first), mirroring
+                    // native (engine/behaviour.rs) so request-response
+                    // negotiates the best common rung with each peer.
+                    SNAPSHOT_PROTOCOLS
+                        .iter()
+                        .map(|p| (p.clone(), request_response::ProtocolSupport::Full)),
                     // Match the native side (engine/behaviour.rs): a
                     // catch-up `ChangesetResponse` against a peer with
                     // months of history can take well over the default
@@ -827,7 +577,7 @@ impl WebSyncClient {
                 ),
                 relay_client,
                 identify: identify::Behaviour::new(identify::Config::new(
-                    "/wavesync/2.0.0".into(),
+                    crate::wire::IDENTIFY_PROTOCOL_VERSION.to_string(),
                     key.public(),
                 )),
                 ping: ping::Behaviour::default(),
@@ -1532,13 +1282,14 @@ async fn send_version_vector(state: &EngineState, out_tx: &mpsc::UnboundedSender
 /// joining a relay-mediated mesh receives only *future* writes — any
 /// historical state on the peer never lands in IndexedDB, because the
 /// real-time `Push` request-response path only forwards new writes, not
-/// history. The `peer_versions` table in `BrowserStore` was always being
-/// written on successful Push receipt but never read for catch-up. See issue #57.
+/// history. The `peer_versions` store persists the per-peer cursor;
+/// `get_peer_version` seeds `your_last_db_version` so reconnects request
+/// only the delta (0 = first contact = full sync).
 ///
 /// HMAC: when a passphrase is configured, the `VersionVector` request
-/// MUST carry an HMAC tag — Rule 2.7 in `CLAUDE.md` (HMAC verification
-/// is mandatory on ALL message paths, the catch-up path included).
-/// Peers drop unauthenticated `VersionVector` requests silently.
+/// MUST carry an HMAC tag (HMAC verification is mandatory on ALL message
+/// paths, the catch-up path included). Peers drop unauthenticated
+/// `VersionVector` requests silently.
 ///
 /// `db_version=0` semantics (Rule 2.5): if the new peer hasn't been
 /// seen before, `get_peer_version` returns 0 and the peer replies with

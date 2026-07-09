@@ -14,9 +14,9 @@
 //!   every restart forgets what version it last saw and remote changes
 //!   that should have lost would re-apply on top of newer local data.
 //! - **`peer_versions`** — per-peer `last_db_version` (u64), keyed by
-//!   peer-id string. Reserved for a future version-vector catch-up; not
-//!   read on this branch but written on every successful incoming Push so
-//!   the data is ready when catch-up lands.
+//!   peer-id string. Read on every (re)connect to seed the version-vector
+//!   catch-up cursor; written on every successful incoming Push so the
+//!   cursor advances as new changes arrive.
 //! - **`peer_addrs`** — per-(peer_id, multiaddr) cache of working
 //!   addresses with last-success / last-try timestamps and a fail count.
 //!   Mirrors the native `_wavesync_peer_addrs` table (see
