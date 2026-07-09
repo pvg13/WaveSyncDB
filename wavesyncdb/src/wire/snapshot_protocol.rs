@@ -20,8 +20,9 @@ pub const SNAPSHOT_PROTOCOL: StreamProtocol = StreamProtocol::new("/wavesync/sna
 /// ladder: a future breaking change adds its new id at the front here (and bumps
 /// the wire format behind it) while keeping the old rung for a transition window,
 /// so mixed-version fleets keep syncing on the common rung instead of failing
-/// silently (see CLAUDE.md §5). Today it is a single rung — behaviourally
-/// identical to advertising `SNAPSHOT_PROTOCOL` alone.
+/// silently. Protocol-id strings are the peer-compatibility signal: any
+/// breaking wire change MUST add a new rung here. Today it is a single rung —
+/// behaviourally identical to advertising `SNAPSHOT_PROTOCOL` alone.
 pub const SNAPSHOT_PROTOCOLS: &[StreamProtocol] = &[SNAPSHOT_PROTOCOL];
 
 /// Given the protocol identifiers a peer advertises (via libp2p identify),

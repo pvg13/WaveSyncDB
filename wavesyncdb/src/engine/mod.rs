@@ -19,7 +19,7 @@ pub(crate) mod peer_manager;
 pub(crate) mod push_protocol;
 pub(crate) mod reconcile;
 pub(crate) mod relay_manager;
-pub(crate) mod snapshot_protocol;
+pub use crate::wire::snapshot_protocol;
 pub(crate) mod sync_handler;
 
 /// Cross-implementation convergence checks — hidden test support, not a
