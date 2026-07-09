@@ -35,7 +35,9 @@ pub struct TableMeta {
 ///
 /// Native-only: the `schema_fn` signature is typed against `sea_orm::DatabaseBackend`,
 /// and `sea-orm` is not available on wasm32 builds. Browser apps register
-/// table metadata directly via [`TableRegistry::register`].
+/// table metadata directly via [`TableRegistry::register`]. See
+/// [`SyncEntityDescriptor`] for the target-independent sibling that both
+/// engines can read.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct SyncEntityInfo {
     /// The `module_path!()` of the entity, used for prefix matching.
@@ -58,7 +60,6 @@ pub struct SyncEntityInfo {
 ///
 /// All variants are `const`-constructible so the derive macro can emit them in
 /// the static [`SyncEntityInfo`] inventory record.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityScope {
     /// Default. Only the node's *default* group (the user's own-devices replica,
@@ -73,7 +74,6 @@ pub enum EntityScope {
     Groups(&'static [&'static str]),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl EntityScope {
     /// Whether an entity with this scope should be created+registered for a group.
     ///
@@ -91,6 +91,31 @@ impl EntityScope {
 
 #[cfg(not(target_arch = "wasm32"))]
 inventory::collect!(SyncEntityInfo);
+
+/// Target-independent sibling of [`SyncEntityInfo`].
+///
+/// `SyncEntityInfo` carries a `schema_fn` typed against `sea_orm::DatabaseBackend`,
+/// which doesn't exist on wasm32 (no `sea-orm` there). A browser entity still needs
+/// to announce its table name, primary key, delete policy, and scope so *both*
+/// engines (native P2P and the browser's `web_engine`) can discover it the same
+/// way — via `inventory` at link time, no manual registration call required. This
+/// struct is that shared, schema-generation-free metadata: everything an entity
+/// can describe about itself without depending on a SeaORM connection.
+#[derive(Debug, Clone)]
+pub struct SyncEntityDescriptor {
+    /// The SQL table name (e.g., `"tasks"`).
+    pub table_name: &'static str,
+    /// Name of the primary key column (e.g., `"id"`).
+    pub pk_column: &'static str,
+    /// How to resolve delete vs. non-delete conflicts for this table.
+    pub delete_policy: DeletePolicy,
+    /// Which sync groups this entity replicates in.
+    pub scope: EntityScope,
+    /// The `module_path!()` of the entity, used for prefix matching.
+    pub module_path: &'static str,
+}
+
+inventory::collect!(SyncEntityDescriptor);
 
 /// Registry of tables that participate in sync.
 ///
@@ -260,15 +285,33 @@ impl NotificationGate {
     }
 }
 
-// `EntityScope`/`TableMeta`/`TableRegistry` are native-only (see the
-// `not(wasm32)` gates above) — `wasm-pack test` always runs `cargo build
-// --tests`, which builds this crate's own lib unit tests alongside whatever
-// integration test was named, so this module must not compile under a
-// wasm32 `cfg(test)` build or it fails to resolve the gated-out types.
+// `SyncEntityInfo`/`NotificationGate` (and the notification-gate test below)
+// are native-only (see the `not(wasm32)` gates above) — `wasm-pack test`
+// always runs `cargo build --tests`, which builds this crate's own lib unit
+// tests alongside whatever integration test was named, so this module must
+// not compile under a wasm32 `cfg(test)` build or it fails to resolve the
+// gated-out types.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::messages::DeletePolicy;
+
+    inventory::submit! {
+        crate::SyncEntityDescriptor {
+            table_name: "reg_test_desc",
+            pk_column: "id",
+            delete_policy: crate::DeletePolicy::DeleteWins,
+            scope: crate::EntityScope::All,
+            module_path: module_path!(),
+        }
+    }
+
+    #[test]
+    fn descriptor_inventory_collects() {
+        let found = inventory::iter::<crate::SyncEntityDescriptor>()
+            .any(|d| d.table_name == "reg_test_desc");
+        assert!(found);
+    }
 
     #[test]
     fn entity_scope_private_matches_only_default() {
