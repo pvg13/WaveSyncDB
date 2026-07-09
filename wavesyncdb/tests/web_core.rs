@@ -1075,6 +1075,40 @@ async fn gc_disabled_reaps_nothing() {
     );
 }
 
+// ── target-independent descriptor inventory (#93) ─────────────────────────
+
+// Mirrors the real `#[derive(SyncEntity)]` scope-entity pattern from
+// `integration_multigroup.rs`'s `scope_entities` module (SeaORM
+// `DeriveEntityModel` + `SyncEntity`, `#[wavesync(scope = ...)]`) — this
+// file is native-only (`not(target_arch = "wasm32")` above), so the same
+// pattern applies directly; `SyncEntityDescriptor` submission itself is
+// ungated in the derive, which is exactly what this test asserts.
+mod desc_entities {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "desc_house")]
+    #[wavesync(scope = groups("household"))]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub body: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn derive_emits_descriptor() {
+    let d = inventory::iter::<wavesyncdb::SyncEntityDescriptor>()
+        .find(|d| d.table_name == "desc_house")
+        .expect("descriptor for desc_house");
+    assert_eq!(d.pk_column, "id");
+    assert!(matches!(d.scope, wavesyncdb::EntityScope::Groups(ks) if ks.contains(&"household")));
+}
+
 #[tokio::test]
 async fn gc_keeps_unstamped_tombstones() {
     // deleted_ts == None (defensive: pre-4.0.0 row) never ages, matching

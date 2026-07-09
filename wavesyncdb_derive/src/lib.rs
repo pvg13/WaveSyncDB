@@ -106,6 +106,25 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Target-independent sibling of `inventory_block`: every entity submits
+    // a `SyncEntityDescriptor` regardless of target, so scope-aware
+    // registration (#93) works on wasm32 too, where `SyncEntityInfo`'s
+    // `schema_fn` (typed against `sea_orm::DatabaseBackend`) can't exist.
+    // `delete_policy` is always `DeleteWins` — there is no attribute for it,
+    // mirroring the same hardcoded value in `inventory_block`'s `schema_fn`.
+    let pk_column_str = meta.pk_ident.to_string();
+    let descriptor_block = quote! {
+        wavesyncdb::register_sync_entity_descriptor! {
+            wavesyncdb::SyncEntityDescriptor {
+                table_name: #table_name,
+                pk_column: #pk_column_str,
+                delete_policy: wavesyncdb::DeletePolicy::DeleteWins,
+                scope: #scope,
+                module_path: module_path!(),
+            }
+        }
+    };
+
     let synced_model_body = build_synced_model_body(&meta);
     let browser_entity_body = build_browser_entity_body(&meta);
 
@@ -113,6 +132,8 @@ pub fn derive_sync_entity(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
+        #descriptor_block
+
         #[cfg(not(target_arch = "wasm32"))]
         #inventory_block
 

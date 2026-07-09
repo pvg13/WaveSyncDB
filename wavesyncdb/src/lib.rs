@@ -219,6 +219,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Re-export for use by the #[derive(SyncEntity)] macro
 pub use inventory::submit as register_sync_entity;
 
+// Sibling re-export for the target-independent `SyncEntityDescriptor`
+// submission (see `registry.rs`). Same shape as `register_sync_entity`
+// above — both are aliases of `inventory::submit!` — kept as a separate
+// name so derive-generated code reads as "submitting a descriptor" at the
+// call site, ungated so it works on wasm32 too.
+pub use inventory::submit as register_sync_entity_descriptor;
+
 // Re-export sea-orm for users of the library. sea-orm is not available on
 // wasm32 (sqlx-sqlite pulls in libsqlite3-sys, a C library), so this
 // re-export is gated to native targets. The `SyncEntity` derive uses it.
