@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use bollard::Docker;
 use libp2p::identity::Keypair;
 use serde::{Deserialize, Serialize};
 use testcontainers::{
@@ -793,6 +794,128 @@ impl RunningPeer {
         self.netem = None;
         Ok(())
     }
+}
+
+/// Connect to the local Docker daemon. All lifecycle helpers below go
+/// through bollard directly because testcontainers deliberately doesn't
+/// expose stop/start/pause on a running container.
+fn docker() -> Result<Docker> {
+    Docker::connect_with_local_defaults().context("connect to local Docker daemon")
+}
+
+impl RunningPeer {
+    /// Stop this peer's container (SIGTERM + wait). The `/data` volume
+    /// survives, so the peer's SQLite — including `_wavesync_peer_addrs`
+    /// — is intact on the next `start()`.
+    pub async fn stop(&self) -> Result<()> {
+        docker()?
+            .stop_container(self.container.id(), None)
+            .await
+            .with_context(|| format!("stop container for peer {}", self.name))
+    }
+
+    /// Start a previously stopped container. The host port mapping is
+    /// reassigned — callers must `refresh_base_url()` before HTTP calls
+    /// (or use `RunningHarness::restart_peer_and_wait` which does both).
+    pub async fn start(&self) -> Result<()> {
+        docker()?
+            .start_container(self.container.id(), None)
+            .await
+            .with_context(|| format!("start container for peer {}", self.name))
+    }
+
+    /// Freeze every process in the container (cgroup freezer). Sockets
+    /// stay open but nothing is scheduled — the closest Docker analogue
+    /// to a mobile OS freezing a backgrounded app. Remote idle timeouts
+    /// kill the frozen peer's connections without it noticing.
+    pub async fn pause(&self) -> Result<()> {
+        docker()?
+            .pause_container(self.container.id())
+            .await
+            .with_context(|| format!("pause container for peer {}", self.name))
+    }
+
+    /// Unfreeze a paused container — the "app returned to foreground"
+    /// moment. The engine resumes with whatever stale state it had.
+    pub async fn unpause(&self) -> Result<()> {
+        docker()?
+            .unpause_container(self.container.id())
+            .await
+            .with_context(|| format!("unpause container for peer {}", self.name))
+    }
+
+    /// Block until `GET /health` on this peer returns 2xx, or time out.
+    pub async fn wait_http_ready(&self, timeout: Duration) -> Result<()> {
+        let url = format!("{}/health", self.base_url);
+        let start = Instant::now();
+        let client = reqwest::Client::new();
+        loop {
+            if let Ok(r) = client.get(&url).send().await
+                && r.status().is_success()
+            {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                bail!("peer {} HTTP not ready within {:?}", self.name, timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// `wait_for_task`, but returns how long visibility took. The
+    /// measurement primitive for the WAN-latency scenarios.
+    pub async fn wait_for_task_timed(
+        &self,
+        id: &str,
+        title: &str,
+        timeout: Duration,
+    ) -> Result<Duration> {
+        let start = Instant::now();
+        self.wait_for_task_at("tasks", id, title, timeout).await?;
+        Ok(start.elapsed())
+    }
+}
+
+impl RunningHarness {
+    /// stop → start → refresh host port → wait for HTTP. The standard
+    /// "cold restart" building block for latency scenarios.
+    pub async fn restart_peer_and_wait(&mut self, name: &str, timeout: Duration) -> Result<()> {
+        self.peer(name).stop().await?;
+        self.peer(name).start().await?;
+        let peer = self.peer_mut(name);
+        peer.refresh_base_url().await?;
+        peer.wait_http_ready(timeout).await
+    }
+
+    /// Stop the relay container. Peers lose their reservation and all
+    /// relay-path discovery until `start_relay`.
+    pub async fn stop_relay(&self) -> Result<()> {
+        docker()?
+            .stop_container(self.relay.id(), None)
+            .await
+            .context("stop relay container")
+    }
+
+    /// Start the relay back up. Identity is pinned via IDENTITY_KEYPAIR,
+    /// so the PeerId — and therefore every peer's configured relay
+    /// multiaddr — is still valid.
+    pub async fn start_relay(&self) -> Result<()> {
+        docker()?
+            .start_container(self.relay.id(), None)
+            .await
+            .context("start relay container")
+    }
+}
+
+/// Emit one machine-greppable measurement line. Grep test output for
+/// `[ttfs]` to collect the numbers that set fix thresholds.
+pub fn report_ttfs(scenario: &str, phase: &str, elapsed: Duration) {
+    println!(
+        "[ttfs] scenario={} phase={} ms={}",
+        scenario,
+        phase,
+        elapsed.as_millis()
+    );
 }
 
 /// Run a `tc` invocation inside a container and assert exit-code 0.

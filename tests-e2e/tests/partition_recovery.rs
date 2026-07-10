@@ -21,7 +21,6 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bollard::Docker;
 use wavesyncdb_e2e::WaveSyncE2eHarness;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -45,8 +44,7 @@ async fn peer_restart_then_rejoin_converges() -> Result<()> {
 
     // Phase 2: stop Bob's container. Alice keeps writing locally;
     // those writes won't reach Bob (no other peer to fan-out to).
-    let bob_id = harness.peer("bob").container.id().to_string();
-    stop_container(&bob_id).await?;
+    harness.peer("bob").stop().await?;
 
     for i in 0..5 {
         let id = format!("offline-{i}");
@@ -61,14 +59,15 @@ async fn peer_restart_then_rejoin_converges() -> Result<()> {
     // restart (declared as VOLUME in the test-peer Dockerfile), so the
     // engine resumes from the prior shadow-table state and triggers a
     // version-vector catch-up.
-    start_container(&bob_id).await?;
+    harness.peer("bob").start().await?;
 
     // The host port forwarding is reassigned on restart — refresh it
     // before any further HTTP calls.
     harness.peer_mut("bob").refresh_base_url().await?;
-
-    let bob_url = harness.peer("bob").base_url.clone();
-    wait_for_http_ready(&bob_url, Duration::from_secs(30)).await?;
+    harness
+        .peer("bob")
+        .wait_http_ready(Duration::from_secs(30))
+        .await?;
 
     for i in 0..5 {
         let id = format!("offline-{i}");
@@ -88,35 +87,4 @@ async fn peer_restart_then_rejoin_converges() -> Result<()> {
     assert_eq!(a.len(), 6, "expected 1 seed + 5 offline writes, got {a:?}");
 
     Ok(())
-}
-
-async fn stop_container(id: &str) -> Result<()> {
-    Docker::connect_with_local_defaults()?
-        .stop_container(id, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("stop_container failed: {e}"))
-}
-
-async fn start_container(id: &str) -> Result<()> {
-    Docker::connect_with_local_defaults()?
-        .start_container(id, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("start_container failed: {e}"))
-}
-
-/// Block until `GET {base_url}/health` returns 2xx, or time out.
-async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> Result<()> {
-    let url = format!("{base_url}/health");
-    let start = std::time::Instant::now();
-    let client = reqwest::Client::new();
-    loop {
-        match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => return Ok(()),
-            _ => {}
-        }
-        if start.elapsed() >= timeout {
-            anyhow::bail!("HTTP {url} did not become ready within {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
