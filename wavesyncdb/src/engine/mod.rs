@@ -1713,9 +1713,11 @@ impl EngineRunner {
 
         // Register push token with relay if configured
         self.maybe_register_push_token(peer_id);
-        // Announce presence so the relay can introduce us to other peers
-        // on the same topic (works for desktop too, no push token needed).
-        self.announce_presence_to_relay(peer_id);
+        // Presence announce deliberately does NOT happen here — it moved
+        // to ReservationReqAccepted so peers introduced to us can reach
+        // us through the relay from their very first dial (N14). The
+        // reconnect sweep re-announces from Connected state if the
+        // reservation never completes.
     }
 
     /// Track bootstrap peer, emit event, update last_seen.
@@ -2160,6 +2162,12 @@ impl EngineRunner {
         // nothing un-acked (the steady state).
         let mut redeliver_interval = tokio::time::interval(Duration::from_secs(3));
 
+        // Level-triggered reconnection (N14). Deliberately NOT gated on
+        // `has_relay` — `wanted_peers` also carries cached-address peers,
+        // and the announce half no-ops without a relay. First tick is
+        // immediate (harmless: nothing is wanted-and-disconnected yet).
+        let mut reconnect_sweep = tokio::time::interval(Duration::from_secs(5));
+
         // The registry-ready notifier is awaited inside the select! arm, which
         // cannot hold a borrow of `self` across the await. Clone the default
         // group's `Arc<Notify>` out here so the arm only touches the local.
@@ -2188,6 +2196,9 @@ impl EngineRunner {
                 },
                 _ = redeliver_interval.tick() => {
                     self.redeliver_pending_pushes();
+                },
+                _ = reconnect_sweep.tick() => {
+                    self.sweep_wanted_peers();
                 },
                 _ = rendezvous_interval.tick(), if has_rendezvous => {
                     self.rendezvous_discover();

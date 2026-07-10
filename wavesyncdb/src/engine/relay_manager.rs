@@ -69,6 +69,16 @@ impl EngineRunner {
                     crate::network_status::RelayStatus::Listening,
                 ));
                 self.update_network_status();
+                // Announce only once we are reachable. Announcing from
+                // `Connected` (as the relay-connect handler used to) makes
+                // the relay fan out PeerJoined immediately, and receivers'
+                // circuit dials toward us then race a reservation that
+                // doesn't exist yet and fail as one-shots (N14). The
+                // reconnect sweep still re-announces from `Connected` if
+                // the reservation never lands, so a reservation-less relay
+                // setup degrades to slower introductions, not none.
+                self.announce_presence_to_relay(relay_peer_id);
+                self.last_presence_announce = Some(tokio::time::Instant::now());
             }
             _ => {
                 tracing::info!("Relay client event (non-acceptance): {:?}", event);
@@ -709,15 +719,37 @@ impl EngineRunner {
             return;
         };
 
+        if peer_id == self.local_peer_id || self.infrastructure_peers.contains(&peer_id) {
+            return;
+        }
+
+        // Remember this peer regardless of whether the dial below is
+        // suppressed — the reconnect sweep retries from `wanted_peers`
+        // once the suppressing condition (backoff, stale connection,
+        // in-flight dial) clears. Introductions being one-shot events
+        // was the core of N14: a suppressed dial partitioned the mesh
+        // until an app restart. Fresh relay-vouched addresses replace
+        // the stored set (the peer may have restarted with new ones).
+        self.wanted_peers.insert(peer_id, addrs.clone());
+
         let rejected_by_all =
             !self.groups.is_empty() && self.groups.values().all(|g| g.is_rejected(&peer_id));
-        if peer_id == self.local_peer_id
-            || self.infrastructure_peers.contains(&peer_id)
-            || rejected_by_all
-            || self.swarm.is_connected(&peer_id)
-            || self.dialing_peers.contains(&peer_id)
-            || !self.dial_backoff_ok(&peer_id)
-        {
+        let suppressed_by = if rejected_by_all {
+            Some("rejected_by_all_groups")
+        } else if self.swarm.is_connected(&peer_id) {
+            Some("already_connected")
+        } else if self.dialing_peers.contains(&peer_id) {
+            Some("dial_in_flight")
+        } else if !self.dial_backoff_ok(&peer_id) {
+            Some("dial_backoff_active")
+        } else {
+            None
+        };
+        if let Some(reason) = suppressed_by {
+            // Not silent (this early-return hid N14 at every log level):
+            // the sweep will retry, but the operator can see why the
+            // introduction didn't dial right now.
+            tracing::debug!(peer = %peer_id, reason, "introduction dial suppressed");
             return;
         }
 
@@ -756,6 +788,88 @@ impl EngineRunner {
             Err(e) => {
                 tracing::warn!("Failed to dial relay-introduced peer {peer_id}: {e}");
             }
+        }
+    }
+
+    /// Level-triggered reconnection (N14): retry wanted-but-disconnected
+    /// peers and re-announce presence when a ready group has no sync
+    /// peers. Runs on a 5s tick from the engine event loop.
+    ///
+    /// Every other reconnection mechanism is an edge-triggered one-shot
+    /// (cached pre-dials at startup, PeerList on announce, PeerJoined on
+    /// a newcomer's announce, mDNS on LAN only); when those race each
+    /// other's failure bookkeeping the mesh stays partitioned until an
+    /// app restart. This sweep is the level-triggered floor under all of
+    /// them. Anti-storm: dials respect the quadratic per-peer dial
+    /// backoff (a permanently-dead peer converges to ≤1 dial per 5
+    /// minutes, same budget the #84 storm guard assumes) and the
+    /// re-announce is throttled to 20s and conditioned on having zero
+    /// connected sync peers.
+    pub(super) fn sweep_wanted_peers(&mut self) {
+        let candidates: Vec<(libp2p::PeerId, Vec<libp2p::Multiaddr>)> = self
+            .wanted_peers
+            .iter()
+            .filter(|(pid, _)| {
+                let rejected_by_all =
+                    !self.groups.is_empty() && self.groups.values().all(|g| g.is_rejected(pid));
+                !self.swarm.is_connected(pid)
+                    && !self.dialing_peers.contains(pid)
+                    && self.dial_backoff_ok(pid)
+                    && !rejected_by_all
+                    && !self.infrastructure_peers.contains(pid)
+            })
+            .map(|(pid, addrs)| (*pid, addrs.clone()))
+            .collect();
+
+        for (pid, addrs) in candidates {
+            let addrs = dialable_addrs_preferring_direct(addrs, self.suppress_relay_dial(&pid));
+            if addrs.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                "Reconnect sweep: dialing wanted peer {pid} with {} address(es)",
+                addrs.len()
+            );
+            let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(pid)
+                .addresses(addrs)
+                .build();
+            match self.swarm.dial(dial_opts) {
+                Ok(()) => {
+                    self.diagnostics
+                        .peer_dial_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.dialing_peers.insert(pid);
+                }
+                Err(e) => tracing::debug!("Reconnect sweep dial of {pid} failed: {e}"),
+            }
+        }
+
+        // Re-announce when isolated: a ready group with zero connected
+        // sync peers means our one-shot introductions are spent — ask the
+        // relay to re-send PeerList (and re-advertise us via PeerJoined
+        // to the others). Runs from `Connected` too, so a node whose
+        // reservation never completes still gets introductions.
+        let relay_pid = match self.relay_state {
+            RelayState::Connected { relay_peer_id, .. }
+            | RelayState::Listening { relay_peer_id } => Some(relay_peer_id),
+            _ => None,
+        };
+        let any_ready_group = self.groups.values().any(|g| g.registry_is_ready);
+        let any_sync_peer_connected = self
+            .swarm
+            .connected_peers()
+            .any(|p| !self.infrastructure_peers.contains(p));
+        let throttle_ok = self
+            .last_presence_announce
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(20));
+        if let Some(relay_pid) = relay_pid
+            && any_ready_group
+            && !any_sync_peer_connected
+            && throttle_ok
+        {
+            tracing::info!("Reconnect sweep: no connected sync peers — re-announcing presence");
+            self.announce_presence_to_relay(relay_pid);
+            self.last_presence_announce = Some(tokio::time::Instant::now());
         }
     }
 
