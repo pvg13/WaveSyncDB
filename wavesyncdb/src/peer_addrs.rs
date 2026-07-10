@@ -25,10 +25,19 @@
 //! * **One row per `(peer_id, multiaddr)` pair.** A peer with multiple
 //!   reachable addresses (LAN + circuit-relay + DCUtR-upgraded direct)
 //!   has multiple rows; the engine fires them all in parallel at next
-//!   startup and lets libp2p race them.
+//!   startup and lets libp2p race them. Only *dialable* multiaddrs are
+//!   stored — a bare `/p2p/<id>` remote address (as surfaced by some
+//!   upgraded connections) is rejected at [`record_success`].
 //! * **Last-success / last-attempt timestamps + consecutive-failure
 //!   counter.** Enough to drive a recency filter and a future per-peer
 //!   circuit breaker (#34) without retaining a full history.
+//!   `fail_count` grows **per address**, and the engine only records a
+//!   failure when the peer is simultaneously connected via another path
+//!   — the one signal that distinguishes "this address is stale" from
+//!   "the peer is asleep". A sleeping phone fails on ALL its addresses;
+//!   counting that would erase its whole cache within ~10 push wakes
+//!   (the normal mobile rhythm). Rows that never accumulate failures
+//!   leave via the 7-day age GC instead.
 //! * **No reputation / scoring beyond age and failure count.** Bitcoin's
 //!   AddrMan tries / new buckets are overkill for our scale (typically
 //!   under 20 peers per topic). If we ever get there, the schema is
@@ -66,16 +75,37 @@ pub async fn create_peer_addrs_table(db: &impl ConnectionTrait) -> Result<ExecRe
     .await
 }
 
+/// A multiaddr worth caching: it must parse and contain at least one
+/// non-`/p2p/` component (a transport we can dial later). Hole-punched /
+/// upgraded connections can surface bare `/p2p/<id>` remote addresses;
+/// caching those wastes a cold-start pre-dial on a guaranteed
+/// "Unsupported resolved address" failure — and pre-dial failures are
+/// exactly what start the dial backoff that suppresses introduction
+/// dials (PROBLEMS N14).
+pub fn is_dialable_multiaddr(addr: &str) -> bool {
+    let Ok(ma) = addr.parse::<libp2p::Multiaddr>() else {
+        return false;
+    };
+    ma.iter()
+        .any(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+}
+
 /// Record a successful connection / message exchange for `(peer_id, multiaddr)`.
 ///
 /// Sets both `last_ok_at` and `last_try_at` to now, and resets the
 /// consecutive-failure counter to 0. Insert if the row doesn't exist
-/// (a peer/address pair we haven't seen before).
+/// (a peer/address pair we haven't seen before). Silently skips
+/// addresses that could never be re-dialed (see
+/// [`is_dialable_multiaddr`]).
 pub async fn record_success(
     db: &impl ConnectionTrait,
     peer_id: &str,
     multiaddr: &str,
-) -> Result<ExecResult, DbErr> {
+) -> Result<(), DbErr> {
+    if !is_dialable_multiaddr(multiaddr) {
+        tracing::debug!("peer_addrs: skipping non-dialable multiaddr {multiaddr}");
+        return Ok(());
+    }
     let now = now_secs();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Sqlite,
@@ -87,7 +117,8 @@ pub async fn record_success(
             fail_count  = 0",
         [peer_id.into(), multiaddr.into(), (now as i64).into()],
     ))
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Record a failed dial attempt for `(peer_id, multiaddr)`.
@@ -109,29 +140,6 @@ pub async fn record_failure(
             SET last_try_at = $3, fail_count = fail_count + 1
             WHERE peer_id = $1 AND multiaddr = $2",
         [peer_id.into(), multiaddr.into(), (now as i64).into()],
-    ))
-    .await
-}
-
-/// Bump `fail_count` for **every** cached address of `peer_id`.
-///
-/// Used by the engine's `OutgoingConnectionError` handler: libp2p reports
-/// the failed peer-id but races multiple addresses internally and surfaces
-/// a single error. Treating "the peer is unreachable" as a per-peer signal
-/// (rather than per-address) is the right granularity for the circuit
-/// breaker without coupling us to libp2p's `DialError` internal variants.
-/// A no-op if no rows exist for the peer.
-pub async fn record_failure_for_peer(
-    db: &impl ConnectionTrait,
-    peer_id: &str,
-) -> Result<ExecResult, DbErr> {
-    let now = now_secs();
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Sqlite,
-        "UPDATE _wavesync_peer_addrs
-            SET last_try_at = $2, fail_count = fail_count + 1
-            WHERE peer_id = $1",
-        [peer_id.into(), (now as i64).into()],
     ))
     .await
 }
@@ -210,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn record_success_inserts_new_row_with_fail_count_zero() {
         let db = fresh_db().await;
-        record_success(&db, "peer-A", "/ip4/1.2.3.4/udp/4001/quic-v1/p2p/peer-A")
+        record_success(&db, "peer-A", "/ip4/1.2.3.4/udp/4001/quic-v1")
             .await
             .unwrap();
 
@@ -289,33 +297,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_failure_for_peer_bumps_all_addresses() {
+    async fn record_success_skips_transport_less_addr() {
         let db = fresh_db().await;
-        record_success(&db, "peer-A", "/ip4/1.1.1.1").await.unwrap();
-        record_success(&db, "peer-A", "/ip4/2.2.2.2").await.unwrap();
-        record_success(&db, "peer-B", "/ip4/3.3.3.3").await.unwrap();
-
-        record_failure_for_peer(&db, "peer-A").await.unwrap();
-        record_failure_for_peer(&db, "peer-A").await.unwrap();
-
+        // A bare /p2p/<id> multiaddr has no transport component and can
+        // never be dialed — caching it wastes a cold-start pre-dial on a
+        // guaranteed "Unsupported resolved address" failure.
+        record_success(
+            &db,
+            "12D3KooWQoYdYSkm4Ypb7TA9qVW4PFQNAHhN3FiHEaBpt7DxRWfC",
+            "/p2p/12D3KooWQoYdYSkm4Ypb7TA9qVW4PFQNAHhN3FiHEaBpt7DxRWfC",
+        )
+        .await
+        .unwrap();
         let rows = load_recent(&db, 3600, 100).await.unwrap();
-        // peer-A's two rows both at fail_count=2; peer-B untouched.
-        let a_rows: Vec<_> = rows.iter().filter(|r| r.peer_id == "peer-A").collect();
-        let b_rows: Vec<_> = rows.iter().filter(|r| r.peer_id == "peer-B").collect();
-        assert_eq!(a_rows.len(), 2);
-        for r in a_rows {
-            assert_eq!(r.fail_count, 2);
-        }
-        assert_eq!(b_rows.len(), 1);
-        assert_eq!(b_rows[0].fail_count, 0);
+        assert!(rows.is_empty(), "transport-less addr was cached: {rows:?}");
     }
 
     #[tokio::test]
-    async fn record_failure_for_peer_on_unknown_peer_is_noop() {
+    async fn record_success_skips_unparseable_addr() {
         let db = fresh_db().await;
-        record_failure_for_peer(&db, "peer-ghost").await.unwrap();
+        record_success(&db, "peer-A", "not a multiaddr")
+            .await
+            .unwrap();
         let rows = load_recent(&db, 3600, 100).await.unwrap();
-        assert!(rows.is_empty());
+        assert!(rows.is_empty(), "unparseable addr was cached: {rows:?}");
+    }
+
+    #[tokio::test]
+    async fn record_success_keeps_circuit_and_direct_addrs() {
+        let db = fresh_db().await;
+        record_success(
+            &db,
+            "12D3KooWQoYdYSkm4Ypb7TA9qVW4PFQNAHhN3FiHEaBpt7DxRWfC",
+            "/ip4/10.0.0.2/udp/4001/quic-v1/p2p/12D3KooWJdeCPk9kiQN1L19ESVcUrcEfC1d1pNnpkAyk8spniCiX/p2p-circuit/p2p/12D3KooWQoYdYSkm4Ypb7TA9qVW4PFQNAHhN3FiHEaBpt7DxRWfC",
+        )
+        .await
+        .unwrap();
+        record_success(
+            &db,
+            "12D3KooWQoYdYSkm4Ypb7TA9qVW4PFQNAHhN3FiHEaBpt7DxRWfC",
+            "/ip4/10.0.0.3/udp/9999/quic-v1",
+        )
+        .await
+        .unwrap();
+        let rows = load_recent(&db, 3600, 100).await.unwrap();
+        assert_eq!(rows.len(), 2, "both dialable addrs must be cached");
     }
 
     #[tokio::test]

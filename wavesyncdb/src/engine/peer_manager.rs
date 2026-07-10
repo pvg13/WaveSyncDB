@@ -317,6 +317,27 @@ impl EngineRunner {
                     continue;
                 }
             };
+
+            // Remember the peer for the reconnect sweep regardless of how
+            // the pre-dial below goes — cached peers are topic members we
+            // should keep trying to reach (N14).
+            if let Ok(pid) = entry.peer_id.parse::<libp2p::PeerId>() {
+                self.wanted_peers.entry(pid).or_default().push(addr.clone());
+            }
+
+            let is_circuit = addr
+                .iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit));
+            if is_circuit && self.config.relay_server.is_some() {
+                // Hold circuit dials until the relay connection exists —
+                // issued now they are CANCELED (not queued) by the relay
+                // client, and the failure starts the dial backoff that
+                // suppresses the introduction dial arriving right after
+                // relay connect (N14).
+                self.deferred_circuit_predials.push(addr);
+                continue;
+            }
+
             match self.swarm.dial(addr.clone()) {
                 Ok(()) => {
                     self.diagnostics

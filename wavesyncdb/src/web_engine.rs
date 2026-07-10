@@ -3291,15 +3291,18 @@ async fn handle_event(
         }
         SwarmEvent::OutgoingConnectionError { error, peer_id, .. } => {
             tracing::warn!("WebSyncClient: dial failure ({peer_id:?}): {error}");
-            // Bump fail_count on every cached address for this peer
-            // when libp2p tells us the dial didn't land. We can't tell
-            // *which* multiaddr was attempted from this event, so
-            // failing the whole peer is the conservative choice — it
-            // matches `peer_addrs::record_failure_for_peer` on native.
+            // Bump fail_count on this peer's cached addresses ONLY when
+            // the peer is simultaneously connected via another path —
+            // the one signal that distinguishes "this address is stale"
+            // from "the peer is asleep". A sleeping peer fails on ALL
+            // its addresses; counting that erases its whole cache within
+            // ~10 reconnect cycles (the native N14 poisoning bug — this
+            // mirrors native's gated `OutgoingConnectionError` handler).
             // Skip when the peer was the relay (relay reconnects have
             // their own state machine) or unknown.
             if let (Some(store), Some(pid)) = (default_store.clone(), peer_id)
                 && Some(pid) != state.relay_peer_id
+                && connected.contains(&pid)
             {
                 let peer_str = pid.to_string();
                 wasm_bindgen_futures::spawn_local(async move {

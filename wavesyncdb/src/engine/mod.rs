@@ -853,6 +853,10 @@ async fn run_engine(
         peer_identities: HashMap::new(),
         infrastructure_peers,
         dialing_peers: std::collections::HashSet::new(),
+        wanted_peers: HashMap::new(),
+        deferred_circuit_predials: Vec::new(),
+        last_presence_announce: None,
+        sync_timeout_strikes: HashMap::new(),
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
         database_url,
@@ -1096,6 +1100,33 @@ struct EngineRunner {
     pub(crate) infrastructure_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
     pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Topic members we have evidence of (cached addresses, relay
+    /// introductions) keyed to their last-known address set. Unlike
+    /// `peers` — which is erased on dial failure — entries here survive
+    /// failures, which is what lets the periodic reconnect sweep retry
+    /// them (N14: introductions used to be one-shot events, so a single
+    /// suppressed dial partitioned the mesh until restart). Growth is
+    /// bounded by actual topic membership; rejected peers are skipped at
+    /// sweep time rather than evicted, so a recovered peer resumes.
+    pub(crate) wanted_peers: HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>>,
+    /// Cached circuit-relay pre-dials held back until the relay
+    /// connection exists. A circuit dial issued before then is CANCELED
+    /// by the relay client (not queued) — and that failure used to start
+    /// the dial backoff that suppressed the PeerList introduction dial
+    /// arriving milliseconds later (N14).
+    pub(crate) deferred_circuit_predials: Vec<libp2p::Multiaddr>,
+    /// When presence was last announced to the relay — throttles the
+    /// reconnect sweep's isolation re-announce.
+    pub(crate) last_presence_announce: Option<tokio::time::Instant>,
+    /// Consecutive sync-request timeouts per peer. QUIC only notices a
+    /// dead path at its ~30s idle timeout; until then a stale connection
+    /// eats every request, suppresses introduction dials via the
+    /// `is_connected` guard, and (having demoted the relay path) leaves
+    /// no working route. Two consecutive timeouts are treated as proof
+    /// the connection is a corpse: it is closed proactively so discovery
+    /// and the reconnect sweep can rebuild a live one (N14). Cleared on
+    /// any received sync response.
+    pub(crate) sync_timeout_strikes: HashMap<libp2p::PeerId, u32>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
     pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
@@ -1648,6 +1679,26 @@ impl EngineRunner {
         // pile additional reservation requests onto an already-pending one.
         self.try_listen_on_circuit(false);
 
+        // Release cached circuit pre-dials now that the relay connection
+        // exists (an outbound circuit dial needs our relay leg only, not
+        // our reservation). One-shot: later relay reconnects find this
+        // empty; the reconnect sweep owns retries from then on.
+        for addr in std::mem::take(&mut self.deferred_circuit_predials) {
+            match self.swarm.dial(addr.clone()) {
+                Ok(()) => {
+                    self.diagnostics
+                        .cached_addr_dials
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .peer_dial_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!("deferred cached circuit pre-dial of {addr} failed: {e}")
+                }
+            }
+        }
+
         // Manually add circuit address as external
         let my_circuit_addr = relay_addr
             .clone()
@@ -1672,9 +1723,11 @@ impl EngineRunner {
 
         // Register push token with relay if configured
         self.maybe_register_push_token(peer_id);
-        // Announce presence so the relay can introduce us to other peers
-        // on the same topic (works for desktop too, no push token needed).
-        self.announce_presence_to_relay(peer_id);
+        // Presence announce deliberately does NOT happen here — it moved
+        // to ReservationReqAccepted so peers introduced to us can reach
+        // us through the relay from their very first dial (N14). The
+        // reconnect sweep re-announces from Connected state if the
+        // reservation never completes.
     }
 
     /// Track bootstrap peer, emit event, update last_seen.
@@ -2119,6 +2172,12 @@ impl EngineRunner {
         // nothing un-acked (the steady state).
         let mut redeliver_interval = tokio::time::interval(Duration::from_secs(3));
 
+        // Level-triggered reconnection (N14). Deliberately NOT gated on
+        // `has_relay` — `wanted_peers` also carries cached-address peers,
+        // and the announce half no-ops without a relay. First tick is
+        // immediate (harmless: nothing is wanted-and-disconnected yet).
+        let mut reconnect_sweep = tokio::time::interval(Duration::from_secs(5));
+
         // The registry-ready notifier is awaited inside the select! arm, which
         // cannot hold a borrow of `self` across the await. Clone the default
         // group's `Arc<Notify>` out here so the arm only touches the local.
@@ -2147,6 +2206,9 @@ impl EngineRunner {
                 },
                 _ = redeliver_interval.tick() => {
                     self.redeliver_pending_pushes();
+                },
+                _ = reconnect_sweep.tick() => {
+                    self.sweep_wanted_peers();
                 },
                 _ = rendezvous_interval.tick(), if has_rendezvous => {
                     self.rendezvous_discover();
@@ -3038,18 +3100,32 @@ impl EngineRunner {
                     // on the next successful connection.
                     self.record_dial_failure(pid);
 
-                    // Bump fail_count on cached addresses for this peer
-                    // (#29). No-op if the peer isn't cached yet — cache rows
-                    // are only seeded on a successful connection.
-                    let db = self.default_group().db.clone();
-                    let peer_str = pid.to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::peer_addrs::record_failure_for_peer(&db, &peer_str).await
-                        {
-                            tracing::debug!("peer_addrs::record_failure_for_peer failed: {e}");
-                        }
-                    });
+                    // Penalize cached rows per-address, and only when this
+                    // peer is simultaneously reachable via another path —
+                    // that is the only signal that distinguishes "this
+                    // address is stale" from "the peer is asleep". A
+                    // sleeping phone fails on ALL its addresses; bumping
+                    // rows for that erased the whole cache within ~10 push
+                    // wakes (the normal mobile rhythm; N14). Rows that
+                    // never earn a failure this way age out via the 7-day
+                    // GC instead.
+                    if self.swarm.is_connected(&pid)
+                        && let libp2p::swarm::DialError::Transport(failed) = &error
+                    {
+                        let db = self.default_group().db.clone();
+                        let peer_str = pid.to_string();
+                        let addrs: Vec<String> =
+                            failed.iter().map(|(a, _)| a.to_string()).collect();
+                        tokio::spawn(async move {
+                            for addr in addrs {
+                                if let Err(e) =
+                                    crate::peer_addrs::record_failure(&db, &peer_str, &addr).await
+                                {
+                                    tracing::debug!("peer_addrs::record_failure failed: {e}");
+                                }
+                            }
+                        });
+                    }
                 }
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
