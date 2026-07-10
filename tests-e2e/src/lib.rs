@@ -576,7 +576,10 @@ impl WaveSyncE2eHarness {
         )
         .with_exposed_port(RELAY_QUIC_PORT.udp())
         .with_exposed_port(RELAY_METRICS_PORT.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Listening on"))
+        // The relay logs via tracing_subscriber::fmt(), which writes to
+        // STDOUT (the pre-tracing env_logger wrote to stderr — waiting
+        // on the wrong stream times out container startup at 60s).
+        .with_wait_for(WaitFor::message_on_stdout("Listening on"))
         .with_env_var("IDENTITY_KEYPAIR", &relay_identity_b64)
         .with_env_var("EXTERNAL_ADDRESS", &relay_external)
         .with_env_var("RUST_LOG", "info")
