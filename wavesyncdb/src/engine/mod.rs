@@ -853,6 +853,9 @@ async fn run_engine(
         peer_identities: HashMap::new(),
         infrastructure_peers,
         dialing_peers: std::collections::HashSet::new(),
+        wanted_peers: HashMap::new(),
+        deferred_circuit_predials: Vec::new(),
+        last_presence_announce: None,
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
         database_url,
@@ -1096,6 +1099,24 @@ struct EngineRunner {
     pub(crate) infrastructure_peers: std::collections::HashSet<libp2p::PeerId>,
     /// Peers currently being dialed (not yet connected). Prevents duplicate dials.
     pub(crate) dialing_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Topic members we have evidence of (cached addresses, relay
+    /// introductions) keyed to their last-known address set. Unlike
+    /// `peers` — which is erased on dial failure — entries here survive
+    /// failures, which is what lets the periodic reconnect sweep retry
+    /// them (N14: introductions used to be one-shot events, so a single
+    /// suppressed dial partitioned the mesh until restart). Growth is
+    /// bounded by actual topic membership; rejected peers are skipped at
+    /// sweep time rather than evicted, so a recovered peer resumes.
+    pub(crate) wanted_peers: HashMap<libp2p::PeerId, Vec<libp2p::Multiaddr>>,
+    /// Cached circuit-relay pre-dials held back until the relay
+    /// connection exists. A circuit dial issued before then is CANCELED
+    /// by the relay client (not queued) — and that failure used to start
+    /// the dial backoff that suppressed the PeerList introduction dial
+    /// arriving milliseconds later (N14).
+    pub(crate) deferred_circuit_predials: Vec<libp2p::Multiaddr>,
+    /// When presence was last announced to the relay — throttles the
+    /// reconnect sweep's isolation re-announce.
+    pub(crate) last_presence_announce: Option<tokio::time::Instant>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
     pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).
@@ -1647,6 +1668,26 @@ impl EngineRunner {
         // handler again per `max_established_per_peer = 1` selection) don't
         // pile additional reservation requests onto an already-pending one.
         self.try_listen_on_circuit(false);
+
+        // Release cached circuit pre-dials now that the relay connection
+        // exists (an outbound circuit dial needs our relay leg only, not
+        // our reservation). One-shot: later relay reconnects find this
+        // empty; the reconnect sweep owns retries from then on.
+        for addr in std::mem::take(&mut self.deferred_circuit_predials) {
+            match self.swarm.dial(addr.clone()) {
+                Ok(()) => {
+                    self.diagnostics
+                        .cached_addr_dials
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.diagnostics
+                        .peer_dial_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::debug!("deferred cached circuit pre-dial of {addr} failed: {e}")
+                }
+            }
+        }
 
         // Manually add circuit address as external
         let my_circuit_addr = relay_addr
