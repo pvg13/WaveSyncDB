@@ -3038,18 +3038,32 @@ impl EngineRunner {
                     // on the next successful connection.
                     self.record_dial_failure(pid);
 
-                    // Bump fail_count on cached addresses for this peer
-                    // (#29). No-op if the peer isn't cached yet — cache rows
-                    // are only seeded on a successful connection.
-                    let db = self.default_group().db.clone();
-                    let peer_str = pid.to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::peer_addrs::record_failure_for_peer(&db, &peer_str).await
-                        {
-                            tracing::debug!("peer_addrs::record_failure_for_peer failed: {e}");
-                        }
-                    });
+                    // Penalize cached rows per-address, and only when this
+                    // peer is simultaneously reachable via another path —
+                    // that is the only signal that distinguishes "this
+                    // address is stale" from "the peer is asleep". A
+                    // sleeping phone fails on ALL its addresses; bumping
+                    // rows for that erased the whole cache within ~10 push
+                    // wakes (the normal mobile rhythm; N14). Rows that
+                    // never earn a failure this way age out via the 7-day
+                    // GC instead.
+                    if self.swarm.is_connected(&pid)
+                        && let libp2p::swarm::DialError::Transport(failed) = &error
+                    {
+                        let db = self.default_group().db.clone();
+                        let peer_str = pid.to_string();
+                        let addrs: Vec<String> =
+                            failed.iter().map(|(a, _)| a.to_string()).collect();
+                        tokio::spawn(async move {
+                            for addr in addrs {
+                                if let Err(e) =
+                                    crate::peer_addrs::record_failure(&db, &peer_str, &addr).await
+                                {
+                                    tracing::debug!("peer_addrs::record_failure failed: {e}");
+                                }
+                            }
+                        });
+                    }
                 }
                 if let Some(pid) = peer_id {
                     self.dialing_peers.remove(&pid);
