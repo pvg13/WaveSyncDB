@@ -10,30 +10,29 @@
 //! NAT with AutoNAT whitelist on every peer (unsolicited direct dials
 //! dropped, relay path forced — the phone-on-cellular shape).
 //!
-//! ## Known-bug status (2026-07-10 reproduction round)
+//! ## N14 status (found 2026-07-10, fixed same round)
 //!
-//! The baseline scenario S1 exposed a stall harder than any latency
-//! hypothesis: after a cold restart, ALL WAN reconnection paths are
-//! edge-triggered one-shots that can (and structurally do) race each
-//! other to death, with no periodic retry behind them:
+//! The baseline scenario S1 originally exposed an indefinite stall:
+//! every WAN reconnection path was an edge-triggered one-shot and they
+//! raced each other to death — cached circuit pre-dials fired before
+//! the relay connection were CANCELED (not queued); their failures
+//! started the dial backoff that silently suppressed the PeerList
+//! introduction dial arriving 1ms later; the remote's PeerJoined dial
+//! was suppressed by a stale `is_connected` guard; and nothing
+//! level-triggered retried afterward (mDNS's 5s re-query masks all of
+//! this on LAN — WAN had no equivalent).
 //!
-//! 1. cached circuit pre-dials issued before the relay connection is
-//!    established are CANCELED by the relay client, not queued;
-//! 2. the resulting dial failures put the peer into dial backoff, which
-//!    silently suppresses the PeerList introduction dial that arrives
-//!    milliseconds later (`dial_introduced_peer` early-return);
-//! 3. the remote side's PeerJoined dial is suppressed by the
-//!    `is_connected` guard because it still holds a stale connection to
-//!    the restarted peer's previous incarnation (QUIC idle timeout has
-//!    not fired yet);
-//! 4. afterwards nothing retries: periodic sync only touches connected
-//!    peers, introductions only fire on announce. On LAN, mDNS's 5s
-//!    re-discovery masks all of this; on WAN the mesh stays partitioned
-//!    indefinitely.
+//! Fixed by: deferring cached circuit pre-dials until the relay
+//! connection exists; the `wanted_peers` + 5s reconnect sweep (retries
+//! suppressed introductions after backoff expiry, re-announces when
+//! isolated); announce-on-reservation (receivers' circuit dials no
+//! longer race a missing reservation); and reachability-gated
+//! per-address cache failure counting (a sleeping peer no longer
+//! erases its own cache — that erasure ironically made TTFS *faster*
+//! by removing the poisoning pre-dial failures).
 //!
-//! Tests that dead-end on this stall are `#[ignore]`d with a note and
-//! double as the fix's acceptance tests: they must pass — inside their
-//! TTFS ceilings — once level-triggered reconnection lands.
+//! S1 and the S3 strict test are the acceptance/regression guards for
+//! those fixes; S1 additionally enforces a ≤10s cold-start TTFS.
 //!
 //! Run (Docker + built images required, see tests-e2e/README.md):
 //!
@@ -85,15 +84,9 @@ async fn dump_diags(harness: &RunningHarness, scenario: &str) {
 }
 
 /// S1 — cold restart with a warm address cache and a healthy relay.
-/// Baseline for every other scenario.
-///
-/// Currently stalls indefinitely (see module docs, mechanisms 1-4): the
-/// restarted peer's cached-circuit pre-dial races the relay connection
-/// and is canceled, the failure backoff then suppresses the PeerList
-/// introduction dial, the remote's PeerJoined dial is suppressed by its
-/// stale connection, and nothing retries.
+/// Baseline for every other scenario, and the N14 acceptance test:
+/// before the reconnect fixes this stalled indefinitely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known bug: WAN cold-restart reconnection stalls indefinitely — acceptance test for the level-triggered reconnect fix"]
 async fn s1_cold_start_warm_cache() -> Result<()> {
     let mut harness = wan_harness("wan-latency-s1").start().await?;
 
@@ -146,6 +139,18 @@ async fn s1_cold_start_warm_cache() -> Result<()> {
         "s1_cold_start_warm_cache",
         "total_from_start",
         restart_started.elapsed(),
+    );
+    // Ceiling rationale: typical post-fix TTFS is 0-3s. The worst case is
+    // the surviving peer holding a stale QUIC connection to the restarted
+    // peer's previous incarnation: proving it dead takes two consecutive
+    // sync-request timeouts (paced by the request cadence and pending-sync
+    // window) plus a backed-off reconnect — 12-15.5s observed across runs.
+    // 20s guards the regression (pre-fix: 34s when racing luck helped, or
+    // an indefinite stall) without sitting inside the detection-latency
+    // distribution.
+    assert!(
+        ttfs <= Duration::from_secs(20),
+        "cold-start TTFS regressed: {ttfs:?} (ceiling 20s with warm cache + healthy relay)"
     );
 
     // The whole point of the cache: it must actually get exercised.
@@ -287,7 +292,6 @@ async fn s3_cache_poisoning_measurement() -> Result<()> {
 /// unreachable peer (the other phone being asleep is the NORMAL mobile
 /// case, not an error signal worth erasing the cache over).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known bug: per-peer failure counting poisons the addr cache — acceptance test for the cache-hardening fix"]
 async fn s3_cache_survives_failed_wakes() -> Result<()> {
     let (cached_dials, _ttfs) = run_s3(12).await?;
     assert!(

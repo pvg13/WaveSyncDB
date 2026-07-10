@@ -856,6 +856,7 @@ async fn run_engine(
         wanted_peers: HashMap::new(),
         deferred_circuit_predials: Vec::new(),
         last_presence_announce: None,
+        sync_timeout_strikes: HashMap::new(),
         pending_rendezvous_dials: VecDeque::new(),
         push_token,
         database_url,
@@ -1117,6 +1118,15 @@ struct EngineRunner {
     /// When presence was last announced to the relay — throttles the
     /// reconnect sweep's isolation re-announce.
     pub(crate) last_presence_announce: Option<tokio::time::Instant>,
+    /// Consecutive sync-request timeouts per peer. QUIC only notices a
+    /// dead path at its ~30s idle timeout; until then a stale connection
+    /// eats every request, suppresses introduction dials via the
+    /// `is_connected` guard, and (having demoted the relay path) leaves
+    /// no working route. Two consecutive timeouts are treated as proof
+    /// the connection is a corpse: it is closed proactively so discovery
+    /// and the reconnect sweep can rebuild a live one (N14). Cleared on
+    /// any received sync response.
+    pub(crate) sync_timeout_strikes: HashMap<libp2p::PeerId, u32>,
     /// Queue of rendezvous-discovered peers waiting to be dialed (rate-limited).
     pub(crate) pending_rendezvous_dials: VecDeque<(libp2p::PeerId, libp2p::Multiaddr)>,
     /// Push notification token to register with relay: (platform, device_token).

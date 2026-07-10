@@ -91,6 +91,9 @@ impl EngineRunner {
                         }
                     }
                     tracing::info!("Received sync response from peer {peer}");
+                    // A response proves the path is alive — reset the
+                    // stale-connection strike counter.
+                    self.sync_timeout_strikes.remove(&peer);
 
                     match response {
                         crate::protocol::SyncResponse::ChangesetResponse {
@@ -343,6 +346,39 @@ impl EngineRunner {
                     self.note_protocol_mismatch(peer);
                 } else {
                     tracing::warn!("Sync request to {peer} failed: {error}");
+                    match error {
+                        request_response::OutboundFailure::Timeout => {
+                            // A request timing out on a connection the swarm
+                            // still considers alive is the signature of a
+                            // stale path (remote rebooted / NAT rebound; QUIC
+                            // won't notice for ~30s). Two strikes proves the
+                            // corpse — close it so discovery and the
+                            // reconnect sweep can rebuild a live connection
+                            // instead of every path staying suppressed by
+                            // the `is_connected` guard (N14).
+                            let strikes = self.sync_timeout_strikes.entry(peer).or_insert(0);
+                            *strikes += 1;
+                            if *strikes >= 2 && self.swarm.is_connected(&peer) {
+                                tracing::info!(
+                                    "Closing presumed-dead connection(s) to {peer} after {strikes} consecutive sync timeouts"
+                                );
+                                self.sync_timeout_strikes.remove(&peer);
+                                let _ = self.swarm.disconnect_peer_id(peer);
+                            }
+                        }
+                        request_response::OutboundFailure::ConnectionClosed => {
+                            // The connection died before answering — count it
+                            // as a dial failure so the re-dial below (and the
+                            // reconnect sweep) back off instead of spinning a
+                            // millisecond-scale dial→die→re-dial loop that
+                            // burns the relay's per-peer circuit budget (the
+                            // ConnectionEstablished handler clears backoff on
+                            // every transient establishment, so without this
+                            // the loop never throttles).
+                            self.record_dial_failure(peer);
+                        }
+                        _ => {}
+                    }
                     // Connection might be dead — re-dial if we know the peer's
                     // address. Storm guards (#84 regression): (1) never re-dial a
                     // circuit address for a peer we already reach directly — the

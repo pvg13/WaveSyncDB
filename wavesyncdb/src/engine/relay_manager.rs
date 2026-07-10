@@ -725,12 +725,21 @@ impl EngineRunner {
 
         // Remember this peer regardless of whether the dial below is
         // suppressed — the reconnect sweep retries from `wanted_peers`
-        // once the suppressing condition (backoff, stale connection,
-        // in-flight dial) clears. Introductions being one-shot events
-        // was the core of N14: a suppressed dial partitioned the mesh
-        // until an app restart. Fresh relay-vouched addresses replace
-        // the stored set (the peer may have restarted with new ones).
+        // once the suppressing condition (stale connection, in-flight
+        // dial) clears. Introductions being one-shot events was the
+        // core of N14: a suppressed dial partitioned the mesh until an
+        // app restart. Fresh relay-vouched addresses replace the stored
+        // set (the peer may have restarted with new ones).
         self.wanted_peers.insert(peer_id, addrs.clone());
+
+        // An introduction is live, relay-vouched evidence the peer is
+        // reachable NOW — backoff accumulated by earlier failed dials
+        // (typically burned against a down relay, or pre-dial races) no
+        // longer describes reality, so drop it. Storm-safe: PeerJoined
+        // only fires when a peer actually (re-)announces, and announces
+        // are reservation-gated and 20s-throttled — unlike the mDNS 5s
+        // rediscovery loop the backoff exists to protect against.
+        self.clear_dial_backoff(&peer_id);
 
         let rejected_by_all =
             !self.groups.is_empty() && self.groups.values().all(|g| g.is_rejected(&peer_id));
@@ -740,8 +749,6 @@ impl EngineRunner {
             Some("already_connected")
         } else if self.dialing_peers.contains(&peer_id) {
             Some("dial_in_flight")
-        } else if !self.dial_backoff_ok(&peer_id) {
-            Some("dial_backoff_active")
         } else {
             None
         };
@@ -821,8 +828,24 @@ impl EngineRunner {
             .map(|(pid, addrs)| (*pid, addrs.clone()))
             .collect();
 
+        // With no relay connection, a circuit address is a guaranteed
+        // failure (the dial is canceled locally) — dialing it anyway
+        // inflates the peer's backoff, which then DELAYS the real
+        // recovery once the relay returns. Filter circuit addrs out of
+        // sweep dials until the relay leg exists.
+        let relay_usable = matches!(
+            self.relay_state,
+            RelayState::Connected { .. } | RelayState::Listening { .. }
+        );
+
         for (pid, addrs) in candidates {
-            let addrs = dialable_addrs_preferring_direct(addrs, self.suppress_relay_dial(&pid));
+            let mut addrs = dialable_addrs_preferring_direct(addrs, self.suppress_relay_dial(&pid));
+            if !relay_usable {
+                addrs.retain(|a| {
+                    !a.iter()
+                        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                });
+            }
             if addrs.is_empty() {
                 continue;
             }
