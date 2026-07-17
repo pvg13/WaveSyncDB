@@ -6,8 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, ExecResult, Iterable,
-    PrimaryKeyToColumn, QueryResult, Schema, Statement, TransactionTrait,
-    sea_query::SqliteQueryBuilder,
+    PrimaryKeyToColumn, QueryResult, Schema, Statement, sea_query::SqliteQueryBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
@@ -1084,7 +1083,11 @@ impl WaveSyncDb {
         // Open the bookkeeping transaction. Roll back the in-memory counter
         // if we can't even start a tx — keeps it in sync with the persisted
         // state.
-        let txn = match inner.begin().await {
+        // IMMEDIATE, not deferred: this transaction reads shadow state before
+        // writing it, and under WAL a deferred read→write upgrade fails with
+        // an instant SQLITE_BUSY whenever another connection committed in
+        // between (see `shadow::begin_write_txn`).
+        let txn = match crate::shadow::begin_write_txn(inner).await {
             Ok(t) => t,
             Err(e) => {
                 *ver -= 1;

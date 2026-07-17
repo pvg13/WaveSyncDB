@@ -1609,9 +1609,11 @@ async fn apply_changeset_chunk<'a>(
     source: crate::messages::ChangeSource,
     notify: Option<NotifyCtx<'_>>,
 ) -> bool {
-    use sea_orm::TransactionTrait;
-
-    let txn = match db.begin().await {
+    // IMMEDIATE, not deferred: this transaction reads shadow state before
+    // writing it, and under WAL a deferred read→write upgrade fails with an
+    // instant SQLITE_BUSY whenever another connection committed in between
+    // (see `shadow::begin_write_txn`).
+    let txn = match shadow::begin_write_txn(db).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("Failed to begin transaction for remote changeset: {e}");
