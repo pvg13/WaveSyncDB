@@ -41,8 +41,11 @@ PACKAGE="com.wavesync.mobile_demo"
 TOPIC="mobile-tasks-demo"
 PASSPHRASE="demo-shared-secret"
 WRITER_HTTP_PORT="${WRITER_HTTP_PORT:-8499}"
+# The relay derives its QUIC listener from the TCP listen port
+# (wavesync_relay main.rs `extract_tcp_port`), so TCP and QUIC must be
+# the SAME port or the advertised QUIC address points at nothing.
 RELAY_QUIC_PORT="${RELAY_QUIC_PORT:-4011}"
-RELAY_TCP_PORT="${RELAY_TCP_PORT:-4012}"
+RELAY_TCP_PORT="${RELAY_TCP_PORT:-4011}"
 # Same pinned key the fcm test uses — stable PeerId across runs.
 RELAY_KEY='CAESQGlCc264ZKF3D4l/5VXTLjnGdDKxg0cyX2UosIkZmNAbxV5oeISRfEDIrc/+hdQuqepe9CCCc3M5G3DJBs6N6lE='
 

@@ -76,6 +76,13 @@ repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 }
 
+# The workspace may redirect build output (CARGO_TARGET_DIR / cargo
+# config — this repo uses a shared target dir), so never assume ./target.
+cargo_target_dir() {
+    (cd "$(repo_root)" && cargo metadata --format-version=1 --no-deps 2>/dev/null \
+        | grep -oP '"target_directory":"\K[^"]+')
+}
+
 stop_all() {
     local pidfile name pid
     for pidfile in "${PIDDIR:?}"/*.pid; do
@@ -101,9 +108,10 @@ lan_ip() {
 }
 
 start_relay() {
-    local root lan
+    local root lan tgt
     root="$(repo_root)"
     lan="$(lan_ip)"
+    tgt="$(cargo_target_dir)"
     echo "==> Pre-building relay + writer"
     (cd "$root" && cargo build --release --quiet -p wavesync_relay)
     (cd "$root" && cargo build --release --quiet -p wavesyncdb-e2e --bin test-peer)
@@ -112,7 +120,7 @@ start_relay() {
     (
         cd "$root"
         setsid env RUST_LOG=info \
-            ./target/release/wavesync-relay \
+            "$tgt/release/wavesync-relay" \
             --identity-keypair="$RELAY_KEY" \
             --listen-addr "/ip4/0.0.0.0/tcp/$RELAY_TCP_PORT" \
             --external-address "/ip4/$lan/tcp/$RELAY_TCP_PORT" \
@@ -151,9 +159,10 @@ start_relay() {
 }
 
 start_writer() {
-    local root db
+    local root db tgt
     root="$(repo_root)"
     db="$(mktemp -d)/writer.db"
+    tgt="$(cargo_target_dir)"
     echo "==> Starting writer peer on http://127.0.0.1:$WRITER_HTTP_PORT"
     (
         cd "$root"
@@ -164,7 +173,7 @@ start_writer() {
             RELAY_ADDR="$RELAY_ADDR" \
             MDNS_ENABLED=false \
             RUST_LOG=info,libp2p_swarm=warn \
-            ./target/release/test-peer \
+            "$tgt/release/test-peer" \
             > "$LOGDIR/writer.log" 2>&1 &
         echo $! > "$PIDDIR/writer.pid"
     )
