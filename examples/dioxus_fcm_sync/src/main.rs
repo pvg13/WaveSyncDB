@@ -355,6 +355,15 @@ fn TaskList() -> Element {
     let db = use_wavesync();
     let tasks = use_synced_table::<task::Model>(SyncHandle::new(db));
 
+    // Measurement marker: one logcat line per list update carrying every
+    // visible title. The emulator WAN scenarios (tests-e2e/android)
+    // timestamp `tasks_visible` against a host-side write to compute
+    // time-to-first-sync without touching the app's private storage.
+    {
+        let titles: Vec<String> = tasks.read().iter().map(|t| t.title.clone()).collect();
+        log::info!("tasks_visible titles={titles:?}");
+    }
+
     rsx! {
         ul { class: "task-list",
             if tasks.read().is_empty() {
