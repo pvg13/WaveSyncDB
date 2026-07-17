@@ -21,6 +21,23 @@ impl EngineRunner {
                 self.handle_resume(true).await;
                 false
             }
+            EngineCommand::PushWake => {
+                while let Ok(EngineCommand::PushWake) = self.cmd_rx.try_recv() {}
+                // Force a relay reset only when the event loop observed a
+                // suspension-length gap — frozen-process sockets are dead but
+                // QUIC won't notice for ~30s, and the reactive
+                // sync_timeout_strikes eviction takes ~20s the push window
+                // doesn't have. A wake without a detected suspension behaves
+                // exactly like a plain Resume, preserving the anti-churn
+                // guarantee for healthy relay reservations.
+                let force = self.push_wake_wants_relay_reset();
+                tracing::info!(
+                    force_relay_reset = force,
+                    "Push wake — rediscovery and sync"
+                );
+                self.handle_resume(force).await;
+                false
+            }
             EngineCommand::RequestFullSync => {
                 tracing::info!("Full sync requested by user");
                 // Reset peer versions to trigger full re-sync (every group)

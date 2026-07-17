@@ -319,6 +319,68 @@ pub(crate) struct WaveSyncNodeInner {
     group_key_cache_enabled: bool,
 }
 
+/// Accessors for the background-sync reuse path (`background_sync` +
+/// `node_registry`): a push wake that found this live node drives it through
+/// these instead of building a second engine. All are cheap and
+/// runtime-agnostic (tokio sync primitives work across runtimes), so the
+/// per-wake runtime the FFI layer creates can call them directly.
+impl WaveSyncNodeInner {
+    /// Signal a push wake: the engine rediscovers/re-syncs (forcing a relay
+    /// reset if it detected a suspension gap — see `EngineCommand::PushWake`),
+    /// and foreground hooks get a refresh tick in case the app comes back to
+    /// the foreground during or right after the sync window.
+    pub(crate) fn push_wake(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::PushWake);
+        let _ = self.refresh_tx.send(());
+    }
+
+    /// Escalation backstop for the reuse wait loop: force-reset the relay and
+    /// peer connections when a wake made no contact at all (covers the case
+    /// where the engine's suspension-gap detection missed).
+    pub(crate) fn escalate_network_transition(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::NetworkTransition);
+    }
+
+    /// One-shot full-sync fallback, mirroring the cold path's
+    /// "peer connected but no incremental sync completed" timer.
+    pub(crate) fn send_request_full_sync(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::RequestFullSync);
+    }
+
+    pub(crate) fn subscribe_network_events(
+        &self,
+    ) -> broadcast::Receiver<crate::network_status::NetworkEvent> {
+        self.network_event_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_notifications(
+        &self,
+    ) -> broadcast::Receiver<crate::notify::Notification> {
+        self.notification_tx.subscribe()
+    }
+
+    /// Peers already connected at wake time. Seeds the reuse wait loop's
+    /// "saw any peer" flag — an already-connected peer emits no fresh
+    /// `PeerConnected` event for the loop to observe.
+    pub(crate) fn connected_peer_count(&self) -> usize {
+        self.network_status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .connected_peers
+            .len()
+    }
+
+    /// Whether this node currently serves more than one live group. Drives
+    /// the reuse wait loop's post-first-sync linger window, mirroring the
+    /// cold path's longer grace when extra groups were rejoined.
+    pub(crate) fn serves_multiple_groups(&self) -> bool {
+        self.groups
+            .lock()
+            .map(|g| g.values().filter(|w| w.strong_count() > 0).count() > 1)
+            .unwrap_or(false)
+    }
+}
+
 impl Drop for WaveSyncNodeInner {
     fn drop(&mut self) {
         // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk
@@ -346,7 +408,6 @@ pub struct WaveSyncNode {
 /// Internal shared state for [`WaveSyncDb`] — a single sync group's handle.
 struct WaveSyncDbInner {
     inner: DatabaseConnection,
-    #[allow(dead_code)]
     database_url: String,
     /// Clone of the node's local-write channel. Every local write funnels
     /// through `dispatch_sync`'s single `send` site, which stamps
@@ -1687,13 +1748,7 @@ impl SyncConfig {
     ///
     /// The config is stored alongside the database file as `.wavesync_config.json`.
     pub fn config_path(database_url: &str) -> Option<PathBuf> {
-        // Strip the "sqlite:" or "sqlite://" prefix and query parameters
-        let path_str = database_url
-            .strip_prefix("sqlite://")
-            .or_else(|| database_url.strip_prefix("sqlite:"))
-            .unwrap_or(database_url);
-        let path_str = path_str.split('?').next().unwrap_or(path_str);
-        let db_path = PathBuf::from(path_str);
+        let db_path = crate::node_registry::sqlite_lexical_path(database_url)?;
         db_path.parent().map(|dir| dir.join(CONFIG_FILE_NAME))
     }
 
@@ -2513,6 +2568,12 @@ impl WaveSyncDbBuilder {
             .lock()
             .unwrap()
             .insert(default_user_topic, Arc::downgrade(&db.inner));
+
+        // Record the live node in the process-global registry so a push wake
+        // in this process reuses this engine instead of building a second one
+        // with the same persisted PeerId/site_id. Weak entry — never keeps
+        // the engine alive.
+        crate::node_registry::register(&db.inner.database_url, &node);
 
         Ok(db)
     }

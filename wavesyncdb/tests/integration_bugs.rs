@@ -2232,6 +2232,125 @@ async fn test_capture_repair_does_not_cascade_delete_children_96() {
 //     registry) instead of building a second one.
 // ---------------------------------------------------------------------------
 
+/// Not-killed push wake must REUSE the live in-process engine (node
+/// registry), not build a duplicate-identity second one — and must fall back
+/// to the cold path cleanly once the live engine is gone.
+///
+/// Peer A gets its own directory: `background_sync` loads
+/// `.wavesync_config.json` from the DB's parent dir, and every `mem_db()`
+/// file shares one temp dir, so builds would overwrite each other's config.
+#[tokio::test]
+async fn test_bg_push_wake_reuses_live_engine_then_cold_falls_through() {
+    use wavesyncdb::background_sync::{BackgroundSyncResult, background_sync_with_peers_for_topic};
+
+    let dir = std::env::temp_dir().join(format!("wavesync_bg_reuse_{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url_a = format!("sqlite:{}?mode=rwc", dir.join("a.db").display());
+    let topic = format!("test-bg-reuse-{}", Uuid::new_v4());
+
+    let a = make_peer(&url_a, &topic, 77).await;
+    let b = make_peer(&mem_db("bg_reuse_b"), &topic, 78).await;
+
+    // B writes a row while both engines are live.
+    task::ActiveModel {
+        id: Set("reuse-1".to_string()),
+        title: Set("written on B".to_string()),
+        completed: Set(false),
+    }
+    .insert(&b)
+    .await
+    .unwrap();
+
+    // Simulate the push wake exactly the way the FFI layer runs it: a fresh
+    // tokio runtime on another thread calling the shared background-sync
+    // entry point for A's database.
+    let wake_url = url_a.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(background_sync_with_peers_for_topic(
+            &wake_url,
+            Duration::from_secs(20),
+            &[],
+            None,
+        ))
+    })
+    .await
+    .unwrap()
+    .expect("push wake must not error");
+    assert!(
+        matches!(result, BackgroundSyncResult::Synced { .. }),
+        "push wake with a live engine and a reachable peer must sync, got {result:?}"
+    );
+
+    // The live engine must have been reused, not raced or torn down.
+    assert!(
+        a.is_engine_alive(),
+        "the app's engine must survive the push wake"
+    );
+    assert_eventually(
+        "A received B's row via the reused engine",
+        Duration::from_secs(15),
+        || async {
+            task::Entity::find_by_id("reuse-1")
+                .one(&a)
+                .await
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+
+    // And it must still sync normally afterwards (A → B direction).
+    task::ActiveModel {
+        id: Set("reuse-2".to_string()),
+        title: Set("written on A after wake".to_string()),
+        completed: Set(false),
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+    assert_eventually(
+        "B receives A's post-wake row",
+        Duration::from_secs(15),
+        || async {
+            task::Entity::find_by_id("reuse-2")
+                .one(&b)
+                .await
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+
+    // Cold fall-through: with the live engine gone, the same call builds a
+    // fresh engine (killed-app path) and still syncs. This also exercises
+    // the registry's dead-entry pruning end to end.
+    drop(a);
+    let wake_url = url_a.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(background_sync_with_peers_for_topic(
+            &wake_url,
+            Duration::from_secs(20),
+            &[],
+            None,
+        ))
+    })
+    .await
+    .unwrap()
+    .expect("cold fall-through must not error");
+    assert!(
+        matches!(result, BackgroundSyncResult::Synced { .. }),
+        "cold path after engine drop must still sync, got {result:?}"
+    );
+}
+
 /// Shared-file safety: the wrapper's connections must run in WAL mode, and a
 /// write through the wrapper must succeed while a *separate* connection pool
 /// (standing in for the background-sync / NSE process) holds a long read
