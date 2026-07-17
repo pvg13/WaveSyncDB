@@ -31,7 +31,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,10 @@ struct AppState {
     /// Secondary (non-default) group, present only when `SECONDARY_TOPIC`
     /// is configured. Backs the `/g2/...` routes.
     db2: Option<WaveSyncDb>,
+    /// The default group's database URL, kept for `/push_wake`: the
+    /// background-sync entry point is keyed by URL exactly like the mobile
+    /// FFI layer is.
+    db_url: String,
 }
 
 impl AppState {
@@ -139,11 +143,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    let state = AppState { db, db2 };
+    let state = AppState { db, db2, db_url };
     let router = Router::new()
         .route("/health", get(health))
         .route("/peers", get(peers))
         .route("/diagnostics", get(diagnostics))
+        .route("/push_wake", post(push_wake))
         .route("/tasks", get(list_tasks).post(insert_task))
         .route("/tasks/:id", get(get_task).put(update_task))
         .route("/g2/tasks", get(list_tasks_g2).post(insert_task_g2))
@@ -169,6 +174,70 @@ async fn peers(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn diagnostics(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.db.diagnostics())
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PushWakeRequest {
+    /// Background-execution budget, mirroring the OS-granted push window.
+    timeout_secs: Option<u64>,
+}
+
+/// Simulate a not-killed push wake: run the same shared background-sync
+/// entry point the mobile FFI layer calls (`run_background_sync`), on a
+/// fresh tokio runtime in a blocking thread, against this peer's own live
+/// database. With the engine alive in this process, the call must reuse it
+/// (node registry) rather than build a duplicate-identity second engine.
+async fn push_wake(
+    State(s): State<AppState>,
+    body: Option<Json<PushWakeRequest>>,
+) -> impl IntoResponse {
+    let timeout = Duration::from_secs(body.and_then(|Json(b)| b.timeout_secs).unwrap_or(20));
+    let db_url = s.db_url.clone();
+    let started = std::time::Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        rt.block_on(
+            wavesyncdb::background_sync::background_sync_with_peers_for_topic(
+                &db_url,
+                timeout,
+                &[],
+                None,
+            ),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    use wavesyncdb::background_sync::BackgroundSyncResult;
+    let (result, peers_synced) = match outcome {
+        Ok(Ok(BackgroundSyncResult::Synced { peers_synced })) => ("synced", peers_synced),
+        Ok(Ok(BackgroundSyncResult::NoPeers)) => ("no_peers", 0),
+        Ok(Ok(BackgroundSyncResult::TimedOut { peers_synced })) => ("timed_out", peers_synced),
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e, "elapsed_ms": elapsed_ms})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("join: {e}"), "elapsed_ms": elapsed_ms})),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "result": result,
+            "peers_synced": peers_synced,
+            "elapsed_ms": elapsed_ms,
+        })),
+    )
 }
 
 // --- Core CRUD, parameterised by which group's db to use. The route

@@ -1111,6 +1111,23 @@ impl RunningPeer {
             .await?)
     }
 
+    /// Trigger a simulated not-killed push wake at this peer (see the test
+    /// peer's `/push_wake` route): the peer runs the shared background-sync
+    /// entry point against its own live database, which must reuse the live
+    /// in-process engine. `timeout` is the simulated OS push budget.
+    pub async fn push_wake(&self, timeout: Duration) -> Result<PushWakeOutcome> {
+        Ok(reqwest::Client::new()
+            .post(format!("{}/push_wake", self.base_url))
+            // Generous HTTP timeout: the endpoint blocks for up to `timeout`.
+            .timeout(timeout + Duration::from_secs(15))
+            .json(&serde_json::json!({ "timeout_secs": timeout.as_secs() }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<PushWakeOutcome>()
+            .await?)
+    }
+
     /// Block until a task with the given pk is visible at this peer, or
     /// time out. Used by scenarios to assert convergence.
     ///
@@ -1176,6 +1193,16 @@ pub struct Task {
 #[derive(Debug, Deserialize)]
 struct PeersResponse {
     connected: usize,
+}
+
+/// Outcome of a simulated push wake (`POST /push_wake`). `result` mirrors
+/// `wavesyncdb::background_sync::BackgroundSyncResult` as a lowercase tag:
+/// `"synced"`, `"no_peers"`, or `"timed_out"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PushWakeOutcome {
+    pub result: String,
+    pub peers_synced: usize,
+    pub elapsed_ms: u64,
 }
 
 /// Diagnostics counter snapshot returned by `GET /diagnostics`. Field
