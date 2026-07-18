@@ -125,5 +125,15 @@ services:
       # ---------- Logging ----------
       RUST_LOG: "${RUST_LOG:-info}"
 
+  # ---------- Monitoring (internal-only; see header notes) ----------
+  # Scrapes wavesync-relay:9464 over the compose network. NO published
+  # ports — the metrics surface never touches the host.
+  prometheus:
+    build: ./monitoring/prometheus
+    restart: unless-stopped
+    volumes:
+      - prometheus-data:/prometheus
+
 volumes:
   relay-data:
+  prometheus-data:

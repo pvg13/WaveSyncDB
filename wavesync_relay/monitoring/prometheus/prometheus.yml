@@ -1,0 +1,11 @@
+# Scrape config for the WaveSync relay. This file is baked into the image
+# (see Dockerfile) so it survives orchestrators that mishandle bind mounts;
+# changing it means rebuild + redeploy, same as the relay itself.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: wavesync-relay
+    static_configs:
+      - targets: ["wavesync-relay:9464"]
