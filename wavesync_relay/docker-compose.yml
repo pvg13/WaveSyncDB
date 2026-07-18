@@ -33,6 +33,30 @@
 #
 #   6. Hit Redeploy (not Restart) so the container picks up new mounts.
 #
+# -- Monitoring (Prometheus + Grafana) --
+#   The prometheus and grafana services run on the internal compose network
+#   only — no metrics port is ever published. To expose the Grafana UI:
+#     1. Dokploy → your compose service → Domains → Add Domain
+#        Host: grafana.yourdomain.com, Service Name: grafana, Port: 3000,
+#        HTTPS: on (Let's Encrypt).
+#     2. Environment tab: set GRAFANA_ADMIN_PASSWORD (and optionally
+#        GRAFANA_ADMIN_USER, default "admin"). If unset, Grafana starts with
+#        admin/admin and forces a password change on first login.
+#        NOTE: the env password applies on FIRST boot only — once grafana-data
+#        holds a database, changing the env var is a silent no-op; rotate the
+#        password in Grafana's UI instead (or: grafana-cli admin
+#        reset-admin-password). After the first deploy, verify your password
+#        actually works at the domain; if admin/admin is still accepted, set
+#        the password in the UI — it persists in grafana-data.
+#   The "WaveSync Relay" dashboard and the Prometheus datasource are baked
+#   into the grafana image (monitoring/grafana/) — config changes are a git
+#   commit + Redeploy, never a UI edit. Metric history persists in the
+#   prometheus-data volume (60d retention); Grafana state in grafana-data.
+#   Local preview: docker compose -f docker-compose.yml -f docker-compose.local.yml up
+#   Note: UI edits to the provisioned dashboard are clobbered whenever the
+#   baked dashboard JSON changes — use "Save as copy" for ad-hoc dashboards
+#   (copies persist in grafana-data).
+#
 # -- Local testing --
 #   Place your secrets under ./secrets/ next to this file and run:
 #     docker compose up --build
@@ -125,5 +149,29 @@ services:
       # ---------- Logging ----------
       RUST_LOG: "${RUST_LOG:-info}"
 
+  # ---------- Monitoring (internal-only; see header notes) ----------
+  # Scrapes wavesync-relay:9464 over the compose network. NO published
+  # ports — the metrics surface never touches the host.
+  prometheus:
+    build: ./monitoring/prometheus
+    restart: unless-stopped
+    volumes:
+      - prometheus-data:/prometheus
+
+  # Exposed ONLY via a Dokploy Domain (service: grafana, port 3000) —
+  # Traefik terminates HTTPS; no ports published here. Set
+  # GRAFANA_ADMIN_PASSWORD in Dokploy's Environment tab; if unset, Grafana
+  # boots with admin/admin and forces a password change on first login.
+  grafana:
+    build: ./monitoring/grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
 volumes:
   relay-data:
+  prometheus-data:
+  grafana-data:
