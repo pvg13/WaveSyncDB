@@ -123,6 +123,24 @@ impl GroupKey {
         self.derive_topic(user_topic)
     }
 
+    /// Derive the mailbox payload-sealing key for this group.
+    ///
+    /// Domain separation: topic derivation uses BLAKE3's derive_key mode with
+    /// the `wavesyncdb-topic-v1` context, message MACs use BLAKE3's keyed-hash
+    /// mode with the raw group key, and this uses derive_key with a distinct
+    /// context — three independent sub-key domains from one root. The result
+    /// is the XChaCha20-Poly1305 key for `mailbox_seal`; the relay stores
+    /// sealed entries without ever holding any of these keys.
+    ///
+    /// The context string is protocol-frozen: changing it makes every peer
+    /// unable to open existing mailbox entries (a unit test pins it via a
+    /// fixed test vector).
+    pub(crate) fn mailbox_key(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key("wavesyncdb-mailbox-v1");
+        hasher.update(&self.key);
+        *hasher.finalize().as_bytes()
+    }
+
     /// Compute a BLAKE3 keyed MAC over the given data.
     pub fn mac(&self, data: &[u8]) -> [u8; 32] {
         *blake3::keyed_hash(&self.key, data).as_bytes()
