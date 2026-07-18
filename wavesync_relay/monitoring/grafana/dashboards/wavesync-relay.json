@@ -222,6 +222,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Circuit-seconds by topic (1h increase)",
+      "interval": "1h",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "x": 14, "y": 10, "w": 10, "h": 8 },
       "fieldConfig": {

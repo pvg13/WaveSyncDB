@@ -42,13 +42,20 @@
 #     2. Environment tab: set GRAFANA_ADMIN_PASSWORD (and optionally
 #        GRAFANA_ADMIN_USER, default "admin"). If unset, Grafana starts with
 #        admin/admin and forces a password change on first login.
+#        NOTE: the env password applies on FIRST boot only — once grafana-data
+#        holds a database, changing the env var is a silent no-op; rotate the
+#        password in Grafana's UI instead (or: grafana-cli admin
+#        reset-admin-password). After the first deploy, verify your password
+#        actually works at the domain; if admin/admin is still accepted, set
+#        the password in the UI — it persists in grafana-data.
 #   The "WaveSync Relay" dashboard and the Prometheus datasource are baked
 #   into the grafana image (monitoring/grafana/) — config changes are a git
 #   commit + Redeploy, never a UI edit. Metric history persists in the
 #   prometheus-data volume (60d retention); Grafana state in grafana-data.
 #   Local preview: docker compose -f docker-compose.yml -f docker-compose.local.yml up
-#   Note: UI edits to the provisioned dashboard don't survive a redeploy —
-#   use "Save as copy" for ad-hoc dashboards (copies persist in grafana-data).
+#   Note: UI edits to the provisioned dashboard are clobbered whenever the
+#   baked dashboard JSON changes — use "Save as copy" for ad-hoc dashboards
+#   (copies persist in grafana-data).
 #
 # -- Local testing --
 #   Place your secrets under ./secrets/ next to this file and run:
