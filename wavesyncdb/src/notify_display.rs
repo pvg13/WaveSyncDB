@@ -71,7 +71,7 @@ mod imp {
         }
     }
 
-    pub(super) fn show(title: &str, body: &str, group: &str) {
+    pub(super) fn show(title: &str, body: &str, group: &str, deeplink: &str) {
         use jni::objects::{JClass, JValue};
 
         let Some(vm) = JAVA_VM.get() else {
@@ -88,16 +88,23 @@ mod imp {
                 return;
             }
         };
-        let (Ok(t), Ok(b), Ok(g)) = (
+        let (Ok(t), Ok(b), Ok(g), Ok(d)) = (
             env.new_string(title),
             env.new_string(body),
             env.new_string(group),
+            env.new_string(deeplink),
         ) else {
             tracing::warn!("notify_display: failed to build JNI strings");
             return;
         };
-        let args = [JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)];
-        const SIG: &str = "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V";
+        let args = [
+            JValue::Object(&t),
+            JValue::Object(&b),
+            JValue::Object(&g),
+            JValue::Object(&d),
+        ];
+        const SIG: &str =
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V";
 
         // Use the class cached on the JNI entry thread (correct classloader).
         // Fall back to a name lookup only if caching failed — that path works
@@ -132,7 +139,9 @@ mod imp {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_void};
 
-    pub(super) fn show(title: &str, body: &str, group: &str) {
+    // iOS display plumbing for the deeplink is a follow-up; the field is
+    // carried on the struct only.
+    pub(super) fn show(title: &str, body: &str, group: &str, _deeplink: &str) {
         unsafe extern "C" {
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
@@ -160,13 +169,18 @@ mod imp {
 // desktop via notify-rust).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod imp {
-    pub(super) fn show(_title: &str, _body: &str, _group: &str) {}
+    pub(super) fn show(_title: &str, _body: &str, _group: &str, _deeplink: &str) {}
 }
 
 /// Display `n` as a native OS notification from a headless (background-sync)
 /// context. Best-effort; never panics.
 pub(crate) fn show_background(n: &Notification) {
-    imp::show(&n.title, &n.body, &group_of(n));
+    imp::show(
+        &n.title,
+        &n.body,
+        &group_of(n),
+        n.deeplink.as_deref().unwrap_or(""),
+    );
 }
 
 /// Capture the `JavaVM` from the background-sync JNI entry so [`show_background`]

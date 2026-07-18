@@ -71,6 +71,15 @@ pub struct Notification {
     /// short window are collapsed (e.g. `"chat:42"` → one "new messages"
     /// notification instead of many). When `None`, `table:primary_key` is used.
     pub coalesce_key: Option<String>,
+    /// Optional deep-link URL delivered when the user taps the notification.
+    ///
+    /// The library carries the URL opaquely — it never interprets it. On
+    /// Android the tap fires an **explicit** `ACTION_VIEW` intent (launch
+    /// intent + this URL as data) at the app's launcher activity, so no
+    /// manifest intent filter is needed and the app routes the URL itself
+    /// (`onNewIntent` warm / `onCreate` intent cold, depending on the
+    /// activity's `launchMode`). `None` → tapping simply opens the app.
+    pub deeplink: Option<String>,
 }
 
 impl Notification {
@@ -84,12 +93,19 @@ impl Notification {
             title: title.into(),
             body: body.into(),
             coalesce_key: None,
+            deeplink: None,
         }
     }
 
     /// Set the coalescing/grouping key (see [`Notification::coalesce_key`]).
     pub fn group(mut self, key: impl Into<String>) -> Self {
         self.coalesce_key = Some(key.into());
+        self
+    }
+
+    /// Set the tap deep-link URL (see [`Notification::deeplink`]).
+    pub fn deeplink(mut self, url: impl Into<String>) -> Self {
+        self.deeplink = Some(url.into());
         self
     }
 }
@@ -285,6 +301,18 @@ mod tests {
         let dispatch = make_dispatch::<TestMsg>();
         let cn = change(WriteKind::Delete, remote(), None);
         assert!(dispatch(&cn).is_none());
+    }
+
+    #[test]
+    fn deeplink_defaults_to_none_and_builder_sets_it() {
+        let n = Notification::new("t", "b");
+        assert_eq!(n.deeplink, None);
+
+        let n = Notification::new("t", "b")
+            .group("chat:1")
+            .deeplink("https://example.com/compra");
+        assert_eq!(n.deeplink.as_deref(), Some("https://example.com/compra"));
+        assert_eq!(n.coalesce_key.as_deref(), Some("chat:1"));
     }
 
     #[test]

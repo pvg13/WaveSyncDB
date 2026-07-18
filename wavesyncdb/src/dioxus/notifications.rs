@@ -95,7 +95,12 @@ fn show_os_notification(n: &Notification) {
     // in-app toasts, and apps can pass a custom callback to
     // `use_sync_notifications_with`.
     #[cfg(all(target_os = "android", feature = "push-sync"))]
-    show_android_notification(&n.title, &n.body, &notification_group(n));
+    show_android_notification(
+        &n.title,
+        &n.body,
+        &notification_group(n),
+        n.deeplink.as_deref().unwrap_or(""),
+    );
 
     #[cfg(all(target_os = "ios", feature = "push-sync"))]
     show_ios_notification(&n.title, &n.body, &notification_group(n));
@@ -130,13 +135,14 @@ fn notification_group(n: &Notification) -> String {
 }
 
 /// Post an Android notification by calling the bundled Kotlin
-/// `NotificationHelper.show(context, title, body, group)` over JNI.
+/// `NotificationHelper.show(context, title, body, group, deeplink)` over JNI.
+/// `deeplink` is the opaque tap URL, empty = none.
 ///
 /// Runs on a plain Rust thread (not a JNI callback), so it bootstraps the
 /// `JavaVM` + `Context` via `ndk_context` — the same pattern as the lifecycle
 /// listener. Failures are logged, never fatal.
 #[cfg(all(target_os = "android", feature = "push-sync"))]
-fn show_android_notification(title: &str, body: &str, group: &str) {
+fn show_android_notification(title: &str, body: &str, group: &str, deeplink: &str) {
     use jni::JavaVM;
     use jni::objects::{JObject, JValue};
 
@@ -180,10 +186,11 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
         }
     };
 
-    let (Ok(title_j), Ok(body_j), Ok(group_j)) = (
+    let (Ok(title_j), Ok(body_j), Ok(group_j), Ok(deeplink_j)) = (
         env.new_string(title),
         env.new_string(body),
         env.new_string(group),
+        env.new_string(deeplink),
     ) else {
         tracing::warn!("notification: failed to build JNI strings");
         return;
@@ -191,12 +198,13 @@ fn show_android_notification(title: &str, body: &str, group: &str) {
     match env.call_static_method(
         &helper,
         "show",
-        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         &[
             JValue::Object(&context),
             JValue::Object(&title_j),
             JValue::Object(&body_j),
             JValue::Object(&group_j),
+            JValue::Object(&deeplink_j),
         ],
     ) {
         Ok(_) => tracing::debug!("notification: NotificationHelper.show returned ok"),
