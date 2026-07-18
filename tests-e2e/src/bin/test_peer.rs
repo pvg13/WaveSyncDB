@@ -15,6 +15,7 @@
 //! | `MDNS_ENABLED` | no | `false` disables mDNS (forces relay-only discovery) |
 //! | `SECONDARY_TOPIC` | no | join a second (non-default) group on this topic |
 //! | `SECONDARY_PASSPHRASE` | no | passphrase for the secondary group |
+//! | `PUSH_TOKEN` | no | register this (dummy) push token with the relay so NotifyTopic is accepted |
 //! | `RUST_LOG` | no | log level filter |
 //!
 //! When `SECONDARY_TOPIC` is set the peer joins a second group at runtime via
@@ -143,12 +144,24 @@ async fn main() -> Result<()> {
         None
     };
 
+    // PUSH_TOKEN: register a (dummy) push token with the relay. The relay
+    // only accepts NotifyTopic from peers that registered a token for the
+    // topic (anti-wake-spam), so a host-side writer that should trigger
+    // FCM wakes on real devices registers this placeholder — the relay's
+    // fan-out excludes the sender's own token, so nothing is sent to it.
+    if let Ok(token) = std::env::var("PUSH_TOKEN")
+        && !token.is_empty()
+    {
+        db.register_push_token("Fcm", &token);
+    }
+
     let state = AppState { db, db2, db_url };
     let router = Router::new()
         .route("/health", get(health))
         .route("/peers", get(peers))
         .route("/diagnostics", get(diagnostics))
         .route("/push_wake", post(push_wake))
+        .route("/register_push", post(register_push))
         .route("/tasks", get(list_tasks).post(insert_task))
         .route("/tasks/:id", get(get_task).put(update_task))
         .route("/g2/tasks", get(list_tasks_g2).post(insert_task_g2))
@@ -174,6 +187,22 @@ async fn peers(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn diagnostics(State(s): State<AppState>) -> impl IntoResponse {
     Json(s.db.diagnostics())
+}
+
+/// (Re-)register the `PUSH_TOKEN` dummy token with the relay. Needed by
+/// scenarios where another peer's write pushes to this dummy token first:
+/// FCM rejects it as invalid and the relay (correctly) evicts the row,
+/// which would then make this peer's own `NotifyTopic` be rejected as
+/// unregistered. The harness calls this right before the write whose push
+/// it actually wants delivered.
+async fn register_push(State(s): State<AppState>) -> impl IntoResponse {
+    match std::env::var("PUSH_TOKEN") {
+        Ok(t) if !t.is_empty() => {
+            s.db.register_push_token("Fcm", &t);
+            StatusCode::OK
+        }
+        _ => StatusCode::PRECONDITION_FAILED,
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

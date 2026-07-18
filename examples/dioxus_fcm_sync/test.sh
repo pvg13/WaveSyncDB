@@ -79,8 +79,11 @@ WRITER_HTTP_PORT="${WRITER_HTTP_PORT:-8489}"
 # WAVESYNC_RELAY_OVERRIDE for the APK build — that way we don't have
 # to hand-maintain a peer-id constant that has to match the keypair.
 RELAY_KEY='CAESQGlCc264ZKF3D4l/5VXTLjnGdDKxg0cyX2UosIkZmNAbxV5oeISRfEDIrc/+hdQuqepe9CCCc3M5G3DJBs6N6lE='
+# The relay derives its QUIC listener from the TCP listen port
+# (wavesync_relay main.rs `extract_tcp_port`), so TCP and QUIC must be
+# the SAME port or the advertised QUIC address points at nothing.
 RELAY_QUIC_PORT="${RELAY_QUIC_PORT:-4001}"
-RELAY_TCP_PORT="${RELAY_TCP_PORT:-4002}"
+RELAY_TCP_PORT="${RELAY_TCP_PORT:-4001}"
 
 stop_all() {
     for pidfile in "$PIDDIR"/*.pid; do
@@ -176,12 +179,18 @@ echo "==> Pre-building relay + writer (cold compile can take several minutes)"
 echo "==> Starting relay (peer-id will be read from log)"
 (
     cd "$ROOT"
+    # --push-db is what ENABLES the push subsystem — without it the relay
+    # answers every RegisterToken/NotifyTopic with "Push notifications not
+    # configured" and FCM credentials are never even read. Fresh file per
+    # run so the wake budget/coalescing state doesn't leak across runs.
+    rm -f "$LOGDIR/push.db"
     setsid env RUST_LOG=info cargo run --release --quiet -p wavesync_relay -- \
         --identity-keypair="$RELAY_KEY" \
         --listen-addr "/ip4/0.0.0.0/tcp/$RELAY_TCP_PORT" \
         --external-address "/ip4/$LAN_IP/tcp/$RELAY_TCP_PORT" \
         --external-address "/ip4/$LAN_IP/udp/$RELAY_QUIC_PORT/quic-v1" \
         --max-reservations-per-peer 256 \
+        --push-db "$LOGDIR/push.db" \
         --fcm-credentials "$FCM_CREDENTIALS" \
         > "$LOGDIR/relay.log" 2>&1 &
     echo $! > "$PIDDIR/relay.pid"
@@ -230,11 +239,17 @@ echo "==> Starting writer peer on http://127.0.0.1:$WRITER_HTTP_PORT"
 WRITER_DB="$(mktemp -d)/writer.db"
 (
     cd "$ROOT"
+    # PUSH_TOKEN: the relay only accepts NotifyTopic from a peer that has
+    # itself registered a token for the topic (anti-wake-spam). The writer
+    # is a host process with no real FCM token, so it registers a dummy one
+    # — the fan-out excludes the sender's own token, so nothing is ever
+    # actually sent to it.
     setsid env BIND_ADDR="0.0.0.0:$WRITER_HTTP_PORT" \
         DB_URL="sqlite:$WRITER_DB?mode=rwc" \
         TOPIC="$TOPIC" \
         PASSPHRASE="$PASSPHRASE" \
         RELAY_ADDR="$RELAY_ADDR" \
+        PUSH_TOKEN="host-writer-dummy-token" \
         RUST_LOG=info,libp2p_swarm=warn \
         cargo run --release -p wavesyncdb-e2e --bin test-peer \
             > "$LOGDIR/writer.log" 2>&1 &
@@ -283,22 +298,78 @@ if [[ -z "${SKIP_INSTALL:-}" ]]; then
     adb -s "$ANDROID_SERIAL" install -r -g "$APK" >/dev/null
 fi
 
-# ── 4. Maestro phase A — launch, add sentinel, killApp ─────────────
+# ── 4. Phase A — bootstrap boot, sentinel, token registration, kill ─
 
 # Per-run unique titles. UUID-suffixing makes the assertions
-# idempotent: residual rows from prior runs (the SQLite DB inside
-# the app's data dir survives `clearState` in some Maestro/Dioxus
-# combos) can't make the test trivially pass with an old row.
+# idempotent: residual rows from prior runs can't make the test
+# trivially pass with an old row.
 RUN_TAG="$(date +%s)-$$"
 PHONE_SENTINEL="from-phone-$RUN_TAG"
 REMOTE_TITLE="from-cli-$RUN_TAG"
 
-echo "==> Maestro phase A (launch + sentinel + killApp)"
+# Boot 1 (config bootstrap): after `pm clear`, the app cannot init
+# Firebase — ensureFirebaseFromConfig needs .wavesync_config.json,
+# which build() only writes during this very boot. Boot once so the
+# config exists; the phase-A boot below then fetches + registers the
+# FCM token. Without this, the phone is killed token-less and the
+# cold wake is structurally impossible (the old single-boot flow
+# false-passed via phase B's foreground catch-up sync).
+ACTIVITY="$(adb -s "$ANDROID_SERIAL" shell cmd package resolve-activity --brief "$PACKAGE" 2>/dev/null | tail -1 | tr -d '\r')"
+[[ "$ACTIVITY" == */* ]] || { echo "ERROR: could not resolve launcher activity for $PACKAGE" >&2; exit 1; }
+echo "==> Boot 1: config bootstrap (pm clear + first launch)"
+adb -s "$ANDROID_SERIAL" shell pm clear "$PACKAGE" >/dev/null
+adb -s "$ANDROID_SERIAL" shell am start -n "$ACTIVITY" >/dev/null
+sleep 10
+adb -s "$ANDROID_SERIAL" shell am force-stop "$PACKAGE"
+
+echo "==> Maestro phase A (relaunch + sentinel)"
 echo "    phone sentinel:  $PHONE_SENTINEL"
 maestro --device "$ANDROID_SERIAL" test \
     --env "WAVESYNC_FCM_PHONE_SENTINEL=$PHONE_SENTINEL" \
     "$HERE/test.maestro.phase-a.yaml" \
     | tee "$LOGDIR/maestro-a.log"
+
+# Wait for the PHONE's token registration at the relay before killing
+# it — the writer's own (dummy) registration is the first "Registered"
+# line, so wait for a second one. A phone killed without a registered
+# token can never be woken, and the test would false-pass via phase
+# B's foreground sync.
+echo "==> Waiting for the phone's FCM token registration at the relay..."
+REG_OK=0
+for i in {1..60}; do
+    if (( $(grep -c "Registered Fcm push token" "$LOGDIR/relay.log" || true) >= 2 )); then
+        REG_OK=1
+        echo "phone token registered after ${i}s"
+        break
+    fi
+    sleep 1
+done
+if [[ $REG_OK -eq 0 ]]; then
+    echo "ERROR: phone never registered its FCM token with the relay —" >&2
+    echo "       cold-wake cannot work. Check Play services on the device" >&2
+    echo "       and the relay log:" >&2
+    grep -iE "token|register" "$LOGDIR/relay.log" | tail -10 >&2
+    exit 1
+fi
+
+# Kill the app WITHOUT Maestro: its on-device driver has been observed
+# relaunching the app minutes after a `killApp` flow (ActivityManager
+# logs a MainActivity START from uid dev.mobile.maestro), which turns
+# the cold-wake scenario into a warm one. HOME + `am kill` is the
+# swipe-from-recents analogue: `am kill` terminates the (now
+# background) process but — unlike `am force-stop` — does NOT put the
+# package in stopped-state, so FCM remains deliverable.
+echo "==> Killing app (HOME + am kill; NOT force-stop, NOT maestro)"
+adb -s "$ANDROID_SERIAL" shell input keyevent 3
+sleep 2
+adb -s "$ANDROID_SERIAL" shell am kill "$PACKAGE"
+sleep 2
+if [[ -n "$(adb -s "$ANDROID_SERIAL" shell pidof "$PACKAGE" | tr -d '[:space:]')" ]]; then
+    echo "ERROR: app process still alive after am kill — cold-wake scenario invalid." >&2
+    exit 1
+fi
+echo "app process is dead; clearing logcat for the wake-window assertions"
+adb -s "$ANDROID_SERIAL" logcat -c
 
 # ── 5. Verify the writer received the sentinel (app→relay path alive) ─
 
@@ -324,6 +395,26 @@ fi
 
 # ── 6. Writer adds the under-test task while phone is killed ───────
 
+# Re-register the writer's dummy token first: the phone's sentinel write
+# pushed to it, FCM rejected it as invalid, and the relay (correctly)
+# evicted it — without re-registration the writer's NotifyTopic below is
+# rejected as unregistered and no push is ever sent.
+echo "==> Re-registering writer's dummy push token"
+REG_BEFORE=$(grep -c "Registered Fcm push token" "$LOGDIR/relay.log" || true)
+curl -fsS -X POST "http://127.0.0.1:$WRITER_HTTP_PORT/register_push" > /dev/null
+REREG_OK=0
+for i in {1..30}; do
+    if (( $(grep -c "Registered Fcm push token" "$LOGDIR/relay.log" || true) > REG_BEFORE )); then
+        REREG_OK=1
+        break
+    fi
+    sleep 1
+done
+if [[ $REREG_OK -eq 0 ]]; then
+    echo "ERROR: writer's dummy token re-registration never reached the relay." >&2
+    exit 1
+fi
+
 echo "==> Writer adds task '$REMOTE_TITLE' while phone is killed"
 curl -fsS -X POST "http://127.0.0.1:$WRITER_HTTP_PORT/tasks" \
     -H 'content-type: application/json' \
@@ -335,6 +426,43 @@ curl -fsS -X POST "http://127.0.0.1:$WRITER_HTTP_PORT/tasks" \
 WAKE_WAIT="${WAKE_WAIT:-90}"
 echo "==> Sleeping ${WAKE_WAIT}s for FCM to deliver and wake the engine in background..."
 sleep "$WAKE_WAIT"
+
+# Hard evidence the relay actually sent an FCM push for the write —
+# without this check the test can false-pass: phase B's 5s first-paint
+# window is wide enough for the foreground catch-up sync to fetch the
+# row even when no push was ever sent.
+if ! grep -q "Push sent to token=" "$LOGDIR/relay.log"; then
+    echo "ERROR: relay never sent an FCM push (no 'Push sent to token=' in" >&2
+    echo "       relay.log) — any row visible in phase B would be foreground" >&2
+    echo "       sync, not a cold wake. Push-pipeline tail of relay log:" >&2
+    grep -iE "notify|token|push" "$LOGDIR/relay.log" | tail -10 >&2
+    exit 1
+fi
+echo "relay confirmed FCM send:"
+grep "Push sent to token=" "$LOGDIR/relay.log" | tail -2
+
+# Device-side proof of the COLD wake (logcat was cleared at the kill, so
+# every match below happened during the wake window):
+#  * the FCM service actually received the push, and
+#  * the background engine ran the COLD path (stage=engine_built) — a
+#    stage=live_engine_found here means the app process was alive at
+#    push time and the run did not measure the killed-app path at all.
+if ! adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep -q "Received sync_available push"; then
+    echo "ERROR: push was sent but the device's FCM service never received it." >&2
+    exit 1
+fi
+if adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep -q "bg_sync stage=live_engine_found"; then
+    echo "ERROR: wake found a LIVE engine — the app process was not dead;" >&2
+    echo "       this run degenerated to the not-killed scenario." >&2
+    exit 1
+fi
+if ! adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep -q "bg_sync stage=engine_built"; then
+    echo "ERROR: background sync never built the cold engine after the push." >&2
+    adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep -E "WaveSyncService|bg_sync" | tail -15 >&2
+    exit 1
+fi
+echo "device confirmed cold wake:"
+adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep -E "bg_sync stage=(engine_built|first_peer_synced|done)" | tail -3
 
 # ── 8. Maestro phase B — relaunch and assert the row is present ────
 
