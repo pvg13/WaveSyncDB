@@ -93,6 +93,14 @@ pub struct RelayMetrics {
     push_notifies_total: Family<TopicLabel, Counter<u64>>,
     pushes_sent_total: Family<PushLabel, Counter<u64>>,
     registered_tokens: Gauge<i64>,
+    mailbox_appends_total: Family<TopicOutcomeLabel, Counter<u64>>,
+    mailbox_append_bytes_total: Counter<u64>,
+    mailbox_fetches_total: Family<TopicLabel, Counter<u64>>,
+    mailbox_fetched_entries_total: Counter<u64>,
+    mailbox_evictions_total: Counter<u64>,
+    mailbox_gc_purged_total: Counter<u64>,
+    mailbox_stored_entries: Gauge<i64>,
+    mailbox_stored_bytes: Gauge<i64>,
 }
 
 impl RelayMetrics {
@@ -173,6 +181,62 @@ impl RelayMetrics {
             registered_tokens.clone(),
         );
 
+        let mailbox_appends_total = Family::<TopicOutcomeLabel, Counter<u64>>::default();
+        registry.register(
+            "relay_mailbox_appends",
+            "Mailbox append requests, by topic and outcome",
+            mailbox_appends_total.clone(),
+        );
+
+        let mailbox_append_bytes_total = Counter::<u64>::default();
+        registry.register(
+            "relay_mailbox_append_bytes",
+            "Ciphertext bytes accepted into the mailbox",
+            mailbox_append_bytes_total.clone(),
+        );
+
+        let mailbox_fetches_total = Family::<TopicLabel, Counter<u64>>::default();
+        registry.register(
+            "relay_mailbox_fetches",
+            "Mailbox fetch requests served, by topic",
+            mailbox_fetches_total.clone(),
+        );
+
+        let mailbox_fetched_entries_total = Counter::<u64>::default();
+        registry.register(
+            "relay_mailbox_fetched_entries",
+            "Mailbox entries returned to fetching peers",
+            mailbox_fetched_entries_total.clone(),
+        );
+
+        let mailbox_evictions_total = Counter::<u64>::default();
+        registry.register(
+            "relay_mailbox_evictions",
+            "Mailbox entries evicted by per-topic quota caps",
+            mailbox_evictions_total.clone(),
+        );
+
+        let mailbox_gc_purged_total = Counter::<u64>::default();
+        registry.register(
+            "relay_mailbox_gc_purged",
+            "Mailbox entries aged out by the TTL garbage collector",
+            mailbox_gc_purged_total.clone(),
+        );
+
+        let mailbox_stored_entries = Gauge::<i64>::default();
+        registry.register(
+            "relay_mailbox_stored_entries",
+            "Mailbox entries currently stored",
+            mailbox_stored_entries.clone(),
+        );
+
+        let mailbox_stored_bytes = Gauge::<i64>::default();
+        registry.register(
+            "relay_mailbox_stored_bytes",
+            "Mailbox bytes currently stored",
+            mailbox_stored_bytes.clone(),
+        );
+
         Self {
             connections_total,
             connected_peers,
@@ -183,6 +247,14 @@ impl RelayMetrics {
             push_notifies_total,
             pushes_sent_total,
             registered_tokens,
+            mailbox_appends_total,
+            mailbox_append_bytes_total,
+            mailbox_fetches_total,
+            mailbox_fetched_entries_total,
+            mailbox_evictions_total,
+            mailbox_gc_purged_total,
+            mailbox_stored_entries,
+            mailbox_stored_bytes,
         }
     }
 
@@ -243,6 +315,46 @@ impl RelayMetrics {
 
     pub fn set_registered_tokens(&self, n: i64) {
         self.registered_tokens.set(n);
+    }
+
+    /// One append attempt. `outcome` is a fixed small set ("ok",
+    /// "too_large", "quota_exceeded", "rate_limited", "error");
+    /// `bytes`/`evicted` only count on success.
+    pub fn mailbox_append(&self, topic: &str, outcome: &str, bytes: u64, evicted: u64) {
+        self.mailbox_appends_total
+            .get_or_create(&TopicOutcomeLabel {
+                topic: short(topic),
+                outcome: outcome.to_string(),
+            })
+            .inc();
+        if bytes > 0 {
+            self.mailbox_append_bytes_total.inc_by(bytes);
+        }
+        if evicted > 0 {
+            self.mailbox_evictions_total.inc_by(evicted);
+        }
+    }
+
+    pub fn mailbox_fetch(&self, topic: &str, entries: u64) {
+        self.mailbox_fetches_total
+            .get_or_create(&TopicLabel {
+                topic: short(topic),
+            })
+            .inc();
+        if entries > 0 {
+            self.mailbox_fetched_entries_total.inc_by(entries);
+        }
+    }
+
+    pub fn mailbox_gc_purged(&self, purged: u64) {
+        if purged > 0 {
+            self.mailbox_gc_purged_total.inc_by(purged);
+        }
+    }
+
+    pub fn set_mailbox_stored(&self, entries: i64, bytes: i64) {
+        self.mailbox_stored_entries.set(entries);
+        self.mailbox_stored_bytes.set(bytes);
     }
 }
 
