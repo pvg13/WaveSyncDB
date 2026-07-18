@@ -1,25 +1,85 @@
-# Relay monitoring on Dokploy — Prometheus + Grafana as separate services
+# Relay monitoring on Dokploy — three Application services
 
-The relay's compose service (`wavesync_relay/docker-compose.yml`) is
-relay-only. Prometheus and Grafana run as **two separate Dokploy services**
-using stock images, configured entirely in the Dokploy UI — because Dokploy's
-Compose service type allows no UI-side edits to ports, mounts, or the compose
-file itself.
+On Dokploy, the relay, Prometheus, and Grafana all run as **Application**
+services configured entirely in the Dokploy UI (env, file mounts to real
+container paths, ports, domain). The Compose service type is deliberately not
+used — it allows no UI-side edits to ports, mounts, or the compose file
+(`docker-compose.yml` remains for plain docker-compose self-hosting and the
+local preview stack).
 
-How the pieces connect (all container-to-container, nothing published on the
-host):
+Internal hostnames are **project-prefixed service names** (`<project>-<name>`
+on the shared `dokploy-network`) — in a project called `almares`, services
+named `relay` / `prometheus` / `grafana` are reachable as `almares-relay`,
+`almares-prometheus`, `almares-grafana`. Substitute your own names below.
 
 ```
-wavesync-relay:9464  ◄── scrape ──  prometheus:9090  ◄── datasource ──  grafana:3000  ◄── Dokploy Domain (HTTPS + login)
+almares-relay:9464  ◄── scrape ──  almares-prometheus:9090  ◄── datasource ──  almares-grafana:3000  ◄── Dokploy Domain (HTTPS + login)
 ```
 
-- The relay binds its metrics endpoint on `0.0.0.0:9464` inside the container
-  (`METRICS_ADDR`), never publishes it, and pins `container_name:
-  wavesync-relay` — so any container on the shared `dokploy-network` resolves
-  `wavesync-relay:9464`.
-- The files in this directory are the source of truth for the configuration
-  you paste into Dokploy (and they back the local preview stack — see the
-  end of this file).
+The files in this directory are the source of truth for the configuration
+you paste into Dokploy (and they back the local preview stack — see the end
+of this file).
+
+---
+
+## 0. Relay service
+
+Dokploy → project → **Create Service → Application**.
+
+| Setting | Value |
+|---|---|
+| Name | `relay` (→ internal hostname `<project>-relay`) |
+| Provider | this Git repo, branch with the release you deploy |
+| Build Type | Dockerfile |
+| Docker File | `wavesync_relay/Dockerfile` |
+| Docker Context Path | `.` (repo root — same as CI; the Dockerfile COPYs the whole workspace) |
+| Domain | none (libp2p, not HTTP) |
+
+**Ports** (Advanced → Ports): publish `4001` → `4001` **tcp** and `4001` →
+`4001` **udp**. If a publish-mode choice is offered, pick **host** — ingress
+(Swarm mesh) SNATs inbound connections, which makes libp2p `identify` report
+a private IP back to clients and generates wasted AutoNAT dials (harmless but
+noisy, since `EXTERNAL_ADDRESS` is authoritative anyway). Open 4001/tcp+udp
+in the server firewall.
+
+**Volume Mount**: named volume `relay-data` → `/data` (persists the identity
+key = PeerId, `push_tokens.db`, `mailbox.db`). Never delete it — a new
+identity breaks every client config pinning the old `/p2p/<PeerId>`.
+
+**File Mounts** (only the push credentials you use — auto-discovered at
+these exact paths, no env var needed):
+
+| Mount Path | Content |
+|---|---|
+| `/run/secrets/fcm.json` | FCM service-account JSON |
+| `/run/secrets/apns.p8` | APNs signing key PEM |
+
+**Environment:**
+
+```
+EXTERNAL_ADDRESS=/dns4/relay.yourdomain.com/tcp/4001
+METRICS_ADDR=0.0.0.0:9464
+MAILBOX_DB=/data/mailbox.db
+```
+
+- `EXTERNAL_ADDRESS` — REQUIRED; without it clients get
+  `NoAddressesInReservation`. Comma-separate to also advertise QUIC:
+  `...,/dns4/relay.yourdomain.com/udp/4001/quic-v1`.
+- `METRICS_ADDR=0.0.0.0:9464` — REQUIRED for monitoring: the binary's
+  default is loopback-only (`127.0.0.1:9464`), unreachable from the
+  Prometheus container. Do NOT publish 9464 in the Ports tab — container-
+  to-container over `dokploy-network` needs no published port, and
+  publishing it would expose metrics to the internet.
+- `MAILBOX_DB` — enables the durable store-and-forward mailbox (off when
+  unset). Deploy the relay with it before clients that use the mailbox.
+- Plus APNs metadata if you use APNs: `APNS_KEY_ID`, `APNS_TEAM_ID`,
+  `APNS_BUNDLE_ID` (and `APNS_SANDBOX=1` for dev builds).
+- Already baked into the image (do not set): `PUSH_DB=/data/push_tokens.db`,
+  `IDENTITY_FILE=/data/identity.key`.
+
+Deploy, then check logs for: the PeerId, listen addresses,
+`Metrics endpoint on http://0.0.0.0:9464/metrics`, and (if enabled)
+`Mailbox enabled (db: /data/mailbox.db, ...)`.
 
 ---
 
@@ -34,20 +94,12 @@ Dokploy → project → **Create Service → Application** (Docker image type).
 | Domain | none. Never expose Prometheus. |
 | Ports | none published |
 
-> **Service names are project-prefixed.** Dokploy names Application
-> containers `<project>-<service>` (e.g. in a project called `almares` this
-> service's internal hostname becomes `almares-prometheus`). That full name
-> is what Grafana's datasource URL must use in step 2. The **relay** is the
-> exception: its compose file pins `container_name: wavesync-relay`, which
-> Dokploy does not prefix — so the scrape target below is always
-> `wavesync-relay:9464` regardless of project name (requires the relay to
-> have been redeployed at least once since the container_name pin landed).
+**Mounts** — File Mount → Mount Path `/etc/prometheus/prometheus.yml`,
+content = [`prometheus/prometheus.yml`](prometheus/prometheus.yml) **with one
+edit**: change the scrape target `wavesync-relay:9464` to your relay
+service's project-prefixed internal name, e.g. `almares-relay:9464` (the repo
+file's un-prefixed name is for the local preview stack).
 
-**Mounts** (Application services allow real container paths):
-
-- **File Mount** → Mount Path `/etc/prometheus/prometheus.yml`, content =
-  [`prometheus/prometheus.yml`](prometheus/prometheus.yml) from this repo
-  (scrapes `wavesync-relay:9464` every 15s).
 - **Volume Mount** → name `prometheus-data`, Mount Path `/prometheus`
   (metric history survives redeploys).
 
@@ -128,18 +180,17 @@ keep should be saved as a copy first — a re-import overwrites the
 
 1. Grafana → Explore → query `up{job="wavesync-relay"}` → value `1` means
    Prometheus is up AND scraping the relay successfully. If it returns no
-   data, Grafana can't reach Prometheus (check both service names); if `0`,
-   Prometheus runs but can't reach `wavesync-relay:9464` (is the relay
-   deployed and on `dokploy-network`?).
+   data, Grafana can't reach Prometheus (check the datasource URL against
+   the real service name); if `0`, Prometheus runs but can't reach the relay
+   (wrong scrape target name, relay not deployed, or METRICS_ADDR not set to
+   0.0.0.0:9464).
 2. Open the WaveSync Relay dashboard; generate some client traffic —
    Connected peers / Reservations / Bandwidth should move within ~30s.
 
 ## Notes
 
-- **Nothing to configure on the relay side**: `METRICS_ADDR: 0.0.0.0:9464`
-  and `container_name: wavesync-relay` are already in its compose file. The
-  metrics port is intentionally unpublished — anything on `dokploy-network`
-  can scrape it, the internet cannot.
+- The metrics port 9464 is intentionally unpublished — anything on
+  `dokploy-network` can scrape it, the internet cannot.
 - The Dockerfiles in this directory (`prometheus/Dockerfile`,
   `grafana/Dockerfile`) are used by the **local preview** stack, which runs
   the exact same configs with everything auto-provisioned:
