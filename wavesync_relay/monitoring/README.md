@@ -29,10 +29,19 @@ Dokploy → project → **Create Service → Application** (Docker image type).
 
 | Setting | Value |
 |---|---|
-| Name | `prometheus` (exact — Grafana reaches it by this name) |
+| Name | `prometheus` |
 | Docker Image | `prom/prometheus:latest` |
 | Domain | none. Never expose Prometheus. |
 | Ports | none published |
+
+> **Service names are project-prefixed.** Dokploy names Application
+> containers `<project>-<service>` (e.g. in a project called `almares` this
+> service's internal hostname becomes `almares-prometheus`). That full name
+> is what Grafana's datasource URL must use in step 2. The **relay** is the
+> exception: its compose file pins `container_name: wavesync-relay`, which
+> Dokploy does not prefix — so the scrape target below is always
+> `wavesync-relay:9464` regardless of project name (requires the relay to
+> have been redeployed at least once since the container_name pin landed).
 
 **Mounts** (Application services allow real container paths):
 
@@ -91,10 +100,13 @@ the UI — it persists in the volume.
 
 - **File Mount** → Mount Path
   `/etc/grafana/provisioning/datasources/prometheus.yml`, content =
-  [`grafana/provisioning/datasources/prometheus.yml`](grafana/provisioning/datasources/prometheus.yml).
-  This pins the datasource **uid to `prometheus`**, which the dashboard JSON
-  references — creating the datasource by hand in the UI gives it a random
-  uid and every imported panel breaks. Use the file.
+  [`grafana/provisioning/datasources/prometheus.yml`](grafana/provisioning/datasources/prometheus.yml)
+  **with one edit**: change `url: http://prometheus:9090` to your Prometheus
+  service's project-prefixed internal name, e.g.
+  `url: http://almares-prometheus:9090` (the repo file's un-prefixed name is
+  for the local preview stack). Keep `uid: prometheus` EXACTLY as-is — the
+  dashboard JSON references that uid; creating the datasource by hand in the
+  UI gives it a random uid and every imported panel breaks. Use the file.
 - **Volume Mount** → name `grafana-data`, Mount Path `/var/lib/grafana`.
 
 Deploy, log in at the domain.
