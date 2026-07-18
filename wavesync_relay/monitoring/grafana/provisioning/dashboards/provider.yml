@@ -7,4 +7,7 @@ providers:
     disableDeletion: false
     allowUiUpdates: true
     options:
-      path: /var/lib/grafana/dashboards
+      # Outside /var/lib/grafana: that path is masked by the grafana-data
+      # volume after first deploy (named volumes seed from the image only
+      # when empty), which would silently freeze baked dashboards.
+      path: /etc/grafana/dashboards
