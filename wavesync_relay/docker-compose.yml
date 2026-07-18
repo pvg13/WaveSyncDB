@@ -134,6 +134,20 @@ services:
     volumes:
       - prometheus-data:/prometheus
 
+  # Exposed ONLY via a Dokploy Domain (service: grafana, port 3000) —
+  # Traefik terminates HTTPS; no ports published here. Set
+  # GRAFANA_ADMIN_PASSWORD in Dokploy's Environment tab; if unset, Grafana
+  # boots with admin/admin and forces a password change on first login.
+  grafana:
+    build: ./monitoring/grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
 volumes:
   relay-data:
   prometheus-data:
+  grafana-data:
