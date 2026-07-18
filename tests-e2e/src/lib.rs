@@ -418,6 +418,11 @@ pub struct WaveSyncE2eHarness {
     /// in addition to the default group: `(topic, passphrase)`. Drives the
     /// peer's `/g2/...` routes. `None` ⇒ single-group (today's behaviour).
     secondary_group: Option<(String, String)>,
+    /// Extra environment variables for the relay container, applied on top
+    /// of the fixed set (identity, external address, metrics). Used to
+    /// enable/configure optional relay subsystems per scenario (e.g.
+    /// `MAILBOX_DB` + a short `MAILBOX_TTL_SECS` for the TTL-fallback test).
+    relay_env: Vec<(String, String)>,
 }
 
 /// Configuration for a single peer in the harness.
@@ -443,6 +448,7 @@ impl WaveSyncE2eHarness {
             default_nat: NatProfile::Open,
             mdns_enabled: true,
             secondary_group: None,
+            relay_env: Vec::new(),
         }
     }
 
@@ -524,6 +530,14 @@ impl WaveSyncE2eHarness {
         self
     }
 
+    /// Set an extra environment variable on the relay container (see the
+    /// `relay_env` field). Later calls with the same key append — the
+    /// container runtime keeps the last value.
+    pub fn with_relay_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.relay_env.push((key.into(), value.into()));
+        self
+    }
+
     /// Have every peer join a secondary (non-default) group in addition
     /// to the default one. The group is reachable through the peer's
     /// `/g2/...` routes (`insert_task_g2`, `wait_for_task_g2`, …). Models
@@ -570,7 +584,7 @@ impl WaveSyncE2eHarness {
         //    don't fight over the name.
         let relay_host = format!("relay-{suffix}");
         let relay_external = format!("/dns4/{relay_host}/udp/{}/quic-v1", RELAY_QUIC_PORT);
-        let relay = GenericImage::new(
+        let mut relay_img = GenericImage::new(
             RELAY_IMAGE.split(':').next().unwrap(),
             RELAY_IMAGE.split(':').nth(1).unwrap(),
         )
@@ -583,12 +597,16 @@ impl WaveSyncE2eHarness {
         .with_env_var("IDENTITY_KEYPAIR", &relay_identity_b64)
         .with_env_var("EXTERNAL_ADDRESS", &relay_external)
         .with_env_var("RUST_LOG", "info")
-        .with_env_var("METRICS_ADDR", "0.0.0.0:9464")
-        .with_network(&net_name)
-        .with_container_name(&relay_host)
-        .start()
-        .await
-        .context("start relay container")?;
+        .with_env_var("METRICS_ADDR", "0.0.0.0:9464");
+        for (key, value) in &self.relay_env {
+            relay_img = relay_img.with_env_var(key.clone(), value.clone());
+        }
+        let relay = relay_img
+            .with_network(&net_name)
+            .with_container_name(&relay_host)
+            .start()
+            .await
+            .context("start relay container")?;
 
         let relay_addr = format!(
             "/dns4/{relay_host}/udp/{}/quic-v1/p2p/{}",
@@ -636,7 +654,10 @@ impl WaveSyncE2eHarness {
             .with_env_var("DB_URL", "sqlite:/data/peer.db?mode=rwc")
             .with_env_var("TOPIC", &self.topic)
             .with_env_var("RELAY_ADDR", &relay_addr)
-            .with_env_var("RUST_LOG", "info,libp2p_swarm=warn")
+            .with_env_var(
+                "RUST_LOG",
+                "info,wavesyncdb::engine::mailbox_manager=debug,libp2p_swarm=warn",
+            )
             .with_network(&net_name)
             .with_container_name(&container_name);
 
@@ -993,6 +1014,73 @@ impl RunningHarness {
             .context("resolve relay metrics host port")?;
         Ok(format!("http://127.0.0.1:{host_port}"))
     }
+
+    /// Fetch the relay's OpenMetrics text exposition.
+    pub async fn relay_metrics_text(&self) -> Result<String> {
+        let url = self.relay_metrics_url().await?;
+        Ok(reqwest::get(format!("{url}/metrics")).await?.text().await?)
+    }
+
+    /// Sum the current value of every sample of a relay metric whose
+    /// exposition line starts with `metric_name` and contains `filter`
+    /// (pass "" for no label filter).
+    pub async fn relay_metric_value(&self, metric_name: &str, filter: &str) -> f64 {
+        let text = self.relay_metrics_text().await.unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.starts_with('#') && l.starts_with(metric_name) && l.contains(filter))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// Poll the relay metrics until the summed samples of `metric_name`
+    /// (label-filtered by `filter`, "" = all) reach `min`. Used e.g. to
+    /// wait for a mailbox append to be durably acked before freezing the
+    /// writer — asserting on the row alone would race the async append.
+    pub async fn wait_for_relay_metric(
+        &self,
+        metric_name: &str,
+        filter: &str,
+        min: f64,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.relay_metric_value(metric_name, filter).await >= min {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("relay metric {metric_name}{filter} did not reach {min} within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Read files from inside the relay container by shell glob (e.g.
+    /// `/data/mailbox.db*` to cover the SQLite main file plus its WAL)
+    /// and return the concatenated raw bytes. Missing globs yield empty
+    /// output rather than an error — callers should pair a negative scan
+    /// with a positive control (e.g. assert the schema string is present)
+    /// so an empty read can't silently pass. Used by the "relay stores
+    /// only ciphertext" assertion — the relay image has no sqlite3
+    /// binary, but a raw byte scan is sufficient: plaintext changeset
+    /// JSON would appear verbatim inside the DB pages.
+    pub async fn relay_read_files(&self, glob: &str) -> Result<Vec<u8>> {
+        let cmd = ExecCommand::new([
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat {glob} 2>/dev/null; true"),
+        ])
+        .with_cmd_ready_condition(CmdWaitFor::exit_code(0));
+        let mut result = self
+            .relay
+            .exec(cmd)
+            .await
+            .with_context(|| format!("docker exec cat {glob}"))?;
+        result
+            .stdout_to_vec()
+            .await
+            .with_context(|| format!("read {glob} from relay container"))
+    }
 }
 
 /// Per-peer HTTP API matching the routes in `bin/test_peer.rs`.
@@ -1256,6 +1344,10 @@ pub struct DiagnosticsSnapshot {
     pub direct_bytes_out: u64,
     #[serde(default)]
     pub direct_bytes_in: u64,
+    #[serde(default)]
+    pub mailbox_entries_drained: u64,
+    #[serde(default)]
+    pub mailbox_gap_fallbacks: u64,
     #[serde(default)]
     pub sync_rtt_histogram: Vec<(u64, u64)>,
 }
