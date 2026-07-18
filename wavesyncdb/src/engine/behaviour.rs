@@ -9,6 +9,7 @@ use libp2p_swarm_derive::NetworkBehaviour;
 use super::auth_protocol::{
     AUTH_CHALLENGE_PROTOCOL, AUTH_RESULT_PROTOCOL, AuthChallengeCodec, AuthResultCodec,
 };
+use super::mailbox_protocol::{MAILBOX_PROTOCOL, MailboxCodec};
 use super::push_protocol::{PUSH_PROTOCOL, PushCodec};
 use super::snapshot_protocol::{SNAPSHOT_PROTOCOLS, SnapshotCodec};
 
@@ -20,6 +21,10 @@ pub struct WaveSyncBehaviour {
     pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub snapshot: request_response::Behaviour<SnapshotCodec>,
     pub push: request_response::Behaviour<PushCodec>,
+    /// Relay-mailbox protocol (durable encrypted store-and-forward). Spoken
+    /// only with the relay; a relay without the protocol fails the request
+    /// with `UnsupportedProtocols`, handled gracefully.
+    pub mailbox: request_response::Behaviour<MailboxCodec>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub autonat: autonat::v2::client::Behaviour,
@@ -109,6 +114,11 @@ impl WaveSyncBehaviour {
             request_response::Config::default(),
         );
 
+        let mailbox_behaviour = request_response::Behaviour::new(
+            [(MAILBOX_PROTOCOL, request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+
         let auth_behaviour = request_response::Behaviour::new(
             [(
                 AUTH_CHALLENGE_PROTOCOL,
@@ -153,6 +163,7 @@ impl WaveSyncBehaviour {
             mdns: mdns_behaviour,
             snapshot: snapshot_behaviour,
             push: push_behaviour,
+            mailbox: mailbox_behaviour,
             relay_client,
             dcutr: dcutr_behaviour,
             autonat: autonat_behaviour,

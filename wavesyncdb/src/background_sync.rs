@@ -507,6 +507,7 @@ async fn background_sync_core(
 
     let mut synced_peers = HashSet::new();
     let mut saw_any_peer = false;
+    let mut mailbox_drained = false;
     let mut full_sync_fallback_done = false;
     let mut logged_relay_listening = false;
     let mut logged_first_peer = false;
@@ -553,6 +554,22 @@ async fn background_sync_core(
                         tokio::time::sleep(completion_grace).await;
                         break;
                     }
+                    Ok(NetworkEvent::MailboxDrained { entries, .. }) if entries > 0 => {
+                        // A non-empty mailbox drain is a completion signal in
+                        // its own right: in the both-offline scenario the
+                        // writer's changes sit durably at the relay and no
+                        // PeerSynced can ever fire (no peer is reachable) —
+                        // without this branch the wake would burn its whole
+                        // OS-granted budget despite already holding the data.
+                        // The drain event fires after the applies committed
+                        // and the cursor persisted, so tearing down after the
+                        // grace window is safe. An EMPTY drain proves nothing
+                        // (nothing was pending) and keeps waiting for peers.
+                        log_stage("mailbox_drained");
+                        mailbox_drained = true;
+                        tokio::time::sleep(completion_grace).await;
+                        break;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     _ => continue,
@@ -571,9 +588,11 @@ async fn background_sync_core(
     }
     db.shutdown().await;
 
-    // 8. Return result
+    // 8. Return result. A completed non-empty mailbox drain counts as a
+    // successful sync even with zero reachable peers (the data came from the
+    // relay's durable store); `peers_synced` stays honest about live peers.
     let peers_synced = synced_peers.len();
-    let result = if peers_synced > 0 {
+    let result = if peers_synced > 0 || mailbox_drained {
         BackgroundSyncResult::Synced { peers_synced }
     } else if saw_any_peer {
         BackgroundSyncResult::TimedOut { peers_synced: 0 }
@@ -673,6 +692,7 @@ async fn resume_live_engine<F: Fn(&str)>(
     tokio::pin!(fallback);
 
     let mut synced_peers = HashSet::new();
+    let mut mailbox_drained = false;
     let mut fallback_done = false;
     let mut logged_relay_listening = false;
     let mut logged_first_peer = false;
@@ -720,6 +740,18 @@ async fn resume_live_engine<F: Fn(&str)>(
                         tokio::time::sleep(completion_grace).await;
                         break;
                     }
+                    Ok(NetworkEvent::MailboxDrained { entries, .. }) if entries > 0 => {
+                        // Same rationale as the cold path: a non-empty drain
+                        // means the wake's data arrived from the relay's
+                        // durable mailbox — success even with no reachable
+                        // peer (the both-offline scenario), instead of
+                        // burning the whole background budget waiting for a
+                        // PeerSynced that cannot come.
+                        log_stage("mailbox_drained");
+                        mailbox_drained = true;
+                        tokio::time::sleep(completion_grace).await;
+                        break;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     _ => continue,
@@ -733,8 +765,9 @@ async fn resume_live_engine<F: Fn(&str)>(
     }
     // NO shutdown: the engine belongs to the app.
 
+    // See the cold path: a completed non-empty drain is a success signal.
     let peers_synced = synced_peers.len();
-    let result = if peers_synced > 0 {
+    let result = if peers_synced > 0 || mailbox_drained {
         BackgroundSyncResult::Synced { peers_synced }
     } else if saw_any_peer {
         BackgroundSyncResult::TimedOut { peers_synced: 0 }

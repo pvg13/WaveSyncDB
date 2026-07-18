@@ -1,0 +1,1027 @@
+//! Relay-mailbox client: append-on-write, watermark healing, and
+//! drain-on-wake.
+//!
+//! The relay's mailbox is a durable, end-to-end-encrypted, append-only
+//! per-topic log (see `wire::mailbox_protocol` and `mailbox_seal`). This
+//! module is the engine side of it:
+//!
+//! * **Append (fast path)** — every local changeset is sealed and appended to
+//!   the relay in parallel with the peer fan-out. The relay acks only after
+//!   fsync, so an acked write is durable even if every peer (including this
+//!   one) goes offline the next instant. Appends are NEVER gated on version
+//!   comparisons: local `db_version`s come from the connection-side write
+//!   counter while remote applies stamp through the persistent meta counter,
+//!   and the two interleave over the same numeric range — a fresh local
+//!   write can carry a number lower than the newest applied-remote stamp, so
+//!   "version already covered" reasoning silently drops appends (found the
+//!   hard way in e2e bring-up).
+//! * **Watermark + unacked set (outage healing)** — there is deliberately no
+//!   queue of sealed envelopes: the durable state IS the shadow tables. Each
+//!   group tracks the exact set of local-write versions whose append is not
+//!   yet acked (`mailbox_unacked`, in-memory) plus a persisted watermark W
+//!   with the invariant **W < every unacked version**. A healing delta built
+//!   from `shadow::get_changes_since(W)` therefore always covers everything
+//!   un-appended, no matter how long a relay outage lasted. W advances to
+//!   the current version stamp only when nothing local is outstanding, which
+//!   keeps heal deltas small without ever claiming coverage it doesn't have.
+//!   One startup heal per group covers writes stranded by a previous session
+//!   that died before its appends acked (the unacked set does not survive a
+//!   restart; W does).
+//! * **Drain (wake path)** — on relay reservation and on resume/push-wake,
+//!   fetch entries after the locally persisted cursor, decrypt, apply via the
+//!   normal remote-changeset path (idempotent + commutative CRDT), and
+//!   advance the cursor only after the applies commit.
+//! * **Gap fallback** — when the fetch response proves the cursor's
+//!   continuation is gone (entries aged out / evicted, relay log reset via
+//!   epoch mismatch, cursor beyond the newest seq), fall back to the
+//!   version-vector reconcile for the group. Convergence never depends on
+//!   the mailbox alone.
+//! * **Tamper policy** — an entry that fails AEAD is never applied. The drain
+//!   advances past it (a poison entry must not wedge the mailbox forever)
+//!   AND triggers the same group reconcile, so whatever data the entry
+//!   carried still converges via the authenticated sync path.
+//!
+//! Note on Rule "HMAC on every message path": the mailbox path substitutes
+//! AEAD-open for HMAC-verify. AEAD subsumes the guarantee (authenticity under
+//! a key derived from the same group root; failure ⇒ payload never applied).
+//! Do not add a separate HMAC on top.
+
+use super::*;
+use crate::mailbox_seal;
+use crate::wire::mailbox_protocol::{
+    MailboxEntry, MailboxRequest, MailboxResponse, b64, fetch_gap_detected,
+};
+
+/// Fetch page bounds. 256 entries / 4 MiB per page keeps a single response
+/// comfortably under the protocol's 16 MiB frame cap while letting a backlog
+/// drain in few round-trips.
+const DRAIN_PAGE_MAX_ENTRIES: u32 = 256;
+const DRAIN_PAGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Target serialized size for one healing-delta chunk. Deliberately well
+/// under the relay's default 4 MiB per-entry cap (which is operator-tunable
+/// and not known client-side).
+const HEAL_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// An in-flight append, keyed by its outbound request id.
+pub(crate) struct MailboxAppendCtx {
+    pub effective_topic: String,
+    /// Fast path: the local `db_version` this entry carries (removed from
+    /// `mailbox_unacked` on ack). `None` for healing-delta chunks, whose
+    /// coverage is tracked on `GroupState::mailbox_heal` instead.
+    pub version: Option<u64>,
+}
+
+/// An active healing-delta batch (see `GroupState::mailbox_heal`). The
+/// watermark moves to `to` only when every chunk is acked. (The build's
+/// `from` is the watermark itself and needs no copy here — it only travels
+/// on `MailboxTaskMsg::HealReady` for logging.)
+pub(crate) struct MailboxHeal {
+    pub to: u64,
+    /// Chunks still awaiting their ack.
+    pub remaining: usize,
+    /// The unacked local versions the delta covers — the snapshot of
+    /// `mailbox_unacked` taken when the delta was built. Versions dispatched
+    /// AFTER the build are not in the delta and must stay unacked.
+    pub covers: Vec<u64>,
+}
+
+/// Messages sent from spawned mailbox tasks back to the engine loop.
+pub(crate) enum MailboxTaskMsg {
+    /// One drained page has been decrypted and applied; the cursor is
+    /// persisted through `last_seq`.
+    DrainPageDone {
+        effective_topic: String,
+        last_seq: u64,
+        epoch: u64,
+        applied: u64,
+        truncated: bool,
+        /// At least one entry failed AEAD (tampered / non-member garbage).
+        tampered: bool,
+        /// An apply failed to commit (DB error) — the page stopped early and
+        /// the cursor was NOT advanced past the failing entry; the next
+        /// drain re-fetches it.
+        apply_failed: bool,
+    },
+    /// A healing delta is sealed and ready to append (possibly chunked).
+    HealReady {
+        effective_topic: String,
+        from: u64,
+        to: u64,
+        covers: Vec<u64>,
+        /// `(nonce_b64, ciphertext_b64)` per chunk. Empty = build failed;
+        /// abandon and retry on a later tick.
+        parts: Vec<(String, String)>,
+    },
+    /// `get_changes_since(W)` returned nothing although versions advanced —
+    /// advance W directly so healing doesn't spin.
+    HealEmpty {
+        effective_topic: String,
+        to: u64,
+        covers: Vec<u64>,
+    },
+}
+
+/// The watermark invariant, factored out for unit tests: W may sit at
+/// `candidate` only if no unacked local version is ≤ it — a healing delta is
+/// built from `get_changes_since(W)`, so any unacked version at or below W
+/// would be silently excluded from healing forever.
+fn effective_watermark(candidate: u64, unacked: &std::collections::BTreeSet<u64>) -> u64 {
+    match unacked.first() {
+        Some(&lowest) => candidate.min(lowest.saturating_sub(1)),
+        None => candidate,
+    }
+}
+
+impl EngineRunner {
+    /// The relay peer to talk mailbox to, if one is connected.
+    fn mailbox_relay_peer(&self) -> Option<libp2p::PeerId> {
+        match self.relay_state {
+            RelayState::Connected { relay_peer_id, .. }
+            | RelayState::Listening { relay_peer_id } => Some(relay_peer_id),
+            _ => None,
+        }
+    }
+
+    /// Recompute the group's watermark toward `candidate` (or away from it,
+    /// if an unacked version forces a rewind), persisting on change.
+    async fn set_mailbox_watermark(&mut self, effective_topic: &str, candidate: u64) {
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        let w = effective_watermark(candidate, &g.mailbox_unacked);
+        if w == g.mailbox_acked_version {
+            return;
+        }
+        g.mailbox_acked_version = w;
+        let db = g.db.clone();
+        // Persisted inline (the loop already awaits DB work in its arms) so
+        // watermark writes stay ordered — a spawned persist could race an
+        // older value over a newer one.
+        if let Err(e) = shadow::set_mailbox_acked_version(&db, w).await {
+            tracing::warn!("failed to persist mailbox watermark: {e}");
+        }
+    }
+
+    /// Fast-path append: seal `changeset` and send it to the relay's mailbox.
+    /// Called from `handle_local_changeset` alongside the peer fan-out (in
+    /// parallel — the fan-out never waits on the relay round-trip). If the
+    /// relay isn't reachable, the version is still recorded as unacked so
+    /// the healing path covers it on reconnect.
+    pub(super) async fn maybe_append_to_mailbox(
+        &mut self,
+        effective_topic: &str,
+        changeset: &SyncChangeset,
+    ) {
+        if !self.config.mailbox_enabled {
+            return;
+        }
+        let relay_peer = self.mailbox_relay_peer();
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        // No passphrase → no key to seal with → no mailbox for this group.
+        let Some(ref gk) = g.group_key else {
+            return;
+        };
+        let version = changeset.db_version;
+        let mailbox_key = gk.mailbox_key();
+        let topic_name = g.topic_name.clone();
+        g.mailbox_unacked.insert(version);
+
+        // Restore the W < min(unacked) invariant BEFORE anything can build a
+        // heal delta: local versions come from the connection-side write
+        // counter and can sit below stamps the remote-apply path already
+        // produced, so this new version may be at or below the current W.
+        let w = g.mailbox_acked_version;
+        self.set_mailbox_watermark(effective_topic, w).await;
+
+        let Some(relay_peer) = relay_peer else {
+            tracing::debug!(
+                topic = %short_topic(effective_topic),
+                version,
+                "mailbox append deferred: no relay connection (healing will cover)"
+            );
+            return;
+        };
+
+        let Ok(plaintext) = serde_json::to_vec(changeset) else {
+            return;
+        };
+        let sealed = match mailbox_seal::seal(&mailbox_key, &topic_name, &plaintext) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(topic = %short_topic(effective_topic), "mailbox seal failed: {e}");
+                return;
+            }
+        };
+        let request = MailboxRequest::Append {
+            topic: topic_name,
+            nonce: b64::encode(&sealed.nonce),
+            ciphertext: b64::encode(&sealed.ciphertext),
+        };
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .mailbox
+            .send_request(&relay_peer, request);
+        tracing::debug!(
+            topic = %short_topic(effective_topic),
+            version,
+            ?request_id,
+            "mailbox append sent"
+        );
+        self.pending_mailbox_appends.insert(
+            request_id,
+            MailboxAppendCtx {
+                effective_topic: effective_topic.to_string(),
+                version: Some(version),
+            },
+        );
+    }
+
+    /// Start a drain for every group. Called on relay reservation accepted
+    /// and on resume/push-wake.
+    pub(super) fn start_mailbox_drains_all(&mut self) {
+        let topics: Vec<String> = self.groups.keys().cloned().collect();
+        for topic in topics {
+            self.start_mailbox_drain(&topic);
+        }
+    }
+
+    /// Issue the first fetch of a drain session for one group. No-op when a
+    /// drain is already in flight (reservation-accepted and push-wake can
+    /// land together — duplicate concurrent drains would double-apply and
+    /// double-write the cursor for nothing).
+    pub(super) fn start_mailbox_drain(&mut self, effective_topic: &str) {
+        if !self.config.mailbox_enabled {
+            return;
+        }
+        let Some(relay_peer) = self.mailbox_relay_peer() else {
+            return;
+        };
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        if g.group_key.is_none() || g.mailbox_drain_in_flight {
+            return;
+        }
+        g.mailbox_drain_in_flight = true;
+        g.mailbox_drain_applied = 0;
+        let after_seq = g.mailbox_cursor;
+        let request = MailboxRequest::Fetch {
+            topic: g.topic_name.clone(),
+            after_seq,
+            max_entries: DRAIN_PAGE_MAX_ENTRIES,
+            max_bytes: DRAIN_PAGE_MAX_BYTES,
+        };
+        tracing::debug!(
+            topic = %short_topic(effective_topic),
+            after_seq,
+            "mailbox drain: fetching"
+        );
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .mailbox
+            .send_request(&relay_peer, request);
+        self.pending_mailbox_fetches
+            .insert(request_id, (effective_topic.to_string(), after_seq));
+    }
+
+    /// Sync-context variant for the reservation-accepted handler (which
+    /// cannot await): kick heals only; the freshness advance waits for the
+    /// next maintenance tick.
+    pub(super) fn start_mailbox_heals_all(&mut self) {
+        if !self.config.mailbox_enabled || self.mailbox_relay_peer().is_none() {
+            return;
+        }
+        let topics: Vec<String> = self.groups.keys().cloned().collect();
+        for topic in topics {
+            self.maybe_heal_mailbox(&topic);
+        }
+    }
+
+    /// Kick the healing path for every group that needs it, and advance idle
+    /// groups' watermark freshness. Cheap no-op in the steady state; called
+    /// from the periodic redeliver tick and after drains complete.
+    pub(super) async fn mailbox_maintenance_tick(&mut self) {
+        if !self.config.mailbox_enabled || self.mailbox_relay_peer().is_none() {
+            return;
+        }
+        let topics: Vec<String> = self.groups.keys().cloned().collect();
+        for topic in topics {
+            self.maybe_heal_mailbox(&topic);
+            // Freshness: with nothing outstanding, everything up to the
+            // current stamp is covered (local writes acked; remote-origin
+            // stamps are the origin peer's job) — advancing W keeps future
+            // heal deltas small. Gated on the startup heal having run:
+            // before it, W's lag is exactly what covers a previous session's
+            // stranded writes.
+            let advance = self.groups.get(&topic).and_then(|g| {
+                let idle = g.mailbox_startup_healed
+                    && g.mailbox_heal.is_none()
+                    && g.mailbox_unacked.is_empty()
+                    && !self
+                        .pending_mailbox_appends
+                        .values()
+                        .any(|ctx| ctx.effective_topic == topic);
+                if !idle || g.group_key.is_none() {
+                    return None;
+                }
+                let current = g
+                    .db_version_cache
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(g.local_db_version);
+                (current > g.mailbox_acked_version).then_some(current)
+            });
+            if let Some(current) = advance {
+                self.set_mailbox_watermark(&topic, current).await;
+            }
+        }
+    }
+
+    /// Spawn a healing-delta build for one group if it needs one: either the
+    /// one-shot startup heal (covers a previous session's stranded writes)
+    /// or unacked versions with no append in flight (relay outage / failed
+    /// appends).
+    fn maybe_heal_mailbox(&mut self, effective_topic: &str) {
+        let has_outstanding = self
+            .pending_mailbox_appends
+            .values()
+            .any(|ctx| ctx.effective_topic == effective_topic);
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        if g.group_key.is_none()
+            || !g.registry_is_ready
+            || has_outstanding
+            || g.mailbox_heal.is_some()
+        {
+            return;
+        }
+        let watermark = g.mailbox_acked_version;
+        let current = g
+            .db_version_cache
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(g.local_db_version);
+        let needs_startup_heal = !g.mailbox_startup_healed && current > watermark;
+        let needs_unacked_heal = !g.mailbox_unacked.is_empty();
+        if !needs_startup_heal && !needs_unacked_heal {
+            // Nothing could be stranded: mark the startup pass done so the
+            // freshness advance may engage.
+            g.mailbox_startup_healed = true;
+            return;
+        }
+
+        let covers: Vec<u64> = g.mailbox_unacked.iter().copied().collect();
+        let db = g.db.clone();
+        let registry = g.registry.clone();
+        let site_id = g.site_id;
+        let topic = effective_topic.to_string();
+        let topic_name = g.topic_name.clone();
+        let mailbox_key = g.group_key.as_ref().map(|gk| gk.mailbox_key());
+        let tx = self.mailbox_task_tx.clone();
+        // Reserve the heal slot before spawning so a second tick can't spawn
+        // a duplicate build while this one is reading the shadow tables.
+        g.mailbox_heal = Some(MailboxHeal {
+            to: current,
+            remaining: 0,
+            covers: covers.clone(),
+        });
+
+        tokio::spawn(async move {
+            let Some(mailbox_key) = mailbox_key else {
+                return;
+            };
+            let changes = match shadow::get_changes_since(&db, &registry, watermark).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("mailbox heal: get_changes_since failed: {e}");
+                    // Abandon via an empty HealReady.
+                    let _ = tx
+                        .send(MailboxTaskMsg::HealReady {
+                            effective_topic: topic,
+                            from: watermark,
+                            to: current,
+                            covers,
+                            parts: Vec::new(),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            if changes.is_empty() {
+                let _ = tx
+                    .send(MailboxTaskMsg::HealEmpty {
+                        effective_topic: topic,
+                        to: current,
+                        covers,
+                    })
+                    .await;
+                return;
+            }
+
+            // Greedy-chunk by serialized size so no single entry exceeds the
+            // relay's per-entry cap. Receivers dedup via the CRDT comparator,
+            // so chunks (and heal/fast-path overlap) are safe.
+            let mut parts: Vec<(String, String)> = Vec::new();
+            let mut chunk: Vec<crate::messages::ColumnChange> = Vec::new();
+            let mut chunk_bytes = 0usize;
+            let seal_chunk = |chunk: &mut Vec<crate::messages::ColumnChange>,
+                              parts: &mut Vec<(String, String)>| {
+                if chunk.is_empty() {
+                    return true;
+                }
+                let changeset = SyncChangeset {
+                    site_id,
+                    db_version: current,
+                    changes: std::mem::take(chunk),
+                };
+                let Ok(plain) = serde_json::to_vec(&changeset) else {
+                    return false;
+                };
+                match mailbox_seal::seal(&mailbox_key, &topic_name, &plain) {
+                    Ok(sealed) => {
+                        parts.push((b64::encode(&sealed.nonce), b64::encode(&sealed.ciphertext)));
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!("mailbox heal: seal failed: {e}");
+                        false
+                    }
+                }
+            };
+            let mut ok = true;
+            for change in changes {
+                let size = serde_json::to_vec(&change).map(|v| v.len()).unwrap_or(0);
+                if chunk_bytes + size > HEAL_CHUNK_BYTES && !chunk.is_empty() {
+                    ok &= seal_chunk(&mut chunk, &mut parts);
+                    chunk_bytes = 0;
+                }
+                chunk_bytes += size;
+                chunk.push(change);
+            }
+            ok &= seal_chunk(&mut chunk, &mut parts);
+
+            let _ = tx
+                .send(MailboxTaskMsg::HealReady {
+                    effective_topic: topic,
+                    from: watermark,
+                    to: current,
+                    covers,
+                    parts: if ok { parts } else { Vec::new() },
+                })
+                .await;
+        });
+    }
+
+    /// A fully-acked healing delta: everything in its coverage snapshot is
+    /// durably at the relay. Versions dispatched after the build stay
+    /// unacked (they are not in the delta) and keep W rewound via the
+    /// invariant.
+    async fn complete_mailbox_heal(&mut self, effective_topic: &str, to: u64, covers: &[u64]) {
+        if let Some(g) = self.groups.get_mut(effective_topic) {
+            for v in covers {
+                g.mailbox_unacked.remove(v);
+            }
+            g.mailbox_heal = None;
+            g.mailbox_startup_healed = true;
+        }
+        self.set_mailbox_watermark(effective_topic, to).await;
+    }
+
+    /// Handle a mailbox request-response event from the swarm.
+    pub(super) async fn handle_mailbox_event(
+        &mut self,
+        event: request_response::Event<MailboxRequest, MailboxResponse>,
+    ) {
+        match event {
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            } => {
+                if let Some(ctx) = self.pending_mailbox_appends.remove(&request_id) {
+                    self.handle_append_response(ctx, response).await;
+                } else if let Some((topic, after_seq)) =
+                    self.pending_mailbox_fetches.remove(&request_id)
+                {
+                    self.handle_fetch_response(&topic, after_seq, response)
+                        .await;
+                }
+            }
+            request_response::Event::Message {
+                message: request_response::Message::Request { .. },
+                peer,
+                ..
+            } => {
+                // Only the relay serves the mailbox; a peer sending us a
+                // mailbox request is confused or hostile. Drop it (the
+                // channel closes unanswered).
+                tracing::debug!("ignoring inbound mailbox request from {peer}");
+            }
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                if let Some(ctx) = self.pending_mailbox_appends.remove(&request_id) {
+                    tracing::debug!(
+                        topic = %short_topic(&ctx.effective_topic),
+                        version = ctx.version,
+                        "mailbox append failed: {error} (healing will cover)"
+                    );
+                    // Fast path: the version stays in `mailbox_unacked`.
+                    // Heal chunk: abandon the whole batch; the covers stay
+                    // unacked and a later heal retries. Sibling-chunk acks
+                    // find their ctx gone and are ignored.
+                    if ctx.version.is_none()
+                        && let Some(g) = self.groups.get_mut(&ctx.effective_topic)
+                    {
+                        g.mailbox_heal = None;
+                    }
+                } else if let Some((topic, _)) = self.pending_mailbox_fetches.remove(&request_id) {
+                    tracing::debug!(
+                        topic = %short_topic(&topic),
+                        "mailbox fetch failed: {error}"
+                    );
+                    if let Some(g) = self.groups.get_mut(&topic) {
+                        g.mailbox_drain_in_flight = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_append_response(&mut self, ctx: MailboxAppendCtx, response: MailboxResponse) {
+        match response {
+            MailboxResponse::Appended { seq, epoch: _ } => {
+                tracing::debug!(
+                    topic = %short_topic(&ctx.effective_topic),
+                    seq,
+                    version = ctx.version,
+                    "mailbox append acked"
+                );
+                match ctx.version {
+                    // Fast path: this exact local version is durable now.
+                    Some(version) => {
+                        let advance = if let Some(g) = self.groups.get_mut(&ctx.effective_topic) {
+                            g.mailbox_unacked.remove(&version);
+                            // With nothing outstanding, everything up to the
+                            // current stamp is covered (see the maintenance
+                            // tick for why this is sound only after the
+                            // startup heal).
+                            (g.mailbox_startup_healed
+                                && g.mailbox_unacked.is_empty()
+                                && g.mailbox_heal.is_none())
+                            .then(|| {
+                                g.db_version_cache
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    .max(g.local_db_version)
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(current) = advance {
+                            self.set_mailbox_watermark(&ctx.effective_topic, current)
+                                .await;
+                        }
+                    }
+                    // Heal chunk: count down the batch.
+                    None => {
+                        let done = match self
+                            .groups
+                            .get_mut(&ctx.effective_topic)
+                            .and_then(|g| g.mailbox_heal.as_mut())
+                        {
+                            Some(heal) => {
+                                heal.remaining = heal.remaining.saturating_sub(1);
+                                (heal.remaining == 0)
+                                    .then(|| (heal.to, std::mem::take(&mut heal.covers)))
+                            }
+                            // Batch was abandoned (a sibling failed) — ignore.
+                            None => None,
+                        };
+                        if let Some((to, covers)) = done {
+                            self.complete_mailbox_heal(&ctx.effective_topic, to, &covers)
+                                .await;
+                        }
+                    }
+                }
+            }
+            MailboxResponse::Error { kind, message } => {
+                tracing::warn!(
+                    topic = %short_topic(&ctx.effective_topic),
+                    ?kind,
+                    "mailbox append rejected: {message}"
+                );
+                // Fast path: version stays unacked; healing retries later
+                // (rate limits and quota rejections are exactly the cases
+                // where backing off to the periodic tick is right).
+                if ctx.version.is_none()
+                    && let Some(g) = self.groups.get_mut(&ctx.effective_topic)
+                {
+                    g.mailbox_heal = None;
+                }
+            }
+            other => {
+                tracing::debug!("unexpected mailbox append response: {other:?}");
+            }
+        }
+    }
+
+    async fn handle_fetch_response(
+        &mut self,
+        effective_topic: &str,
+        after_seq: u64,
+        response: MailboxResponse,
+    ) {
+        let entries = match response {
+            MailboxResponse::Entries {
+                entries,
+                latest_seq,
+                first_retained_seq,
+                epoch,
+                truncated,
+            } => {
+                let stored_epoch = self
+                    .groups
+                    .get(effective_topic)
+                    .and_then(|g| g.mailbox_epoch);
+                if fetch_gap_detected(
+                    after_seq,
+                    stored_epoch,
+                    first_retained_seq,
+                    latest_seq,
+                    epoch,
+                ) {
+                    tracing::warn!(
+                        topic = %short_topic(effective_topic),
+                        after_seq,
+                        first_retained_seq,
+                        latest_seq,
+                        "mailbox gap detected (entries aged out or relay log reset) — falling back to full reconcile"
+                    );
+                    self.diagnostics
+                        .mailbox_gap_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Reset the cursor to the edge of what's retained and
+                    // adopt the (possibly new) epoch, then reconcile: the
+                    // retained window still drains below, the reconcile
+                    // recovers the lost middle.
+                    let new_cursor = first_retained_seq.saturating_sub(1);
+                    if let Some(g) = self.groups.get_mut(effective_topic) {
+                        g.mailbox_cursor = new_cursor;
+                        g.mailbox_epoch = Some(epoch);
+                    }
+                    if let Some(g) = self.groups.get(effective_topic) {
+                        let db = g.db.clone();
+                        if let Err(e) = shadow::set_mailbox_cursor(&db, new_cursor, epoch).await {
+                            tracing::warn!("failed to persist mailbox cursor: {e}");
+                        }
+                    }
+                    self.trigger_group_reconcile(effective_topic).await;
+                } else if stored_epoch.is_none()
+                    && let Some(g) = self.groups.get_mut(effective_topic)
+                {
+                    // First-ever drain: adopt the epoch (persisted with the
+                    // cursor once the page applies).
+                    g.mailbox_epoch = Some(epoch);
+                }
+
+                if entries.is_empty() {
+                    self.finish_mailbox_drain(effective_topic).await;
+                    return;
+                }
+                (entries, epoch, truncated)
+            }
+            MailboxResponse::Error { kind, message } => {
+                tracing::debug!(
+                    topic = %short_topic(effective_topic),
+                    ?kind,
+                    "mailbox fetch rejected: {message}"
+                );
+                if let Some(g) = self.groups.get_mut(effective_topic) {
+                    g.mailbox_drain_in_flight = false;
+                }
+                return;
+            }
+            other => {
+                tracing::debug!("unexpected mailbox fetch response: {other:?}");
+                if let Some(g) = self.groups.get_mut(effective_topic) {
+                    g.mailbox_drain_in_flight = false;
+                }
+                return;
+            }
+        };
+        let (entries, epoch, truncated) = entries;
+
+        // Decrypt + apply off-loop (Rule: never hold the swarm across DB
+        // awaits). The task reports back via `mailbox_task_tx` so the loop
+        // can page the next fetch / finish the drain.
+        let Some(g) = self.groups.get(effective_topic) else {
+            return;
+        };
+        let Some(mailbox_key) = g.group_key.as_ref().map(|gk| gk.mailbox_key()) else {
+            return;
+        };
+        let db = g.db.clone();
+        let change_tx = g.change_tx.clone();
+        let registry = g.registry.clone();
+        let cache = g.db_version_cache.clone();
+        let notif_registry = g.notification_registry.clone();
+        let notif_tx = g.notification_tx.clone();
+        let topic_name = g.topic_name.clone();
+        let local_site = g.site_id;
+        let topic = effective_topic.to_string();
+        let tx = self.mailbox_task_tx.clone();
+
+        tokio::spawn(async move {
+            let mut applied = 0u64;
+            let mut tampered = false;
+            let mut apply_failed = false;
+            let mut cursor = 0u64;
+            for MailboxEntry {
+                seq,
+                nonce,
+                ciphertext,
+            } in &entries
+            {
+                let opened = b64::decode(nonce)
+                    .and_then(|n| <[u8; mailbox_seal::NONCE_LEN]>::try_from(n).ok())
+                    .zip(b64::decode(ciphertext))
+                    .and_then(|(nonce, ct)| {
+                        mailbox_seal::open(&mailbox_key, &topic_name, &nonce, &ct).ok()
+                    })
+                    .and_then(|plain| serde_json::from_slice::<SyncChangeset>(&plain).ok());
+
+                match opened {
+                    None => {
+                        // Tampered / non-member garbage / malformed. Never
+                        // applied; advance past it (the reconcile triggered
+                        // by the outcome recovers any real data it carried).
+                        tracing::warn!(
+                            seq,
+                            "mailbox entry failed authentication; skipping and falling back to reconcile"
+                        );
+                        tampered = true;
+                    }
+                    Some(changeset) if changeset.site_id == local_site => {
+                        // Our own entry, round-tripped. Nothing to apply.
+                    }
+                    Some(changeset) => {
+                        let notify_ctx = sync_handler::NotifyCtx {
+                            registry: &notif_registry,
+                            tx: &notif_tx,
+                        };
+                        let source = crate::messages::ChangeSource::Remote {
+                            peer_site: changeset.site_id,
+                        };
+                        let committed = apply_remote_changeset(
+                            &db,
+                            &change_tx,
+                            &registry,
+                            &changeset.changes,
+                            Some(&cache),
+                            source,
+                            Some(notify_ctx),
+                        )
+                        .await;
+                        if !committed {
+                            // DB-level failure: stop WITHOUT advancing the
+                            // cursor past this entry so the next drain
+                            // retries it.
+                            apply_failed = true;
+                            break;
+                        }
+                        applied += 1;
+                    }
+                }
+                cursor = *seq;
+                // Persist after the apply committed — crash between apply
+                // and cursor write re-fetches (idempotent), never skips.
+                if let Err(e) = shadow::set_mailbox_cursor(&db, cursor, epoch).await {
+                    tracing::warn!("failed to persist mailbox cursor: {e}");
+                    break;
+                }
+            }
+            let last_seq = if cursor > 0 {
+                cursor
+            } else {
+                entries
+                    .first()
+                    .map(|e| e.seq.saturating_sub(1))
+                    .unwrap_or(0)
+            };
+            let _ = tx
+                .send(MailboxTaskMsg::DrainPageDone {
+                    effective_topic: topic,
+                    last_seq,
+                    epoch,
+                    applied,
+                    truncated,
+                    tampered,
+                    apply_failed,
+                })
+                .await;
+        });
+    }
+
+    /// Handle a message from a spawned mailbox task.
+    pub(super) async fn handle_mailbox_task_msg(&mut self, msg: MailboxTaskMsg) {
+        match msg {
+            MailboxTaskMsg::DrainPageDone {
+                effective_topic,
+                last_seq,
+                epoch,
+                applied,
+                truncated,
+                tampered,
+                apply_failed,
+            } => {
+                if let Some(g) = self.groups.get_mut(&effective_topic) {
+                    g.mailbox_cursor = g.mailbox_cursor.max(last_seq);
+                    g.mailbox_epoch = Some(epoch);
+                    g.mailbox_drain_applied += applied;
+                }
+                if tampered {
+                    self.trigger_group_reconcile(&effective_topic).await;
+                }
+                if apply_failed {
+                    // Leave the session; the next wake retries from the
+                    // persisted cursor.
+                    if let Some(g) = self.groups.get_mut(&effective_topic) {
+                        g.mailbox_drain_in_flight = false;
+                    }
+                    return;
+                }
+                if truncated {
+                    // Next page. Re-arm the fetch from the advanced cursor.
+                    let next = self
+                        .groups
+                        .get(&effective_topic)
+                        .map(|g| (g.topic_name.clone(), g.mailbox_cursor));
+                    if let (Some((topic_name, after_seq)), Some(relay_peer)) =
+                        (next, self.mailbox_relay_peer())
+                    {
+                        let request = MailboxRequest::Fetch {
+                            topic: topic_name,
+                            after_seq,
+                            max_entries: DRAIN_PAGE_MAX_ENTRIES,
+                            max_bytes: DRAIN_PAGE_MAX_BYTES,
+                        };
+                        let request_id = self
+                            .swarm
+                            .behaviour_mut()
+                            .mailbox
+                            .send_request(&relay_peer, request);
+                        self.pending_mailbox_fetches
+                            .insert(request_id, (effective_topic, after_seq));
+                    } else if let Some(g) = self.groups.get_mut(&effective_topic) {
+                        g.mailbox_drain_in_flight = false;
+                    }
+                } else {
+                    self.finish_mailbox_drain(&effective_topic).await;
+                }
+            }
+            MailboxTaskMsg::HealReady {
+                effective_topic,
+                from,
+                to,
+                covers,
+                parts,
+            } => {
+                if parts.is_empty() {
+                    // Build/seal failure — abandon, retry on a later tick.
+                    if let Some(g) = self.groups.get_mut(&effective_topic) {
+                        g.mailbox_heal = None;
+                    }
+                    return;
+                }
+                let (Some(relay_peer), Some(g)) = (
+                    self.mailbox_relay_peer(),
+                    self.groups.get_mut(&effective_topic),
+                ) else {
+                    if let Some(g) = self.groups.get_mut(&effective_topic) {
+                        g.mailbox_heal = None;
+                    }
+                    return;
+                };
+                g.mailbox_heal = Some(MailboxHeal {
+                    to,
+                    remaining: parts.len(),
+                    covers,
+                });
+                let topic_name = g.topic_name.clone();
+                tracing::info!(
+                    topic = %short_topic(&effective_topic),
+                    from,
+                    to,
+                    parts = parts.len(),
+                    "mailbox heal: appending delta for un-acked versions"
+                );
+                for (nonce, ciphertext) in parts {
+                    let request = MailboxRequest::Append {
+                        topic: topic_name.clone(),
+                        nonce,
+                        ciphertext,
+                    };
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .mailbox
+                        .send_request(&relay_peer, request);
+                    self.pending_mailbox_appends.insert(
+                        request_id,
+                        MailboxAppendCtx {
+                            effective_topic: effective_topic.clone(),
+                            version: None,
+                        },
+                    );
+                }
+            }
+            MailboxTaskMsg::HealEmpty {
+                effective_topic,
+                to,
+                covers,
+            } => {
+                self.complete_mailbox_heal(&effective_topic, to, &covers)
+                    .await;
+            }
+        }
+    }
+
+    /// Final page applied: emit the completion event, release the session,
+    /// and use the quiet moment to heal any append backlog.
+    async fn finish_mailbox_drain(&mut self, effective_topic: &str) {
+        let applied = if let Some(g) = self.groups.get_mut(effective_topic) {
+            g.mailbox_drain_in_flight = false;
+            std::mem::take(&mut g.mailbox_drain_applied)
+        } else {
+            0
+        };
+        tracing::info!(
+            topic = %short_topic(effective_topic),
+            entries = applied,
+            "mailbox drain complete"
+        );
+        self.diagnostics
+            .mailbox_entries_drained
+            .fetch_add(applied, std::sync::atomic::Ordering::Relaxed);
+        self.emit_network_event(crate::network_status::NetworkEvent::MailboxDrained {
+            topic: effective_topic.to_string(),
+            entries: applied,
+        });
+        self.maybe_heal_mailbox(effective_topic);
+    }
+
+    /// Group-scoped equivalent of `EngineCommand::RequestFullSync`: clear the
+    /// group's peer cursors so the next version-vector round asks from 0,
+    /// then kick a sync pass. Used by the gap and tamper fallbacks — the
+    /// paths where mailbox data was lost or unusable and correctness now
+    /// rides on the reconcile.
+    async fn trigger_group_reconcile(&mut self, effective_topic: &str) {
+        if let Some(g) = self.groups.get_mut(effective_topic) {
+            g.peer_db_versions.clear();
+            g.peer_reported_versions.clear();
+            g.pending_sync_peers.clear();
+        }
+        self.sync_all_known_peers().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_watermark;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn no_unacked_versions_lets_candidate_through() {
+        let unacked = BTreeSet::new();
+        assert_eq!(effective_watermark(7, &unacked), 7);
+    }
+
+    #[test]
+    fn unacked_version_below_candidate_rewinds() {
+        // A local write stamped 3 (connection-side counter) while the
+        // remote-apply path already produced stamp 7: W must sit below 3 or
+        // healing (`get_changes_since(W)`) would never pick the write up.
+        let unacked = BTreeSet::from([3, 9]);
+        assert_eq!(effective_watermark(7, &unacked), 2);
+    }
+
+    #[test]
+    fn unacked_version_above_candidate_is_no_constraint() {
+        let unacked = BTreeSet::from([9]);
+        assert_eq!(effective_watermark(7, &unacked), 7);
+    }
+
+    #[test]
+    fn unacked_version_zero_saturates() {
+        let unacked = BTreeSet::from([0]);
+        assert_eq!(effective_watermark(5, &unacked), 0);
+    }
+}

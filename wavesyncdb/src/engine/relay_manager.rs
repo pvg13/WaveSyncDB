@@ -79,6 +79,11 @@ impl EngineRunner {
                 // setup degrades to slower introductions, not none.
                 self.announce_presence_to_relay(relay_peer_id);
                 self.last_presence_announce = Some(tokio::time::Instant::now());
+                // Reachable via the relay ⇒ drain the durable mailbox (the
+                // wake path for changes written while we were offline) and
+                // heal any append backlog from the outage.
+                self.start_mailbox_drains_all();
+                self.start_mailbox_heals_all();
             }
             _ => {
                 tracing::info!("Relay client event (non-acceptance): {:?}", event);

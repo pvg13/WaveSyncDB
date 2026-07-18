@@ -1864,6 +1864,9 @@ pub struct WaveSyncDbBuilder {
     change_channel_capacity: usize,
     tombstone_retention: Option<Option<std::time::Duration>>,
     ios_unspecified_quic_bind: bool,
+    /// Relay-mailbox participation (append-on-write + drain-on-wake).
+    /// Default `true`; see `without_relay_mailbox`.
+    mailbox_enabled: bool,
     /// Whether the on-disk group-key cache is enabled. iOS only — see
     /// `with_group_key_cache`.
     group_key_cache_enabled: bool,
@@ -1907,6 +1910,7 @@ impl WaveSyncDbBuilder {
             change_channel_capacity: 1024,
             tombstone_retention: None,
             ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
+            mailbox_enabled: defaults.mailbox_enabled,
             group_key_cache_enabled: true,
             key_cache_load_only: false,
             key_cache_load_only_miss: false,
@@ -2062,6 +2066,20 @@ impl WaveSyncDbBuilder {
     /// (and synced) forever. Storage grows with all-time deletes.
     pub fn without_tombstone_gc(mut self) -> Self {
         self.tombstone_retention = Some(None);
+        self
+    }
+
+    /// Opt out of the relay's durable encrypted mailbox (on by default when a
+    /// relay and a passphrase are configured). With the mailbox on, every
+    /// local write's changeset is sealed client-side (XChaCha20-Poly1305
+    /// under a key derived from the group key — the relay stores only
+    /// ciphertext) and appended to the relay's store-and-forward log, and a
+    /// waking peer drains missed entries even when no other peer is online.
+    /// Opting out returns to pure peer-to-peer delivery: changes written
+    /// while every recipient is offline wait for the next reconcile where
+    /// both sides are online simultaneously.
+    pub fn without_relay_mailbox(mut self) -> Self {
+        self.mailbox_enabled = false;
         self
     }
 
@@ -2476,6 +2494,7 @@ impl WaveSyncDbBuilder {
             circuit_max_duration: self.circuit_max_duration,
             tcp_enabled: self.tcp_enabled,
             ios_unspecified_quic_bind: self.ios_unspecified_quic_bind,
+            mailbox_enabled: self.mailbox_enabled,
         };
 
         // Diagnostics counters are owned jointly by the engine task (writer)
@@ -2707,6 +2726,16 @@ impl WaveSyncNode {
             }
         };
 
+        // Hydrate the relay-mailbox cursor/watermark. Failure degrades to
+        // Default (cursor 0 = re-drain from the start, idempotent).
+        let mailbox_meta = match crate::shadow::get_mailbox_meta(&db).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("Failed to hydrate mailbox meta for joined group: {e}");
+                crate::shadow::MailboxMeta::default()
+            }
+        };
+
         let db_handle = WaveSyncDb {
             inner: Arc::new(WaveSyncDbInner {
                 inner: db.clone(),
@@ -2750,6 +2779,7 @@ impl WaveSyncNode {
             notification_tx,
             notification_registry,
             peer_db_versions,
+            mailbox_meta,
         };
         let _ = self
             .inner

@@ -148,6 +148,7 @@ impl EngineRunner {
             notification_tx,
             notification_registry,
             peer_db_versions,
+            mailbox_meta,
         } = init;
 
         let rendezvous_namespace = topic_name.clone();
@@ -173,6 +174,14 @@ impl EngineRunner {
             verified_peers: std::collections::HashSet::new(),
             pending_sync_peers: std::collections::HashMap::new(),
             pending_pushes: std::collections::BTreeMap::new(),
+            mailbox_cursor: mailbox_meta.cursor,
+            mailbox_epoch: mailbox_meta.epoch,
+            mailbox_acked_version: mailbox_meta.acked_version,
+            mailbox_unacked: std::collections::BTreeSet::new(),
+            mailbox_startup_healed: false,
+            mailbox_drain_in_flight: false,
+            mailbox_drain_applied: 0,
+            mailbox_heal: None,
         };
         self.groups.insert(effective_topic.clone(), group);
         tracing::info!("Joined sync group (effective topic {effective_topic})");
@@ -197,6 +206,9 @@ impl EngineRunner {
             // moment; a group joined later (e.g. a household joined after
             // login) would otherwise never be registered.
             self.register_push_token_for_topic(relay_peer_id, &topic_name);
+            // Catch up on anything durably appended for this group while no
+            // local engine was serving it.
+            self.start_mailbox_drain(&effective_topic);
         }
 
         self.update_network_status();
@@ -311,7 +323,15 @@ impl EngineRunner {
         // 4. Sync with any peers still connected (may be none — that's OK)
         self.sync_all_known_peers().await;
 
-        // 5. Schedule a delayed retry to catch peers rediscovered via mDNS/rendezvous
+        // 5. Drain the relay mailbox — the path that delivers changes even
+        // when NO peer is reachable (both-offline scenario: the writer's
+        // changes sit durably at the relay). If the relay connection is
+        // still being (re)established this no-ops; the reservation-accepted
+        // handler fires the drain once we're reachable.
+        self.start_mailbox_drains_all();
+        self.mailbox_maintenance_tick().await;
+
+        // 6. Schedule a delayed retry to catch peers rediscovered via mDNS/rendezvous
         self.resume_sync_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
     }
 }
