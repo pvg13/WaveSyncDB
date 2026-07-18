@@ -1,3 +1,5 @@
+mod mailbox_protocol;
+mod mailbox_store;
 mod metrics;
 mod push_notifier;
 mod push_protocol;
@@ -19,6 +21,10 @@ use libp2p::{
 use libp2p_swarm_derive::NetworkBehaviour;
 use rand::rngs::OsRng;
 
+use mailbox_protocol::{
+    MAILBOX_PROTOCOL, MailboxCodec, MailboxErrorKind, MailboxRequest, MailboxResponse, b64,
+};
+use mailbox_store::{AppendError, MailboxLimits, MailboxStore};
 use metrics::{CircuitLedger, RelayMetrics, ReservationOutcome};
 use push_protocol::{PUSH_PROTOCOL, PushCodec, PushRequest, PushResponse};
 use push_sender::{ApnsConfig, FcmConfig, PushSender};
@@ -194,6 +200,47 @@ struct Cli {
     #[arg(long, env = "ALERT_COALESCE_SECS", default_value_t = 30)]
     alert_coalesce_secs: u64,
 
+    /// Path to the mailbox SQLite database (enables the durable encrypted
+    /// store-and-forward mailbox). Independent of PUSH_DB — the mailbox
+    /// uses its own file because it runs `synchronous=FULL` (append acks
+    /// promise power-loss durability; push tokens don't need that).
+    #[arg(long, env = "MAILBOX_DB")]
+    mailbox_db: Option<String>,
+
+    /// Mailbox entry time-to-live in seconds (default: 604800 = 7 days,
+    /// matching the client's default tombstone-retention window — a peer
+    /// offline longer than that needs a full reconcile anyway).
+    #[arg(long, env = "MAILBOX_TTL_SECS", default_value_t = 604_800)]
+    mailbox_ttl_secs: u64,
+
+    /// Mailbox TTL garbage-collection cadence in seconds (default: 60).
+    #[arg(long, env = "MAILBOX_GC_INTERVAL_SECS", default_value_t = 60)]
+    mailbox_gc_interval_secs: u64,
+
+    /// Max size of one sealed mailbox entry in bytes (default: 4 MiB).
+    #[arg(long, env = "MAILBOX_MAX_ENTRY_BYTES", default_value_t = 4 * 1024 * 1024)]
+    mailbox_max_entry_bytes: u64,
+
+    /// Per-topic mailbox entry cap; exceeding appends evict the oldest
+    /// entries (default: 10000).
+    #[arg(long, env = "MAILBOX_MAX_TOPIC_ENTRIES", default_value_t = 10_000)]
+    mailbox_max_topic_entries: u64,
+
+    /// Per-topic mailbox byte cap; exceeding appends evict the oldest
+    /// entries (default: 64 MiB).
+    #[arg(long, env = "MAILBOX_MAX_TOPIC_BYTES", default_value_t = 64 * 1024 * 1024)]
+    mailbox_max_topic_bytes: u64,
+
+    /// Global mailbox byte cap across all topics; exceeding appends are
+    /// rejected (default: 1 GiB).
+    #[arg(long, env = "MAILBOX_MAX_TOTAL_BYTES", default_value_t = 1024 * 1024 * 1024)]
+    mailbox_max_total_bytes: u64,
+
+    /// Per-peer mailbox append rate limit, appends per minute (default:
+    /// 120). Enforced in memory per connected PeerId.
+    #[arg(long, env = "MAILBOX_APPENDS_PER_MIN", default_value_t = 120)]
+    mailbox_appends_per_min: u32,
+
     /// External address to advertise (repeatable, e.g. /ip4/77.37.125.212/tcp/4001).
     /// Required when running behind NAT or in Docker.
     #[arg(long, env = "EXTERNAL_ADDRESS", value_delimiter = ',')]
@@ -215,6 +262,7 @@ struct RelayServerBehaviour {
     ping: ping::Behaviour,
     autonat: libp2p::autonat::v2::server::Behaviour,
     push: request_response::Behaviour<PushCodec>,
+    mailbox: request_response::Behaviour<MailboxCodec>,
 }
 
 /// Read a secret file and return its trimmed contents, or log a warning and
@@ -629,6 +677,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Durable encrypted mailbox (store-and-forward). Opens its own DB —
+    // synchronous=FULL, see mailbox_store module doc — and spawns the TTL
+    // GC worker.
+    let mailbox = if let Some(ref mailbox_db_path) = cli.mailbox_db {
+        let limits = MailboxLimits {
+            ttl: Duration::from_secs(cli.mailbox_ttl_secs),
+            max_entry_bytes: cli.mailbox_max_entry_bytes,
+            max_topic_entries: cli.mailbox_max_topic_entries,
+            max_topic_bytes: cli.mailbox_max_topic_bytes,
+            max_total_bytes: cli.mailbox_max_total_bytes,
+        };
+        let store = Arc::new(
+            MailboxStore::open(mailbox_db_path, limits)
+                .await
+                .expect("Failed to open mailbox database"),
+        );
+
+        // Seed the storage gauges so a restarted relay reports its real
+        // backlog on the first scrape (same rationale as the token gauge).
+        match store.stats().await {
+            Ok((entries, bytes)) => relay_metrics.set_mailbox_stored(entries as i64, bytes as i64),
+            Err(e) => tracing::warn!("Failed to read initial mailbox stats: {e}"),
+        }
+
+        // TTL GC worker. A dedicated task (not a branch in the swarm
+        // select!) — GC deletes can touch many rows and must not stall
+        // event handling.
+        {
+            let store = store.clone();
+            let relay_metrics = relay_metrics.clone();
+            let gc_interval = Duration::from_secs(cli.mailbox_gc_interval_secs.max(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(gc_interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    match store.gc(unix_now_secs()).await {
+                        Ok(purged) => {
+                            if purged > 0 {
+                                tracing::info!(purged, "Mailbox GC: aged out entries");
+                            }
+                            relay_metrics.mailbox_gc_purged(purged);
+                            match store.stats().await {
+                                Ok((entries, bytes)) => {
+                                    relay_metrics.set_mailbox_stored(entries as i64, bytes as i64)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Mailbox GC: failed to read stats: {e}")
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!("Mailbox GC failed: {e}"),
+                    }
+                }
+            });
+        }
+
+        tracing::info!(
+            "Mailbox enabled (db: {mailbox_db_path}, ttl: {}s)",
+            cli.mailbox_ttl_secs
+        );
+        Some(store)
+    } else {
+        None
+    };
+
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(
@@ -671,6 +785,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 request_response::Config::default(),
             );
 
+            let mailbox_behaviour = request_response::Behaviour::new(
+                [(MAILBOX_PROTOCOL, request_response::ProtocolSupport::Full)],
+                request_response::Config::default(),
+            );
+
             let conn_limits = connection_limits::ConnectionLimits::default()
                 .with_max_pending_outgoing(Some(8))
                 .with_max_established_outgoing(Some(16))
@@ -693,6 +812,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 autonat: libp2p::autonat::v2::server::Behaviour::new(OsRng),
                 push: push_behaviour,
+                mailbox: mailbox_behaviour,
             }
         })?
         .with_swarm_config(|cfg| {
@@ -778,6 +898,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // not survive a relay restart (peers will re-announce when they reconnect).
     let mut topic_peers: HashMap<String, HashSet<libp2p::PeerId>> = HashMap::new();
 
+    // Per-peer mailbox append rate limiting (token bucket, in-memory —
+    // sender identity is deliberately never persisted). Entries are pruned
+    // when the peer's last connection closes.
+    let mut mailbox_rate: HashMap<libp2p::PeerId, TokenBucket> = HashMap::new();
+
     // Rendezvous-namespace membership per peer, for circuit topic
     // attribution (`topics_for_peer` below). Populated on `PeerRegistered`,
     // pruned when the peer's last connection closes — mirrors `topic_peers`'
@@ -851,6 +976,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         !set.is_empty()
                     });
                     rendezvous_topics.remove(&peer_id);
+                    mailbox_rate.remove(&peer_id);
                 }
                 // gauge = distinct peers (map size), not connection count
                 relay_metrics.set_connected_peers(peer_addresses.len() as i64);
@@ -1170,6 +1296,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )) => {
                 tracing::debug!("PeerJoined delivery to {peer} failed: {error}");
             }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Mailbox(
+                request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => {
+                // Awaited inline like handle_push_request: an append is one
+                // IMMEDIATE transaction whose FULL-sync commit costs
+                // single-digit milliseconds — acceptable in the event loop
+                // for v1 (offloading via a response-channel task is the
+                // noted future optimization if append volume demands it).
+                let response = handle_mailbox_request(
+                    &mailbox,
+                    request,
+                    &peer,
+                    &mut mailbox_rate,
+                    cli.mailbox_appends_per_min,
+                    &relay_metrics,
+                )
+                .await;
+                if let Err(resp) = swarm
+                    .behaviour_mut()
+                    .mailbox
+                    .send_response(channel, response)
+                {
+                    tracing::error!("Failed to send mailbox response: {:?}", resp);
+                }
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Mailbox(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { .. },
+                    ..
+                },
+            )) => {
+                // The relay never sends mailbox requests; nothing to do.
+            }
+            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Mailbox(
+                request_response::Event::OutboundFailure { peer, error, .. },
+            )) => {
+                tracing::debug!("Mailbox outbound to {peer} failed: {error}");
+            }
             SwarmEvent::IncomingConnectionError {
                 local_addr,
                 send_back_addr,
@@ -1238,6 +1409,183 @@ fn topics_for_peer(
         topics.extend(ns.iter().cloned());
     }
     topics.into_iter().collect()
+}
+
+/// Wall-clock unix seconds, for mailbox `received_at` stamps and TTL math.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// In-memory token bucket for per-peer mailbox append rate limiting.
+/// Burst capacity == the per-minute rate; refills continuously.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(per_min: u32) -> Self {
+        Self {
+            tokens: per_min as f64,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self, per_min: u32) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        let cap = per_min as f64;
+        self.tokens = (self.tokens + elapsed * cap / 60.0).min(cap);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Serve one mailbox request. The relay treats topics as opaque strings and
+/// payloads as opaque blobs — it cannot verify group membership (it holds no
+/// group key) and never inspects entry contents. Authorization is quota-
+/// shaped, not identity-shaped: a non-member who learns a derived topic can
+/// at worst burn bounded storage (its garbage fails AEAD client-side), and
+/// computing a valid derived topic requires the group key in the first place.
+async fn handle_mailbox_request(
+    mailbox: &Option<Arc<MailboxStore>>,
+    request: MailboxRequest,
+    peer: &libp2p::PeerId,
+    rate: &mut HashMap<libp2p::PeerId, TokenBucket>,
+    appends_per_min: u32,
+    relay_metrics: &RelayMetrics,
+) -> MailboxResponse {
+    let Some(store) = mailbox else {
+        return MailboxResponse::Error {
+            kind: MailboxErrorKind::Disabled,
+            message: "mailbox not configured on this relay".into(),
+        };
+    };
+
+    match request {
+        MailboxRequest::Append {
+            topic,
+            nonce,
+            ciphertext,
+        } => {
+            let bucket = rate
+                .entry(*peer)
+                .or_insert_with(|| TokenBucket::new(appends_per_min));
+            if !bucket.try_take(appends_per_min) {
+                relay_metrics.mailbox_append(&topic, "rate_limited", 0, 0);
+                return MailboxResponse::Error {
+                    kind: MailboxErrorKind::RateLimited,
+                    message: "append rate limit exceeded".into(),
+                };
+            }
+
+            let (Some(nonce), Some(ciphertext)) = (b64::decode(&nonce), b64::decode(&ciphertext))
+            else {
+                relay_metrics.mailbox_append(&topic, "error", 0, 0);
+                return MailboxResponse::Error {
+                    kind: MailboxErrorKind::Internal,
+                    message: "invalid base64 payload".into(),
+                };
+            };
+
+            match store
+                .append(&topic, &nonce, &ciphertext, unix_now_secs())
+                .await
+            {
+                Ok(appended) => {
+                    let bytes = (nonce.len() + ciphertext.len()) as u64;
+                    relay_metrics.mailbox_append(&topic, "ok", bytes, appended.evicted);
+                    if let Ok((entries, total)) = store.stats().await {
+                        relay_metrics.set_mailbox_stored(entries as i64, total as i64);
+                    }
+                    tracing::debug!(
+                        topic = %short_topic(&topic),
+                        seq = appended.seq,
+                        evicted = appended.evicted,
+                        "Mailbox: appended entry"
+                    );
+                    MailboxResponse::Appended {
+                        seq: appended.seq,
+                        epoch: appended.epoch,
+                    }
+                }
+                Err(AppendError::TooLarge) => {
+                    relay_metrics.mailbox_append(&topic, "too_large", 0, 0);
+                    MailboxResponse::Error {
+                        kind: MailboxErrorKind::TooLarge,
+                        message: "entry exceeds per-entry size cap".into(),
+                    }
+                }
+                Err(AppendError::QuotaExceeded) => {
+                    relay_metrics.mailbox_append(&topic, "quota_exceeded", 0, 0);
+                    MailboxResponse::Error {
+                        kind: MailboxErrorKind::QuotaExceeded,
+                        message: "mailbox storage quota exhausted".into(),
+                    }
+                }
+                Err(AppendError::Db(e)) => {
+                    relay_metrics.mailbox_append(&topic, "error", 0, 0);
+                    tracing::error!("Mailbox append failed: {e}");
+                    MailboxResponse::Error {
+                        kind: MailboxErrorKind::Internal,
+                        message: "storage failure".into(),
+                    }
+                }
+            }
+        }
+        MailboxRequest::Fetch {
+            topic,
+            after_seq,
+            max_entries,
+            max_bytes,
+        } => {
+            // Bound the page the caller can demand; the frame cap is 16 MiB.
+            let max_entries = max_entries.min(512);
+            let max_bytes = max_bytes.min(8 * 1024 * 1024);
+            match store.fetch(&topic, after_seq, max_entries, max_bytes).await {
+                Ok(fetched) => {
+                    relay_metrics.mailbox_fetch(&topic, fetched.entries.len() as u64);
+                    tracing::debug!(
+                        topic = %short_topic(&topic),
+                        after_seq,
+                        returned = fetched.entries.len(),
+                        truncated = fetched.truncated,
+                        "Mailbox: served fetch"
+                    );
+                    MailboxResponse::Entries {
+                        entries: fetched
+                            .entries
+                            .into_iter()
+                            .map(|e| mailbox_protocol::MailboxEntry {
+                                seq: e.seq,
+                                nonce: b64::encode(&e.nonce),
+                                ciphertext: b64::encode(&e.ciphertext),
+                            })
+                            .collect(),
+                        latest_seq: fetched.latest_seq,
+                        first_retained_seq: fetched.first_retained_seq,
+                        epoch: fetched.epoch,
+                        truncated: fetched.truncated,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Mailbox fetch failed: {e}");
+                    MailboxResponse::Error {
+                        kind: MailboxErrorKind::Internal,
+                        message: "storage failure".into(),
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn handle_push_request(

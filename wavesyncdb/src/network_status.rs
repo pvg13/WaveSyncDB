@@ -187,6 +187,13 @@ pub enum NetworkEvent {
     RendezvousStatusChanged { registered: bool },
     /// Version vector sync completed with a peer.
     PeerSynced { peer_id: PeerId, db_version: u64 },
+    /// A relay-mailbox drain for `topic` completed: every retained entry
+    /// after the local cursor was fetched, decrypted, and applied (`entries`
+    /// = how many). Fired after the cursor persists. This is a completion
+    /// signal in its own right — in the both-peers-offline scenario no
+    /// `PeerSynced` can ever fire (there is no reachable peer), yet the
+    /// woken device already holds every change the writer durably appended.
+    MailboxDrained { topic: String, entries: u64 },
     /// A reconcile-digest exchange (#82) *proved* this peer holds data identical
     /// to ours for the given group — full convergence, not just matching
     /// `db_version` height. The signal an app/operator can trust to say "this

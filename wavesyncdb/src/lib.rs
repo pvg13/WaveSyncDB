@@ -41,6 +41,7 @@
 // shared with browser builds.
 pub mod auth;
 pub mod conflict;
+pub(crate) mod mailbox_seal;
 pub mod messages;
 pub mod network_status;
 pub mod protocol;

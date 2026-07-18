@@ -176,6 +176,17 @@ pub(crate) struct Counters {
     /// Wire bytes received from peers over a direct (non-relay) connection.
     pub direct_bytes_in: AtomicU64,
 
+    /// Relay-mailbox entries drained (fetched, decrypted, applied) across all
+    /// groups. The durability path's delivery counter — rises on wakes that
+    /// caught up from the relay's store rather than from a live peer.
+    pub mailbox_entries_drained: AtomicU64,
+    /// Times a mailbox fetch proved the local cursor's continuation was gone
+    /// (entries aged out / evicted, or the relay log was reset) and the
+    /// engine fell back to a full version-vector reconcile for the group.
+    /// Steady state is 0; a rising count means peers are offline longer than
+    /// the relay's mailbox TTL (or the relay store was wiped).
+    pub mailbox_gap_fallbacks: AtomicU64,
+
     /// Per-bucket counts for catch-up (version-vector) round-trip latency.
     /// Each observation increments exactly ONE bucket — the smallest threshold
     /// it is <=. To get Prometheus-style cumulative 'le' counts, sum buckets 0..=i.
@@ -243,6 +254,8 @@ impl Counters {
             relay_bytes_in: self.relay_bytes_in.load(Ordering::Relaxed),
             direct_bytes_out: self.direct_bytes_out.load(Ordering::Relaxed),
             direct_bytes_in: self.direct_bytes_in.load(Ordering::Relaxed),
+            mailbox_entries_drained: self.mailbox_entries_drained.load(Ordering::Relaxed),
+            mailbox_gap_fallbacks: self.mailbox_gap_fallbacks.load(Ordering::Relaxed),
             sync_rtt_histogram: self.sync_rtt_histogram(),
         }
     }
@@ -292,6 +305,12 @@ pub struct Snapshot {
     pub direct_bytes_out: u64,
     #[serde(default)]
     pub direct_bytes_in: u64,
+    /// See [`Counters::mailbox_entries_drained`].
+    #[serde(default)]
+    pub mailbox_entries_drained: u64,
+    /// See [`Counters::mailbox_gap_fallbacks`].
+    #[serde(default)]
+    pub mailbox_gap_fallbacks: u64,
     /// Catch-up round-trip-time histogram as `(le_ms, count)` pairs,
     /// `u64::MAX` marking the `+Inf` overflow bucket. Each count is the number
     /// of observations in that bucket. To get Prometheus-style cumulative 'le'

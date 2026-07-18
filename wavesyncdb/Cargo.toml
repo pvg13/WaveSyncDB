@@ -31,6 +31,14 @@ dioxus = { version = "0.7.6", optional = true }
 manganis = { version = "0.7.6", optional = true }
 subtle = "2.6.1"
 argon2 = "0.5.3"
+# Payload AEAD for the relay mailbox (mailbox_seal.rs). XChaCha20-Poly1305:
+# 192-bit nonces make fresh-random-per-message safe with no counter
+# bookkeeping. Pure Rust, wasm-clean; nonce entropy comes through `getrandom`
+# (the wasm32 `js` backend is already configured below).
+chacha20poly1305 = "0.10"
+# Sealed mailbox entries travel base64-encoded inside the JSON wire frames
+# (a serde_json `Vec<u8>` would be an array of numbers, ~3.7x the size).
+base64 = "0.22"
 
 # Native targets: full sync engine, libp2p transports, sea-orm with sqlx-sqlite,
 # tokio with the OS-I/O surface. None of these compile on wasm32-unknown-unknown.

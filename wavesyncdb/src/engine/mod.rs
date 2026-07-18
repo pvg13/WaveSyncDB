@@ -15,9 +15,11 @@ pub(crate) mod auth_protocol;
 pub(crate) mod behaviour;
 pub(crate) mod command_handler;
 pub(crate) mod identity_handler;
+pub(crate) mod mailbox_manager;
 pub(crate) mod peer_manager;
 pub(crate) mod reconcile;
 pub(crate) mod relay_manager;
+pub use crate::wire::mailbox_protocol;
 pub use crate::wire::push_protocol;
 pub use crate::wire::snapshot_protocol;
 pub(crate) mod sync_handler;
@@ -119,6 +121,9 @@ pub struct GroupInit {
     pub notification_tx: broadcast::Sender<crate::notify::Notification>,
     pub notification_registry: Arc<crate::registry::NotificationRegistry>,
     pub peer_db_versions: HashMap<libp2p::PeerId, u64>,
+    /// Persistent relay-mailbox state (drain cursor + epoch + append
+    /// watermark), hydrated from `_wavesync_meta` on the connection side.
+    pub mailbox_meta: crate::shadow::MailboxMeta,
 }
 
 impl std::fmt::Debug for GroupInit {
@@ -255,6 +260,12 @@ pub struct EngineConfig {
     /// engine start — that lets the bind strategy be flipped from an Xcode
     /// scheme without a rebuild.
     pub ios_unspecified_quic_bind: bool,
+    /// Whether local writes are appended to the relay's durable encrypted
+    /// mailbox and drained from it on wake (default: `true`). Effective only
+    /// when a relay is configured and the group has a passphrase (no group
+    /// key ⇒ nothing to seal with). Opt out via
+    /// `WaveSyncDbBuilder::without_relay_mailbox`.
+    pub mailbox_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -278,6 +289,7 @@ impl Default for EngineConfig {
             circuit_max_duration: Duration::from_secs(3600),
             tcp_enabled: false,
             ios_unspecified_quic_bind: false,
+            mailbox_enabled: true,
         }
     }
 }
@@ -788,6 +800,7 @@ async fn run_engine(
     // `snapshot_resp_tx` for the response direction.
     let (reconcile_req_tx, reconcile_req_rx) =
         mpsc::channel::<(libp2p::PeerId, crate::protocol::SyncRequest)>(16);
+    let (mailbox_task_tx, mailbox_task_rx) = mpsc::channel::<mailbox_manager::MailboxTaskMsg>(16);
 
     let effective_topic = match &group_key {
         Some(gk) => gk.derive_topic(&topic_name),
@@ -817,6 +830,16 @@ async fn run_engine(
 
     let mdns_enabled = config.mdns_enabled;
     let default_effective_topic = effective_topic.clone();
+    // Hydrate the relay-mailbox cursor/watermark for the default group. A
+    // read failure degrades to `Default` (cursor 0 = drain from the start —
+    // idempotent, just more re-applied no-ops on the first drain).
+    let mailbox_meta = match shadow::get_mailbox_meta(&db).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("failed to load mailbox meta; starting from scratch: {e}");
+            shadow::MailboxMeta::default()
+        }
+    };
     let default_group = GroupState {
         db,
         change_tx,
@@ -839,6 +862,14 @@ async fn run_engine(
         verified_peers: std::collections::HashSet::new(),
         pending_sync_peers: std::collections::HashMap::new(),
         pending_pushes: std::collections::BTreeMap::new(),
+        mailbox_cursor: mailbox_meta.cursor,
+        mailbox_epoch: mailbox_meta.epoch,
+        mailbox_acked_version: mailbox_meta.acked_version,
+        mailbox_unacked: std::collections::BTreeSet::new(),
+        mailbox_startup_healed: false,
+        mailbox_drain_in_flight: false,
+        mailbox_drain_applied: 0,
+        mailbox_heal: None,
     };
     let mut groups = HashMap::new();
     groups.insert(default_effective_topic.clone(), default_group);
@@ -875,6 +906,10 @@ async fn run_engine(
         push_registered_topics: std::collections::HashSet::new(),
         push_pending_registrations: std::collections::HashMap::new(),
         pending_push_reqs: std::collections::HashMap::new(),
+        pending_mailbox_appends: std::collections::HashMap::new(),
+        pending_mailbox_fetches: std::collections::HashMap::new(),
+        mailbox_task_tx,
+        mailbox_task_rx,
         relayed_conn_ids: std::collections::HashMap::new(),
         network_status,
         network_event_tx,
@@ -988,6 +1023,37 @@ pub(crate) struct GroupState {
     /// once every connected peer has acked it (or proven converged), and the
     /// oldest is evicted to the reconcile backstop on overflow.
     pub(crate) pending_pushes: std::collections::BTreeMap<u64, PendingPush>,
+    /// Relay-mailbox drain cursor: last mailbox seq applied locally.
+    /// Persisted (`shadow::set_mailbox_cursor`) only after the drained
+    /// entries' applies commit.
+    pub(crate) mailbox_cursor: u64,
+    /// The relay log epoch the cursor belongs to (`None` before the first
+    /// drain). A mismatch on fetch = relay log reset = gap fallback.
+    pub(crate) mailbox_epoch: Option<u64>,
+    /// Mailbox heal cursor / watermark W. Invariant: W is strictly below
+    /// every version in `mailbox_unacked`, so a healing delta built from
+    /// `get_changes_since(W)` always covers everything un-appended. Advanced
+    /// to the current stamp only when nothing local is outstanding;
+    /// persisted via `shadow::set_mailbox_acked_version`.
+    pub(crate) mailbox_acked_version: u64,
+    /// Local-write `db_version`s whose mailbox append has not been acked
+    /// (in-flight, failed, or never sent because the relay was away).
+    /// In-memory only — a restart falls back to the one-shot startup heal.
+    pub(crate) mailbox_unacked: std::collections::BTreeSet<u64>,
+    /// Whether this session's one-shot startup heal has run (or was proven
+    /// unnecessary). Gates the watermark freshness advance: before the
+    /// startup heal, W's lag is exactly what covers a previous session's
+    /// stranded writes.
+    pub(crate) mailbox_startup_healed: bool,
+    /// A drain session (possibly multi-page) is in flight — dedups the
+    /// reservation-accepted and push-wake triggers racing each other.
+    pub(crate) mailbox_drain_in_flight: bool,
+    /// Entries applied so far in the current drain session (for the
+    /// `MailboxDrained` completion event).
+    pub(crate) mailbox_drain_applied: u64,
+    /// Active healing-delta batch. W advances to its `to` only when every
+    /// chunk is acked. See [`mailbox_manager::MailboxHeal`].
+    pub(crate) mailbox_heal: Option<mailbox_manager::MailboxHeal>,
 }
 
 /// A locally-originated changeset awaiting confirmed delivery. See
@@ -1198,6 +1264,22 @@ struct EngineRunner {
     /// redelivery tick). Correlation is local — nothing new goes on the wire.
     pub(crate) pending_push_reqs:
         std::collections::HashMap<request_response::OutboundRequestId, (String, u64)>,
+    /// In-flight mailbox appends, keyed by outbound request id. An
+    /// `Appended` ack feeds the group's watermark; a failure just drops the
+    /// entry (the healing path re-covers the range).
+    pub(crate) pending_mailbox_appends: std::collections::HashMap<
+        request_response::OutboundRequestId,
+        mailbox_manager::MailboxAppendCtx,
+    >,
+    /// In-flight mailbox fetches: request id -> `(effective_topic,
+    /// after_seq)` (the cursor the fetch was issued from, needed for the
+    /// gap predicate on the response).
+    pub(crate) pending_mailbox_fetches:
+        std::collections::HashMap<request_response::OutboundRequestId, (String, u64)>,
+    /// Channel for spawned mailbox tasks (drain apply, heal build) to report
+    /// back to the event loop.
+    pub(crate) mailbox_task_tx: mpsc::Sender<mailbox_manager::MailboxTaskMsg>,
+    pub(crate) mailbox_task_rx: mpsc::Receiver<mailbox_manager::MailboxTaskMsg>,
     /// Shared network status snapshot, read by consumers.
     pub(crate) network_status: Arc<std::sync::RwLock<crate::network_status::NetworkStatus>>,
     /// Broadcast sender for network events.
@@ -1998,6 +2080,16 @@ impl EngineRunner {
         // post-reconnect sweep re-sends rather than waiting on acks that will
         // never arrive on the old substream.
         self.push_pending_registrations.clear();
+        // Same for in-flight mailbox traffic: appends/fetches on the dead
+        // connection never resolve. Their versions stay in `mailbox_unacked`
+        // (the healing path covers them after reconnect); release drain/heal
+        // sessions so the post-reconnect triggers re-arm.
+        self.pending_mailbox_appends.clear();
+        self.pending_mailbox_fetches.clear();
+        for g in self.groups.values_mut() {
+            g.mailbox_drain_in_flight = false;
+            g.mailbox_heal = None;
+        }
         // The reservation died with the connection; clear both idempotency
         // flags so the immediate reconnect path below can re-arm.
         self.circuit_listen_pending = false;
@@ -2305,6 +2397,11 @@ impl EngineRunner {
                 },
                 _ = redeliver_interval.tick() => {
                     self.redeliver_pending_pushes();
+                    // Mailbox backstop: heal un-appended local writes (an
+                    // append failed or the relay was away at write time) and
+                    // advance idle groups' watermark freshness. No-op in the
+                    // steady state.
+                    self.mailbox_maintenance_tick().await;
                 },
                 _ = reconnect_sweep.tick() => {
                     self.sweep_wanted_peers();
@@ -2347,6 +2444,12 @@ impl EngineRunner {
                 Some((peer, req)) = self.reconcile_req_rx.recv() => {
                     // Off-loop-built reconcile digest (#82) — send it on the swarm.
                     self.swarm.behaviour_mut().snapshot.send_request(&peer, req);
+                },
+                Some(msg) = self.mailbox_task_rx.recv() => {
+                    // Spawned mailbox work (drain apply / heal build) reporting
+                    // back: page the next fetch, finish the drain, or send the
+                    // sealed healing delta.
+                    self.handle_mailbox_task_msg(msg).await;
                 },
                 Some(rc) = self.remote_changeset_rx.recv() => {
                     // Route the changeset to the group it was received for.
@@ -2621,6 +2724,15 @@ impl EngineRunner {
         // peers are behind NAT with no direct connection, and push is the
         // only way to wake the other side.
         self.notify_relay_topic(&effective_topic, visible);
+
+        // Durability path: seal and append the changeset to the relay's
+        // mailbox, in parallel with the fan-out above (the fan-out never
+        // waits on the relay round-trip; a mailbox seq is deliberately not
+        // carried on pushes — cursors advance only via drain). If the relay
+        // is unreachable the version is recorded as un-appended and the
+        // healing path covers it on reconnect.
+        self.maybe_append_to_mailbox(&effective_topic, &changeset)
+            .await;
     }
 
     /// Connected peers eligible for a fan-out push of `effective_topic`: every
@@ -2942,6 +3054,9 @@ impl EngineRunner {
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Push(event)) => {
                 self.handle_push_event(event);
+            }
+            SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Mailbox(event)) => {
+                self.handle_mailbox_event(event).await;
             }
             SwarmEvent::Behaviour(WaveSyncBehaviourEvent::Auth(event)) => {
                 self.handle_auth_challenge(event);

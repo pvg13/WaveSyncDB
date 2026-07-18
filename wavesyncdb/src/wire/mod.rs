@@ -8,10 +8,16 @@
 //! build once shipped a stale snapshot protocol id from a hand-kept copy,
 //! which silently broke web↔native negotiation.
 //!
-//! Framing invariant: snapshot and push use a **big-endian** 4-byte length
-//! prefix + serde_json. (The native-only auth handshake uses little-endian
-//! and stays in `engine/auth_protocol.rs`.)
+//! Framing invariant: snapshot, push and mailbox use a **big-endian** 4-byte
+//! length prefix + serde_json. (The native-only auth handshake uses
+//! little-endian and stays in `engine/auth_protocol.rs`.)
+//!
+//! The relay binary keeps hand-maintained lockstep copies of the push and
+//! mailbox protocol files (`wavesync_relay/src/{push,mailbox}_protocol.rs`) —
+//! it deliberately does not depend on this crate. Changes here must be
+//! mirrored there.
 
+pub mod mailbox_protocol;
 pub mod push_protocol;
 pub mod snapshot_protocol;
 

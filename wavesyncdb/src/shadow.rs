@@ -757,6 +757,105 @@ pub async fn set_tombstone_retention(
     Ok(())
 }
 
+/// Persistent relay-mailbox state for this group's database, stored in
+/// `_wavesync_meta` (one scalar each, `u64` LE — the same encoding as
+/// `tombstone_retention`). Absent keys mean "never touched the mailbox".
+/// (`pub` because it rides on the `pub` `GroupInit` handed through
+/// `EngineCommand::JoinGroup`; construct it via `Default` — the fields are
+/// internal bookkeeping, not API.)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MailboxMeta {
+    /// Last mailbox seq applied locally (drain cursor). 0 = drain from the
+    /// beginning.
+    pub cursor: u64,
+    /// The relay log's epoch stored beside the cursor. A mismatch against a
+    /// fetch response means the relay's log was reset and the cursor is
+    /// meaningless (gap → reconcile fallback).
+    pub epoch: Option<u64>,
+    /// Mailbox heal cursor / watermark W: a healing delta built from
+    /// `get_changes_since(W)` covers every local write whose append wasn't
+    /// acked. Kept strictly below every unacked local version; advanced to
+    /// the current stamp only when nothing local is outstanding (see
+    /// `engine::mailbox_manager`).
+    pub acked_version: u64,
+}
+
+pub(crate) async fn get_mailbox_meta(db: &impl ConnectionTrait) -> Result<MailboxMeta, DbErr> {
+    #[derive(Debug, FromQueryResult)]
+    struct MetaRow {
+        key: String,
+        value: Vec<u8>,
+    }
+    let rows = MetaRow::find_by_statement(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT key, value FROM _wavesync_meta WHERE key IN ($1, $2, $3)",
+        [
+            "mailbox_cursor".into(),
+            "mailbox_epoch".into(),
+            "mailbox_acked_version".into(),
+        ],
+    ))
+    .all(db)
+    .await?;
+    let mut meta = MailboxMeta::default();
+    for row in rows {
+        let Ok(bytes) = <[u8; 8]>::try_from(row.value) else {
+            continue;
+        };
+        let v = u64::from_le_bytes(bytes);
+        match row.key.as_str() {
+            "mailbox_cursor" => meta.cursor = v,
+            "mailbox_epoch" => meta.epoch = Some(v),
+            "mailbox_acked_version" => meta.acked_version = v,
+            _ => {}
+        }
+    }
+    Ok(meta)
+}
+
+/// Persist the drain cursor and the relay-log epoch it belongs to. Written
+/// only AFTER the drained entries' apply transactions commit — a crash
+/// in between just re-fetches (idempotent), never skips.
+pub(crate) async fn set_mailbox_cursor(
+    db: &impl ConnectionTrait,
+    cursor: u64,
+    epoch: u64,
+) -> Result<(), DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        [
+            "mailbox_cursor".into(),
+            cursor.to_le_bytes().to_vec().into(),
+        ],
+    ))
+    .await?;
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        ["mailbox_epoch".into(), epoch.to_le_bytes().to_vec().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Persist the append watermark W (see [`MailboxMeta::acked_version`]).
+pub(crate) async fn set_mailbox_acked_version(
+    db: &impl ConnectionTrait,
+    version: u64,
+) -> Result<(), DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT OR REPLACE INTO _wavesync_meta (key, value) VALUES ($1, $2)",
+        [
+            "mailbox_acked_version".into(),
+            version.to_le_bytes().to_vec().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
 /// The exclusion cutoff: tombstones with `deleted_ts < cutoff` are treated
 /// as nonexistent EVERYWHERE (wire, digests, RBSR, conflict gates). `None`
 /// disables retention. Absent key = the 7-day default.
@@ -1019,6 +1118,30 @@ mod tests {
         let db = setup_db().await;
         // Should be idempotent
         create_meta_table(&db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mailbox_meta_roundtrip() {
+        let db = setup_db().await;
+        // Untouched DB: all defaults, epoch absent (drain-from-scratch).
+        let meta = get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 0);
+        assert_eq!(meta.epoch, None);
+        assert_eq!(meta.acked_version, 0);
+
+        set_mailbox_cursor(&db, 42, 7).await.unwrap();
+        set_mailbox_acked_version(&db, 17).await.unwrap();
+        let meta = get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 42);
+        assert_eq!(meta.epoch, Some(7));
+        assert_eq!(meta.acked_version, 17);
+
+        // Overwrites (cursor advances, relay-log epoch swap on reset).
+        set_mailbox_cursor(&db, 0, 8).await.unwrap();
+        let meta = get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 0);
+        assert_eq!(meta.epoch, Some(8));
+        assert_eq!(meta.acked_version, 17);
     }
 
     #[tokio::test]
