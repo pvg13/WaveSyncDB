@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
-    EntityTrait, ExecResult, Iterable, PrimaryKeyToColumn, QueryResult, Schema, Statement,
-    TransactionTrait, sea_query::SqliteQueryBuilder,
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, ExecResult, Iterable,
+    PrimaryKeyToColumn, QueryResult, Schema, Statement, sea_query::SqliteQueryBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
@@ -40,6 +39,51 @@ fn may_write(sql: &str) -> bool {
 /// directory as the SQLite file itself.
 pub(crate) fn key_cache_dir(database_url: &str) -> Option<PathBuf> {
     SyncConfig::config_path(database_url).and_then(|p| p.parent().map(PathBuf::from))
+}
+
+/// Open the SQLite connection pool for a WaveSyncDB-managed database.
+///
+/// Every WaveSyncDB-managed file goes through this (the default group and
+/// every runtime-joined group) instead of a plain `Database::connect`,
+/// because the file is deliberately shared with connection pools in *other
+/// processes*: the FCM/APNs background-sync wake and the iOS Notification
+/// Service Extension each open their own pool on the same file while the
+/// app's pool may still be alive. Under SQLite's default rollback journal,
+/// readers and the writer exclude each other across pools — a long catch-up
+/// read in one process starves a write in the other past `busy_timeout`, the
+/// write fails with "database is locked", and a remote-apply transaction
+/// rolls back (the sync silently degrades to the next catch-up round).
+///
+/// * `journal_mode=WAL` — removes reader↔writer blocking entirely;
+///   writer↔writer stays serialized via the busy handler, which both sides'
+///   short transactions tolerate. WAL is a persistent property of the DB
+///   file; the `-wal`/`-shm` sidecars live next to it (the app data dir on
+///   mobile) and inherit the directory's protection class on iOS.
+/// * `busy_timeout=5s` — sqlx's default, made explicit because correctness
+///   here depends on it.
+/// * `synchronous=NORMAL` — the standard WAL pairing: no corruption risk, at
+///   most the last commit is lost on power failure.
+/// * `log_statements(Debug)` — same rationale as the previous
+///   `ConnectOptions::sqlx_logging_level(Debug)`: per-query INFO logs drown
+///   engine events on logcat (a sync round can be hundreds of queries).
+async fn connect_sqlite(database_url: &str) -> Result<DatabaseConnection, DbErr> {
+    use sea_orm::sqlx::ConnectOptions as _;
+    use sea_orm::sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
+    use std::str::FromStr;
+
+    let opts = SqliteConnectOptions::from_str(database_url)
+        .map_err(|e| DbErr::Custom(format!("invalid SQLite URL '{database_url}': {e}")))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .synchronous(SqliteSynchronous::Normal)
+        .log_statements(log::LevelFilter::Debug);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(opts)
+        .await
+        .map_err(|e| DbErr::Custom(format!("failed to open SQLite pool: {e}")))?;
+    Ok(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
 /// Returned by [`group_key_for_dir`] when called with `load_only: true` and
@@ -274,6 +318,68 @@ pub(crate) struct WaveSyncNodeInner {
     group_key_cache_enabled: bool,
 }
 
+/// Accessors for the background-sync reuse path (`background_sync` +
+/// `node_registry`): a push wake that found this live node drives it through
+/// these instead of building a second engine. All are cheap and
+/// runtime-agnostic (tokio sync primitives work across runtimes), so the
+/// per-wake runtime the FFI layer creates can call them directly.
+impl WaveSyncNodeInner {
+    /// Signal a push wake: the engine rediscovers/re-syncs (forcing a relay
+    /// reset if it detected a suspension gap — see `EngineCommand::PushWake`),
+    /// and foreground hooks get a refresh tick in case the app comes back to
+    /// the foreground during or right after the sync window.
+    pub(crate) fn push_wake(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::PushWake);
+        let _ = self.refresh_tx.send(());
+    }
+
+    /// Escalation backstop for the reuse wait loop: force-reset the relay and
+    /// peer connections when a wake made no contact at all (covers the case
+    /// where the engine's suspension-gap detection missed).
+    pub(crate) fn escalate_network_transition(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::NetworkTransition);
+    }
+
+    /// One-shot full-sync fallback, mirroring the cold path's
+    /// "peer connected but no incremental sync completed" timer.
+    pub(crate) fn send_request_full_sync(&self) {
+        let _ = self.cmd_tx.try_send(EngineCommand::RequestFullSync);
+    }
+
+    pub(crate) fn subscribe_network_events(
+        &self,
+    ) -> broadcast::Receiver<crate::network_status::NetworkEvent> {
+        self.network_event_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_notifications(
+        &self,
+    ) -> broadcast::Receiver<crate::notify::Notification> {
+        self.notification_tx.subscribe()
+    }
+
+    /// Peers already connected at wake time. Seeds the reuse wait loop's
+    /// "saw any peer" flag — an already-connected peer emits no fresh
+    /// `PeerConnected` event for the loop to observe.
+    pub(crate) fn connected_peer_count(&self) -> usize {
+        self.network_status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .connected_peers
+            .len()
+    }
+
+    /// Whether this node currently serves more than one live group. Drives
+    /// the reuse wait loop's post-first-sync linger window, mirroring the
+    /// cold path's longer grace when extra groups were rejoined.
+    pub(crate) fn serves_multiple_groups(&self) -> bool {
+        self.groups
+            .lock()
+            .map(|g| g.values().filter(|w| w.strong_count() > 0).count() > 1)
+            .unwrap_or(false)
+    }
+}
+
 impl Drop for WaveSyncNodeInner {
     fn drop(&mut self) {
         // Abort the engine task to prevent zombie swarms (e.g. mDNS cross-talk
@@ -301,7 +407,6 @@ pub struct WaveSyncNode {
 /// Internal shared state for [`WaveSyncDb`] — a single sync group's handle.
 struct WaveSyncDbInner {
     inner: DatabaseConnection,
-    #[allow(dead_code)]
     database_url: String,
     /// Clone of the node's local-write channel. Every local write funnels
     /// through `dispatch_sync`'s single `send` site, which stamps
@@ -978,7 +1083,11 @@ impl WaveSyncDb {
         // Open the bookkeeping transaction. Roll back the in-memory counter
         // if we can't even start a tx — keeps it in sync with the persisted
         // state.
-        let txn = match inner.begin().await {
+        // IMMEDIATE, not deferred: this transaction reads shadow state before
+        // writing it, and under WAL a deferred read→write upgrade fails with
+        // an instant SQLITE_BUSY whenever another connection committed in
+        // between (see `shadow::begin_write_txn`).
+        let txn = match crate::shadow::begin_write_txn(inner).await {
             Ok(t) => t,
             Err(e) => {
                 *ver -= 1;
@@ -1642,13 +1751,7 @@ impl SyncConfig {
     ///
     /// The config is stored alongside the database file as `.wavesync_config.json`.
     pub fn config_path(database_url: &str) -> Option<PathBuf> {
-        // Strip the "sqlite:" or "sqlite://" prefix and query parameters
-        let path_str = database_url
-            .strip_prefix("sqlite://")
-            .or_else(|| database_url.strip_prefix("sqlite:"))
-            .unwrap_or(database_url);
-        let path_str = path_str.split('?').next().unwrap_or(path_str);
-        let db_path = PathBuf::from(path_str);
+        let db_path = crate::node_registry::sqlite_lexical_path(database_url)?;
         db_path.parent().map(|dir| dir.join(CONFIG_FILE_NAME))
     }
 
@@ -2200,13 +2303,7 @@ impl WaveSyncDbBuilder {
             }
         }
 
-        let mut opts = ConnectOptions::new(&self.database_url);
-        // Silence sqlx's per-query INFO logs (one line per SELECT/INSERT/DELETE
-        // — and a sync round can be hundreds of queries). Tracing them at this
-        // verbosity drowns out engine-level events on logcat. Bump to debug if
-        // actually diagnosing slow queries.
-        opts.sqlx_logging_level(log::LevelFilter::Debug);
-        let inner = Database::connect(opts).await?;
+        let inner = connect_sqlite(&self.database_url).await?;
 
         // Create meta table and get/generate persistent site_id
         crate::shadow::create_meta_table(&inner).await?;
@@ -2475,6 +2572,12 @@ impl WaveSyncDbBuilder {
             .unwrap()
             .insert(default_user_topic, Arc::downgrade(&db.inner));
 
+        // Record the live node in the process-global registry so a push wake
+        // in this process reuses this engine instead of building a second one
+        // with the same persisted PeerId/site_id. Weak entry — never keeps
+        // the engine alive.
+        crate::node_registry::register(&db.inner.database_url, &node);
+
         Ok(db)
     }
 }
@@ -2557,9 +2660,7 @@ impl WaveSyncNode {
         // topic is already `wavesync2-<hex>`, so it is filesystem-safe.
         let group_url = derive_group_database_url(&self.inner.base_database_url, &effective_topic);
 
-        let mut opts = ConnectOptions::new(&group_url);
-        opts.sqlx_logging_level(log::LevelFilter::Debug);
-        let db = Database::connect(opts).await?;
+        let db = connect_sqlite(&group_url).await?;
 
         // Same per-DB setup that `build()` performs for the default group.
         crate::shadow::create_meta_table(&db).await?;

@@ -2213,3 +2213,218 @@ async fn test_capture_repair_does_not_cascade_delete_children_96() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Background-not-killed collision regressions (seeds 77–79).
+//
+// A push wake runs in the same OS process as the (possibly frozen) foreground
+// engine but historically opened a SECOND full engine — and a second SQLite
+// connection pool — on the same database file. Two hazards, each with its own
+// regression test below:
+//
+//   * shared-file SQLite: the default rollback journal makes readers and the
+//     writer mutually exclusive, so a long catch-up read in one pool starves
+//     a write in the other past busy_timeout → "database is locked" and the
+//     apply rolls back. WAL removes reader↔writer blocking entirely.
+//   * duplicate engine identity: the second engine loads the same persisted
+//     libp2p keypair + site_id, and the two contend for the relay
+//     reservation. Fixed by reusing the live in-process engine (node
+//     registry) instead of building a second one.
+// ---------------------------------------------------------------------------
+
+/// Not-killed push wake must REUSE the live in-process engine (node
+/// registry), not build a duplicate-identity second one — and must fall back
+/// to the cold path cleanly once the live engine is gone.
+///
+/// Peer A gets its own directory: `background_sync` loads
+/// `.wavesync_config.json` from the DB's parent dir, and every `mem_db()`
+/// file shares one temp dir, so builds would overwrite each other's config.
+#[tokio::test]
+async fn test_bg_push_wake_reuses_live_engine_then_cold_falls_through() {
+    use wavesyncdb::background_sync::{BackgroundSyncResult, background_sync_with_peers_for_topic};
+
+    let dir = std::env::temp_dir().join(format!("wavesync_bg_reuse_{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url_a = format!("sqlite:{}?mode=rwc", dir.join("a.db").display());
+    let topic = format!("test-bg-reuse-{}", Uuid::new_v4());
+
+    let a = make_peer(&url_a, &topic, 77).await;
+    let b = make_peer(&mem_db("bg_reuse_b"), &topic, 78).await;
+
+    // B writes a row while both engines are live.
+    task::ActiveModel {
+        id: Set("reuse-1".to_string()),
+        title: Set("written on B".to_string()),
+        completed: Set(false),
+    }
+    .insert(&b)
+    .await
+    .unwrap();
+
+    // Simulate the push wake exactly the way the FFI layer runs it: a fresh
+    // tokio runtime on another thread calling the shared background-sync
+    // entry point for A's database.
+    let wake_url = url_a.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(background_sync_with_peers_for_topic(
+            &wake_url,
+            Duration::from_secs(20),
+            &[],
+            None,
+        ))
+    })
+    .await
+    .unwrap()
+    .expect("push wake must not error");
+    assert!(
+        matches!(result, BackgroundSyncResult::Synced { .. }),
+        "push wake with a live engine and a reachable peer must sync, got {result:?}"
+    );
+
+    // The live engine must have been reused, not raced or torn down.
+    assert!(
+        a.is_engine_alive(),
+        "the app's engine must survive the push wake"
+    );
+    assert_eventually(
+        "A received B's row via the reused engine",
+        Duration::from_secs(15),
+        || async {
+            task::Entity::find_by_id("reuse-1")
+                .one(&a)
+                .await
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+
+    // And it must still sync normally afterwards (A → B direction).
+    task::ActiveModel {
+        id: Set("reuse-2".to_string()),
+        title: Set("written on A after wake".to_string()),
+        completed: Set(false),
+    }
+    .insert(&a)
+    .await
+    .unwrap();
+    assert_eventually(
+        "B receives A's post-wake row",
+        Duration::from_secs(15),
+        || async {
+            task::Entity::find_by_id("reuse-2")
+                .one(&b)
+                .await
+                .unwrap()
+                .is_some()
+        },
+    )
+    .await;
+
+    // Cold fall-through: with the live engine gone, the same call builds a
+    // fresh engine (killed-app path) and still syncs. This also exercises
+    // the registry's dead-entry pruning end to end.
+    drop(a);
+    let wake_url = url_a.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(background_sync_with_peers_for_topic(
+            &wake_url,
+            Duration::from_secs(20),
+            &[],
+            None,
+        ))
+    })
+    .await
+    .unwrap()
+    .expect("cold fall-through must not error");
+    assert!(
+        matches!(result, BackgroundSyncResult::Synced { .. }),
+        "cold path after engine drop must still sync, got {result:?}"
+    );
+}
+
+/// Shared-file safety: the wrapper's connections must run in WAL mode, and a
+/// write through the wrapper must succeed while a *separate* connection pool
+/// (standing in for the background-sync / NSE process) holds a long read
+/// transaction on the same file. Under the pre-fix rollback journal the
+/// reader's SHARED lock blocks the writer's commit past the 5s busy_timeout
+/// and the write fails with "database is locked".
+#[tokio::test]
+async fn test_bg_shared_file_wal_concurrent_reader_writer() {
+    let url = mem_db("bg_wal");
+    let topic = format!("test-bg-wal-{}", Uuid::new_v4());
+    let a = make_peer(&url, &topic, 79).await;
+
+    // The wrapper's own pool must be in WAL mode.
+    #[derive(FromQueryResult)]
+    struct JournalModeRow {
+        journal_mode: String,
+    }
+    let mode = JournalModeRow::find_by_statement(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "PRAGMA journal_mode".to_string(),
+    ))
+    .one(a.inner())
+    .await
+    .unwrap()
+    .expect("PRAGMA journal_mode returns a row");
+    assert_eq!(
+        mode.journal_mode, "wal",
+        "wrapper connections must run in WAL mode"
+    );
+
+    // Second, independent connection pool on the same file — the shape of the
+    // background-sync process sharing the DB. Hold a read transaction open
+    // longer than the 5s busy_timeout.
+    let raw = sea_orm::Database::connect(&url).await.unwrap();
+    let read_txn = {
+        use sea_orm::TransactionTrait;
+        let txn = raw.begin().await.unwrap();
+        // Force the transaction to actually take its read snapshot / lock.
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            #[allow(dead_code)]
+            n: i64,
+        }
+        CountRow::find_by_statement(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT count(*) AS n FROM tasks".to_string(),
+        ))
+        .one(&txn)
+        .await
+        .unwrap();
+        txn
+    };
+    let reader = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        read_txn.commit().await.unwrap();
+    });
+
+    // Write through the wrapper while the reader transaction is open. In WAL
+    // this completes immediately; under the rollback journal it exhausts
+    // busy_timeout and errors.
+    let started = std::time::Instant::now();
+    task::ActiveModel {
+        id: Set("wal-1".to_string()),
+        title: Set("written during concurrent read txn".to_string()),
+        completed: Set(false),
+    }
+    .insert(&a)
+    .await
+    .expect("write must not be blocked by a concurrent reader under WAL");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "write should not have waited on the reader (took {:?})",
+        started.elapsed()
+    );
+
+    reader.await.unwrap();
+}

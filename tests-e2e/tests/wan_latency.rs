@@ -365,3 +365,108 @@ async fn s4_frozen_resume() -> Result<()> {
     );
     Ok(())
 }
+
+/// S5 — not-killed push wake. Bob's app process stays alive (his engine is
+/// live) but is frozen past the QUIC idle timeout AND past the engine's
+/// 60s suspension-gap threshold, so every connection dies silently. On
+/// unfreeze, a simulated silent push (`POST /push_wake`) runs the shared
+/// background-sync entry point *in Bob's process, next to his live engine*.
+///
+/// Acceptance (fix/bg-engine-reuse): the wake must REUSE the live engine —
+/// one identity in the swarm — and, because `PushWake` force-resets the
+/// suspension-killed relay circuit proactively, converge within a mobile
+/// push budget instead of waiting ~20s for reactive stale-connection
+/// eviction. The live engine must survive the wake and keep syncing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s5_not_killed_push_wake() -> Result<()> {
+    /// Simulated OS-granted push budget (the mobile default).
+    const PUSH_BUDGET: Duration = Duration::from_secs(20);
+
+    let harness = wan_harness("wan-latency-s5").start().await?;
+
+    // Warm-up: both directions once, so address caches and peer versions
+    // are populated (the realistic pre-background state).
+    harness
+        .peer("alice")
+        .insert_task("seed-a", "from alice", false)
+        .await?;
+    harness
+        .peer("bob")
+        .wait_for_task("seed-a", "from alice", CEILING)
+        .await?;
+    harness
+        .peer("bob")
+        .insert_task("seed-b", "from bob", false)
+        .await?;
+    harness
+        .peer("alice")
+        .wait_for_task("seed-b", "from bob", CEILING)
+        .await?;
+
+    // Freeze bob past the QUIC idle timeout (~30s) and past the engine's
+    // suspension-gap threshold (60s at the default sync interval), then
+    // write on alice — the data the push would announce.
+    harness.peer("bob").pause().await?;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    harness
+        .peer("alice")
+        .insert_task("s5-row", "written while bob frozen", false)
+        .await?;
+    tokio::time::sleep(Duration::from_secs(55)).await;
+
+    harness.peer("bob").unpause().await?;
+    let woke = Instant::now();
+
+    // The simulated silent push: same entry point the mobile FFI calls, in
+    // the same process as bob's live engine.
+    let outcome_res = harness.peer("bob").push_wake(PUSH_BUDGET).await;
+    dump_diags(&harness, "s5").await;
+    let outcome = outcome_res?;
+    report_ttfs(
+        "s5_not_killed_push_wake",
+        "push_wake_return",
+        Duration::from_millis(outcome.elapsed_ms),
+    );
+    assert_eq!(
+        outcome.result, "synced",
+        "push wake with a live engine and reachable peer must sync: {outcome:?}"
+    );
+    assert!(
+        Duration::from_millis(outcome.elapsed_ms) <= PUSH_BUDGET,
+        "wake must finish inside the push budget: {outcome:?}"
+    );
+
+    // The pushed row must already be present when the wake returns (small
+    // grace for the HTTP read itself).
+    let ttfs_res = harness
+        .peer("bob")
+        .wait_for_task_timed("s5-row", "written while bob frozen", Duration::from_secs(5))
+        .await;
+    let ttfs = ttfs_res?;
+    report_ttfs("s5_not_killed_push_wake", "row_visible_after_wake", ttfs);
+    report_ttfs(
+        "s5_not_killed_push_wake",
+        "row_visible_after_unfreeze",
+        woke.elapsed(),
+    );
+
+    // The live engine must have survived the wake with its one identity
+    // intact: bob keeps syncing in both directions afterwards.
+    harness
+        .peer("bob")
+        .insert_task("s5-after", "written after wake", false)
+        .await?;
+    harness
+        .peer("alice")
+        .wait_for_task("s5-after", "written after wake", CEILING)
+        .await?;
+    harness
+        .peer("alice")
+        .insert_task("s5-after-2", "alice after wake", false)
+        .await?;
+    harness
+        .peer("bob")
+        .wait_for_task("s5-after-2", "alice after wake", CEILING)
+        .await?;
+    Ok(())
+}

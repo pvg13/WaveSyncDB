@@ -213,6 +213,31 @@ async fn background_sync_core(
         }
     })?;
 
+    // 1b. Serialize wakes per DB, then reuse a live in-process engine if one
+    // exists. When the app is backgrounded-but-not-killed, this wake runs in
+    // the app's own process and the foreground engine is still alive — since
+    // the libp2p keypair and site_id are persisted, building a fresh engine
+    // here would put a SECOND instance of the same PeerId on the swarm, and
+    // the two contend for the relay reservation (remote peers' stale-conn
+    // eviction can kill either one's circuit). Reuse drives the existing
+    // engine instead; the cold path below is unchanged and still serves the
+    // app-killed case. The wake lock also stops two overlapping pushes (iOS
+    // delivers them on a concurrent queue) from racing each other into two
+    // cold engines.
+    let wake_lock = crate::node_registry::wake_lock(database_url);
+    let _wake_guard = wake_lock.lock().await;
+    if let Some(node) = crate::node_registry::live_node(database_url) {
+        log_stage("live_engine_found");
+        let relay_configured = config.relay_server.is_some();
+        let (result, notifications) =
+            resume_live_engine(node, timeout, capture, relay_configured, &log_stage).await;
+        tracing::info!(
+            "bg_sync stage=done elapsed_ms={} result={result:?} (reused live engine)",
+            t_start.elapsed().as_millis()
+        );
+        return Ok((result, notifications));
+    }
+
     // 2. Reconstruct the builder
     let mut builder = WaveSyncDbBuilder::new(database_url, &config.topic)
         .with_group_key_cache(config.group_key_cache_enabled)
@@ -561,6 +586,163 @@ async fn background_sync_core(
     );
     let notifications = std::mem::take(&mut *captured.lock().unwrap());
     Ok((result, notifications))
+}
+
+/// Drive a live in-process engine through a push-wake sync instead of
+/// building a second one (see the reuse branch in [`background_sync_core`]).
+///
+/// The caller runs on its own per-wake tokio runtime while the engine task
+/// runs on the app's — safe, because everything crossing that boundary here
+/// is a tokio sync primitive (mpsc command send, broadcast receives), which
+/// are runtime-agnostic; the timers below belong to the *calling* runtime.
+///
+/// Differences from the cold path, on purpose:
+/// * `target_effective_topic` and payload peer-address hints are ignored —
+///   the live engine already serves every group the app joined and already
+///   knows its peers (address cache, `wanted_peers`); `PushWake` rediscovery
+///   covers the rest.
+/// * The engine is **never** shut down — it belongs to the app.
+/// * The fallback timer has an extra branch: if the wake made no peer
+///   contact at all and a relay is configured, escalate once to a forced
+///   relay reset (`NetworkTransition`). This is the backstop for the
+///   engine-side suspension-gap detection missing (e.g. wall-clock jitter):
+///   without it a silently-dead relay circuit is only noticed by the ~20s
+///   reactive sync-timeout eviction, which overruns the push window.
+async fn resume_live_engine<F: Fn(&str)>(
+    node: std::sync::Arc<crate::connection::WaveSyncNodeInner>,
+    timeout: Duration,
+    capture: bool,
+    relay_configured: bool,
+    log_stage: &F,
+) -> (BackgroundSyncResult, Vec<crate::notify::Notification>) {
+    // Subscribe before commanding: broadcast only delivers to existing
+    // subscribers, and the engine may react to PushWake immediately.
+    let mut events = node.subscribe_network_events();
+
+    // Notification pumps, mirroring the cold path's two mutually-exclusive
+    // consumers — but subscribed ONCE: every group's notification sender is a
+    // clone of the node-level channel, so one receiver sees all groups.
+    let captured: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::Notification>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut notif_pumps: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    #[cfg(feature = "push-sync")]
+    if !capture {
+        let mut rx = node.subscribe_notifications();
+        notif_pumps.push(tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(n) => crate::notify_display::show_background(&n),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+    if capture {
+        let mut rx = node.subscribe_notifications();
+        let captured = captured.clone();
+        notif_pumps.push(tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(n) => captured.lock().unwrap().push(n),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+
+    node.push_wake();
+    log_stage("push_wake_sent");
+
+    // Peers connected before the wake emit no fresh PeerConnected event, so
+    // seed the flag from the engine's current status snapshot.
+    let mut saw_any_peer = node.connected_peer_count() > 0;
+
+    let completion_grace_base = if node.serves_multiple_groups() {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(500)
+    };
+    let completion_grace = scaled_completion_grace(completion_grace_base, timeout);
+    let fallback_after = scaled_fallback_after(timeout);
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let fallback = tokio::time::sleep(fallback_after);
+    tokio::pin!(fallback);
+
+    let mut synced_peers = HashSet::new();
+    let mut fallback_done = false;
+    let mut logged_relay_listening = false;
+    let mut logged_first_peer = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                log_stage("timeout");
+                break;
+            }
+            _ = &mut fallback, if synced_peers.is_empty() && !fallback_done => {
+                fallback_done = true;
+                if saw_any_peer {
+                    // Peer contact but no incremental sync completed — same
+                    // one-shot full-sync fallback as the cold path.
+                    log_stage("full_sync_fallback");
+                    node.send_request_full_sync();
+                } else if relay_configured {
+                    // No contact at all: the relay circuit most likely died
+                    // during suspension without the engine's gap detection
+                    // firing. Force a clean relay/peer reconnect once.
+                    log_stage("relay_escalation");
+                    node.escalate_network_transition();
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(NetworkEvent::PeerConnected(_)) => {
+                        if !logged_first_peer {
+                            log_stage("first_peer");
+                            logged_first_peer = true;
+                        }
+                        saw_any_peer = true;
+                    }
+                    Ok(NetworkEvent::RelayStatusChanged(crate::RelayStatus::Listening)) => {
+                        if !logged_relay_listening {
+                            log_stage("relay_listening");
+                            logged_relay_listening = true;
+                        }
+                    }
+                    Ok(NetworkEvent::PeerSynced { peer_id, .. }) => {
+                        log_stage("first_peer_synced");
+                        synced_peers.insert(peer_id);
+                        // Brief window for additional peers/groups to finish.
+                        tokio::time::sleep(completion_grace).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    for h in notif_pumps {
+        h.abort();
+    }
+    // NO shutdown: the engine belongs to the app.
+
+    let peers_synced = synced_peers.len();
+    let result = if peers_synced > 0 {
+        BackgroundSyncResult::Synced { peers_synced }
+    } else if saw_any_peer {
+        BackgroundSyncResult::TimedOut { peers_synced: 0 }
+    } else {
+        BackgroundSyncResult::NoPeers
+    };
+    let notifications = std::mem::take(&mut *captured.lock().unwrap());
+    (result, notifications)
 }
 
 /// Scale the "connected-but-no-incremental-sync" fallback timer (see the

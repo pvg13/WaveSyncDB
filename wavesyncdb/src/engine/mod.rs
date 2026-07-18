@@ -139,6 +139,17 @@ pub enum EngineCommand {
     /// Network interface changed (WiFi ↔ cellular) — force-disconnect all
     /// connections and re-establish on the new interface.
     NetworkTransition,
+    /// Push-notification wake of a live (backgrounded-but-not-killed) engine.
+    /// Behaves like [`Resume`](Self::Resume), except that when the engine's
+    /// event loop observed a suspension-length gap — meaning the relay
+    /// circuit and peer connections likely died silently while the process
+    /// was frozen — the relay is proactively reset (as
+    /// [`NetworkTransition`](Self::NetworkTransition) would) instead of
+    /// waiting ~20s for reactive `sync_timeout_strikes` detection, which a
+    /// 10–25s push window cannot afford. Ordinary foreground resumes keep
+    /// using `Resume`, so the reservation-churn protection there is
+    /// untouched.
+    PushWake,
     /// Request a full sync from peers (user-triggered).
     RequestFullSync,
     /// Register a push notification token with the relay server.
@@ -868,6 +879,8 @@ async fn run_engine(
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
+        last_loop_wall: std::time::SystemTime::now(),
+        suspension_detected_until: None,
         api_key,
         keypair,
         nat_assumption_deadline: None,
@@ -1034,6 +1047,28 @@ const DEMOTION_DWELL: Duration = Duration::from_secs(10);
 /// instead of stalling the peer for the full timeout window.
 pub(crate) const PENDING_SYNC_STALE: Duration = Duration::from_secs(10);
 
+/// How long a detected suspension gap stays "fresh" for a subsequent
+/// `PushWake`. The wake FFI call follows process unfreeze within
+/// milliseconds; this only needs to outlive scheduling jitter between the
+/// loop iteration that observed the gap and the one that handles the command.
+const SUSPENSION_MARK_TTL: Duration = Duration::from_secs(120);
+
+/// Whether the wall-clock distance from `prev` to `now` indicates the process
+/// was suspended (frozen cgroup, iOS background suspension) rather than just
+/// an idle select loop. Wall clock, not `Instant`: monotonic clocks stop
+/// during device suspend and would under-report exactly the gaps this must
+/// catch. A backwards jump (NTP correction) reads as no gap — the worst case
+/// is a missed proactive reset, covered by the wait-loop escalation backstop
+/// in `background_sync`. This feeds connectivity decisions only, never
+/// conflict resolution.
+fn wall_gap_exceeded(
+    prev: std::time::SystemTime,
+    now: std::time::SystemTime,
+    threshold: Duration,
+) -> bool {
+    now.duration_since(prev).is_ok_and(|gap| gap >= threshold)
+}
+
 fn peer_dial_backoff(prior_failures: u32) -> Duration {
     const BASE_SECS: u64 = 5;
     const COEF_SECS: u64 = 1;
@@ -1169,6 +1204,18 @@ struct EngineRunner {
     pub(crate) network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     /// Optional deadline for a post-resume sync retry (gives mDNS/rendezvous time to rediscover).
     pub(crate) resume_sync_deadline: Option<tokio::time::Instant>,
+    /// Wall-clock stamp of the last event-loop iteration. A large jump
+    /// between iterations means the process was suspended (see
+    /// [`wall_gap_exceeded`]) — the signal that turns the next `PushWake`
+    /// into a forced relay reset.
+    pub(crate) last_loop_wall: std::time::SystemTime,
+    /// Sticky "a suspension gap was recently observed" marker, set by the
+    /// loop-top gap check and consumed by the `PushWake` handler. Needed
+    /// because after unfreeze the overdue timer arms race the command arm:
+    /// if a timer arm wins, the loop wraps and refreshes `last_loop_wall`
+    /// before the command is handled, so the handler's own live-gap check
+    /// would miss.
+    pub(crate) suspension_detected_until: Option<tokio::time::Instant>,
     /// API key for managed relay authentication.
     pub(crate) api_key: Option<String>,
     /// Keypair used for signing auth challenges (same identity as the swarm).
@@ -1977,6 +2024,57 @@ impl EngineRunner {
         self.try_dial_relay();
     }
 
+    /// The wall-clock gap between event-loop iterations that indicates the
+    /// process was suspended rather than merely idle. The loop's slowest
+    /// idle cadence is a periodic timer (3–5s, plus `sync_interval`), so the
+    /// threshold sits well above `2 × sync_interval` and never below 60s —
+    /// a healthy loop can't trip it, and connections rarely die under
+    /// shorter suspensions anyway (keep-alives cover them).
+    fn suspension_gap_threshold(&self) -> Duration {
+        (self.config.sync_interval * 2).max(Duration::from_secs(60))
+    }
+
+    /// Loop-top check: detect a suspension-length wall-clock gap since the
+    /// previous iteration and remember it (with a TTL) for the `PushWake`
+    /// handler. See the `last_loop_wall` / `suspension_detected_until` field
+    /// docs for why the sticky marker is needed in addition to the handler's
+    /// own live check.
+    fn observe_loop_gap(&mut self) {
+        let now = std::time::SystemTime::now();
+        if wall_gap_exceeded(self.last_loop_wall, now, self.suspension_gap_threshold()) {
+            tracing::info!(
+                gap_secs = now
+                    .duration_since(self.last_loop_wall)
+                    .map(|g| g.as_secs())
+                    .unwrap_or(0),
+                "engine loop gap detected — process was likely suspended; a push wake \
+                 within {}s will force a relay reset",
+                SUSPENSION_MARK_TTL.as_secs()
+            );
+            self.suspension_detected_until =
+                Some(tokio::time::Instant::now() + SUSPENSION_MARK_TTL);
+        }
+        self.last_loop_wall = now;
+    }
+
+    /// Whether a `PushWake` arriving now should force a relay reset: a
+    /// suspension gap was observed either live (this iteration spans the
+    /// frozen window — the command arm won the post-unfreeze race) or by a
+    /// recent loop-top check (a timer arm won). Consumes the sticky marker.
+    /// Meaningless without a relay configured, so gated on that.
+    pub(super) fn push_wake_wants_relay_reset(&mut self) -> bool {
+        let live = wall_gap_exceeded(
+            self.last_loop_wall,
+            std::time::SystemTime::now(),
+            self.suspension_gap_threshold(),
+        );
+        let marked = self
+            .suspension_detected_until
+            .take()
+            .is_some_and(|until| tokio::time::Instant::now() < until);
+        (live || marked) && self.config.relay_server.is_some()
+    }
+
     async fn run(
         &mut self,
         sync_rx: &mut mpsc::Receiver<TaggedChangeset>,
@@ -2184,6 +2282,7 @@ impl EngineRunner {
         let registry_ready = self.default_group().registry_ready.clone();
 
         loop {
+            self.observe_loop_gap();
             tokio::select! {
                 Some(tc) = sync_rx.recv() => {
                     self.handle_local_changeset(tc).await;
@@ -3472,6 +3571,42 @@ mod tests {
                 "{s} should NOT be classified LAN"
             );
         }
+    }
+
+    #[test]
+    fn wall_gap_detects_suspension_and_tolerates_clock_jumps() {
+        use std::time::SystemTime;
+        let threshold = Duration::from_secs(60);
+        let now = SystemTime::now();
+        // Idle-loop cadence (a few seconds) is not a suspension.
+        assert!(!wall_gap_exceeded(
+            now - Duration::from_secs(5),
+            now,
+            threshold
+        ));
+        // Just under the threshold: not a suspension.
+        assert!(!wall_gap_exceeded(
+            now - Duration::from_secs(59),
+            now,
+            threshold
+        ));
+        // At/over the threshold: suspension.
+        assert!(wall_gap_exceeded(
+            now - Duration::from_secs(60),
+            now,
+            threshold
+        ));
+        assert!(wall_gap_exceeded(
+            now - Duration::from_secs(3600),
+            now,
+            threshold
+        ));
+        // Backwards clock jump (NTP correction): reads as no gap, never panics.
+        assert!(!wall_gap_exceeded(
+            now + Duration::from_secs(120),
+            now,
+            threshold
+        ));
     }
 
     #[test]

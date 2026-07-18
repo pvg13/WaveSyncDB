@@ -94,6 +94,11 @@ pub(crate) mod key_cache;
 // at the same directory. See `ffi::wavesync_app_group_container`'s docs.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi", target_os = "ios"))]
 pub use ffi::wavesync_app_group_container;
+// Process-global registry of live sync nodes, keyed by canonical DB path.
+// Lets a push wake reuse the in-process engine instead of building a
+// duplicate-identity second one. See the module docs.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod node_registry;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod notify;
 // Native notification display for the headless background-sync path (the

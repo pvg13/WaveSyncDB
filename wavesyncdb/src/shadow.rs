@@ -12,6 +12,29 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, ExecResult, FromQueryResu
 use crate::messages::{ColumnChange, NodeId};
 use crate::registry::TableRegistry;
 
+/// Begin one of this crate's bookkeeping transactions as `BEGIN IMMEDIATE`.
+///
+/// Managed DBs run in WAL (`connection::connect_sqlite`). A *deferred*
+/// transaction that reads before its first write takes its snapshot at that
+/// read; if any other connection commits before the write, SQLite fails the
+/// write-lock upgrade **immediately** with `SQLITE_BUSY` ("database is
+/// locked") — the busy handler is deliberately bypassed, because waiting
+/// cannot un-stale the snapshot. Both bookkeeping transactions in this crate
+/// (the local-write drain and the remote-changeset apply) are
+/// read-then-write, so under concurrent pool traffic a plain `begin()` fails
+/// constantly. `IMMEDIATE` takes the write lock at `BEGIN`, where
+/// `busy_timeout` *does* apply — concurrent writers queue instead of failing.
+pub(crate) async fn begin_write_txn(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<sea_orm::DatabaseTransaction, DbErr> {
+    use sea_orm::TransactionTrait;
+    db.begin_with_options(sea_orm::TransactionOptions {
+        sqlite_transaction_mode: Some(sea_orm::SqliteTransactionMode::Immediate),
+        ..Default::default()
+    })
+    .await
+}
+
 /// A single clock entry from a shadow table.
 #[derive(Debug, Clone)]
 pub struct ClockEntry {
