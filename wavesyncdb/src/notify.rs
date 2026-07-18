@@ -79,6 +79,9 @@ pub struct Notification {
     /// manifest intent filter is needed and the app routes the URL itself
     /// (`onNewIntent` warm / `onCreate` intent cold, depending on the
     /// activity's `launchMode`). `None` → tapping simply opens the app.
+    ///
+    /// iOS display does not consume this yet — taps open the app regardless
+    /// (plumbing is a follow-up). Desktop notifications have no tap action.
     pub deeplink: Option<String>,
 }
 
