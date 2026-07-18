@@ -171,6 +171,7 @@ start_writer() {
             TOPIC="$TOPIC" \
             PASSPHRASE="$PASSPHRASE" \
             RELAY_ADDR="$RELAY_ADDR" \
+            PUSH_TOKEN="${PUSH_TOKEN:-}" \
             MDNS_ENABLED=false \
             RUST_LOG=info,libp2p_swarm=warn \
             "$tgt/release/test-peer" \
