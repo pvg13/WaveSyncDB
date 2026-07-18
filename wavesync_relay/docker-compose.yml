@@ -10,9 +10,17 @@
 #      project's files/ directory on the host; the "mount path" field is
 #      relative to that directory, not the container). Two working options:
 #
-#      a) INLINE ENV (recommended — simplest and what this file assumes):
-#         paste the secret CONTENT directly into the env var in Dokploy's
-#         Environment tab; the relay auto-detects content vs path:
+#      a) FILE MOUNT + compose bind (ACTIVE in this file for FCM + APNs):
+#         in Dokploy create File Mounts named exactly `fcm.json` (service-
+#         account JSON) and `apns.p8` (APNs PEM). They land at
+#         <project>/files/<name> on the host; the volumes: section below
+#         already binds them into /run/secrets/, which the content env vars
+#         default to. Skip the ones you don't use — but then also comment
+#         out the matching bind line below (see the warning there).
+#
+#      b) INLINE ENV alternative: paste the secret CONTENT into the env var
+#         in Dokploy's Environment tab; the relay auto-detects content vs
+#         path (env overrides the mounted-path default):
 #           FCM_CREDENTIALS  = service-account JSON minified to ONE line
 #                              (jq -c . fcm.json) — detected by leading `{`
 #           IDENTITY_KEYPAIR = base64 keypair string (only to migrate an
@@ -20,15 +28,7 @@
 #                              and persists it in the relay-data volume)
 #           APNS_KEY_FILE    = inline PEM (detected by -----BEGIN). PEMs are
 #                              multiline and .env-style editors often mangle
-#                              them — if you use APNs, prefer option (b) for
-#                              this one secret.
-#
-#      b) FILE MOUNT + compose bind: create the File Mount in Dokploy (it
-#         lands at <project>/files/<name> on the host), then uncomment the
-#         matching `../files/...` bind line in the volumes: section below,
-#         commit, Redeploy. The exact ../ depth from this compose file to
-#         the files dir depends on Dokploy's checkout layout — if the relay
-#         logs a missing-file error at startup, adjust the depth.
+#                              them — the file mount (a) is safer for APNs.
 #
 #   5. Environment Variables — set at minimum:
 #          EXTERNAL_ADDRESS   (REQUIRED — public multiaddr clients dial)
@@ -106,21 +106,30 @@ services:
       # Persists /data/identity.key (PeerId) and /data/push_tokens.db.
       - relay-data:/data
 
-      # NO secret bind mounts active by default — inline env vars are the
-      # canonical production mechanism (header step 4a). If you use Dokploy
-      # File Mounts instead (header step 4b), uncomment the ../files lines;
-      # for local docker-compose testing, uncomment the ./secrets lines and
-      # place real files there.
+      # ACTIVE Dokploy File-Mount binds (header step 4b): create File Mounts
+      # named exactly `fcm.json` and `apns.p8` in Dokploy (Advanced → Mounts;
+      # they land at <project>/files/<name> on the host). Relative bind paths
+      # resolve against this compose file's directory — the repo checkout
+      # lives at <project>/code/, this file at code/wavesync_relay/, so
+      # <project>/files is ../../files from here. If the relay logs a
+      # missing-file / is-a-directory error for /run/secrets/*, the checkout
+      # nesting differs — adjust the ../ depth.
+      # If you don't use push notifications (or use inline env instead),
+      # comment these two lines out; a bind whose host file doesn't exist
+      # makes docker create an empty DIRECTORY at that path, which the relay
+      # then treats as an unreadable credential (push stays disabled) and
+      # which blocks creating the same-named File Mount later until removed.
+      - ../../files/fcm.json:/run/secrets/fcm.json:ro
+      - ../../files/apns.p8:/run/secrets/apns.p8:ro
+      # Identity stays volume-persisted (relay-data); only mount it when
+      # migrating an existing PeerId:
+      # - ../../files/identity.b64:/run/secrets/identity.b64:ro
       #
-      # Dokploy File Mounts (step 4b):
-      # - ../files/identity.b64:/run/secrets/identity.b64:ro
-      # - ../files/fcm.json:/run/secrets/fcm.json:ro
-      # - ../files/apns.p8:/run/secrets/apns.p8:ro
-      #
-      # Local testing:
-      # - ./secrets/identity.b64:/run/secrets/identity.b64:ro
+      # Local testing variant (comment the ../../files lines above, use these,
+      # place real files in ./secrets/):
       # - ./secrets/fcm.json:/run/secrets/fcm.json:ro
       # - ./secrets/apns.p8:/run/secrets/apns.p8:ro
+      # - ./secrets/identity.b64:/run/secrets/identity.b64:ro
     environment:
       # ---------- REQUIRED ----------
       # Public multiaddr advertised to clients. Without it, clients get
