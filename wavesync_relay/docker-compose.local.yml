@@ -1,14 +1,34 @@
-# LOCAL TESTING ONLY — publishes the monitoring UIs on localhost so you can
-# eyeball dashboards before deploying. Never deploy this file: production
-# exposure goes through a Dokploy Domain on the grafana service (see the
-# header of docker-compose.yml).
+# LOCAL TESTING ONLY — runs the full monitoring stack (Prometheus + Grafana,
+# baked-config images from ./monitoring/) next to the relay and publishes the
+# UIs on localhost. In production these two run as SEPARATE Dokploy services
+# configured entirely in the Dokploy UI — see monitoring/README.md; the
+# production relay compose (docker-compose.yml) is deliberately relay-only.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 #
+# Heads-up: docker-compose.yml's active ../../files secret binds will create
+# empty directories outside the repo when the files don't exist locally —
+# comment them out (or create the files) for local runs.
 services:
   prometheus:
+    build: ./monitoring/prometheus
+    restart: unless-stopped
     ports:
       - "127.0.0.1:9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+
   grafana:
+    build: ./monitoring/grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
     ports:
       - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  prometheus-data:
+  grafana-data:
