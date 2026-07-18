@@ -1,0 +1,14 @@
+# LOCAL TESTING ONLY — publishes the monitoring UIs on localhost so you can
+# eyeball dashboards before deploying. Never deploy this file: production
+# exposure goes through a Dokploy Domain on the grafana service (see the
+# header of docker-compose.yml).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+#
+services:
+  prometheus:
+    ports:
+      - "127.0.0.1:9090:9090"
+  grafana:
+    ports:
+      - "127.0.0.1:3000:3000"
