@@ -891,6 +891,16 @@ impl WaveSyncDb {
     /// to call it manually when registering tables via [`register_table()`](Self::register_table)
     /// without using the schema builder.
     pub fn registry_ready(&self) {
+        // One-shot readiness latch with two notify calls, both load-bearing:
+        // `notify_waiters` wakes every task currently parked on `notified()`
+        // (a lone `notify_one` wedged all but one concurrent waiter — test
+        // setups racing sync() calls, #8/M9) but stores NO permit, so on its
+        // own it loses the signal whenever nobody is parked yet — the common
+        // case, since the engine loop re-creates its `Notified` future each
+        // select iteration and `sync()` usually fires between two of them.
+        // `notify_one` stores that permit for the next arrival. Extra calls
+        // are harmless (the permit caps at one; readiness is idempotent).
+        self.inner.registry_ready.notify_waiters();
         self.inner.registry_ready.notify_one();
         // The engine awaits only the *default* group's `registry_ready` Notify.
         // A runtime-joined group has no such await, so signal it explicitly —
@@ -2914,5 +2924,47 @@ mod tests {
         assert!(!may_write("SELECT * FROM tasks"));
         assert!(!may_write("PRAGMA table_info(tasks)"));
         assert!(!may_write("CREATE TABLE t (id TEXT)"));
+    }
+
+    /// #8 — the readiness latch in `registry_ready()` must reach BOTH every
+    /// waiter already parked on `notified()` AND a waiter that only arrives
+    /// after the signal. This pins the two-call pattern
+    /// (`notify_waiters` + `notify_one`): dropping either call fails one half
+    /// — `notify_one` alone wedges all but one parked waiter, and
+    /// `notify_waiters` alone stores no permit, losing the signal for late
+    /// arrivals (which would leave the engine to its 30s deadline fallback).
+    #[tokio::test]
+    async fn registry_ready_pattern_reaches_parked_and_late_waiters() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        // Two waiters parked BEFORE the signal.
+        let parked: Vec<_> = (0..2)
+            .map(|_| {
+                let n = notify.clone();
+                tokio::spawn(async move { n.notified().await })
+            })
+            .collect();
+        // Let both tasks reach their await point.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The exact call pair `registry_ready()` makes.
+        notify.notify_waiters();
+        notify.notify_one();
+
+        for (i, w) in parked.into_iter().enumerate() {
+            timeout(Duration::from_secs(1), w)
+                .await
+                .unwrap_or_else(|_| panic!("parked waiter {i} was never woken"))
+                .unwrap();
+        }
+
+        // A waiter arriving only after the signal must still proceed (permit).
+        timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("late waiter must consume the stored permit");
     }
 }
