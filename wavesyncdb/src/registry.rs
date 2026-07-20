@@ -167,6 +167,32 @@ impl TableRegistry {
 pub struct NotificationRegistry {
     dispatch: RwLock<HashMap<String, crate::notify::NotifyDispatch>>,
     gate: NotificationGate,
+    /// Rows whose remote INSERT was dispatched before the typed row could be
+    /// reconstructed (a catch-up path delivered only part of the row's cells,
+    /// #103). The apply that completes such a row arrives classified as
+    /// Update; this set lets it be re-presented to the policy as the Insert
+    /// it logically is. In-memory and best-effort: a restart between the
+    /// parts loses the marker (the data still syncs; only the notification
+    /// is skipped). Bounded — overflow clears oldest-agnostic (same skip).
+    pending_split_inserts: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+}
+
+/// Bound on remembered split inserts; far above any realistic in-flight count
+/// (it only grows while a row's cells are between catch-up batches).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PENDING_SPLIT_INSERTS: usize = 1024;
+
+/// What [`NotificationRegistry::dispatch`] produced, for the apply path.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct DispatchResult {
+    /// The notification to surface (post anti-spam gate), if any.
+    pub notification: Option<crate::notify::Notification>,
+    /// Whether the policy's typed row was reconstructed (see
+    /// [`crate::notify::PolicyOutcome::row_reconstructed`]).
+    pub row_reconstructed: bool,
+    /// Whether the policy itself returned `Some` (pre-gate). Distinguishes
+    /// "gate coalesced it" from "policy declined".
+    pub policy_notified: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -193,7 +219,32 @@ impl NotificationRegistry {
         Self {
             dispatch: RwLock::new(HashMap::new()),
             gate: NotificationGate::new(std::time::Duration::from_secs(2)),
+            pending_split_inserts: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Remember that `(table, pk)`'s remote insert was dispatched without a
+    /// reconstructable row (#103). See `pending_split_inserts`.
+    pub fn note_split_insert(&self, table: &str, pk: &str) {
+        let mut set = self.pending_split_inserts.lock().unwrap();
+        if set.len() >= MAX_PENDING_SPLIT_INSERTS {
+            tracing::warn!(
+                "pending split-insert set at capacity ({MAX_PENDING_SPLIT_INSERTS}); clearing \
+                 (affected rows lose only the deferred notification, never data)"
+            );
+            set.clear();
+        }
+        set.insert((table.to_string(), pk.to_string()));
+    }
+
+    /// Remove and report whether `(table, pk)` was awaiting its completing
+    /// cells. The caller re-arms via [`note_split_insert`](Self::note_split_insert)
+    /// if the row is still not reconstructable.
+    pub fn take_split_insert(&self, table: &str, pk: &str) -> bool {
+        self.pending_split_inserts
+            .lock()
+            .unwrap()
+            .remove(&(table.to_string(), pk.to_string()))
     }
 
     /// Register a per-table dispatch closure. Replaces any existing entry.
@@ -213,26 +264,29 @@ impl NotificationRegistry {
     }
 
     /// Run the policy for this change (if the table has one), then apply the
-    /// anti-spam gate. Returns the notification to surface, or `None` if the
-    /// policy declined or the change was coalesced away.
-    pub fn dispatch(
-        &self,
-        change: &crate::messages::ChangeNotification,
-    ) -> Option<crate::notify::Notification> {
-        let notif = {
+    /// anti-spam gate. Returns `None` when no policy is registered for the
+    /// table; otherwise a [`DispatchResult`] whose `notification` is the one
+    /// to surface (absent if the policy declined or the gate coalesced it —
+    /// the other fields tell those apart).
+    pub fn dispatch(&self, change: &crate::messages::ChangeNotification) -> Option<DispatchResult> {
+        let outcome = {
             let map = self.dispatch.read().unwrap();
             let policy = map.get(&change.table.0)?;
-            policy(change)?
+            policy(change)
         };
-        let key = notif
-            .coalesce_key
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", notif.table, notif.primary_key));
-        if self.gate.allow(&key) {
-            Some(notif)
-        } else {
-            None
-        }
+        let policy_notified = outcome.notification.is_some();
+        let notification = outcome.notification.filter(|n| {
+            let key = n
+                .coalesce_key
+                .clone()
+                .unwrap_or_else(|| format!("{}:{}", n.table, n.primary_key));
+            self.gate.allow(&key)
+        });
+        Some(DispatchResult {
+            notification,
+            row_reconstructed: outcome.row_reconstructed,
+            policy_notified,
+        })
     }
 }
 

@@ -124,9 +124,23 @@ pub trait SyncNotify: SyncedModel + Sized {
     fn on_sync(ev: &SyncEvent<Self>) -> Option<Notification>;
 }
 
+/// What a per-table policy dispatch produced, plus the context the apply path
+/// needs to interpret a `None`: whether the typed row could be reconstructed
+/// from the change's column values. A policy `None` with
+/// `row_reconstructed == false` is a partial-row artifact (the policy never
+/// got a real look at the row — see the split-insert deferral in the apply
+/// path, #103), not a decision.
+pub struct PolicyOutcome {
+    /// The notification the policy returned, if any.
+    pub notification: Option<Notification>,
+    /// Whether `wavesync_from_changes` rebuilt the typed row (`ev.row` was
+    /// `Some`). Always `false` for deletes and non-remote changes.
+    pub row_reconstructed: bool,
+}
+
 /// Type-erased per-table dispatch closure stored in the
 /// [`NotificationRegistry`](crate::registry::NotificationRegistry).
-pub type NotifyDispatch = Box<dyn Fn(&ChangeNotification) -> Option<Notification> + Send + Sync>;
+pub type NotifyDispatch = Box<dyn Fn(&ChangeNotification) -> PolicyOutcome + Send + Sync>;
 
 /// Build the dispatch closure for a concrete entity type `M`. Called by the
 /// `#[derive(SyncNotify)]`-generated registration.
@@ -140,13 +154,17 @@ pub type NotifyDispatch = Box<dyn Fn(&ChangeNotification) -> Option<Notification
 pub fn make_dispatch<M: SyncNotify + 'static>() -> NotifyDispatch {
     Box::new(move |cn: &ChangeNotification| {
         if !matches!(cn.source, ChangeSource::Remote { .. }) {
-            return None;
+            return PolicyOutcome {
+                notification: None,
+                row_reconstructed: false,
+            };
         }
         let row = cn.column_values.as_ref().and_then(|cv| {
             let pairs: Vec<(String, serde_json::Value)> =
                 cv.iter().map(|(c, v)| (c.0.clone(), v.clone())).collect();
             M::wavesync_from_changes("", &cn.primary_key.0, &pairs)
         });
+        let row_reconstructed = row.is_some();
         let ev = SyncEvent {
             op: cn.kind.clone(),
             primary_key: &cn.primary_key.0,
@@ -154,12 +172,16 @@ pub fn make_dispatch<M: SyncNotify + 'static>() -> NotifyDispatch {
             changed_columns: cn.changed_columns.as_deref(),
             row,
         };
-        M::on_sync(&ev).map(|mut n| {
+        let notification = M::on_sync(&ev).map(|mut n| {
             n.table = cn.table.0.clone();
             n.primary_key = cn.primary_key.0.clone();
             n.op = cn.kind.clone();
             n
-        })
+        });
+        PolicyOutcome {
+            notification,
+            row_reconstructed,
+        }
     })
 }
 
@@ -283,7 +305,9 @@ mod tests {
             remote(),
             Some(&[("id", "m1"), ("text", "hello")]),
         );
-        let out = dispatch(&cn).expect("full insert should notify");
+        let outcome = dispatch(&cn);
+        assert!(outcome.row_reconstructed);
+        let out = outcome.notification.expect("full insert should notify");
         assert_eq!(out.title, "changed");
         assert_eq!(out.body, "hello"); // proves the typed row was reconstructed
         assert_eq!(out.table, "msgs"); // stamped by make_dispatch
@@ -296,14 +320,22 @@ mod tests {
         let dispatch = make_dispatch::<TestMsg>();
         // Only "id" present → "text" is missing → row cannot be reconstructed.
         let cn = change(WriteKind::Update, remote(), Some(&[("id", "m1")]));
-        assert!(dispatch(&cn).is_none());
+        let outcome = dispatch(&cn);
+        assert!(outcome.notification.is_none());
+        assert!(
+            !outcome.row_reconstructed,
+            "partial row must be reported as not-reconstructed so the apply \
+             path can tell an artifact from a policy decision"
+        );
     }
 
     #[test]
     fn delete_has_no_row() {
         let dispatch = make_dispatch::<TestMsg>();
         let cn = change(WriteKind::Delete, remote(), None);
-        assert!(dispatch(&cn).is_none());
+        let outcome = dispatch(&cn);
+        assert!(outcome.notification.is_none());
+        assert!(!outcome.row_reconstructed);
     }
 
     #[test]
@@ -326,6 +358,9 @@ mod tests {
             ChangeSource::Local,
             Some(&[("id", "m1"), ("text", "hi")]),
         );
-        assert!(dispatch(&cn).is_none(), "local writes must never notify");
+        assert!(
+            dispatch(&cn).notification.is_none(),
+            "local writes must never notify"
+        );
     }
 }

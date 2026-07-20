@@ -1788,34 +1788,72 @@ async fn apply_changeset_chunk<'a>(
     for n in pending_notifications {
         // Run the per-table notification policy (remote-only) before broadcasting
         // the raw change. The gate inside `dispatch` de-spams bursts.
-        if let Some(ctx) = notify {
-            // Diagnostic: for every applied change on a table that HAS a policy,
-            // record the write kind and the dispatch outcome. This pins down why
-            // a notification did or didn't fire — "Insert DECLINED" means the
-            // policy's `on_sync` returned None (e.g. the typed row couldn't be
-            // rebuilt); "Update DECLINED" is the expected silence for edits;
-            // "generated" means it fired and was queued for display.
-            if ctx.registry.has(&n.table.0) {
-                match ctx.registry.dispatch(&n) {
+        if let Some(ctx) = notify
+            && ctx.registry.has(&n.table.0)
+        {
+            // Split-insert deferral (#103): a catch-up path (RBSR cell
+            // ranges, mailbox heal chunks) can deliver only part of a NEW
+            // row's cells in one apply. Its Insert dispatch then runs before
+            // the typed row can be rebuilt — the policy returns None through
+            // no decision of its own, and the apply that completes the row
+            // arrives classified as Update, which an insert-only policy
+            // rightly ignores: the notification would be lost permanently.
+            // Remember such rows and re-present the completing apply to the
+            // policy as the Insert it logically is. The broadcast to
+            // reactive hooks below keeps the true kind.
+            let was_pending = ctx.registry.take_split_insert(&n.table.0, &n.primary_key.0);
+            let mut policy_view = n.clone();
+            if was_pending && policy_view.kind == WriteKind::Update {
+                policy_view.kind = WriteKind::Insert;
+            }
+            if let Some(result) = ctx.registry.dispatch(&policy_view) {
+                // (Re-)arm only when the policy never got a real look at the
+                // row AND didn't notify anyway — a deliberate decline on a
+                // reconstructed row must never re-arm, or every later update
+                // of that row would masquerade as an Insert.
+                if policy_view.kind == WriteKind::Insert
+                    && !result.row_reconstructed
+                    && !result.policy_notified
+                {
+                    ctx.registry.note_split_insert(&n.table.0, &n.primary_key.0);
+                }
+                // Diagnostic: for every applied change on a table that HAS a
+                // policy, record the write kind and the dispatch outcome —
+                // this pins down why a notification did or didn't fire.
+                match result.notification {
                     Some(user_notif) => {
                         tracing::info!(
                             "notification: generated for table {} kind={:?} pk={} ({} receiver(s) subscribed)",
                             n.table.0,
-                            n.kind,
+                            policy_view.kind,
                             n.primary_key.0,
                             ctx.tx.receiver_count(),
                         );
                         let _ = ctx.tx.send(user_notif);
                     }
+                    None if result.policy_notified => {
+                        tracing::info!(
+                            "notification: gate COALESCED table {} kind={:?} pk={}",
+                            n.table.0,
+                            policy_view.kind,
+                            n.primary_key.0,
+                        );
+                    }
                     None => {
                         tracing::info!(
-                            "notification: policy DECLINED table {} kind={:?} pk={} cols={:?} (on_sync returned None)",
+                            "notification: policy DECLINED table {} kind={:?} pk={} row_reconstructed={} cols={:?}{}",
                             n.table.0,
-                            n.kind,
+                            policy_view.kind,
                             n.primary_key.0,
+                            result.row_reconstructed,
                             n.column_values
                                 .as_ref()
                                 .map(|cv| cv.iter().map(|(c, _)| c.0.as_str()).collect::<Vec<_>>()),
+                            if result.row_reconstructed {
+                                ""
+                            } else {
+                                " (partial row — deferred until the remaining cells arrive)"
+                            },
                         );
                     }
                 }
@@ -2558,6 +2596,277 @@ mod tests {
             "a bool column must reconstruct from the changeset's typed value, not the SQLite int"
         );
         assert_eq!(got.unwrap().body, "done");
+    }
+
+    // ── #103 split-insert notification deferral ──
+
+    /// Shared scaffolding for the split-insert tests: a `notes` table whose
+    /// `title` is nullable at SQL level (a partial insert commits) but
+    /// required by the typed model (reconstruction fails until it arrives).
+    async fn setup_split_insert_db() -> (sea_orm::DatabaseConnection, Arc<TableRegistry>) {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::shadow::create_meta_table(&db).await.unwrap();
+        crate::capture::ensure_capture_tables(&db).await.unwrap();
+        crate::peer_tracker::create_peer_versions_table(&db)
+            .await
+            .unwrap();
+        db.execute_unprepared("CREATE TABLE notes (id TEXT PRIMARY KEY, title TEXT, done INTEGER)")
+            .await
+            .unwrap();
+        crate::shadow::create_shadow_table(&db, "notes")
+            .await
+            .unwrap();
+        let registry = Arc::new(TableRegistry::new());
+        registry.register(TableMeta {
+            table_name: "notes".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string(), "done".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+        (db, registry)
+    }
+
+    fn note_cell(pk: &str, cid: &str, val: serde_json::Value, seq: u32) -> ColumnChange {
+        ColumnChange {
+            table: "notes".into(),
+            pk: pk.into(),
+            cid: cid.into(),
+            val: Some(val),
+            site_id: NodeId([7u8; 16]),
+            col_version: 1,
+            cl: 1,
+            seq,
+            db_version: 0,
+            deleted_ts: None,
+        }
+    }
+
+    async fn apply_with_notify(
+        db: &sea_orm::DatabaseConnection,
+        registry: &Arc<TableRegistry>,
+        notif_registry: &crate::registry::NotificationRegistry,
+        notif_tx: &broadcast::Sender<crate::Notification>,
+        changes: &[ColumnChange],
+    ) {
+        let (change_tx, _crx) = broadcast::channel::<ChangeNotification>(16);
+        apply_remote_changeset(
+            db,
+            &change_tx,
+            registry,
+            changes,
+            None,
+            crate::messages::ChangeSource::Remote {
+                peer_site: NodeId([9u8; 16]),
+            },
+            Some(NotifyCtx {
+                registry: notif_registry,
+                tx: notif_tx,
+            }),
+        )
+        .await;
+    }
+
+    /// #103 REGRESSION — a catch-up path (RBSR cell ranges, mailbox heal
+    /// chunks) can deliver a NEW row's cells split across two applies. The
+    /// first apply dispatches kind=Insert before the typed row can be
+    /// rebuilt (policy sees `row = None`), and the completing apply arrives
+    /// as kind=Update, which an insert-only policy rightly ignores — the
+    /// insert notification was lost permanently. The completing apply must
+    /// be re-presented to the policy as an Insert.
+    #[tokio::test]
+    async fn split_insert_notifies_when_the_completing_cells_arrive() {
+        struct Note {
+            id: String,
+            title: String,
+        }
+        impl crate::SyncedModel for Note {
+            fn wavesync_apply_change(&mut self, _c: &str, _v: &serde_json::Value) {}
+            fn wavesync_from_changes(
+                _pk_col: &str,
+                pk: &str,
+                changes: &[(String, serde_json::Value)],
+            ) -> Option<Self> {
+                let title = changes
+                    .iter()
+                    .find(|(c, _)| c == "title")
+                    .and_then(|(_, v)| v.as_str())?
+                    .to_string();
+                Some(Note {
+                    id: pk.to_string(),
+                    title,
+                })
+            }
+            fn wavesync_pk_string(&self) -> String {
+                self.id.clone()
+            }
+        }
+        impl crate::SyncNotify for Note {
+            fn on_sync(ev: &crate::SyncEvent<Self>) -> Option<crate::Notification> {
+                if ev.op != WriteKind::Insert {
+                    return None;
+                }
+                ev.row
+                    .as_ref()
+                    .map(|n| crate::Notification::new("note", &n.title))
+            }
+        }
+
+        let (db, registry) = setup_split_insert_db().await;
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        notif_registry.register("notes".to_string(), crate::notify::make_dispatch::<Note>());
+        let (notif_tx, mut notif_rx) = broadcast::channel::<crate::Notification>(16);
+
+        // Part 1: the row's first cells arrive WITHOUT the required `title`.
+        let part1 = vec![note_cell("s1", "done", serde_json::json!(1), 0)];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &part1).await;
+        assert!(
+            notif_rx.try_recv().is_err(),
+            "no notification can fire before the row is reconstructable"
+        );
+
+        // Part 2: the remaining cell completes the row. The row now exists,
+        // so this apply classifies as Update — but the pending split-insert
+        // marker must re-present it as the Insert it logically is.
+        let part2 = vec![note_cell("s1", "title", serde_json::json!("milk"), 0)];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &part2).await;
+
+        let got = notif_rx
+            .try_recv()
+            .expect("the completing apply must fire the deferred insert notification");
+        assert_eq!(got.body, "milk");
+        assert_eq!(got.op, WriteKind::Insert, "policy must see kind=Insert");
+    }
+
+    /// Poison guard for the deferral: a policy that DECLINES a complete
+    /// insert by choice must never be re-armed — its later genuine updates
+    /// must still be presented as kind=Update (here, the policy notifies on
+    /// updates only, and must keep doing so).
+    #[tokio::test]
+    async fn deliberate_insert_decline_does_not_hijack_later_updates() {
+        struct Note {
+            id: String,
+            title: String,
+        }
+        impl crate::SyncedModel for Note {
+            fn wavesync_apply_change(&mut self, _c: &str, _v: &serde_json::Value) {}
+            fn wavesync_from_changes(
+                _pk_col: &str,
+                pk: &str,
+                changes: &[(String, serde_json::Value)],
+            ) -> Option<Self> {
+                let title = changes
+                    .iter()
+                    .find(|(c, _)| c == "title")
+                    .and_then(|(_, v)| v.as_str())?
+                    .to_string();
+                Some(Note {
+                    id: pk.to_string(),
+                    title,
+                })
+            }
+            fn wavesync_pk_string(&self) -> String {
+                self.id.clone()
+            }
+        }
+        impl crate::SyncNotify for Note {
+            fn on_sync(ev: &crate::SyncEvent<Self>) -> Option<crate::Notification> {
+                match ev.op {
+                    // Deliberate decline — this row's insert is not
+                    // notification-worthy, and that is a decision, not a
+                    // partial-row artifact.
+                    WriteKind::Insert => None,
+                    WriteKind::Update => ev
+                        .row
+                        .as_ref()
+                        .map(|n| crate::Notification::new("updated", &n.title)),
+                    _ => None,
+                }
+            }
+        }
+
+        let (db, registry) = setup_split_insert_db().await;
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        notif_registry.register("notes".to_string(), crate::notify::make_dispatch::<Note>());
+        let (notif_tx, mut notif_rx) = broadcast::channel::<crate::Notification>(16);
+
+        // Complete insert in one apply: reconstructable, declined by choice.
+        let insert = vec![
+            note_cell("p1", "title", serde_json::json!("bread"), 0),
+            note_cell("p1", "done", serde_json::json!(0), 1),
+        ];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &insert).await;
+        assert!(notif_rx.try_recv().is_err());
+
+        // A genuine update must still reach the policy as kind=Update.
+        let update = vec![{
+            let mut c = note_cell("p1", "title", serde_json::json!("bread and eggs"), 0);
+            c.col_version = 2;
+            c
+        }];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &update).await;
+
+        let got = notif_rx
+            .try_recv()
+            .expect("update-only policy must still fire on the genuine update");
+        assert_eq!(got.title, "updated");
+        assert_eq!(
+            got.op,
+            WriteKind::Update,
+            "a deliberate insert decline must not convert later updates into inserts"
+        );
+    }
+
+    /// A policy that notifies on an Insert even WITHOUT a reconstructable
+    /// row has been heard — the completing cells must not re-notify it.
+    #[tokio::test]
+    async fn row_less_insert_notification_is_not_doubled_by_completion() {
+        struct Note {
+            id: String,
+        }
+        impl crate::SyncedModel for Note {
+            fn wavesync_apply_change(&mut self, _c: &str, _v: &serde_json::Value) {}
+            fn wavesync_from_changes(
+                _pk_col: &str,
+                pk: &str,
+                changes: &[(String, serde_json::Value)],
+            ) -> Option<Self> {
+                // Requires `title`, like the other tests.
+                changes
+                    .iter()
+                    .find(|(c, _)| c == "title")
+                    .and_then(|(_, v)| v.as_str())?;
+                Some(Note { id: pk.to_string() })
+            }
+            fn wavesync_pk_string(&self) -> String {
+                self.id.clone()
+            }
+        }
+        impl crate::SyncNotify for Note {
+            fn on_sync(ev: &crate::SyncEvent<Self>) -> Option<crate::Notification> {
+                // Notifies from the pk alone — no row needed.
+                (ev.op == WriteKind::Insert)
+                    .then(|| crate::Notification::new("new row", ev.primary_key))
+            }
+        }
+
+        let (db, registry) = setup_split_insert_db().await;
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        notif_registry.register("notes".to_string(), crate::notify::make_dispatch::<Note>());
+        let (notif_tx, mut notif_rx) = broadcast::channel::<crate::Notification>(16);
+
+        let part1 = vec![note_cell("d1", "done", serde_json::json!(1), 0)];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &part1).await;
+        assert!(
+            notif_rx.try_recv().is_ok(),
+            "the row-less policy notified on part 1"
+        );
+
+        let part2 = vec![note_cell("d1", "title", serde_json::json!("milk"), 0)];
+        apply_with_notify(&db, &registry, &notif_registry, &notif_tx, &part2).await;
+        assert!(
+            notif_rx.try_recv().is_err(),
+            "a policy that already notified must not be re-presented the insert"
+        );
     }
 
     /// REGRESSION — WSDB-PoC-1 (was: SQL injection via unsanitised `cid`).
