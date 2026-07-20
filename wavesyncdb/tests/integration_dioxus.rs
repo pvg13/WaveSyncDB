@@ -497,6 +497,57 @@ async fn table_driver_lagged_burst_converges() {
 }
 
 // ---------------------------------------------------------------------------
+// #89/H7 REGRESSION — a burst that overflows the channel AND ends within
+// LAGGED_DEBOUNCE of the last full reload used to have its reload silently
+// DROPPED (debounce without deferral): the published snapshot stayed stale
+// until the next unrelated write. The deferred-reload timer must converge it
+// with NO further writes.
+//
+// Determinism: a single multi-row INSERT is one drain, which emits all 40
+// notifications in a tight loop — guaranteed to overflow the capacity-16
+// channel, and guaranteed to land inside the debounce window measured from
+// the driver's start.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn table_driver_lagged_burst_inside_debounce_window_still_converges() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_lag_defer"), "test-drv-lag-defer")
+        .with_change_channel_capacity(16)
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    let (sink, publish) = collector::<Vec<task::Model>>();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        publish,
+    ));
+    wait_for(|| sink.lock().unwrap().len() == 1, "initial publish").await;
+
+    let values: Vec<String> = (0..40).map(|i| format!("('defer-{i}', 't', 0)")).collect();
+    db.execute_unprepared(&format!(
+        "INSERT INTO \"tasks\" (\"id\", \"title\", \"completed\") VALUES {}",
+        values.join(",")
+    ))
+    .await
+    .unwrap();
+
+    // No further writes: only the deferred reload can surface the rows the
+    // overflow discarded.
+    wait_for(
+        || {
+            sink.lock()
+                .unwrap()
+                .last()
+                .is_some_and(|rows| rows.len() == 40)
+        },
+        "deferred lagged reload converges to 40 rows without further writes",
+    )
+    .await;
+    drv.abort();
+}
+
+// ---------------------------------------------------------------------------
 // M10 at the driver layer: cancelling the old driver and starting one on a
 // fresh engine (what the generation-reactive effect does) must track the
 // new DB — and dropping the old task must release the old engine.

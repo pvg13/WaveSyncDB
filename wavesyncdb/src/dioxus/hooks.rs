@@ -550,6 +550,12 @@ pub async fn run_table_driver<E>(
     publish(rows.clone());
 
     let mut last_full_reload = Instant::now();
+    // A lagged full reload the debounce window pushed into the future. A
+    // debounced `Lagged` must DEFER the reload, never drop it: the missed
+    // notifications' rows have no other trigger, and later in-place applies
+    // land on that stale base — without this timer the staleness persists
+    // until the next unrelated change (#89 / H7).
+    let mut lagged_reload_due: Option<Instant> = None;
     let mut refresh_rx = db.refresh_rx();
     // Closed means every sender is gone. While this driver holds `db` the
     // inner sender field cannot drop, so this is effectively unreachable —
@@ -595,6 +601,24 @@ pub async fn run_table_driver<E>(
                         continue;
                     }
                 }
+                lagged_reload_due = None;
+                continue;
+            }
+            _ = async {
+                match lagged_reload_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            }, if lagged_reload_due.is_some() => {
+                // The deferred lagged reload came due (see `lagged_reload_due`).
+                lagged_reload_due = None;
+                if let Ok(r) = E::find().all(&db).await {
+                    rows = r;
+                    rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                    db.set_table_cache(rows.clone());
+                    publish(rows.clone());
+                    last_full_reload = Instant::now();
+                }
                 continue;
             }
             n = rx.recv() => n,
@@ -606,14 +630,18 @@ pub async fn run_table_driver<E>(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("Missed {} change notifications for {}", n, target_table);
-                if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
-                    && let Ok(r) = E::find().all(&db).await
-                {
-                    rows = r;
-                    rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
-                    db.set_table_cache(rows.clone());
-                    publish(rows.clone());
-                    last_full_reload = Instant::now();
+                if last_full_reload.elapsed() >= LAGGED_DEBOUNCE {
+                    if let Ok(r) = E::find().all(&db).await {
+                        rows = r;
+                        rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                        db.set_table_cache(rows.clone());
+                        publish(rows.clone());
+                        last_full_reload = Instant::now();
+                        lagged_reload_due = None;
+                    }
+                } else {
+                    // Defer, never drop (see `lagged_reload_due`).
+                    lagged_reload_due.get_or_insert(last_full_reload + LAGGED_DEBOUNCE);
                 }
                 continue;
             }
@@ -643,14 +671,18 @@ pub async fn run_table_driver<E>(
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                     tracing::warn!("Missed {} change notifications for {}", n, target_table);
                     batch.clear();
-                    if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
-                        && let Ok(r) = E::find().all(&db).await
-                    {
-                        rows = r;
-                        rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
-                        db.set_table_cache(rows.clone());
-                        publish(rows.clone());
-                        last_full_reload = Instant::now();
+                    if last_full_reload.elapsed() >= LAGGED_DEBOUNCE {
+                        if let Ok(r) = E::find().all(&db).await {
+                            rows = r;
+                            rebuild_pk_index::<E::Model>(&rows, &mut pk_index);
+                            db.set_table_cache(rows.clone());
+                            publish(rows.clone());
+                            last_full_reload = Instant::now();
+                            lagged_reload_due = None;
+                        }
+                    } else {
+                        // Defer, never drop (see `lagged_reload_due`).
+                        lagged_reload_due.get_or_insert(last_full_reload + LAGGED_DEBOUNCE);
                     }
                     break;
                 }
@@ -881,6 +913,10 @@ pub async fn run_row_driver<E>(
     publish(current.clone());
 
     let mut last_full_reload = Instant::now();
+    // Deferred lagged re-query — same rationale as the table driver's
+    // `lagged_reload_due` (#89 / H7): a debounced `Lagged` must defer the
+    // re-query, never drop it, or this row can stay stale indefinitely.
+    let mut lagged_reload_due: Option<Instant> = None;
     let mut refresh_rx = db.refresh_rx();
     // Closed means every sender is gone. While this driver holds `db` the
     // inner sender field cannot drop, so this is effectively unreachable —
@@ -921,6 +957,22 @@ pub async fn run_row_driver<E>(
                         continue;
                     }
                 }
+                lagged_reload_due = None;
+                continue;
+            }
+            _ = async {
+                match lagged_reload_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            }, if lagged_reload_due.is_some() => {
+                // The deferred lagged re-query came due (see `lagged_reload_due`).
+                lagged_reload_due = None;
+                if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                    current = row;
+                    publish(current.clone());
+                    last_full_reload = Instant::now();
+                }
                 continue;
             }
             n = rx.recv() => n,
@@ -932,12 +984,16 @@ pub async fn run_row_driver<E>(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("Missed {} change notifications for {}", n, target_table);
-                if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
-                    && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
-                {
-                    current = row;
-                    publish(current.clone());
-                    last_full_reload = Instant::now();
+                if last_full_reload.elapsed() >= LAGGED_DEBOUNCE {
+                    if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                        current = row;
+                        publish(current.clone());
+                        last_full_reload = Instant::now();
+                        lagged_reload_due = None;
+                    }
+                } else {
+                    // Defer, never drop (see `lagged_reload_due`).
+                    lagged_reload_due.get_or_insert(last_full_reload + LAGGED_DEBOUNCE);
                 }
                 continue;
             }
@@ -964,12 +1020,16 @@ pub async fn run_row_driver<E>(
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                     tracing::warn!("Missed {} change notifications for {}", n, target_table);
                     batch.clear();
-                    if last_full_reload.elapsed() >= LAGGED_DEBOUNCE
-                        && let Ok(row) = E::find_by_id(pk.clone()).one(&db).await
-                    {
-                        current = row;
-                        publish(current.clone());
-                        last_full_reload = Instant::now();
+                    if last_full_reload.elapsed() >= LAGGED_DEBOUNCE {
+                        if let Ok(row) = E::find_by_id(pk.clone()).one(&db).await {
+                            current = row;
+                            publish(current.clone());
+                            last_full_reload = Instant::now();
+                            lagged_reload_due = None;
+                        }
+                    } else {
+                        // Defer, never drop (see `lagged_reload_due`).
+                        lagged_reload_due.get_or_insert(last_full_reload + LAGGED_DEBOUNCE);
                     }
                     break;
                 }
