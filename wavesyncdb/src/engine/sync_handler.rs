@@ -1973,11 +1973,27 @@ async fn apply_remote_column_changes(
             continue;
         }
         if change.cid.0 == meta.primary_key_column {
-            tracing::warn!(
-                "Rejecting remote change targeting the primary-key column: {}/{}",
-                table,
-                pk
-            );
+            // Either way the cell is skipped, but the log level depends on
+            // what it carries. A pk cell whose value merely ECHOES the row
+            // key is redundant by construction (the pk already rides in
+            // every change's key): web peers built without this table's
+            // entity descriptor emit exactly that cell on every write
+            // (#100), so skipping it is routine defense, not an anomaly —
+            // log at debug. A pk cell carrying a DIFFERENT value is an
+            // actual pk-rewrite attempt (WSDB-PoC-1b) and stays loud.
+            let is_pk_echo = change
+                .val
+                .as_ref()
+                .is_some_and(|v| crate::capture::json_scalar_to_pk_string(v) == pk);
+            if is_pk_echo {
+                tracing::debug!("Skipping redundant primary-key echo cell: {}/{}", table, pk);
+            } else {
+                tracing::warn!(
+                    "Rejecting remote change targeting the primary-key column: {}/{}",
+                    table,
+                    pk
+                );
+            }
             continue;
         }
 
@@ -2689,6 +2705,79 @@ mod tests {
             pwned.is_none(),
             "remote ColumnChange targeting the PK column must be rejected"
         );
+    }
+
+    /// #100 — a pk cell that merely echoes its own row key is the shape a
+    /// web peer built without this table's entity descriptor emits on every
+    /// write (it has no `primary_key_column` config, so it treats the pk as
+    /// an ordinary column). The cell must still be skipped (never applied —
+    /// the pk guard is a security boundary, WSDB-PoC-1b), while the rest of
+    /// the changeset applies normally. Only the log level differs from the
+    /// attack case: routine defense logs at debug, not WARN.
+    #[tokio::test]
+    async fn pk_echo_cell_is_skipped_and_rest_of_changeset_applies() {
+        let (db, registry) = setup_engine_test_db().await;
+        let (tx, _rx) = broadcast::channel::<ChangeNotification>(16);
+
+        let changes = vec![
+            ColumnChange {
+                table: "tasks".into(),
+                pk: "w1".into(),
+                cid: "id".into(),
+                val: Some(serde_json::json!("w1")), // echoes the row key
+                site_id: NodeId([7u8; 16]),
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+                db_version: 0,
+                deleted_ts: None,
+            },
+            ColumnChange {
+                table: "tasks".into(),
+                pk: "w1".into(),
+                cid: "title".into(),
+                val: Some(serde_json::json!("from web")),
+                site_id: NodeId([7u8; 16]),
+                col_version: 1,
+                cl: 1,
+                seq: 1,
+                db_version: 0,
+                deleted_ts: None,
+            },
+        ];
+
+        apply_remote_changeset(
+            &db,
+            &tx,
+            &registry,
+            &changes,
+            None,
+            crate::messages::ChangeSource::Remote {
+                peer_site: NodeId([7u8; 16]),
+            },
+            None,
+        )
+        .await;
+
+        use sea_orm::ConnectionTrait;
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT title FROM tasks WHERE id = 'w1'".to_string(),
+            ))
+            .await
+            .unwrap();
+        let title: String = row
+            .expect("row must be created from the non-pk cells")
+            .try_get("", "title")
+            .unwrap();
+        assert_eq!(title, "from web");
+        // The pk cell must not have grown a shadow clock entry — it was
+        // skipped before any clock read/write (the WSDB-PoC-1 ordering).
+        let (cv, _) = crate::shadow::get_col_version_with_site(&db, "tasks", "w1", "id")
+            .await
+            .unwrap_or((0, NodeId([0u8; 16])));
+        assert_eq!(cv, 0, "pk echo cell must be skipped, not applied");
     }
 
     /// Sanity test — the fix must not regress the legitimate sync path.

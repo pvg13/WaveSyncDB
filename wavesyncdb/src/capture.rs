@@ -350,7 +350,9 @@ pub(crate) enum LogicalOp {
 
 /// Render a JSON scalar the way `CAST(x AS TEXT)` renders the same SQLite
 /// value, so a pk extracted from `new_row` matches the trigger-captured `pk`.
-fn json_scalar_to_pk_string(v: &serde_json::Value) -> String {
+/// Also used by the remote-apply path to recognize a pk cell that merely
+/// echoes its own row key (#100).
+pub(crate) fn json_scalar_to_pk_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
