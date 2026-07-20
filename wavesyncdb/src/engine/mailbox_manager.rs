@@ -123,6 +123,53 @@ pub(crate) enum MailboxTaskMsg {
     },
 }
 
+/// Greedy-pack `changes` into chunks of at most `max_bytes` serialized size
+/// WITHOUT ever splitting one row's cells across chunks. Cells are grouped by
+/// `(table, pk)` (first-appearance order) and whole rows are packed: a
+/// receiver applies each sealed heal entry independently, so a chunk boundary
+/// through a NEW row would deliver a partial insert — the split-insert
+/// notification-loss window (#103). A single row larger than `max_bytes`
+/// becomes its own oversized chunk (the relay's per-entry cap is
+/// operator-tuned well above any realistic row).
+fn chunk_rowwise(
+    changes: Vec<crate::messages::ColumnChange>,
+    max_bytes: usize,
+) -> Vec<Vec<crate::messages::ColumnChange>> {
+    let mut groups: Vec<Vec<crate::messages::ColumnChange>> = Vec::new();
+    let mut index: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for c in changes {
+        let key = (c.table.0.clone(), c.pk.0.clone());
+        match index.get(&key) {
+            Some(&i) => groups[i].push(c),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![c]);
+            }
+        }
+    }
+
+    let mut chunks: Vec<Vec<crate::messages::ColumnChange>> = Vec::new();
+    let mut chunk: Vec<crate::messages::ColumnChange> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    for group in groups {
+        let group_bytes: usize = group
+            .iter()
+            .map(|c| serde_json::to_vec(c).map(|v| v.len()).unwrap_or(0))
+            .sum();
+        if chunk_bytes + group_bytes > max_bytes && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_bytes = 0;
+        }
+        chunk_bytes += group_bytes;
+        chunk.extend(group);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 /// The watermark invariant, factored out for unit tests: W may sit at
 /// `candidate` only if no unacked local version is ≤ it — a healing delta is
 /// built from `get_changes_since(W)`, so any unacked version at or below W
@@ -584,46 +631,35 @@ impl EngineRunner {
             }
 
             // Greedy-chunk by serialized size so no single entry exceeds the
-            // relay's per-entry cap. Receivers dedup via the CRDT comparator,
-            // so chunks (and heal/fast-path overlap) are safe.
+            // relay's per-entry cap — but never split one row's cells across
+            // chunks (`chunk_rowwise`): each sealed entry is applied
+            // independently, and a partial NEW row in one entry loses its
+            // insert notification to the split-insert window (#103).
+            // Receivers dedup via the CRDT comparator, so chunks (and
+            // heal/fast-path overlap) are safe.
             let mut parts: Vec<(String, String)> = Vec::new();
-            let mut chunk: Vec<crate::messages::ColumnChange> = Vec::new();
-            let mut chunk_bytes = 0usize;
-            let seal_chunk = |chunk: &mut Vec<crate::messages::ColumnChange>,
-                              parts: &mut Vec<(String, String)>| {
-                if chunk.is_empty() {
-                    return true;
-                }
+            let mut ok = true;
+            for chunk in chunk_rowwise(changes, HEAL_CHUNK_BYTES) {
                 let changeset = SyncChangeset {
                     site_id,
                     db_version: current,
-                    changes: std::mem::take(chunk),
+                    changes: chunk,
                 };
                 let Ok(plain) = serde_json::to_vec(&changeset) else {
-                    return false;
+                    ok = false;
+                    break;
                 };
                 match mailbox_seal::seal(&mailbox_key, &topic_name, &plain) {
                     Ok(sealed) => {
                         parts.push((b64::encode(&sealed.nonce), b64::encode(&sealed.ciphertext)));
-                        true
                     }
                     Err(e) => {
                         tracing::warn!("mailbox heal: seal failed: {e}");
-                        false
+                        ok = false;
+                        break;
                     }
                 }
-            };
-            let mut ok = true;
-            for change in changes {
-                let size = serde_json::to_vec(&change).map(|v| v.len()).unwrap_or(0);
-                if chunk_bytes + size > HEAL_CHUNK_BYTES && !chunk.is_empty() {
-                    ok &= seal_chunk(&mut chunk, &mut parts);
-                    chunk_bytes = 0;
-                }
-                chunk_bytes += size;
-                chunk.push(change);
             }
-            ok &= seal_chunk(&mut chunk, &mut parts);
 
             let _ = tx
                 .send(MailboxTaskMsg::HealReady {
@@ -1266,6 +1302,88 @@ mod tests {
         assert_eq!(outcome.applied, 0);
         let meta = shadow::get_mailbox_meta(&db).await.unwrap();
         assert_eq!(meta.cursor, 5);
+    }
+
+    // ── heal chunker row alignment (#103) ──
+
+    fn cell(table: &str, pk: &str, cid: &str, seq: u32) -> ColumnChange {
+        ColumnChange {
+            table: table.into(),
+            pk: pk.into(),
+            cid: cid.into(),
+            val: Some(serde_json::json!("v")),
+            site_id: REMOTE_SITE,
+            col_version: 1,
+            cl: 1,
+            seq,
+            db_version: 1,
+            deleted_ts: None,
+        }
+    }
+
+    fn cell_bytes(c: &ColumnChange) -> usize {
+        serde_json::to_vec(c).unwrap().len()
+    }
+
+    /// #103 — a heal chunk boundary must fall between rows, never through
+    /// one: each sealed entry applies independently, so a split NEW row
+    /// re-creates the partial-insert notification loss.
+    #[test]
+    fn heal_chunks_never_split_a_row() {
+        // Interleave two rows' cells so naive per-cell packing would split
+        // both, and size the budget so the two rows can't share a chunk.
+        let changes = vec![
+            cell("t", "a", "c1", 0),
+            cell("t", "b", "c1", 1),
+            cell("t", "a", "c2", 2),
+            cell("t", "b", "c2", 3),
+            cell("t", "a", "c3", 4),
+        ];
+        let row_a_bytes: usize = changes
+            .iter()
+            .filter(|c| c.pk.0 == "a")
+            .map(cell_bytes)
+            .sum();
+        let chunks = super::chunk_rowwise(changes, row_a_bytes + 1);
+
+        assert!(chunks.len() >= 2, "budget forces at least two chunks");
+        for chunk in &chunks {
+            for pk in ["a", "b"] {
+                let n = chunk.iter().filter(|c| c.pk.0 == pk).count();
+                assert!(
+                    n == 0 || n == (if pk == "a" { 3 } else { 2 }),
+                    "row {pk} must appear whole in one chunk or not at all, found {n} cells"
+                );
+            }
+        }
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 5, "no cell may be dropped");
+    }
+
+    /// A single row larger than the budget still ships — as its own
+    /// oversized chunk, never split.
+    #[test]
+    fn heal_chunk_oversized_row_ships_whole() {
+        let changes = vec![
+            cell("t", "big", "c1", 0),
+            cell("t", "big", "c2", 1),
+            cell("t", "big", "c3", 2),
+        ];
+        let chunks = super::chunk_rowwise(changes, 1);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 3);
+    }
+
+    #[test]
+    fn heal_chunks_pack_multiple_small_rows_together() {
+        let changes = vec![
+            cell("t", "a", "c1", 0),
+            cell("t", "b", "c1", 1),
+            cell("t", "c", "c1", 2),
+        ];
+        let chunks = super::chunk_rowwise(changes, usize::MAX);
+        assert_eq!(chunks.len(), 1, "everything fits in one chunk");
+        assert_eq!(chunks[0].len(), 3);
     }
 
     #[test]
