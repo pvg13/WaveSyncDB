@@ -157,7 +157,10 @@ dioxus = ["derive", "dep:dioxus", "dep:notify-rust", "dep:jni", "dep:ndk-context
 # Kotlin AAR / Swift Package into consumer apps via manganis; gates the
 # Rust-side token-read helpers and FFI exports. Platform-specific code
 # inside the crate is additionally gated by `#[cfg(target_os = "...")]`.
-push-sync = ["mobile-ffi", "dep:manganis", "dep:android_logger"]
+# jni/ndk-context were already a de-facto requirement of push-sync on Android
+# (notify_display and the token-file JNI bridge use them); both deps are
+# target-gated to Android so listing them here is a no-op elsewhere.
+push-sync = ["mobile-ffi", "dep:manganis", "dep:android_logger", "dep:jni", "dep:ndk-context"]
 mobile-ffi = []
 # Browser/wasm32 build. Exposes pure-data modules (messages, conflict, auth,
 # protocol types, registry, network_status) so they can be linked from

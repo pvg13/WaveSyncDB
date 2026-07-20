@@ -2473,6 +2473,16 @@ impl WaveSyncDbBuilder {
         };
         if let Err(e) = sync_config.save() {
             tracing::warn!("Failed to save sync config for background services: {e}");
+        } else {
+            // The Kotlin push bootstrap (WaveSyncInitProvider) ran at process
+            // start — on a fresh install that is BEFORE this config existed,
+            // so its Firebase init failed and Kotlin never retries: the whole
+            // first session would send NotifyTopic unregistered and could not
+            // be woken (#106). Now that the config is on disk, ask it again;
+            // the token file it writes is picked up by the engine's periodic
+            // re-read and registered mid-run.
+            #[cfg(all(target_os = "android", feature = "push-sync"))]
+            crate::push::request_android_token_file();
         }
 
         let engine_config = crate::engine::EngineConfig {

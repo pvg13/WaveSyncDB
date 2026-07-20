@@ -116,6 +116,131 @@ pub(crate) fn read_token_file(database_url: &str) -> Option<String> {
     read_token_from_file(database_url, FCM_TOKEN_FILENAME, "FCM")
 }
 
+/// Fire-and-forget request for the Kotlin push bootstrap to run again now
+/// that `.wavesync_config.json` exists on disk.
+///
+/// On a fresh install's first process lifetime, `WaveSyncInitProvider` runs
+/// at process start — BEFORE `build()` has written the config — so its
+/// Firebase init finds nothing and Kotlin never retries: the token file is
+/// never written, push registration never happens, and the entire first
+/// session (exactly the onboarding session) can neither wake peers nor be
+/// woken (#106). Rust already re-reads the token file mid-run every 5s;
+/// only the Kotlin retry was missing. Called from `build()` right after
+/// `SyncConfig::save`.
+///
+/// Spawns a named thread because `WaveSyncService.ensureTokenFile` blocks on
+/// `Tasks.await` (an FCM round-trip), which must run on neither the caller
+/// nor the Android main thread. In the background-sync (FCM service) process
+/// `ndk_context` was never initialized and panics — contained by
+/// `catch_unwind`; that process doesn't need this call (its InitProvider
+/// already ran with the config present, else no push could have woken it).
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+pub(crate) fn request_android_token_file() {
+    let spawned = std::thread::Builder::new()
+        .name("wavesync-fcm-token".into())
+        .spawn(|| {
+            if std::panic::catch_unwind(ensure_token_file_via_jni).is_err() {
+                tracing::debug!(
+                    "push: token-file request skipped (no ndk context in this process)"
+                );
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("push: could not spawn token-file request thread: {e}");
+    }
+}
+
+/// JNI body of [`request_android_token_file`]: bootstrap `JavaVM` + `Context`
+/// via `ndk_context` (same pattern as the foreground notification display)
+/// and invoke `@JvmStatic WaveSyncService.ensureTokenFile(Context)`.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+fn ensure_token_file_via_jni() {
+    use jni::JavaVM;
+    use jni::objects::{JObject, JValue};
+
+    let ctx = ndk_context::android_context();
+    let vm = match unsafe { JavaVM::from_raw(ctx.vm().cast()) } {
+        Ok(vm) => vm,
+        Err(e) => {
+            tracing::warn!("push: JavaVM unavailable for token-file request: {e}");
+            return;
+        }
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::warn!("push: JNI attach failed for token-file request: {e}");
+            return;
+        }
+    };
+    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    // App classloader, not FindClass — this is a Rust-spawned thread (see
+    // `resolve_app_class`).
+    let service = match resolve_app_class(&mut env, &context, "dev.dioxus.main.WaveSyncService") {
+        Some(c) => c,
+        None => {
+            tracing::warn!("push: could not resolve WaveSyncService via app classloader");
+            describe_and_clear(&mut env);
+            return;
+        }
+    };
+    match env.call_static_method(
+        &service,
+        "ensureTokenFile",
+        "(Landroid/content/Context;)V",
+        &[JValue::Object(&context)],
+    ) {
+        Ok(_) => tracing::info!(
+            "push: requested FCM token file now that the sync config is on disk"
+        ),
+        Err(e) => {
+            tracing::warn!("push: WaveSyncService.ensureTokenFile failed: {e}");
+            describe_and_clear(&mut env);
+        }
+    }
+}
+
+/// Load an application class by its binary name via the Context's classloader,
+/// rather than `FindClass` (which uses the system loader on non-JVM threads and
+/// cannot see app classes). Returns `None` on failure, leaving any pending
+/// exception for the caller to describe/clear.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+pub(crate) fn resolve_app_class<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    context: &jni::objects::JObject,
+    binary_name: &str,
+) -> Option<jni::objects::JClass<'a>> {
+    use jni::objects::{JClass, JValue};
+
+    let loader = env
+        .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .ok()?
+        .l()
+        .ok()?;
+    let name = env.new_string(binary_name).ok()?;
+    let class = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&name)],
+        )
+        .ok()?
+        .l()
+        .ok()?;
+    Some(JClass::from(class))
+}
+
+/// Print a pending Java exception's stack trace to logcat, then clear it.
+#[cfg(all(target_os = "android", feature = "push-sync"))]
+pub(crate) fn describe_and_clear(env: &mut jni::JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+}
+
 /// Firebase credentials parsed from `google-services.json`.
 ///
 /// Used for validation at build time and persisted in the sync config
