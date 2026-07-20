@@ -2512,11 +2512,22 @@ impl EngineRunner {
                     self.update_network_status();
                     tracing::info!("Registry ready, syncing all known peers");
                     self.sync_all_known_peers().await;
+                    // Mailbox drains are gated on registry readiness (#104):
+                    // if the relay reservation landed first, its drain was
+                    // deferred — run it now that applies can't be rejected
+                    // as "unregistered table".
+                    let default_topic = self.default_effective_topic.clone();
+                    self.start_mailbox_drain(&default_topic);
                 },
                 _ = &mut registry_deadline, if !self.default_group().registry_is_ready => {
                     tracing::error!("Schema registry not ready after 30s — proceeding without sync tables");
                     self.default_group_mut().registry_is_ready = true;
                     self.update_network_status();
+                    // Same deferred-drain kick as the ready arm above; with
+                    // no tables registered the drain defers at the first
+                    // foreign entry instead of consuming it.
+                    let default_topic = self.default_effective_topic.clone();
+                    self.start_mailbox_drain(&default_topic);
                 },
                 _ = async {
                     match self.resume_sync_deadline {
