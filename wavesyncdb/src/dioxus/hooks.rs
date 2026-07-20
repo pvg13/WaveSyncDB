@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 
-use dioxus::dioxus_core::Task;
+use dioxus::dioxus_core::{Task, spawn_forever};
 use dioxus::prelude::*;
 use sea_orm::{DbErr, EntityTrait, FromQueryResult, PrimaryKeyTrait};
 use tokio::time::{Duration, Instant};
@@ -169,7 +169,14 @@ impl InitDb {
         sig.set(None);
 
         if let Some(db) = old {
-            spawn(async move {
+            // Root-scope spawn: `reset()`'s canonical caller is a logout
+            // handler that tears down the UI right after, and a scope-tied
+            // `spawn` gets cancelled by that unmount BEFORE the shutdown
+            // command is sent — the old engine (and its peer identity) keeps
+            // running alongside the next login's engine (#105). The engine's
+            // own tasks hold `WaveSyncDb` clones, so nothing is reclaimed by
+            // Drop; only an explicit `shutdown()` stops it.
+            spawn_forever(async move {
                 db.shutdown().await;
             });
         }
@@ -237,7 +244,13 @@ impl InitDb {
         // Check if a reset happened while we were building the DB
         if self.generation() != current_gen {
             tracing::warn!("use_wavesync_init: generation changed during build, discarding new DB");
-            db.shutdown().await;
+            // Same unmount-cancellation hazard as `reset()` (#105): a
+            // generation bump means a reset/logout is in progress, so THIS
+            // task's scope may be about to unmount — hand the discard to the
+            // root scope instead of awaiting it here.
+            spawn_forever(async move {
+                db.shutdown().await;
+            });
             return Ok(());
         }
 
@@ -246,7 +259,9 @@ impl InitDb {
         // Double-check generation after setup
         if self.generation() != current_gen {
             tracing::warn!("use_wavesync_init: generation changed during setup, discarding new DB");
-            db.shutdown().await;
+            spawn_forever(async move {
+                db.shutdown().await;
+            });
             return Ok(());
         }
 
