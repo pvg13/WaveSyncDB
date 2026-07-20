@@ -217,45 +217,10 @@ fn show_android_notification(title: &str, body: &str, group: &str, deeplink: &st
     }
 }
 
-/// Load an application class by its binary name via the Context's classloader,
-/// rather than `FindClass` (which uses the system loader on non-JVM threads and
-/// cannot see app classes). Returns `None` on failure, leaving any pending
-/// exception for the caller to describe/clear.
+// `resolve_app_class` / `describe_and_clear` moved to `crate::push` so the
+// config-write token-file bridge (#106) can share them.
 #[cfg(all(target_os = "android", feature = "push-sync"))]
-fn resolve_app_class<'a>(
-    env: &mut jni::JNIEnv<'a>,
-    context: &jni::objects::JObject,
-    binary_name: &str,
-) -> Option<jni::objects::JClass<'a>> {
-    use jni::objects::{JClass, JValue};
-
-    let loader = env
-        .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-        .ok()?
-        .l()
-        .ok()?;
-    let name = env.new_string(binary_name).ok()?;
-    let class = env
-        .call_method(
-            &loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&name)],
-        )
-        .ok()?
-        .l()
-        .ok()?;
-    Some(JClass::from(class))
-}
-
-/// Print a pending Java exception's stack trace to logcat, then clear it.
-#[cfg(all(target_os = "android", feature = "push-sync"))]
-fn describe_and_clear(env: &mut jni::JNIEnv) {
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_describe();
-        let _ = env.exception_clear();
-    }
-}
+use crate::push::{describe_and_clear, resolve_app_class};
 
 /// Post an iOS notification by calling the bundled Swift
 /// `wavesync_show_notification` C-ABI helper.
