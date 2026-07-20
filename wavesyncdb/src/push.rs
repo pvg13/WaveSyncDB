@@ -191,9 +191,9 @@ fn ensure_token_file_via_jni() {
         "(Landroid/content/Context;)V",
         &[JValue::Object(&context)],
     ) {
-        Ok(_) => tracing::info!(
-            "push: requested FCM token file now that the sync config is on disk"
-        ),
+        Ok(_) => {
+            tracing::info!("push: requested FCM token file now that the sync config is on disk")
+        }
         Err(e) => {
             tracing::warn!("push: WaveSyncService.ensureTokenFile failed: {e}");
             describe_and_clear(&mut env);
