@@ -46,10 +46,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /usr/local/bin/test-peer /usr/local/bin/test-peer
 
+# NAT/firewall rules are applied by the entrypoint BEFORE the engine
+# starts (IPTABLES_RULES env, newline-separated) — post-start exec'd
+# rules raced the engine's first dials, and conntrack grandfathered
+# any flow established rule-free. See docker/peer-entrypoint.sh.
+COPY tests-e2e/docker/peer-entrypoint.sh /usr/local/bin/peer-entrypoint.sh
+RUN chmod +x /usr/local/bin/peer-entrypoint.sh
+
 # Volume for the SQLite file — keep state outside the image so a
 # scenario can stop+start the container and observe restart durability.
 VOLUME /data
 
 EXPOSE 8080/tcp
 
-ENTRYPOINT ["/usr/local/bin/test-peer"]
+ENTRYPOINT ["/usr/local/bin/peer-entrypoint.sh"]

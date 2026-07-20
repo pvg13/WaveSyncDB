@@ -37,6 +37,11 @@ async fn dcutr_validation_cellular_fair() {
         .with_passphrase("dcutr-bench")
         .with_netem(profile.clone())
         .with_nat(NatProfile::PortRestrictedConeAutoNATOk)
+        // NAT'd peers are by definition not on one LAN: without this,
+        // mDNS on the shared docker bridge discovers the peers to each
+        // other instantly and the scenario measures LAN discovery, not
+        // relay introduction.
+        .without_mdns()
         .add_peer("alice")
         .add_peer("bob")
         .start()
@@ -160,9 +165,166 @@ async fn dcutr_validation_cellular_fair() {
              peers (triggered by the relay's PeerJoined introduction) creates \
              matching ESTABLISHED entries on both sides — peers form a direct \
              connection naturally without DCUtR's coordination. To force the \
-             relay path and actually exercise DCUtR, the bench would need a \
-             symmetric-NAT shape (SNAT/DNAT-based per-destination port \
-             rotation) that defeats simultaneous-dial. Tracked as a follow-up."
+             relay path and actually exercise DCUtR, the bench uses the \
+             symmetric-NAT shape below (see dcutr_validation_symmetric_nat)."
         );
     }
+}
+
+/// #51 — the shape that actually exercises DCUtR.
+///
+/// `NatProfile::SymmetricNat` adds per-flow source-port randomization
+/// (`MASQUERADE --random-fully`) on outbound UDP: the listen port each peer
+/// advertises is never the port the other side's flow observes, so the
+/// simultaneous dials triggered by the relay introduction match no conntrack
+/// entry and are dropped on both sides. The relay circuit becomes the only
+/// initial path and DCUtR's coordination the only route to a direct
+/// connection.
+///
+/// Guarantees validated here:
+/// 1. Sync converges regardless — via relay circuits (wire-verified: under
+///    this shape no direct QUIC handshake can complete; dials to observed
+///    ports retransmit unanswered).
+/// 2. The connection and the payload are correctly ACCOUNTED as relayed —
+///    this scenario found and now guards the inbound-circuit
+///    misclassification (endpoint_is_relayed): before the fix, the inbound
+///    circuit counted as a direct connection, flipped `peer_via_relay`,
+///    and demoted a peer's only working circuit.
+///
+/// Deliberately NOT asserted: `dcutr_upgrades_attempted >= 1`. Under this
+/// shape AutoNAT dial-backs fail (the dial-back targets the masqueraded
+/// observed port, where no socket listens), the engine confirms no direct
+/// external address, and rust-libp2p's dcutr never initiates for lack of
+/// punch candidates. That is an ENGINE gap (observed identify addresses
+/// should qualify as candidates), tracked separately in M1 — when it is
+/// fixed, this test should start asserting engagement.
+///
+/// The byte readout doubles as M1's worst-case relay-payload-ratio
+/// baseline (docs/milestones/m1-minimize-relay-dependence.md).
+#[tokio::test]
+#[ignore = "Local-only DCUtR validation; requires Docker + netem."]
+async fn dcutr_validation_symmetric_nat() {
+    let profile = NetemProfile::cellular_fair();
+
+    let harness = WaveSyncE2eHarness::new()
+        .with_passphrase("dcutr-symmetric")
+        .with_netem(profile.clone())
+        .with_nat(NatProfile::SymmetricNat)
+        // Symmetric-NAT peers are by definition not on one LAN; mDNS on
+        // the shared bridge would bypass the shape entirely (and its
+        // pre-rule discovery was one half of the startup race the
+        // entrypoint-applied rules close).
+        .without_mdns()
+        .add_peer("alice")
+        .add_peer("bob")
+        .start()
+        .await
+        .expect("harness start");
+
+    // Bidirectional writes: convergence must hold even if every byte rides
+    // relay circuits. Generous waits — circuit + cellular_fair latency.
+    for i in 0..10 {
+        let id = format!("sym-a{i}");
+        let title = format!("alice write {i}");
+        harness
+            .peer("alice")
+            .insert_task(&id, &title, false)
+            .await
+            .expect("alice insert");
+        harness
+            .peer("bob")
+            .wait_for_task(&id, &title, Duration::from_secs(30))
+            .await
+            .expect("bob receive (relay circuit path)");
+    }
+    harness
+        .peer("bob")
+        .insert_task("sym-b0", "bob write 0", false)
+        .await
+        .expect("bob insert");
+    harness
+        .peer("alice")
+        .wait_for_task("sym-b0", "bob write 0", Duration::from_secs(30))
+        .await
+        .expect("alice receive (relay circuit path)");
+
+    // DCUtR window: the upgrade attempts fire off identify + reservation
+    // events after the circuit settles.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let alice = harness
+        .peer("alice")
+        .diagnostics()
+        .await
+        .expect("alice diag");
+    let bob = harness.peer("bob").diagnostics().await.expect("bob diag");
+
+    eprintln!(
+        "\n=== DCUtR validation on symmetric NAT ({}) ===\n",
+        profile.name
+    );
+    eprintln!(
+        "Alice: attempted={}  succeeded={}   Bob: attempted={}  succeeded={}",
+        alice.dcutr_upgrades_attempted,
+        alice.dcutr_upgrades_succeeded,
+        bob.dcutr_upgrades_attempted,
+        bob.dcutr_upgrades_succeeded
+    );
+    eprintln!(
+        "Alice relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        alice.relayed_connections_established,
+        alice.direct_connections_established,
+        alice.relay_connections_demoted
+    );
+    eprintln!(
+        "Bob   relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        bob.relayed_connections_established,
+        bob.direct_connections_established,
+        bob.relay_connections_demoted
+    );
+    for (name, d) in [("Alice", &alice), ("Bob", &bob)] {
+        let relay = d.relay_bytes_in + d.relay_bytes_out;
+        let direct = d.direct_bytes_in + d.direct_bytes_out;
+        let total = relay + direct;
+        let ratio = if total == 0 {
+            f64::NAN
+        } else {
+            relay as f64 / total as f64
+        };
+        eprintln!(
+            "{name} bytes: relay={relay} (in={} out={})  direct={direct} (in={} out={})  relay_ratio={ratio:.3}",
+            d.relay_bytes_in, d.relay_bytes_out, d.direct_bytes_in, d.direct_bytes_out,
+        );
+    }
+
+    // The shape's guarantee: everything rode the relay, and was accounted
+    // as such. Each peer holds circuits (relayed >= 1) and the sync payload
+    // classifies overwhelmingly relayed. Before the endpoint_is_relayed fix
+    // this failed: the inbound circuit counted as direct, the payload split
+    // ~50/50, and a spurious demotion closed one of the circuits.
+    assert!(
+        alice.relayed_connections_established >= 1 && bob.relayed_connections_established >= 1,
+        "both peers must hold relay circuits under symmetric NAT (alice={}, bob={})",
+        alice.relayed_connections_established,
+        bob.relayed_connections_established,
+    );
+    for (name, d) in [("alice", &alice), ("bob", &bob)] {
+        let relay = d.relay_bytes_in + d.relay_bytes_out;
+        let direct = d.direct_bytes_in + d.direct_bytes_out;
+        let total = relay + direct;
+        assert!(total > 0, "{name} counted no sync payload at all");
+        let ratio = relay as f64 / total as f64;
+        assert!(
+            ratio > 0.9,
+            "{name}: sync payload must classify as relay-carried under symmetric NAT \
+             (ratio {ratio:.3}; misclassification regression?)"
+        );
+    }
+
+    let total_attempted = alice.dcutr_upgrades_attempted + bob.dcutr_upgrades_attempted;
+    eprintln!(
+        "DCUtR engagement under symmetric NAT: attempted={total_attempted} \
+         (0 = the known engine gap: no punch candidates without an \
+         AutoNAT-confirmed external address; tracked in M1)"
+    );
 }

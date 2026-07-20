@@ -332,6 +332,41 @@ pub enum NatProfile {
     /// iptables -A INPUT -p udp -j DROP
     /// ```
     PortRestrictedConeAutoNATOk,
+
+    /// Symmetric NAT (#51) — the shape that defeats simultaneous-dial
+    /// hole-punching, making DCUtR coordination the only direct path.
+    ///
+    /// The cone shapes above only *filter* inbound; the peer's real
+    /// listen port is what every destination observes, so when the relay
+    /// introduces two peers and both dial at once, each side's conntrack
+    /// entry accepts the other's inbound and a direct connection forms
+    /// with `dcutr_upgrades_attempted = 0`. A symmetric NAT instead
+    /// assigns a **different, unpredictable source port per flow**: the
+    /// port a peer advertises (its listen port) never matches the port
+    /// any destination actually observes, so a dial toward the
+    /// advertised port matches no conntrack entry and is dropped.
+    ///
+    /// Simulated with per-flow source-port randomization on outbound
+    /// UDP, on top of the AutoNAT-whitelisted cone filter (the
+    /// whitelist keeps the engine advertising direct addresses, so
+    /// DCUtR has something to attempt — without it the engine downgrades
+    /// to private and never tries):
+    ///
+    /// ```text
+    /// <PortRestrictedConeAutoNATOk INPUT rules>
+    /// iptables -t nat -A POSTROUTING -p udp -j MASQUERADE --random-fully
+    /// ```
+    ///
+    /// True symmetric NAT defeats even coordinated hole-punching by
+    /// design; the shape's guarantee is that no direct QUIC handshake can
+    /// complete (wire-verified: dials to observed ports retransmit
+    /// unanswered) and sync converges via relay circuits — which is also
+    /// the shape's role as M1's worst-case relay-payload-ratio baseline.
+    /// Note: today the ENGINE never even attempts DCUtR here (AutoNAT
+    /// dial-backs target the masqueraded observed port and fail, so no
+    /// punch candidates exist) — an M1-tracked engine gap; when fixed,
+    /// `dcutr_validation_symmetric_nat` should assert engagement.
+    SymmetricNat,
 }
 
 impl NatProfile {
@@ -373,6 +408,31 @@ impl NatProfile {
                 rules.push(udp_drop);
                 rules
             }
+            NatProfile::SymmetricNat => {
+                let mut rules = vec![conntrack_accept, lo_accept, tcp_accept];
+                if let Some(ip) = autonat_server_ip {
+                    rules.push(argv(&["iptables", "-A", "INPUT", "-s", ip, "-j", "ACCEPT"]));
+                }
+                rules.push(udp_drop);
+                // The symmetric half: every outbound UDP flow leaves with
+                // a fully randomized source port, so the listen port a
+                // peer advertises is never the port any destination
+                // observes. UDP only — the harness's HTTP control API
+                // (TCP) must keep its real ports.
+                rules.push(argv(&[
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-p",
+                    "udp",
+                    "-j",
+                    "MASQUERADE",
+                    "--random-fully",
+                ]));
+                rules
+            }
         }
     }
 
@@ -382,6 +442,7 @@ impl NatProfile {
             NatProfile::Open => "open",
             NatProfile::PortRestrictedCone => "port_restricted_cone",
             NatProfile::PortRestrictedConeAutoNATOk => "port_restricted_cone_autonat_ok",
+            NatProfile::SymmetricNat => "symmetric_nat",
         }
     }
 
@@ -389,7 +450,10 @@ impl NatProfile {
     /// before applying this profile. Used to decide if the relay's
     /// bridge address must be resolved before starting peers.
     fn needs_autonat_whitelist(&self) -> bool {
-        matches!(self, NatProfile::PortRestrictedConeAutoNATOk)
+        matches!(
+            self,
+            NatProfile::PortRestrictedConeAutoNATOk | NatProfile::SymmetricNat
+        )
     }
 }
 
@@ -684,6 +748,24 @@ impl WaveSyncE2eHarness {
                 img = img.with_cap_add("NET_ADMIN");
             }
 
+            // NAT rules ride an env var and are applied by the container
+            // ENTRYPOINT before the engine binary starts. Exec'ing them
+            // after start() raced the engine's first dials: any flow
+            // established rule-free (mDNS discovery on the shared bridge
+            // is instant) was grandfathered forever by the conntrack
+            // ESTABLISHED accept, silently voiding the NAT shape. The
+            // entrypoint also re-applies rules on container restart,
+            // which the post-start exec never did.
+            if effective_nat != NatProfile::Open {
+                let rules = effective_nat
+                    .iptables_argvs(autonat_server_ip.as_deref())
+                    .into_iter()
+                    .map(|argv| argv[1..].join(" "))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                img = img.with_env_var("IPTABLES_RULES", rules);
+            }
+
             let container = img
                 .start()
                 .await
@@ -698,21 +780,6 @@ impl WaveSyncE2eHarness {
                     .await
                     .with_context(|| {
                         format!("apply netem profile {} to {}", profile.name, spec.name)
-                    })?;
-            }
-
-            // Apply NAT (iptables) rules. Order matters relative to
-            // netem: netem shapes egress, iptables filters ingress —
-            // they don't conflict, so apply order is just informative.
-            if effective_nat != NatProfile::Open {
-                apply_nat_to_container(&container, effective_nat, autonat_server_ip.as_deref())
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "apply NAT profile {} to {}",
-                            effective_nat.name(),
-                            spec.name
-                        )
                     })?;
             }
 
@@ -965,24 +1032,10 @@ async fn apply_netem_to_container(
     run_tc(container, &profile.tc_args("add")).await
 }
 
-/// Apply a NAT profile by running its `iptables` argv list against
-/// the container. `autonat_server_ip` is forwarded to variants that
-/// need to whitelist a known-good source IP (see [`NatProfile`]).
-async fn apply_nat_to_container(
-    container: &ContainerAsync<GenericImage>,
-    profile: NatProfile,
-    autonat_server_ip: Option<&str>,
-) -> Result<()> {
-    for argv in profile.iptables_argvs(autonat_server_ip) {
-        let cmd = ExecCommand::new(argv.iter().cloned())
-            .with_cmd_ready_condition(CmdWaitFor::exit_code(0));
-        container
-            .exec(cmd)
-            .await
-            .with_context(|| format!("docker exec {:?}", argv))?;
-    }
-    Ok(())
-}
+// NAT rules are no longer exec'd post-start: they ride the
+// IPTABLES_RULES env var and are applied by the container entrypoint
+// before the engine binary starts (see docker/peer-entrypoint.sh and
+// the rendering site in `start()`).
 
 impl RunningHarness {
     /// Look up a peer client by container name.
