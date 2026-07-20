@@ -27,6 +27,32 @@ object NotificationHelper {
     private const val CHANNEL_ID = "wavesync_messages"
 
     /**
+     * Single app-level notification group for every WaveSync notification.
+     *
+     * Deliberately NOT the per-coalesce key: coalescing rides on the
+     * notification *id* (same group → same id → replace), so a coalesce key
+     * can never accumulate more than one visible notification and per-key
+     * `setGroup` values could never form a visible group. What they did do is
+     * leave multiple distinct-key notifications for the OS to force-bundle
+     * (4+ from one app) under a *system-made* summary that carries no content
+     * intent — the collapsed line whose tap was dead until expanded (#102).
+     * One shared key + our own summary (below) makes any collapse ours.
+     */
+    private const val GROUP_KEY = "dev.wavesync.MESSAGES"
+
+    /** Stable id for the single group-summary notification. */
+    private val SUMMARY_ID = "wavesync_summary".hashCode()
+
+    /**
+     * Deeplink of each live grouped child (id → deeplink, "" = none), kept so
+     * the summary's tap can deep-link when every child agrees and fall back to
+     * plain app-open when they differ. Per-process and best-effort: after a
+     * process restart the map re-fills as children re-post; a stale miss only
+     * downgrades the summary tap to opening the app.
+     */
+    private val childDeeplinks = java.util.concurrent.ConcurrentHashMap<Int, String>()
+
+    /**
      * Application context stashed by [WaveSyncInitProvider] (which runs once per
      * process, including the FCM service process). Lets the Rust background-sync
      * path post notifications via [showFromNative] without a Context of its own.
@@ -54,7 +80,10 @@ object NotificationHelper {
     /**
      * Show a notification. [group] is the coalescing key: notifications sharing
      * a group replace each other (a stable notification id), so a burst for the
-     * same conversation collapses to one entry instead of stacking.
+     * same conversation collapses to one entry instead of stacking. All grouped
+     * notifications additionally share one tray group ([GROUP_KEY]) under an
+     * app-posted summary, so when the shade collapses several of them the
+     * collapsed line still carries a content intent (#102).
      *
      * [deeplink] (empty = none) is an opaque URL: tapping the notification fires
      * an explicit ACTION_VIEW intent carrying it at the app's launcher activity,
@@ -89,43 +118,10 @@ object NotificationHelper {
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
         if (group.isNotEmpty()) {
-            builder.setGroup(group)
+            builder.setGroup(GROUP_KEY)
         }
 
-        // Tap-to-open: an explicit launch intent, so no manifest filter is
-        // needed and no app-chooser appears. A non-empty deeplink rides on the
-        // same explicit intent as ACTION_VIEW data for the activity to route
-        // (delivery is onNewIntent / onCreate depending on its launchMode).
-        // No launcher activity (headless install) → tap does nothing, but the
-        // notification still posts.
-        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
-        if (launch != null) {
-            if (deeplink.isNotEmpty()) {
-                launch.action = Intent.ACTION_VIEW
-                launch.data = Uri.parse(deeplink)
-                // The LAUNCHER category is meaningless on a VIEW intent and can
-                // confuse app-side routing that inspects categories.
-                launch.removeCategory(Intent.CATEGORY_LAUNCHER)
-                // Deliver to the running activity via onNewIntent even with the
-                // default launchMode: without SINGLE_TOP|CLEAR_TOP a warm tap
-                // stacks a second activity instance (a second webview + engine
-                // for a Dioxus app) instead of routing in the existing one.
-                launch.addFlags(
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP,
-                )
-            }
-            try {
-                val pending = PendingIntent.getActivity(
-                    context, id, launch,
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-                )
-                builder.setContentIntent(pending)
-            } catch (e: Exception) {
-                // e.g. the Android 12+ per-uid PendingIntent cap
-                // (SecurityException). A tap-less notification beats none.
-                Log.w(TAG, "content intent not attached: ${e.message}")
-            }
-        }
+        buildContentIntent(context, id, deeplink)?.let { builder.setContentIntent(it) }
 
         try {
             NotificationManagerCompat.from(context).notify(id, builder.build())
@@ -133,6 +129,90 @@ object NotificationHelper {
             // POST_NOTIFICATIONS not granted at runtime (Android 13+). The
             // permission is declared in the manifest, but the user can deny it.
             Log.w(TAG, "Notification not posted (permission denied): ${e.message}")
+            return
+        }
+
+        // Keep the collapsed line tappable: with 2+ grouped notifications the
+        // shade shows the group summary, and only an app-posted summary can
+        // carry a content intent (#102). Refreshed on every child post so its
+        // preview text tracks the newest child. With a single child the system
+        // shows the child alone, so posting the summary eagerly is harmless.
+        if (group.isNotEmpty()) {
+            childDeeplinks[id] = deeplink
+            postSummary(context, title, body, icon)
+        }
+    }
+
+    /**
+     * Post/refresh the single group-summary notification. Its tap deep-links
+     * only when every live child agrees on one destination; otherwise (mixed
+     * or absent deeplinks) it just opens the app. The summary never alerts on
+     * its own — children carry the sound/heads-up.
+     */
+    private fun postSummary(context: Context, title: String, body: String, icon: Int) {
+        val deeplinks = childDeeplinks.values.toSet()
+        val summaryDeeplink = deeplinks.singleOrNull()?.takeIf { it.isNotEmpty() } ?: ""
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setSmallIcon(icon)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .setGroup(GROUP_KEY)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_CHILDREN)
+            .setOnlyAlertOnce(true)
+        buildContentIntent(context, SUMMARY_ID, summaryDeeplink)?.let {
+            builder.setContentIntent(it)
+        }
+
+        try {
+            NotificationManagerCompat.from(context).notify(SUMMARY_ID, builder.build())
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Summary not posted (permission denied): ${e.message}")
+        }
+    }
+
+    /**
+     * Tap-to-open: an explicit launch intent, so no manifest filter is needed
+     * and no app-chooser appears. A non-empty [deeplink] rides on the same
+     * explicit intent as ACTION_VIEW data for the activity to route (delivery
+     * is onNewIntent / onCreate depending on its launchMode). Returns null
+     * with no launcher activity (headless install) — tap does nothing, but
+     * the notification still posts — or when the PendingIntent can't be
+     * created (e.g. the Android 12+ per-uid cap): a tap-less notification
+     * beats none.
+     */
+    private fun buildContentIntent(
+        context: Context,
+        requestCode: Int,
+        deeplink: String,
+    ): PendingIntent? {
+        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            ?: return null
+        if (deeplink.isNotEmpty()) {
+            launch.action = Intent.ACTION_VIEW
+            launch.data = Uri.parse(deeplink)
+            // The LAUNCHER category is meaningless on a VIEW intent and can
+            // confuse app-side routing that inspects categories.
+            launch.removeCategory(Intent.CATEGORY_LAUNCHER)
+            // Deliver to the running activity via onNewIntent even with the
+            // default launchMode: without SINGLE_TOP|CLEAR_TOP a warm tap
+            // stacks a second activity instance (a second webview + engine
+            // for a Dioxus app) instead of routing in the existing one.
+            launch.addFlags(
+                Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP,
+            )
+        }
+        return try {
+            PendingIntent.getActivity(
+                context, requestCode, launch,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "content intent not attached: ${e.message}")
+            null
         }
     }
 
