@@ -100,6 +100,24 @@ async fn dcutr_validation_cellular_fair() {
         bob.direct_connections_established,
         bob.relay_connections_demoted
     );
+
+    // Sync-payload byte split (#84 gauge): what fraction of the actual data
+    // rode the relay vs a direct path. Counted at the payload verify/sign
+    // sites, classified by the carrying connection.
+    for (name, d) in [("Alice", &alice), ("Bob", &bob)] {
+        let relay = d.relay_bytes_in + d.relay_bytes_out;
+        let direct = d.direct_bytes_in + d.direct_bytes_out;
+        let total = relay + direct;
+        let ratio = if total == 0 {
+            f64::NAN
+        } else {
+            relay as f64 / total as f64
+        };
+        eprintln!(
+            "{name} bytes: relay={relay} (in={} out={})  direct={direct} (in={} out={})  relay_ratio={ratio:.3}",
+            d.relay_bytes_in, d.relay_bytes_out, d.direct_bytes_in, d.direct_bytes_out,
+        );
+    }
     // Demotions can never exceed the relay connections we ever established.
     assert!(
         alice.relay_connections_demoted <= alice.relayed_connections_established,
