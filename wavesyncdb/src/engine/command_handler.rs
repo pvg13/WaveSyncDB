@@ -109,6 +109,14 @@ impl EngineRunner {
                          connect-time sync initiation"
                     );
                     self.update_network_status();
+                    // Catch up on mailbox entries appended while no engine
+                    // served this group. Drains are gated on registry
+                    // readiness (an earlier drain would consume entries the
+                    // apply path rejects as "unregistered table" — #104), so
+                    // this is the group's first drain opportunity. No-op when
+                    // the relay isn't connected yet; the reservation-accepted
+                    // handler covers that ordering.
+                    self.start_mailbox_drain(&effective_topic);
                     // No eager peer sweep here on purpose: the periodic tick
                     // already syncs every group with known peers, and adding a
                     // burst of version-vector requests across all connected peers
@@ -206,9 +214,11 @@ impl EngineRunner {
             // moment; a group joined later (e.g. a household joined after
             // login) would otherwise never be registered.
             self.register_push_token_for_topic(relay_peer_id, &topic_name);
-            // Catch up on anything durably appended for this group while no
-            // local engine was serving it.
-            self.start_mailbox_drain(&effective_topic);
+            // NOTE: no mailbox drain here. The app registers the group's
+            // schema only after `join_group()` returns, and a drain racing
+            // that registration consumed entries the apply path rejected as
+            // "unregistered table" — permanent data loss (#104). The drain
+            // fires from the GroupRegistryReady handler instead.
         }
 
         self.update_network_status();

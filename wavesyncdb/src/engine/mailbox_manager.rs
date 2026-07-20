@@ -98,9 +98,10 @@ pub(crate) enum MailboxTaskMsg {
         truncated: bool,
         /// At least one entry failed AEAD (tampered / non-member garbage).
         tampered: bool,
-        /// An apply failed to commit (DB error) — the page stopped early and
-        /// the cursor was NOT advanced past the failing entry; the next
-        /// drain re-fetches it.
+        /// The page stopped early without consuming the failing entry —
+        /// either an apply failed to commit (DB error) or a changeset
+        /// targeted a not-yet-registered table (#104). The cursor was NOT
+        /// advanced past that entry; the next drain re-fetches it.
         apply_failed: bool,
     },
     /// A healing delta is sealed and ready to append (possibly chunked).
@@ -130,6 +131,153 @@ fn effective_watermark(candidate: u64, unacked: &std::collections::BTreeSet<u64>
     match unacked.first() {
         Some(&lowest) => candidate.min(lowest.saturating_sub(1)),
         None => candidate,
+    }
+}
+
+/// Outcome of decrypting + applying one fetched mailbox page.
+pub(crate) struct DrainPageOutcome {
+    /// Entries whose changesets were applied (excludes own-site round-trips
+    /// and tampered entries, which are consumed but apply nothing).
+    pub applied: u64,
+    /// At least one entry failed AEAD (tampered / non-member garbage).
+    pub tampered: bool,
+    /// The page stopped early without consuming the failing entry — either a
+    /// DB-level apply failure or a changeset for a not-yet-registered table.
+    /// The cursor was NOT advanced past that entry; the next drain retries.
+    pub apply_failed: bool,
+    /// The seq the cursor was persisted through (the caller max()es it into
+    /// the in-memory cursor; unchanged cursor when nothing was consumed).
+    pub last_seq: u64,
+}
+
+/// Decrypt and apply one fetched mailbox page, persisting the cursor after
+/// each consumed entry. Factored out of the drain task's spawn so the
+/// per-entry consume/defer policy is unit-testable without a relay or swarm.
+///
+/// Consume policy per entry:
+/// * AEAD/parse failure → consumed (a poison entry must not wedge the mailbox
+///   forever; the caller triggers a group reconcile off `tampered`).
+/// * own-site entry → consumed (round-tripped local write, nothing to apply).
+/// * changeset touching an unregistered table → NOT consumed; the page stops
+///   and a later drain (post-registration) retries. Consuming here is what
+///   turned the join-time registration race into permanent data loss (#104).
+/// * DB-level apply failure → NOT consumed; the page stops so the next drain
+///   re-fetches the failing entry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_drain_page(
+    db: &DatabaseConnection,
+    change_tx: &broadcast::Sender<ChangeNotification>,
+    registry: &TableRegistry,
+    db_version_cache: &std::sync::atomic::AtomicU64,
+    notif_registry: &crate::registry::NotificationRegistry,
+    notif_tx: &broadcast::Sender<crate::notify::Notification>,
+    mailbox_key: &[u8; 32],
+    topic_name: &str,
+    local_site: crate::messages::NodeId,
+    entries: &[MailboxEntry],
+    epoch: u64,
+) -> DrainPageOutcome {
+    let mut applied = 0u64;
+    let mut tampered = false;
+    let mut apply_failed = false;
+    let mut cursor = 0u64;
+    for MailboxEntry {
+        seq,
+        nonce,
+        ciphertext,
+    } in entries
+    {
+        let opened = b64::decode(nonce)
+            .and_then(|n| <[u8; mailbox_seal::NONCE_LEN]>::try_from(n).ok())
+            .zip(b64::decode(ciphertext))
+            .and_then(|(nonce, ct)| mailbox_seal::open(mailbox_key, topic_name, &nonce, &ct).ok())
+            .and_then(|plain| serde_json::from_slice::<SyncChangeset>(&plain).ok());
+
+        match opened {
+            None => {
+                // Tampered / non-member garbage / malformed. Never
+                // applied; advance past it (the reconcile triggered
+                // by the outcome recovers any real data it carried).
+                tracing::warn!(
+                    seq,
+                    "mailbox entry failed authentication; skipping and falling back to reconcile"
+                );
+                tampered = true;
+            }
+            Some(changeset) if changeset.site_id == local_site => {
+                // Our own entry, round-tripped. Nothing to apply.
+            }
+            Some(changeset) => {
+                // Defer — never consume — an entry touching a table the app
+                // hasn't registered (yet). `apply_remote_changeset` skips
+                // unregistered tables but still commits the rest, so treating
+                // its `committed` as "delivered" would advance the cursor past
+                // data that was never applied — a transient join-time
+                // registration race would become permanent, group-wide data
+                // loss (#104). Not-delivered keeps the entry in the mailbox;
+                // the drain retries after registration completes (drains are
+                // also gated on `registry_is_ready`).
+                if let Some(missing) = changeset
+                    .changes
+                    .iter()
+                    .find(|c| registry.get(&c.table.0).is_none())
+                {
+                    tracing::warn!(
+                        seq,
+                        table = %missing.table.0,
+                        "mailbox entry targets unregistered table; deferring drain without consuming the entry"
+                    );
+                    apply_failed = true;
+                    break;
+                }
+                let notify_ctx = sync_handler::NotifyCtx {
+                    registry: notif_registry,
+                    tx: notif_tx,
+                };
+                let source = crate::messages::ChangeSource::Remote {
+                    peer_site: changeset.site_id,
+                };
+                let committed = apply_remote_changeset(
+                    db,
+                    change_tx,
+                    registry,
+                    &changeset.changes,
+                    Some(db_version_cache),
+                    source,
+                    Some(notify_ctx),
+                )
+                .await;
+                if !committed {
+                    // DB-level failure: stop WITHOUT advancing the
+                    // cursor past this entry so the next drain
+                    // retries it.
+                    apply_failed = true;
+                    break;
+                }
+                applied += 1;
+            }
+        }
+        cursor = *seq;
+        // Persist after the apply committed — crash between apply
+        // and cursor write re-fetches (idempotent), never skips.
+        if let Err(e) = shadow::set_mailbox_cursor(db, cursor, epoch).await {
+            tracing::warn!("failed to persist mailbox cursor: {e}");
+            break;
+        }
+    }
+    let last_seq = if cursor > 0 {
+        cursor
+    } else {
+        entries
+            .first()
+            .map(|e| e.seq.saturating_sub(1))
+            .unwrap_or(0)
+    };
+    DrainPageOutcome {
+        applied,
+        tampered,
+        apply_failed,
+        last_seq,
     }
 }
 
@@ -263,6 +411,19 @@ impl EngineRunner {
         let Some(g) = self.groups.get_mut(effective_topic) else {
             return;
         };
+        // Never drain before the app has registered the group's schema: the
+        // apply path rejects changesets for unregistered tables, and a drain
+        // racing `register(...).sync()` at join time turned those transient
+        // rejects into consumed-and-lost entries (#104). Readiness arrival
+        // (GroupRegistryReady / the default group's Notify) re-kicks the
+        // drain, so deferring here delays nothing once the schema lands.
+        if !g.registry_is_ready {
+            tracing::debug!(
+                topic = %short_topic(effective_topic),
+                "mailbox drain deferred: schema registry not ready"
+            );
+            return;
+        }
         if g.group_key.is_none() || g.mailbox_drain_in_flight {
             return;
         }
@@ -740,91 +901,29 @@ impl EngineRunner {
         let tx = self.mailbox_task_tx.clone();
 
         tokio::spawn(async move {
-            let mut applied = 0u64;
-            let mut tampered = false;
-            let mut apply_failed = false;
-            let mut cursor = 0u64;
-            for MailboxEntry {
-                seq,
-                nonce,
-                ciphertext,
-            } in &entries
-            {
-                let opened = b64::decode(nonce)
-                    .and_then(|n| <[u8; mailbox_seal::NONCE_LEN]>::try_from(n).ok())
-                    .zip(b64::decode(ciphertext))
-                    .and_then(|(nonce, ct)| {
-                        mailbox_seal::open(&mailbox_key, &topic_name, &nonce, &ct).ok()
-                    })
-                    .and_then(|plain| serde_json::from_slice::<SyncChangeset>(&plain).ok());
-
-                match opened {
-                    None => {
-                        // Tampered / non-member garbage / malformed. Never
-                        // applied; advance past it (the reconcile triggered
-                        // by the outcome recovers any real data it carried).
-                        tracing::warn!(
-                            seq,
-                            "mailbox entry failed authentication; skipping and falling back to reconcile"
-                        );
-                        tampered = true;
-                    }
-                    Some(changeset) if changeset.site_id == local_site => {
-                        // Our own entry, round-tripped. Nothing to apply.
-                    }
-                    Some(changeset) => {
-                        let notify_ctx = sync_handler::NotifyCtx {
-                            registry: &notif_registry,
-                            tx: &notif_tx,
-                        };
-                        let source = crate::messages::ChangeSource::Remote {
-                            peer_site: changeset.site_id,
-                        };
-                        let committed = apply_remote_changeset(
-                            &db,
-                            &change_tx,
-                            &registry,
-                            &changeset.changes,
-                            Some(&cache),
-                            source,
-                            Some(notify_ctx),
-                        )
-                        .await;
-                        if !committed {
-                            // DB-level failure: stop WITHOUT advancing the
-                            // cursor past this entry so the next drain
-                            // retries it.
-                            apply_failed = true;
-                            break;
-                        }
-                        applied += 1;
-                    }
-                }
-                cursor = *seq;
-                // Persist after the apply committed — crash between apply
-                // and cursor write re-fetches (idempotent), never skips.
-                if let Err(e) = shadow::set_mailbox_cursor(&db, cursor, epoch).await {
-                    tracing::warn!("failed to persist mailbox cursor: {e}");
-                    break;
-                }
-            }
-            let last_seq = if cursor > 0 {
-                cursor
-            } else {
-                entries
-                    .first()
-                    .map(|e| e.seq.saturating_sub(1))
-                    .unwrap_or(0)
-            };
+            let outcome = apply_drain_page(
+                &db,
+                &change_tx,
+                &registry,
+                &cache,
+                &notif_registry,
+                &notif_tx,
+                &mailbox_key,
+                &topic_name,
+                local_site,
+                &entries,
+                epoch,
+            )
+            .await;
             let _ = tx
                 .send(MailboxTaskMsg::DrainPageDone {
                     effective_topic: topic,
-                    last_seq,
+                    last_seq: outcome.last_seq,
                     epoch,
-                    applied,
+                    applied: outcome.applied,
                     truncated,
-                    tampered,
-                    apply_failed,
+                    tampered: outcome.tampered,
+                    apply_failed: outcome.apply_failed,
                 })
                 .await;
         });
@@ -996,7 +1095,178 @@ impl EngineRunner {
 #[cfg(test)]
 mod tests {
     use super::effective_watermark;
+    use super::*;
+    use crate::messages::{ColumnChange, NodeId};
+    use crate::registry::{TableMeta, TableRegistry};
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicU64;
+
+    const MAILBOX_KEY: [u8; 32] = [7u8; 32];
+    const TOPIC: &str = "wavesync2-drain-test";
+    const LOCAL_SITE: NodeId = NodeId([1u8; 16]);
+    const REMOTE_SITE: NodeId = NodeId([2u8; 16]);
+
+    async fn drain_test_db() -> DatabaseConnection {
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        shadow::create_meta_table(&db).await.unwrap();
+        crate::capture::ensure_capture_tables(&db).await.unwrap();
+        crate::peer_tracker::create_peer_versions_table(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Registers `tasks` (table + shadow + registry meta) the way a real
+    /// schema registration would, so applies against it commit for real.
+    async fn register_tasks_table(db: &DatabaseConnection, registry: &TableRegistry) {
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT)")
+            .await
+            .unwrap();
+        shadow::create_shadow_table(db, "tasks").await.unwrap();
+        registry.register(TableMeta {
+            table_name: "tasks".to_string(),
+            primary_key_column: "id".to_string(),
+            columns: vec!["id".to_string(), "title".to_string()],
+            delete_policy: crate::messages::DeletePolicy::default(),
+        });
+    }
+
+    fn changeset_for(table: &str, site: NodeId) -> SyncChangeset {
+        SyncChangeset {
+            site_id: site,
+            db_version: 1,
+            changes: vec![ColumnChange {
+                table: table.into(),
+                pk: "row-1".into(),
+                cid: "title".into(),
+                val: Some(serde_json::json!("hello")),
+                site_id: site,
+                col_version: 1,
+                cl: 1,
+                seq: 0,
+                db_version: 1,
+                deleted_ts: None,
+            }],
+        }
+    }
+
+    fn sealed_entry(seq: u64, changeset: &SyncChangeset) -> MailboxEntry {
+        let plain = serde_json::to_vec(changeset).unwrap();
+        let sealed = mailbox_seal::seal(&MAILBOX_KEY, TOPIC, &plain).unwrap();
+        MailboxEntry {
+            seq,
+            nonce: b64::encode(&sealed.nonce),
+            ciphertext: b64::encode(&sealed.ciphertext),
+        }
+    }
+
+    async fn run_page(
+        db: &DatabaseConnection,
+        registry: &TableRegistry,
+        entries: &[MailboxEntry],
+    ) -> DrainPageOutcome {
+        let (change_tx, _) = broadcast::channel::<ChangeNotification>(16);
+        let (notif_tx, _) = broadcast::channel::<crate::notify::Notification>(16);
+        let notif_registry = crate::registry::NotificationRegistry::new();
+        let cache = AtomicU64::new(0);
+        apply_drain_page(
+            db,
+            &change_tx,
+            registry,
+            &cache,
+            &notif_registry,
+            &notif_tx,
+            &MAILBOX_KEY,
+            TOPIC,
+            LOCAL_SITE,
+            entries,
+            3,
+        )
+        .await
+    }
+
+    /// #104 REGRESSION — a drained entry whose changeset targets a table the
+    /// app has not registered YET (join-time race: the drain won against
+    /// `register(...).sync()`) must NOT be consumed. Advancing the cursor
+    /// past it means the entry is never re-fetched and the data is silently
+    /// lost group-wide once no live peer still holds the rows.
+    #[tokio::test]
+    async fn drain_defers_unregistered_table_entries_without_consuming() {
+        let db = drain_test_db().await;
+        let registry = TableRegistry::new(); // schema not registered yet
+
+        let entries = vec![sealed_entry(5, &changeset_for("tasks", REMOTE_SITE))];
+        let outcome = run_page(&db, &registry, &entries).await;
+
+        assert!(
+            outcome.apply_failed,
+            "unregistered-table entry must end the page as not-delivered"
+        );
+        assert_eq!(outcome.applied, 0);
+        let meta = shadow::get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(
+            meta.cursor, 0,
+            "cursor must not be persisted past an entry whose table isn't registered — \
+             consuming it here is permanent data loss (#104)"
+        );
+    }
+
+    /// Companion to the #104 test: once the table IS registered, the same
+    /// entry applies and the cursor advances normally.
+    #[tokio::test]
+    async fn drain_applies_registered_table_entries_and_advances_cursor() {
+        let db = drain_test_db().await;
+        let registry = TableRegistry::new();
+        register_tasks_table(&db, &registry).await;
+
+        let entries = vec![sealed_entry(5, &changeset_for("tasks", REMOTE_SITE))];
+        let outcome = run_page(&db, &registry, &entries).await;
+
+        assert!(!outcome.apply_failed);
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.last_seq, 5);
+        let meta = shadow::get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 5);
+    }
+
+    /// Policy lock-in: a tampered entry is consumed (poison must not wedge
+    /// the mailbox) and flagged so the caller falls back to reconcile.
+    #[tokio::test]
+    async fn drain_consumes_tampered_entries_and_flags_reconcile() {
+        let db = drain_test_db().await;
+        let registry = TableRegistry::new();
+
+        let entries = vec![MailboxEntry {
+            seq: 5,
+            nonce: b64::encode(&[0u8; mailbox_seal::NONCE_LEN]),
+            ciphertext: b64::encode(b"garbage"),
+        }];
+        let outcome = run_page(&db, &registry, &entries).await;
+
+        assert!(outcome.tampered);
+        assert!(!outcome.apply_failed);
+        assert_eq!(outcome.applied, 0);
+        let meta = shadow::get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 5, "poison entries are skipped, not retried");
+    }
+
+    /// Policy lock-in: our own round-tripped entry is consumed without
+    /// applying — even when its table isn't registered (there is nothing to
+    /// lose: the data is already local).
+    #[tokio::test]
+    async fn drain_consumes_own_site_entries_without_applying() {
+        let db = drain_test_db().await;
+        let registry = TableRegistry::new();
+
+        let entries = vec![sealed_entry(5, &changeset_for("tasks", LOCAL_SITE))];
+        let outcome = run_page(&db, &registry, &entries).await;
+
+        assert!(!outcome.apply_failed);
+        assert_eq!(outcome.applied, 0);
+        let meta = shadow::get_mailbox_meta(&db).await.unwrap();
+        assert_eq!(meta.cursor, 5);
+    }
 
     #[test]
     fn no_unacked_versions_lets_candidate_through() {
