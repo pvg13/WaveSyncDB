@@ -496,6 +496,27 @@ fn addr_is_relayed(addr: &libp2p::Multiaddr) -> bool {
         .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
 }
 
+/// Whether a connection endpoint is carried by the relay. The remote address
+/// alone is NOT enough: for an INBOUND circuit connection the
+/// `send_back_addr` is a bare `/p2p/<peer>` with no `/p2p-circuit` in it —
+/// classifying on `get_remote_address()` marked inbound circuits as DIRECT,
+/// which undercounted the #84 relay-cost meters, flipped `peer_via_relay`
+/// to `false` for a peer with no direct path (suppressing circuit redials
+/// via `prefers_direct`), and let the demotion logic close a peer's only
+/// working circuit believing a direct path existed (found by the
+/// symmetric-NAT harness shape, #51). The circuit is visible on the
+/// LISTENER side in `local_addr` — the circuit listen address — so check
+/// every address the endpoint carries.
+fn endpoint_is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => addr_is_relayed(address),
+        libp2p::core::ConnectedPoint::Listener {
+            local_addr,
+            send_back_addr,
+        } => addr_is_relayed(local_addr) || addr_is_relayed(send_back_addr),
+    }
+}
+
 /// Attribute `n` wire bytes exchanged with `peer` to the relay/direct bucket
 /// in `Counters`, and mirror the same total into `PeerHealthStore`. Every
 /// HMAC sign/verify site already runs `serde_json::to_vec` to build/check the
@@ -3131,7 +3152,7 @@ impl EngineRunner {
                     // (carried by the relay server) or direct. A DCUtR upgrade
                     // later arrives as a separate direct ConnectionEstablished,
                     // which flips the peer to direct below.
-                    if addr_is_relayed(endpoint.get_remote_address()) {
+                    if endpoint_is_relayed(&endpoint) {
                         self.diagnostics
                             .relayed_connections_established
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3664,6 +3685,55 @@ fn group_bootstrap_addrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #51-found REGRESSION — an INBOUND circuit connection carries the
+    /// circuit only in `local_addr` (the circuit listen address); its
+    /// `send_back_addr` is a bare `/p2p/<peer>`. Classifying on the remote
+    /// address alone marked inbound circuits as direct: relay-cost meters
+    /// undercounted, `peer_via_relay` flipped to false with no direct path,
+    /// and demotion closed a peer's only working circuit.
+    #[test]
+    fn endpoint_is_relayed_recognizes_inbound_circuits() {
+        let circuit_listen: libp2p::Multiaddr =
+            "/ip4/172.19.0.2/udp/4001/quic-v1/p2p/12D3KooWMeYERaoc69hRBQvoM2K7ySw4apKRy5wmPQDGTsAaJYNG/p2p-circuit"
+                .parse()
+                .unwrap();
+        let bare_peer: libp2p::Multiaddr =
+            "/p2p/12D3KooWHpxvvVtDfFF5B7FfZ6R1FCW6svfZgKfSG63kWhpv2pn6"
+                .parse()
+                .unwrap();
+        let inbound_circuit = libp2p::core::ConnectedPoint::Listener {
+            local_addr: circuit_listen,
+            send_back_addr: bare_peer.clone(),
+        };
+        assert!(
+            endpoint_is_relayed(&inbound_circuit),
+            "inbound circuit must classify as relayed even though send_back_addr has no /p2p-circuit"
+        );
+
+        let direct_inbound = libp2p::core::ConnectedPoint::Listener {
+            local_addr: "/ip4/172.19.0.3/udp/33390/quic-v1".parse().unwrap(),
+            send_back_addr: "/ip4/172.19.0.4/udp/38860/quic-v1".parse().unwrap(),
+        };
+        assert!(!endpoint_is_relayed(&direct_inbound));
+
+        let outbound_circuit = libp2p::core::ConnectedPoint::Dialer {
+            address:
+                "/ip4/172.19.0.2/udp/4001/quic-v1/p2p/12D3KooWMeYERaoc69hRBQvoM2K7ySw4apKRy5wmPQDGTsAaJYNG/p2p-circuit/p2p/12D3KooWHpxvvVtDfFF5B7FfZ6R1FCW6svfZgKfSG63kWhpv2pn6"
+                    .parse()
+                    .unwrap(),
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::Reuse,
+        };
+        assert!(endpoint_is_relayed(&outbound_circuit));
+
+        let direct_outbound = libp2p::core::ConnectedPoint::Dialer {
+            address: "/ip4/172.19.0.4/udp/18292/quic-v1".parse().unwrap(),
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::Reuse,
+        };
+        assert!(!endpoint_is_relayed(&direct_outbound));
+    }
 
     #[test]
     fn addr_is_lan_classifies_local_vs_public() {
