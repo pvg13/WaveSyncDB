@@ -116,10 +116,16 @@ pub(crate) struct Counters {
     /// runs with a warm cache.
     pub cached_addr_dials: AtomicU64,
 
-    /// `dcutr::Event` arrivals — every direct-connection upgrade attempt
-    /// the relay-routed connection produced. Each event resolves to either
-    /// a success (counted in [`Self::dcutr_upgrades_succeeded`]) or a
-    /// failure. Subtraction gives the failure count.
+    /// `dcutr::Event` arrivals — TERMINAL upgrade outcomes, not punch
+    /// starts. Each event resolves to either a success (counted in
+    /// [`Self::dcutr_upgrades_succeeded`]) or a failure; subtraction gives
+    /// the failure count. Semantics pinned by the #110 investigation: the
+    /// dcutr behaviour retries a failed punch dial internally (each retry
+    /// gated on a slow QUIC dial timeout) and only emits its failure event
+    /// after exhausting max attempts — so a short observation window over a
+    /// punch-impossible NAT (symmetric) legitimately reads 0 here even
+    /// while behaviour-level punch attempts are running. A zero is
+    /// "no *resolved* upgrades", never proof that DCUtR didn't engage.
     pub dcutr_upgrades_attempted: AtomicU64,
     /// `dcutr::Event` with `Ok(_)` result — successful upgrades from
     /// circuit-relay to a direct peer-to-peer connection. After a

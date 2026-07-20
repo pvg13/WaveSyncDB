@@ -323,8 +323,129 @@ async fn dcutr_validation_symmetric_nat() {
 
     let total_attempted = alice.dcutr_upgrades_attempted + bob.dcutr_upgrades_attempted;
     eprintln!(
-        "DCUtR engagement under symmetric NAT: attempted={total_attempted} \
-         (0 = the known engine gap: no punch candidates without an \
-         AutoNAT-confirmed external address; tracked in M1)"
+        "DCUtR terminal outcomes under symmetric NAT: attempted={total_attempted} \
+         (behaviour-level punch attempts DO run — see debug logs — but each \
+         failed punch dial takes a slow QUIC timeout and the counter only \
+         counts terminal events after max retries, so short windows read 0)"
+    );
+}
+
+/// #110 — the class where the hole-punch can genuinely land: port-restricted
+/// cone WITHOUT the AutoNAT whitelist.
+///
+/// No whitelist ⇒ AutoNAT dial-backs fail ⇒ the engine advertises only its
+/// circuit address ⇒ relay introductions cannot short-circuit into
+/// simultaneous direct dials (they only carry the circuit). The peers meet
+/// over relay circuits, DCUtR exchanges identify-observed addresses (which
+/// equal the real listen ports — no port rewriting on a cone), and the
+/// coordinated simultaneous dials punch the conntrack filters on both
+/// sides. Success = a direct connection supersedes the circuit and the
+/// steady-state payload leaves the relay.
+#[tokio::test]
+#[ignore = "Local-only DCUtR validation; requires Docker + netem."]
+async fn dcutr_validation_port_restricted_no_whitelist() {
+    let profile = NetemProfile::cellular_fair();
+
+    let harness = WaveSyncE2eHarness::new()
+        .with_passphrase("dcutr-cone-nowl")
+        .with_netem(profile.clone())
+        .with_nat(NatProfile::PortRestrictedCone)
+        .without_mdns()
+        .add_peer("alice")
+        .add_peer("bob")
+        .start()
+        .await
+        .expect("harness start");
+
+    // Converge over whatever path exists first.
+    for i in 0..10 {
+        let id = format!("cone-a{i}");
+        let title = format!("alice write {i}");
+        harness
+            .peer("alice")
+            .insert_task(&id, &title, false)
+            .await
+            .expect("alice insert");
+        harness
+            .peer("bob")
+            .wait_for_task(&id, &title, Duration::from_secs(30))
+            .await
+            .expect("bob receive");
+    }
+
+    // Generous punch window: CONNECT roundtrips + simultaneous dials +
+    // (on failure) dcutr's internal re-attempts each gated on a QUIC dial
+    // timeout.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Post-punch traffic so the byte split reflects the upgraded path.
+    for i in 0..5 {
+        let id = format!("cone-b{i}");
+        let title = format!("post-punch write {i}");
+        harness
+            .peer("alice")
+            .insert_task(&id, &title, false)
+            .await
+            .expect("alice insert");
+        harness
+            .peer("bob")
+            .wait_for_task(&id, &title, Duration::from_secs(30))
+            .await
+            .expect("bob receive");
+    }
+
+    let alice = harness
+        .peer("alice")
+        .diagnostics()
+        .await
+        .expect("alice diag");
+    let bob = harness.peer("bob").diagnostics().await.expect("bob diag");
+
+    eprintln!(
+        "\n=== DCUtR validation on port-restricted cone, no AutoNAT whitelist ({}) ===\n",
+        profile.name
+    );
+    eprintln!(
+        "Alice: attempted={}  succeeded={}   Bob: attempted={}  succeeded={}",
+        alice.dcutr_upgrades_attempted,
+        alice.dcutr_upgrades_succeeded,
+        bob.dcutr_upgrades_attempted,
+        bob.dcutr_upgrades_succeeded
+    );
+    eprintln!(
+        "Alice relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        alice.relayed_connections_established,
+        alice.direct_connections_established,
+        alice.relay_connections_demoted
+    );
+    eprintln!(
+        "Bob   relay-cost: relayed_established={}  direct_established={}  demoted={}",
+        bob.relayed_connections_established,
+        bob.direct_connections_established,
+        bob.relay_connections_demoted
+    );
+    for (name, d) in [("Alice", &alice), ("Bob", &bob)] {
+        let relay = d.relay_bytes_in + d.relay_bytes_out;
+        let direct = d.direct_bytes_in + d.direct_bytes_out;
+        let total = relay + direct;
+        let ratio = if total == 0 {
+            f64::NAN
+        } else {
+            relay as f64 / total as f64
+        };
+        eprintln!(
+            "{name} bytes: relay={relay} (in={} out={})  direct={direct} (in={} out={})  relay_ratio={ratio:.3}",
+            d.relay_bytes_in, d.relay_bytes_out, d.direct_bytes_in, d.direct_bytes_out,
+        );
+    }
+
+    // The milestone-relevant outcome: a direct path formed and carried the
+    // post-punch payload off the relay.
+    assert!(
+        alice.direct_connections_established >= 1 && bob.direct_connections_established >= 1,
+        "the punch (or coordinated direct dials) must land a direct connection on a \
+         port-restricted cone (alice direct={}, bob direct={})",
+        alice.direct_connections_established,
+        bob.direct_connections_established,
     );
 }

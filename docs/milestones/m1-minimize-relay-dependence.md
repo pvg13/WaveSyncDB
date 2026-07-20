@@ -14,7 +14,7 @@ infrastructure; this milestone makes that claim quantitative.
 
 | KPI | Definition | Source | Baseline (2026-07-20) | Target |
 |---|---|---|---|---|
-| Relay payload ratio | relayed sync bytes / total sync bytes, per NAT class | client diagnostics `relay_bytes_*`/`direct_bytes_*` (counted at the payload verify/sign sites, classified by carrying connection); `relay_traffic_ratio()` | LAN: 0.000 · port-restricted-cone WAN: **0.000 measured** (`dcutr_validation`, ~47 KB payload, 0 relayed) · symmetric NAT: **1.000 measured** (`dcutr_validation_symmetric_nat`, 2026-07-21 — every sync byte relay-carried; DCUtR never engages, see #110) | symmetric-NAT target: gated on #110 (punch candidates under failed AutoNAT); cone/LAN: hold at 0.000 |
+| Relay payload ratio | relayed sync bytes / total sync bytes, per NAT class | client diagnostics `relay_bytes_*`/`direct_bytes_*` (counted at the payload verify/sign sites, classified by carrying connection); `relay_traffic_ratio()` | LAN: 0.000 · port-restricted cone (AutoNAT OK **and** AutoNAT failing): **0.000 measured** (`dcutr_validation`, `dcutr_validation_port_restricted_no_whitelist`) · symmetric NAT: **1.000 measured** (`dcutr_validation_symmetric_nat`) | cone/LAN: hold at 0.000. Symmetric NAT: 1.000 is **physics**, not a bug (no hole-punch can succeed; #110 investigation) — the mitigation for those fleets is the durable mailbox + circuits, i.e. the relay is doing exactly its last-resort job |
 | Relay bytes per device-day | all relay-bound bytes incl. mailbox appends/drains and signaling | relay Prometheus (`relay_mailbox_*`, bandwidth counters) / device count; Grafana panel (P0 adds it) | unknown — P0 reads it off production | mailbox dial (#107) cuts steady-state appends by >80% for daily-overlapping fleets |
 | Mobile wake efficiency | after a push wake, sync completes over a direct path when one is possible | wake-scenario diagnostics (`relayed_connections_established` vs `direct_…` in the wake window) | unknown — P1 measures per platform | no lingering relay circuits after a wake when direct is possible |
 
@@ -40,9 +40,19 @@ infrastructure; this milestone makes that claim quantitative.
   - Engine bug fixed: inbound circuit connections classified as direct
     (`endpoint_is_relayed`) — #84 meters undercounted, `peer_via_relay`
     corrupted, demotion closed a peer's only circuit.
-  - Engine gap filed as **#110**: DCUtR never engages when AutoNAT dial-backs
-    fail (no punch candidates without a confirmed external address) — the
-    symmetric-NAT target above is gated on it.
+  - **#110 filed, investigated, DISPROVEN and closed** (2026-07-21). The
+    "DCUtR starved of candidates" premise was wrong on both ends: identify
+    feeds observed addresses to dcutr's candidate cache regardless of
+    AutoNAT (punches visibly run under symmetric NAT — the `attempted`
+    counter reads 0 only because it counts terminal outcomes, each gated
+    on slow QUIC dial timeouts; counter docs now say so), and the
+    punch-capable class needs no punch at all: **the relay introduction
+    machinery (announce → PeerJoined → cross-dials) already produces the
+    simultaneity that punches port-restricted cones** — measured 0.000
+    relay ratio even with AutoNAT failing
+    (`dcutr_validation_port_restricted_no_whitelist`, now a permanent
+    regression scenario). DCUtR remains belt-and-braces for
+    asymmetric-timing edge cases.
 - Remaining P0: Grafana relay-payload-ratio + bytes/device-day panels.
 
 ### P1 — Mobile platform investigations (parallel; reports in docs/research/)
@@ -90,8 +100,8 @@ infrastructure; this milestone makes that claim quantitative.
 
 | Issue | Phase | State at kickoff |
 |---|---|---|
-| #51 symmetric-NAT harness shape | P0 | **done 2026-07-21** (close after push) |
-| #110 DCUtR punch candidates under failed AutoNAT | P2 (found by P0) | filed 2026-07-21 |
+| #51 symmetric-NAT harness shape | P0 | **done, closed 2026-07-21** |
+| #110 DCUtR punch candidates under failed AutoNAT | — | **closed 2026-07-21: premise disproven by measurement** (see P0 notes) |
 | #108 Android investigation | P1 | filed at kickoff |
 | #109 iOS umbrella (#73/#74/#77, feeds #92) | P1 | filed at kickoff |
 | #107 mailbox cost dial | P2 | filed at kickoff |
