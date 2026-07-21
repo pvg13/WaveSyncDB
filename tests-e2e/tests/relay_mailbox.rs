@@ -275,3 +275,87 @@ async fn m4_ttl_expiry_falls_back_to_reconcile() -> Result<()> {
     );
     Ok(())
 }
+
+/// #107 — ack-threshold dial, steady state: with both peers online and
+/// acking, mailbox appends are skipped entirely while data still converges
+/// P2P. The relay's acked-appends counter must not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m5_dial_steady_state_skips_appends() -> Result<()> {
+    let harness = mailbox_harness("relay-mailbox-m5")
+        .with_peer_env("MAILBOX_APPEND_AFTER_SECS", "5")
+        .start()
+        .await?;
+    warm_up(&harness).await?;
+
+    // Let any warm-up write's dial window (5s) + expiry tick (3s) fully
+    // resolve BEFORE sampling the baseline — a still-deferred warm-up write
+    // expiring after the sample would read as a false steady-state append.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let baseline = harness.relay_metric_value(APPENDS_OK.0, APPENDS_OK.1).await;
+
+    for i in 0..5 {
+        let id = format!("m5-row-{i}");
+        harness
+            .peer("alice")
+            .insert_task(&id, "steady", false)
+            .await?;
+        harness
+            .peer("bob")
+            .wait_for_task(&id, "steady", CEILING)
+            .await?;
+    }
+    // Same settling logic for the measured writes: every window must have
+    // either settled by acks or expired into an (unexpected) append.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let after = harness.relay_metric_value(APPENDS_OK.0, APPENDS_OK.1).await;
+    assert_eq!(
+        after, baseline,
+        "steady-state writes must not append with the dial on (baseline {baseline}, after {after})"
+    );
+
+    // The skips must be visible on the writer's diagnostics counter.
+    let diags = harness.peer("alice").diagnostics().await?;
+    assert!(
+        diags.mailbox_appends_skipped >= 5,
+        "every acked write must count as a skipped append: {diags:?}"
+    );
+    Ok(())
+}
+
+/// #107 — ack-threshold dial, durability fallback (the m1 both-offline flow
+/// with the dial ON): the frozen reader never acks, so the dial window
+/// expires and the append happens anyway; the woken reader then converges
+/// from the mailbox alone. The store-and-forward guarantee survives the
+/// dial, just delayed by at most the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_dial_offline_fallback_appends() -> Result<()> {
+    let harness = mailbox_harness("relay-mailbox-m6")
+        .with_peer_env("MAILBOX_APPEND_AFTER_SECS", "5")
+        .start()
+        .await?;
+    warm_up(&harness).await?;
+
+    // Reader goes dark first (paused: the connection lingers half-open, so
+    // the write defers rather than appending immediately — the expiry path,
+    // not the no-eligible-peers path). write_and_await_append's 15s metric
+    // wait covers the 5s window + 3s expiry tick.
+    harness.peer("bob").pause().await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    write_and_await_append(&harness, "m6-row", "deferred then appended").await?;
+    harness.peer("alice").pause().await?;
+
+    // Reader wakes into a world with zero reachable peers: mailbox only.
+    harness.peer("bob").unpause().await?;
+    let outcome = harness.peer("bob").push_wake(PUSH_BUDGET).await?;
+    assert_eq!(
+        outcome.result, "synced",
+        "wake must succeed from the mailbox alone (writer frozen): {outcome:?}"
+    );
+    harness
+        .peer("bob")
+        .wait_for_task("m6-row", "deferred then appended", Duration::from_secs(5))
+        .await?;
+
+    harness.peer("alice").unpause().await?;
+    Ok(())
+}

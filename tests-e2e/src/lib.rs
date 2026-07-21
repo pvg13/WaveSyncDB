@@ -487,6 +487,10 @@ pub struct WaveSyncE2eHarness {
     /// enable/configure optional relay subsystems per scenario (e.g.
     /// `MAILBOX_DB` + a short `MAILBOX_TTL_SECS` for the TTL-fallback test).
     relay_env: Vec<(String, String)>,
+    /// Extra environment variables applied to EVERY peer container, on top
+    /// of the fixed set. The peer analogue of `relay_env` (e.g.
+    /// `MAILBOX_APPEND_AFTER_SECS` for the #107 dial scenarios).
+    peer_env: Vec<(String, String)>,
 }
 
 /// Configuration for a single peer in the harness.
@@ -513,6 +517,7 @@ impl WaveSyncE2eHarness {
             mdns_enabled: true,
             secondary_group: None,
             relay_env: Vec::new(),
+            peer_env: Vec::new(),
         }
     }
 
@@ -599,6 +604,14 @@ impl WaveSyncE2eHarness {
     /// container runtime keeps the last value.
     pub fn with_relay_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.relay_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Set an extra environment variable on every peer container (see the
+    /// `peer_env` field). Later calls with the same key append — the
+    /// container runtime keeps the last value.
+    pub fn with_peer_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.peer_env.push((key.into(), value.into()));
         self
     }
 
@@ -727,6 +740,10 @@ impl WaveSyncE2eHarness {
 
             if let Some(ref p) = spec.passphrase {
                 img = img.with_env_var("PASSPHRASE", p.clone());
+            }
+
+            for (key, value) in &self.peer_env {
+                img = img.with_env_var(key.clone(), value.clone());
             }
 
             if !self.mdns_enabled {
@@ -1401,6 +1418,8 @@ pub struct DiagnosticsSnapshot {
     pub mailbox_entries_drained: u64,
     #[serde(default)]
     pub mailbox_gap_fallbacks: u64,
+    #[serde(default)]
+    pub mailbox_appends_skipped: u64,
     #[serde(default)]
     pub sync_rtt_histogram: Vec<(u64, u64)>,
 }

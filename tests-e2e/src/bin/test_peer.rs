@@ -115,6 +115,14 @@ async fn main() -> Result<()> {
         builder = builder.with_mdns_enabled(false);
     }
 
+    // Ack-threshold mailbox dial (#107), in seconds. Unset/empty keeps the
+    // default always-append behavior.
+    if let Ok(secs) = std::env::var("MAILBOX_APPEND_AFTER_SECS")
+        && let Ok(secs) = secs.parse::<u64>()
+    {
+        builder = builder.with_mailbox_append_after(Duration::from_secs(secs));
+    }
+
     let db = builder.build().await.context("build WaveSyncDb")?;
     db.schema()
         .register(task::Entity)
