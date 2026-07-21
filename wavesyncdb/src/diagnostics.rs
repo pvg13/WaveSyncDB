@@ -199,6 +199,19 @@ pub(crate) struct Counters {
     /// while `relay_bytes_out` stays flat.
     pub mailbox_appends_skipped: AtomicU64,
 
+    /// Catch-up (version-vector) rounds initiated: one per `VersionVector`
+    /// request sent to a peer (#88). RBSR reconcile rounds are counted
+    /// separately (`reconcile_converged`/`reconcile_diverged`); this is the
+    /// plain VV catch-up cadence — discovery-triggered plus the periodic
+    /// tick.
+    pub catchup_rounds: AtomicU64,
+    /// Catch-up responses whose changes were durably applied (#88): a
+    /// `ChangesetResponse` that committed. The delivery half of
+    /// `catchup_rounds` — a rising initiate count with a flat applied count
+    /// means catch-up is asking but never landing (drops, HMAC failures, or
+    /// nothing new to fetch).
+    pub catchup_responses_applied: AtomicU64,
+
     /// Per-bucket counts for catch-up (version-vector) round-trip latency.
     /// Each observation increments exactly ONE bucket — the smallest threshold
     /// it is <=. To get Prometheus-style cumulative 'le' counts, sum buckets 0..=i.
@@ -269,6 +282,8 @@ impl Counters {
             mailbox_entries_drained: self.mailbox_entries_drained.load(Ordering::Relaxed),
             mailbox_gap_fallbacks: self.mailbox_gap_fallbacks.load(Ordering::Relaxed),
             mailbox_appends_skipped: self.mailbox_appends_skipped.load(Ordering::Relaxed),
+            catchup_rounds: self.catchup_rounds.load(Ordering::Relaxed),
+            catchup_responses_applied: self.catchup_responses_applied.load(Ordering::Relaxed),
             sync_rtt_histogram: self.sync_rtt_histogram(),
         }
     }
@@ -327,6 +342,12 @@ pub struct Snapshot {
     /// See [`Counters::mailbox_appends_skipped`].
     #[serde(default)]
     pub mailbox_appends_skipped: u64,
+    /// See [`Counters::catchup_rounds`].
+    #[serde(default)]
+    pub catchup_rounds: u64,
+    /// See [`Counters::catchup_responses_applied`].
+    #[serde(default)]
+    pub catchup_responses_applied: u64,
     /// Catch-up round-trip-time histogram as `(le_ms, count)` pairs,
     /// `u64::MAX` marking the `+Inf` overflow bucket. Each count is the number
     /// of observations in that bucket. To get Prometheus-style cumulative 'le'

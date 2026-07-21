@@ -1105,6 +1105,10 @@ pub(crate) struct PendingPush {
     pub(crate) changeset: SyncChangeset,
     /// Peers that have acked this changeset (or are proven converged past it).
     pub(crate) acked_by: std::collections::HashSet<libp2p::PeerId>,
+    /// When the initial fan-out was dispatched. Observability only (#88):
+    /// feeds `PeerInfo::oldest_unacked_push_age_ms` — never an input to
+    /// delivery or conflict decisions.
+    pub(crate) dispatched_at: tokio::time::Instant,
 }
 
 /// Cap on per-group un-acked pending pushes. Past this the oldest is evicted —
@@ -1576,6 +1580,27 @@ impl EngineRunner {
                 // Health defaults to all-zero/None when nothing has been
                 // recorded for this peer yet (e.g. connected but not synced).
                 let health = self.peer_health.snapshot_for(peer_id).unwrap_or_default();
+                // Confirmed-delivery backlog toward this peer (#88): pending
+                // pushes it hasn't acked, plus the oldest one's age. A
+                // rejected-for-a-group peer is skipped for that group's
+                // entries — its backlog is expected there, not a stall.
+                let now = tokio::time::Instant::now();
+                let mut unacked_pushes = 0u64;
+                let mut oldest: Option<tokio::time::Instant> = None;
+                for g in self.groups.values() {
+                    if g.is_rejected(peer_id) {
+                        continue;
+                    }
+                    for p in g.pending_pushes.values() {
+                        if !p.acked_by.contains(peer_id) {
+                            unacked_pushes += 1;
+                            oldest =
+                                Some(oldest.map_or(p.dispatched_at, |o| o.min(p.dispatched_at)));
+                        }
+                    }
+                }
+                let oldest_unacked_push_age_ms =
+                    oldest.map(|o| now.saturating_duration_since(o).as_millis() as u64);
                 ns::PeerInfo {
                     peer_id: ns::PeerId(peer_id.to_string()),
                     address: addr.to_string(),
@@ -1589,6 +1614,8 @@ impl EngineRunner {
                     last_synced_at_ms: health.last_synced_at_ms,
                     last_converged_at_ms: health.last_converged_at_ms,
                     sync_rtt_ms: health.sync_rtt_ms,
+                    unacked_pushes,
+                    oldest_unacked_push_age_ms,
                 }
             })
             .collect();
@@ -1927,6 +1954,8 @@ impl EngineRunner {
                 last_synced_at_ms: None,
                 last_converged_at_ms: None,
                 sync_rtt_ms: None,
+                unacked_pushes: 0,
+                oldest_unacked_push_age_ms: None,
             },
         ));
         self.update_network_status();
@@ -2530,6 +2559,14 @@ impl EngineRunner {
                     // site).
                     if committed {
                         self.peer_health.stamp_synced(&rc.peer);
+                        // Catch-up delivery half (#88): peer_db_version is Some
+                        // only for a ChangesetResponse (never an inbound Push),
+                        // so this counts exactly the committed catch-up applies.
+                        if rc.peer_db_version.is_some() {
+                            self.diagnostics
+                                .catchup_responses_applied
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         self.update_network_status();
                     }
                     // Record our knowledge of the sender's db_version only now,
@@ -2721,6 +2758,7 @@ impl EngineRunner {
                 PendingPush {
                     changeset: changeset.clone(),
                     acked_by: std::collections::HashSet::new(),
+                    dispatched_at: tokio::time::Instant::now(),
                 },
             );
             while g.pending_pushes.len() > MAX_PENDING_PUSHES {

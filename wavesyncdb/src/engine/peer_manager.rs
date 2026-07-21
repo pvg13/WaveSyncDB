@@ -108,6 +108,9 @@ impl EngineRunner {
             .behaviour_mut()
             .snapshot
             .send_request(&peer_id, req);
+        self.diagnostics
+            .catchup_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(g) = self.groups.get_mut(effective_topic) {
             g.pending_sync_peers
                 .insert(peer_id, tokio::time::Instant::now());
@@ -197,6 +200,8 @@ impl EngineRunner {
                             last_synced_at_ms: None,
                             last_converged_at_ms: None,
                             sync_rtt_ms: None,
+                            unacked_pushes: 0,
+                            oldest_unacked_push_age_ms: None,
                         },
                     ));
                     self.update_network_status();

@@ -65,6 +65,18 @@ pub struct PeerInfo {
     /// exchange with this peer. `None` if no round trip has completed yet.
     #[serde(default)]
     pub sync_rtt_ms: Option<u64>,
+    /// Local changesets awaiting this peer's delivery confirmation (#88):
+    /// pending pushes across all shared groups it has not acked and is not
+    /// proven converged past. Steady state is 0; a value that grows while
+    /// the peer stays connected means confirmed delivery to it has silently
+    /// stalled (the reconcile backstop still converges it eventually).
+    #[serde(default)]
+    pub unacked_pushes: u64,
+    /// Age (milliseconds) of the oldest changeset in `unacked_pushes` — the
+    /// per-peer "acked-cursor age" (#88). `None` when nothing is awaiting
+    /// this peer's ack.
+    #[serde(default)]
+    pub oldest_unacked_push_age_ms: Option<u64>,
 }
 
 /// Relay connection status.
@@ -264,6 +276,8 @@ mod tests {
                     last_synced_at_ms: None,
                     last_converged_at_ms: None,
                     sync_rtt_ms: None,
+                    unacked_pushes: 0,
+                    oldest_unacked_push_age_ms: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("b".into()),
@@ -278,6 +292,8 @@ mod tests {
                     last_synced_at_ms: None,
                     last_converged_at_ms: None,
                     sync_rtt_ms: None,
+                    unacked_pushes: 0,
+                    oldest_unacked_push_age_ms: None,
                 },
                 PeerInfo {
                     peer_id: PeerId("c".into()),
@@ -292,6 +308,8 @@ mod tests {
                     last_synced_at_ms: None,
                     last_converged_at_ms: None,
                     sync_rtt_ms: None,
+                    unacked_pushes: 0,
+                    oldest_unacked_push_age_ms: None,
                 },
             ],
             ..Default::default()
@@ -329,6 +347,8 @@ mod tests {
                 last_synced_at_ms: None,
                 last_converged_at_ms: None,
                 sync_rtt_ms: None,
+                unacked_pushes: 0,
+                oldest_unacked_push_age_ms: None,
             }],
             topic: "my-topic".into(),
             relay_status: RelayStatus::Connected,

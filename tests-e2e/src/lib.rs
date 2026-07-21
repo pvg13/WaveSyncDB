@@ -1435,5 +1435,9 @@ pub struct DiagnosticsSnapshot {
     #[serde(default)]
     pub mailbox_appends_skipped: u64,
     #[serde(default)]
+    pub catchup_rounds: u64,
+    #[serde(default)]
+    pub catchup_responses_applied: u64,
+    #[serde(default)]
     pub sync_rtt_histogram: Vec<(u64, u64)>,
 }
