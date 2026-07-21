@@ -151,6 +151,54 @@ session survives suspension (peer-side observation: when does the
 connection die) and whether resume re-establishes direct or degrades to
 circuits.
 
+## The day — manual runbook (one iPhone "A" + one Android "B")
+
+Cross-platform pair: B (Pixel) is the peer device everywhere the protocol
+wants one, and step 3 recovers the phone↔phone-cellular cell #108 had to
+scope out. Every stint ≥90s (two beacon lines minimum); space visible
+writes ≥1 min apart (ALERT_COALESCE_SECS=30).
+
+Prep already done on the Mac (not phone steps): dev builds of the app for
+BOTH platforms against the beacon rev — debug builds set
+`WAVESYNC_M1_DIAG=1` themselves (the engine beacon is platform-neutral;
+Android's logcat bridge carries it) — pointed at the test relay; a test
+household created on A, joined from B; Console.app os_log smoke passed.
+
+1. **WiFi baseline (S1a)** — both phones on home WiFi, both apps
+   foregrounded, 2 min. Add one item from each side; confirm it appears
+   on the other.
+2. **iOS cellular vs home NAT (S1b, #77)** — A: WiFi OFF in Control
+   Center, app foregrounded, 3 min. B stays on WiFi. One item each way.
+3. **Cellular↔cellular (the #108 leftover cell)** — B: WiFi OFF too.
+   Both foregrounded on cellular, 3 min, one item each way. Then B: WiFi
+   back ON.
+4. **Handoff trials (S4/#74), 3×** — A foregrounded and synced: WiFi
+   OFF → wait ~15 s (B adds an item during the gap) → WiFi ON → wait
+   until synced again. Repeat three times. No stopwatch needed — the
+   laps come out of the device log.
+5. **#73 A/B stint (S3)** — A: flip the hidden dev toggle (unspecified
+   bind), force-quit, relaunch. Repeat a mini round: 1 min on WiFi with
+   a write from B, WiFi OFF, write from B, ~2 min, WiFi ON. Flip the
+   toggle back, force-quit, relaunch. (No toggle in the build? Skip —
+   the orchestrated runner covers S3 separately.)
+6. **Suspension (S6)** — A foregrounded and synced: press HOME (don't
+   lock). Wait 2 min; B adds an item mid-way. Reopen A; note whether the
+   item is there / arrives promptly.
+7. **Push + #92 warm path (S5)** — A: lock the phone, screen off. B adds
+   a grocery item. Watch A's lock screen: banner within a few seconds.
+   **Read the banner text carefully** — composed content ("Ana añadió
+   leche"-style) vs the app's localized fallback vs the operator
+   placeholder is the #92 verdict. Repeat ~3× spread over the day.
+8. **Rest of day** — just use the phones; organic transitions add data.
+   Do NOT reinstall the app on A (the Simulator owns #92's cold-cache
+   row).
+
+End of day: A → Mac USB once: `sudo log collect --device-udid … --last
+8h`, flatten per `analyze_logarchive.sh`'s header, run the analyzer.
+B → `adb logcat -d | grep -E "m1-diag|bg_sync"` into a file next to A's
+summary. Restore both phones: WiFi on, dev toggle off (A), done —
+nothing was installed beyond the dev builds, nothing deleted.
+
 ## Findings
 
 _(per section, pending the hardware day)_
