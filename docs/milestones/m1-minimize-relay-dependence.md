@@ -53,7 +53,13 @@ infrastructure; this milestone makes that claim quantitative.
     (`dcutr_validation_port_restricted_no_whitelist`, now a permanent
     regression scenario). DCUtR remains belt-and-braces for
     asymmetric-timing edge cases.
-- Remaining P0: Grafana relay-payload-ratio + bytes/device-day panels.
+- **P0 COMPLETE (2026-07-21):** the wavesync-relay dashboard gained an
+  "M1 — relay-dependence KPIs" row: relay bytes/device-day (denominator:
+  push-registered tokens), mailbox share of relay bytes (the direct #107
+  gauge), circuit-seconds/device-day, a bytes-by-source timeseries, and
+  the measured payload-ratio baseline table (the live ratio is
+  client-side by definition; a fleet version needs client metric export
+  — future work). Lands on the next monitoring redeploy.
 
 ### P1 — Mobile platform investigations (parallel; reports in docs/research/)
 - **#108** Android: carrier NAT reality (CGNAT/464XLAT on 5G), Doze/App
@@ -78,8 +84,8 @@ infrastructure; this milestone makes that claim quantitative.
 
 ## Acceptance
 
-- [ ] Symmetric-NAT scenario exists; worst-case baseline documented here.
-- [ ] KPI panels live on the relay dashboard.
+- [x] Symmetric-NAT scenario exists; worst-case baseline documented here.
+- [x] KPI panels live on the relay dashboard (deploy pending).
 - [ ] Android + iOS reports in docs/research/ with concrete verdicts;
       #73/#74/#77 closed or converted.
 - [ ] #107 shipped with e2e proof both-offline delivery still converges.
