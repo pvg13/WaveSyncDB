@@ -195,6 +195,44 @@ fn App() -> Element {
     // On desktop, this is a no-op — peers sync via mDNS anyway.
     use_auto_lifecycle(db.clone());
 
+    // M1 diagnostics beacon: one greppable logcat line every 30s so any
+    // device run — emulator or a phone on real cellular — yields the
+    // relay-vs-direct classification evidence (carrier NAT: cone-like ⇒
+    // direct connections + ratio→0; CGNAT/symmetric-like ⇒ circuits +
+    // ratio→1). Root-scope App never unmounts, so the loop lives for the
+    // process.
+    use_hook(|| {
+        let db = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let d = db.diagnostics();
+                let status = db.network_status();
+                let relayed_peers = status
+                    .connected_peers
+                    .iter()
+                    .filter(|p| p.via_relay)
+                    .count();
+                let relay_bytes = d.relay_bytes_in + d.relay_bytes_out;
+                let direct_bytes = d.direct_bytes_in + d.direct_bytes_out;
+                log::info!(
+                    "m1-diag relayed_est={} direct_est={} demoted={} dcutr={}/{} \
+                     relay_bytes={} direct_bytes={} ratio={:?} peers={} peers_via_relay={}",
+                    d.relayed_connections_established,
+                    d.direct_connections_established,
+                    d.relay_connections_demoted,
+                    d.dcutr_upgrades_succeeded,
+                    d.dcutr_upgrades_attempted,
+                    relay_bytes,
+                    direct_bytes,
+                    d.relay_traffic_ratio(),
+                    status.connected_peers.len(),
+                    relayed_peers,
+                );
+            }
+        });
+    });
+
     rsx! {
         style { {STYLE} }
         h1 { "WaveSyncDB Mobile Demo" }

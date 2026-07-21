@@ -1,0 +1,82 @@
+# Android cellular/5G P2P reality — investigation (#108, M1/P1)
+
+> Status: IN PROGRESS. Emulator half runnable from the repo; carrier half
+> needs real devices on real cellular. Findings land in this file.
+
+## Question
+
+How much of Android's sync traffic can avoid the relay on real mobile
+networks — and what structurally prevents it? Concretely: do carrier NATs
+behave **cone-like** (WaveSyncDB's introduction cross-dials punch them →
+relay payload ratio →0) or **CGNAT/symmetric-like** (circuits forever →
+ratio →1, making the #107 mailbox dial the cost lever)?
+
+Context from the #110 investigation (docker, wire-verified): introductions
+already hole-punch port-restricted cones without DCUtR; symmetric NAT is
+1.000-by-physics. The carrier question decides which world mobile fleets
+live in.
+
+## Instrumentation
+
+The `dioxus_fcm_sync` example app now logs an **`m1-diag` beacon** every
+30 s (logcat-greppable):
+
+```
+m1-diag relayed_est=N direct_est=N demoted=N dcutr=S/A relay_bytes=N direct_bytes=N ratio=Some(r) peers=N peers_via_relay=N
+```
+
+Interpretation:
+
+| Signal | cone-like carrier | symmetric-like carrier |
+|---|---|---|
+| `direct_est` for the peer | ≥1 shortly after both apps run | stays 0 (only the relay conn counts if any) |
+| `peers_via_relay` | 0 once settled | equals peer count |
+| `ratio` | → 0.000 | → 1.000 |
+| `dcutr=S/A` | usually 0/0 (introductions punched first) | 0/0 or 0/A (punches can't land) |
+
+## Device protocol (carrier half — needs two phones)
+
+1. Build + install the example app on both phones (`dx build` as usual —
+   the beacon is compiled in).
+2. Phone A on **cellular only** (WiFi off). Phone B: first same-carrier
+   cellular, then home WiFi (two runs — carrier↔carrier and
+   carrier↔home-NAT are different questions).
+3. Open the app on both, write a few tasks from each side, leave both
+   foregrounded ≥2 min.
+4. Collect: `adb logcat -d | grep m1-diag | tail -5` per phone (or
+   Android Studio logcat for the non-USB phone).
+5. Record per run: carrier name, network type (5G/4G, from status bar),
+   the last beacon line of each phone.
+6. Repeat with the app backgrounded 5 min then foregrounded — does the
+   classification change after resume?
+
+Name the carriers in the findings; do not generalize beyond them.
+
+## Emulator half (runnable from repo)
+
+`tests-e2e/android/run_wan_scenarios.sh` — A1–A3 (cold start, WiFi→cell
+migration, airplane blip) from the N14 round, plus the new **A4 Doze**
+scenario (#108): background → `deviceidle force-idle` → write-during-Doze
+observation → recovery TTFS → post-recovery `m1-diag` snapshot.
+
+Note the emulator's NAT is the host's (cone-like, usually punchable) — it
+answers the Doze/lifecycle questions, never the carrier-NAT question.
+
+## Findings
+
+### Emulator: Doze / App Standby (A4)
+
+_(pending run)_
+
+### Carrier NAT classification
+
+_(pending device runs — table: carrier / network / beacon verdict)_
+
+### FCM delivery classes under throttling
+
+_(pending — bounded by the standby-bucket experiments; see issue #108 Q3)_
+
+## Verdicts for M1
+
+_(to fill: which reducers matter on Android; is phone↔phone cellular
+direct achievable at all; expected fleet relay bytes profile)_

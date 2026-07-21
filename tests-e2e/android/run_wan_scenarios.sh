@@ -11,6 +11,10 @@
 #                      one N14-family condition Docker cannot model.
 #   A3 airplane blip   app backgrounded through a 30s airplane-mode
 #                      blackout (elevator/tunnel), then foregrounded.
+#   A4 doze            app backgrounded, deviceidle force-idle (Doze);
+#                      write lands (or not) during the freeze; recovery
+#                      TTFS on unforce+foreground + m1-diag snapshot.
+#                      (#108 / M1 investigation.)
 #
 # Measurement: the example app logs `tasks_visible titles=[…]` on every
 # task-list update; the host writes a UUID-titled row at the reference
@@ -174,6 +178,42 @@ if ms=$(logcat_wait_for "tasks_visible.*$T3" 120); then
 else
     fail_scenario a3_airplane_resume
 fi
+
+# ── A4: Doze (deviceidle force-idle) while backgrounded ────────────
+# #108/M1: what the OS's idle network freeze does to a live sync
+# session. Sequence: background → force Doze → host write → watch
+# whether the row lands DURING Doze (expectation: no — cached apps
+# lose network in Doze; landing anyway means a maintenance window or
+# an exemption is in play, worth knowing either way) → unforce +
+# foreground → TTFS for the recovery. Afterwards, snapshot the app's
+# `m1-diag` beacon for the relay-vs-direct classification of the
+# recovered session.
+
+echo "==> A4: backgrounded Doze (force-idle, 60s), then unforce + foreground"
+app_home
+sleep 2
+adb -s "$ANDROID_SERIAL" shell dumpsys deviceidle force-idle >/dev/null
+T4="wan-a4-$RUN_TAG"
+writer_insert "$T4"
+logcat_clear
+echo "    in forced Doze; watching 60s for sync during idle"
+if ms=$(logcat_wait_for "tasks_visible.*$T4" 60); then
+    echo "[doze] row landed DURING Doze after ${ms}ms (network NOT frozen for this app: maintenance window / exemption / foreground-service)"
+else
+    echo "[doze] row did not land during 60s of forced Doze (expected: cached-app network freeze)"
+fi
+adb -s "$ANDROID_SERIAL" shell dumpsys deviceidle unforce >/dev/null
+sleep 2
+logcat_clear
+app_start
+if ms=$(logcat_wait_for "tasks_visible.*$T4" 120); then
+    report a4_doze_resume "$ms"
+else
+    fail_scenario a4_doze_resume
+fi
+echo "    waiting for the next m1-diag beacon (30s cadence)..."
+sleep 35
+adb -s "$ANDROID_SERIAL" logcat -d 2>/dev/null | grep "m1-diag" | tail -1 | sed 's/^/[m1-diag] /' || true
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then
