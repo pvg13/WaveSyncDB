@@ -207,9 +207,76 @@ edge-triggered introduction one-shots racing the relay reconnect), with
 the periodic tick as the eventual rescue. #111's remaining scope is
 therefore reintroduction-after-reset, not socket detection.
 
-### FCM delivery classes under throttling
+### FCM delivery classes under throttling (#108 Q3) — MEASURED 2026-07-21
 
-_(pending — bounded by the standby-bucket experiments; see issue #108 Q3)_
+Single-phone sweep, Pixel 10 Pro on home WiFi (the FCM socket rides the
+default network; LTE also attached), app backgrounded, battery reported
+unplugged (`dumpsys battery unplug` — buckets don't throttle while
+charging), screen off. Sender: FCM HTTP v1 API driven from the host with
+the relay's service account, so `android.priority` could be set per
+message (the relay itself hardcodes `high` — see push_sender.rs). Each
+send carries a unique marker echoed by `onMessageReceived` to logcat;
+latency is FCM-accept (HTTP 200) → receipt line, 200 ms poll resolution.
+Two sends per cell.
+
+**Phase A — App Standby buckets in isolation** (`deviceidle disable`, so
+Doze can't interfere):
+
+| bucket | HIGH (ms) | NORMAL (ms) |
+|---|---|---|
+| active | 203, 1 012 | 405, 1 013 |
+| working_set | 1 214, 608 | 1 012, 204 |
+| frequent | 1 013, 406 | 608, 1 013 |
+| rare | 607, 608 | 811, 1 013 |
+| restricted | 1 012, 1 821 | 608, 810 |
+
+**Verdict: buckets alone throttle nothing on this device** — 20/20
+delivered sub-2 s, both priorities, even `restricted`. (Caveat: a
+~40-push hour where every push triggers visible work is not the regime
+Google's high-priority *quota* deprioritization targets — apps whose
+high-pri pushes don't lead to engagement may still be demoted over
+days; unobservable in a one-day sweep.)
+
+**Phase B — deep Doze** (`deviceidle force-idle deep` before each send,
+`rare` bucket):
+
+| priority | result |
+|---|---|
+| HIGH | 1 215 ms, 1 012 ms — **delivers through deep Doze** (doze-exempt, as documented) |
+| NORMAL | both **held >240 s**; both flushed **~2 s after screen-wake ended Doze** — total deferral 10.3 min and 6.3 min from send |
+
+An earlier (doze-confounded) sweep pass reproduced the same flush
+mechanic: a deferred NORMAL push landed the instant `deviceidle unforce`
+ran, 5.5 min after send. One NORMAL send from that pass was never
+observed at all (a ~60 s monitoring gap between passes means "arrived
+unobserved" can't be excluded — but "dropped entirely" can't either).
+
+**Bonus finding — natural quick-Doze onset:** with screen off and the
+battery reporting discharge, the Pixel entered **deep Doze in under
+10 minutes** of stillness (no force-idle involved) — it's what
+confounded the first sweep pass. Field translation: a screen-off phone
+on battery is effectively *in the Doze column within minutes*, so the
+bucket table above is the exception and Phase B is the rule for a
+pocketed phone.
+
+Deferred-flush detail worth knowing: consecutive flushed messages
+arrived exactly ~25 s apart — serialized behind the app's per-message
+25 s background-sync window (`backgroundSyncTargeted` timeout), not by
+FCM. A doze-exit burst of N queued normal-priority pushes takes N×25 s
+to drain; another reason the relay's coalescing (one wake signal, data
+via sync) is the right shape.
+
+**Verdicts for #108 Q3:** (1) the relay's hardcoded
+`android.priority: "high"` is load-bearing — it is the only delivery
+class that reaches a dozed device, and Doze-within-minutes is the
+default state of a phone in a pocket; (2) normal priority defers
+minutes-to-unbounded (until wake/maintenance window) and should never
+carry the wake signal; (3) the FCM leg itself is fast and reliable
+(~0.2–1.8 s across every bucket) — wake latency is dominated by the
+engine's post-wake recovery (#111: ~2.9 s), not by push delivery; (4)
+bucket-based throttling contributed zero deferral on this device and can
+be dropped as a modeled concern for the wake path, with the multi-day
+quota caveat above.
 
 ### Foregrounded network-flip (#112) — acceptance met
 
