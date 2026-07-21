@@ -44,9 +44,10 @@ private func wavesync_string_free(_ s: UnsafeMutablePointer<CChar>?)
 /// by the push. If a `SyncNotify` policy fires for whatever synced, this
 /// replaces the operator-branded placeholder title/body with the real
 /// content (e.g. "Ana added milk"). Either way the user sees SOME
-/// notification — the placeholder is the safe fallback if the sync times
-/// out, the NSE is killed before it finishes, or nothing notify-worthy
-/// happened.
+/// notification. When the sync times out, the NSE is killed early, or
+/// nothing notify-worthy happened, delivery degrades through two tiers:
+/// the app's localized fallback file if it wrote one (#92 — see the
+/// fallback section below), else the raw APNs placeholder.
 ///
 /// The Rust side never runs the KDF here (see `wavesyncdb`'s `key_cache`
 /// module docs) — it can only sync a group whose key the app already
@@ -75,6 +76,20 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
 
+    /// Set once `applyResult` has written FFI-composed content into the
+    /// notification. The expiry path reads it to decide whether the app's
+    /// localized fallback (#92) should still be applied — composed content
+    /// always outranks the fallback file.
+    private var composedApplied = false
+
+    /// Directories to probe for `.wavesync_notification_fallback.json`
+    /// (#92): the resolved config dir first (more specific — a per-account
+    /// layout may keep its own fallback), then the container root (where
+    /// single-tenant apps write it). Set in `didReceive` once the App Group
+    /// container resolves; empty until then, which safely disables the
+    /// fallback tier.
+    private var fallbackSearchDirs: [String] = []
+
     /// Serializes `deliver`'s read-nil-call of `contentHandler` — see that
     /// method's doc comment for the race it closes.
     private let deliverQueue = DispatchQueue(label: "com.wavesyncdb.nse.deliver")
@@ -89,13 +104,22 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
         bestAttemptContent = best
 
         guard let configDir = Self.resolveConfigDir(groupId: Self.appGroupId) else {
+            // No container ⇒ the fallback file is unreachable too — the raw
+            // placeholder is genuinely all we have.
             NSLog("[WaveSyncNSE] No App Group container for '%@' — delivering placeholder",
                   Self.appGroupId)
             deliver(best)
             return
         }
+        var searchDirs = [configDir]
+        if let root = Self.containerRoot(groupId: Self.appGroupId), root != configDir {
+            searchDirs.append(root)
+        }
+        fallbackSearchDirs = searchDirs
+
         guard let payloadJson = Self.encodeUserInfo(request.content.userInfo) else {
-            NSLog("[WaveSyncNSE] Could not encode push payload — delivering placeholder")
+            NSLog("[WaveSyncNSE] Could not encode push payload — delivering app fallback/placeholder")
+            applyFallbackIfAvailable(to: best)
             deliver(best)
             return
         }
@@ -119,29 +143,110 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
 
     /// iOS is about to kill the extension — deliver whatever we have. If the
     /// sync already finished, `best` carries the real title/body (written by
-    /// `applyResult` on the same object); if not, it's still the original
-    /// placeholder content untouched.
+    /// `applyResult` on the same object); if not, apply the app's localized
+    /// fallback (#92) — a fast local file read, safe even in the expiry
+    /// window — before falling back to the untouched placeholder.
     override open func serviceExtensionTimeWillExpire() {
         if let best = bestAttemptContent {
+            if !composedApplied {
+                applyFallbackIfAvailable(to: best)
+            }
             deliver(best)
         }
     }
 
     private func applyResult(_ json: String?, to best: UNMutableNotificationContent) {
-        guard let json = json,
-              let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            deliver(best)
-            return
+        var applied = false
+        if let json = json,
+            let data = json.data(using: .utf8),
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let title = obj["title"] as? String, !title.isEmpty {
+                best.title = title
+                applied = true
+            }
+            if let body = obj["body"] as? String, !body.isEmpty {
+                best.body = body
+                applied = true
+            }
         }
-        if let title = obj["title"] as? String, !title.isEmpty {
-            best.title = title
-        }
-        if let body = obj["body"] as? String, !body.isEmpty {
-            best.body = body
+        if applied {
+            composedApplied = true
+        } else {
+            // Composition yielded nothing (sync timeout, cold key cache, no
+            // matching SyncNotify policy) — second tier (#92): the app's
+            // localized fallback, above the raw APNs placeholder.
+            applyFallbackIfAvailable(to: best)
         }
         deliver(best)
+    }
+
+    // ── App-written localized fallback (#92) ───────────────────────────
+    //
+    // Downstream apps may write `.wavesync_notification_fallback.json` into
+    // the App Group container (root, or the active config dir for nested
+    // layouts) on every launch — one object per locale key:
+    //
+    //     { "es": { "title": "…", "body": "…" },
+    //       "en": { "title": "…", "body": "…" } }
+    //
+    // Precedence: FFI-composed content > this file > APNs placeholder.
+    // Reading is NSE-side only; nothing here ever writes (consistent with
+    // the load-only group-key cache design). Any read/parse failure just
+    // leaves the placeholder — a degraded push must never fail to deliver.
+
+    private static let fallbackFileName = ".wavesync_notification_fallback.json"
+
+    /// Overwrite `best`'s title/body from the app's fallback file, if one
+    /// exists and yields a usable locale entry. No-op otherwise.
+    private func applyFallbackIfAvailable(to best: UNMutableNotificationContent) {
+        guard let entry = Self.loadFallbackEntry(searchDirs: fallbackSearchDirs) else { return }
+        if let title = entry["title"] as? String, !title.isEmpty {
+            best.title = title
+        }
+        if let body = entry["body"] as? String, !body.isEmpty {
+            best.body = body
+        }
+    }
+
+    /// First readable fallback file across `searchDirs`, reduced to the
+    /// locale entry best matching the device's language preferences.
+    private static func loadFallbackEntry(searchDirs: [String]) -> [String: Any]? {
+        for dir in searchDirs {
+            let path = (dir as NSString).appendingPathComponent(fallbackFileName)
+            guard let data = FileManager.default.contents(atPath: path),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            if let entry = pickLocaleEntry(obj) {
+                return entry
+            }
+        }
+        return nil
+    }
+
+    /// Locale selection: each preferred language in order, first as the
+    /// exact key ("es-ES") then as its base language ("es"). Failing all
+    /// preferences: "en", then the lexicographically first key —
+    /// `JSONSerialization` does not preserve the file's key order, so
+    /// "first entry in the file" needs a deterministic stand-in.
+    private static func pickLocaleEntry(_ obj: [String: Any]) -> [String: Any]? {
+        for lang in Locale.preferredLanguages {
+            if let entry = obj[lang] as? [String: Any] {
+                return entry
+            }
+            let base = lang.split(separator: "-").first.map(String.init) ?? lang
+            if let entry = obj[base] as? [String: Any] {
+                return entry
+            }
+        }
+        if let en = obj["en"] as? [String: Any] {
+            return en
+        }
+        for key in obj.keys.sorted() {
+            if let entry = obj[key] as? [String: Any] {
+                return entry
+            }
+        }
+        return nil
     }
 
     /// Calls the content handler exactly once. Both `didReceive`'s early-exit
@@ -161,9 +266,19 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
         }
     }
 
-    /// App Group container path as a plain filesystem path string (not a
-    /// `URL`) — matches the `config_dir` contract `wavesync_nse_handle_push`
-    /// expects (the directory containing `.wavesync_config.json`).
+    /// App Group container root as a plain path, or `nil` when the group id
+    /// is empty/unentitled. Shared by the config-dir resolution and the
+    /// fallback-file lookup (#92).
+    private static func containerRoot(groupId: String) -> String? {
+        guard !groupId.isEmpty else { return nil }
+        return FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: groupId)?
+            .path
+    }
+
+    /// Config directory as a plain filesystem path string (not a `URL`) —
+    /// matches the `config_dir` contract `wavesync_nse_handle_push` expects
+    /// (the directory containing `.wavesync_config.json`).
     ///
     /// The container ROOT is not necessarily where `.wavesync_config.json`
     /// lives — an app with a per-account (or otherwise nested) data layout
@@ -177,11 +292,7 @@ open class WaveSyncNotificationService: UNNotificationServiceExtension {
     /// back to the root itself, which is correct for an app that keeps its
     /// database directly there and never writes a pointer at all.
     private static func resolveConfigDir(groupId: String) -> String? {
-        guard !groupId.isEmpty else { return nil }
-        guard let root = FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: groupId)?
-            .path
-        else {
+        guard let root = containerRoot(groupId: groupId) else {
             return nil
         }
 
