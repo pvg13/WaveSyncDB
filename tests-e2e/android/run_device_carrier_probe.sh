@@ -59,6 +59,7 @@ NETTYPE="$(adb -s "$ANDROID_SERIAL" shell getprop gsm.network.type | tr -d '\r')
 echo "Carrier: ${CARRIER:-unknown}   network type(s): ${NETTYPE:-unknown}"
 
 cleanup() {
+    adb -s "$ANDROID_SERIAL" shell svc power stayon false >/dev/null 2>&1 || true
     adb -s "$ANDROID_SERIAL" shell svc wifi enable >/dev/null 2>&1 || true
     adb -s "$ANDROID_SERIAL" shell dumpsys deviceidle unforce >/dev/null 2>&1 || true
     stop_all 2>/dev/null || true
@@ -87,6 +88,12 @@ if [[ -z "${SKIP_INSTALL:-}" ]]; then
 fi
 # Clean state so numbers aren't inflated by prior-run rows.
 adb -s "$ANDROID_SERIAL" shell pm clear "$PACKAGE" >/dev/null
+# Keep the screen awake while USB-connected: a screen timeout mid-run
+# unfocuses the app, and the foreground gate (#112) then correctly
+# suppresses transitions — silently voiding the P1 measurement (this is
+# not hypothetical; it ate a run).
+adb -s "$ANDROID_SERIAL" shell svc power stayon usb
+adb -s "$ANDROID_SERIAL" shell input keyevent 224
 
 ACTIVITY="$(adb -s "$ANDROID_SERIAL" shell cmd package resolve-activity --brief "$PACKAGE" 2>/dev/null | tail -1 | tr -d '\r')"
 [[ "$ACTIVITY" == */* ]] || { echo "ERROR: could not resolve activity for $PACKAGE" >&2; exit 1; }

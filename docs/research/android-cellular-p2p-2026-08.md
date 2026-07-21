@@ -211,6 +211,19 @@ therefore reintroduction-after-reset, not socket detection.
 
 _(pending — bounded by the standby-bucket experiments; see issue #108 Q3)_
 
+### Foregrounded network-flip (#112) — acceptance met
+
+Definitive run (Pixel 10 Pro, DIGI ES, VPN off, screen held awake via
+`svc power stayon usb` — a mid-run screen timeout unfocuses the app and
+the foreground gate correctly suppresses the transition, which silently
+voided one measurement): **foregrounded WiFi→cellular recovery
+2 894 ms** (pre-fix: 36 s). The beacon shows fresh circuits immediately
+after the flip (`relayed_est 0→3`) — detection → NetworkTransition →
+reconnect, as designed. Same run reconfirmed: P0 LAN direct (754 ms,
+ratio 0.0), DIGI LTE relay-carried, and the ~48 s keyguard-case doze
+recovery (consistent with #111's documented semantics; the unlocked
+flow stands at 2.9 s).
+
 ## Verdicts for M1
 
 _(to fill: which reducers matter on Android; is phone↔phone cellular
