@@ -158,13 +158,21 @@ confirmation cycle with the phone untouched and Doze **verified held**
 recovery at **52 526 ms**. The earlier 47 s device number, previously
 dismissed as VPN noise, was evidently real.
 
-Standing conclusion: the #111 reset half works (forced reconnect and
-fresh circuits are observed), but real-hardware recovery is still gated
-on **reintroduction/sync-initiation after the forced reconnect** — the
-same residual seen on the emulator's 46 s run. The measured band for a
-genuinely held Doze is ~47–53 s. Methodology: always verify
-`mState=IDLE` at window end; a screen-on anywhere in the window voids
-the measurement.
+**Final (third cycle, held Doze verified + user unlocks at wake — the
+real user flow): recovery 2 907 ms. ACCEPTANCE MET.** The engine
+timeline post-unlock: foreground event (backgrounded_secs=351) →
+NetworkTransition fires → relay reconnected +53 ms → reservation
++157 ms → writer introduced and connected +283 ms — ~0.3 s of engine
+time; the rest of the 2.9 s is the wake/unlock itself.
+
+The 52.5 s no-unlock cycle stands as a separate, semantically distinct
+case: behind a secure keyguard the activity never resumes, so no
+lifecycle edge fires and recovery is the reactive path — but no user is
+watching a locked phone; sync lands the moment they actually unlock,
+which the 2.9 s run measures. Methodology: verify `mState=IDLE` at
+window end AND ensure the unlock happens for the foreground
+measurement; a screen-on mid-window voids the run, a missing unlock
+measures the keyguard case instead.
 
 ### Superseded first run (VPN-confounded — kept for methodology)
 
