@@ -1,7 +1,9 @@
 # Android cellular/5G P2P reality — investigation (#108, M1/P1)
 
-> Status: IN PROGRESS. Emulator half runnable from the repo; carrier half
-> needs real devices on real cellular. Findings land in this file.
+> Status: COMPLETE (2026-07-21) for one device/carrier (Pixel 10 Pro,
+> DIGI ES). All four questions answered; the single open cell is
+> carrier↔carrier phone↔phone (needs a second device — expected-fail,
+> see Verdicts). Emulator half runnable from the repo.
 
 ## Question
 
@@ -304,7 +306,43 @@ are structurally unavailable regardless of peer support; the relay path
 in future runs — a beacon extension logging global-v6 presence on the
 data interface would answer it fleet-wide.
 
+### Wake efficiency (#108 Q4) — closed by composition
+
+Whether a push wake ends on a direct path or on circuits is decided
+entirely by the topology column above, not by anything wake-specific:
+same-LAN wakes demote to direct once formed (P0 baseline, ratio 0.000);
+LTE wakes on this carrier stay relay-carried (CGNAT verdict, `dcutr
+0/0`, IPv4-only APN — no v6 escape). The wake pipeline itself is fast at
+every stage: FCM HIGH delivery 0.2–1.8 s in every standby bucket and
+through deep Doze, engine recovery ~2.9 s unlocked (#111) / 2.9 s on a
+foregrounded flip (#112), and 1.3 s TTFS over a relay circuit on LTE.
+Nothing in the wake path forces circuits where a direct path is
+possible — the carrier NAT does. No wake-specific reducer exists to
+build; the cost lever for wakes is the same as for steady state (#107).
+
 ## Verdicts for M1
 
-_(to fill: which reducers matter on Android; is phone↔phone cellular
-direct achievable at all; expected fleet relay bytes profile)_
+1. **Which reducers matter on Android: #107 (mailbox/relay-byte cost),
+   and nothing else measured.** On DIGI ES the payload rides the relay
+   regardless (CGNAT, IPv4-only APN, introductions don't punch, DCUtR
+   never engages) and the UX over circuits is already excellent (1.3 s
+   TTFS) — so the mobile relay question is server cost, not user
+   experience. AutoRelay (#31) and gossip re-dissemination (#87) address
+   costs this data says are second-order.
+2. **Phone↔phone cellular direct: expected-fail, one cell unverified.**
+   Same-carrier and cross-carrier DCUtR (the carrier↔carrier column)
+   needs a second phone; given both endpoints on this carrier sit behind
+   IPv4-only CGNAT that defeated every punch attempt against a home
+   cone, direct phone↔phone on DIGI is structurally implausible. Recheck
+   per carrier when a second device is available (~30 min with
+   `run_device_carrier_probe.sh`).
+3. **Expected fleet relay-bytes profile:** LAN/cone fleets ~0 payload
+   (already measured 0.000) + full mailbox appends; mobile-on-CGNAT
+   fleets ~100% payload + mailbox. In both, the mailbox append stream is
+   the dominant steady-state byte source — exactly what the #107
+   ack-threshold dial removes for overlapping fleets. Post-#107 fleet
+   profile: relay bytes ≈ introductions + the genuinely-offline residue.
+4. **Push priority is load-bearing** (Q3): deep Doze is the default
+   state of a pocketed phone (<10 min onset) and only HIGH-priority FCM
+   reaches it; buckets contributed zero deferral. The relay's hardcoded
+   high priority stays.
