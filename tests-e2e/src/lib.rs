@@ -956,7 +956,7 @@ impl RunningPeer {
     pub async fn wait_http_ready(&self, timeout: Duration) -> Result<()> {
         let url = format!("{}/health", self.base_url);
         let start = Instant::now();
-        let client = reqwest::Client::new();
+        let client = http_client();
         loop {
             if let Ok(r) = client.get(&url).send().await
                 && r.status().is_success()
@@ -1153,11 +1153,25 @@ impl RunningHarness {
     }
 }
 
+/// One shared, pooled HTTP client for every harness→peer call.
+///
+/// Load-bearing for latency measurements, not a style choice: a fresh
+/// `reqwest::Client` per call opens a fresh TCP connection per call, and
+/// under a lossy netem profile a dropped SYN retransmits at the kernel's
+/// 1s initial RTO — which showed up as a fake ~1.1s steady-state p95
+/// "sync tail" (#38; sync itself was at ~59ms with pushes fully acked).
+/// A pooled connection's losses recover at RTO_MIN (~200ms) instead, and
+/// most polls reuse the warm connection entirely.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// Per-peer HTTP API matching the routes in `bin/test_peer.rs`.
 impl RunningPeer {
     /// Insert a task via SeaORM through this peer's WaveSyncDb.
     pub async fn insert_task(&self, id: &str, title: &str, completed: bool) -> Result<()> {
-        let resp = reqwest::Client::new()
+        let resp = http_client()
             .post(format!("{}/tasks", self.base_url))
             .json(&Task {
                 id: id.into(),
@@ -1174,7 +1188,7 @@ impl RunningPeer {
 
     /// Update a task via SeaORM through this peer's WaveSyncDb.
     pub async fn update_task(&self, id: &str, title: &str, completed: bool) -> Result<()> {
-        let resp = reqwest::Client::new()
+        let resp = http_client()
             .put(format!("{}/tasks/{}", self.base_url, id))
             .json(&Task {
                 id: id.into(),
@@ -1197,7 +1211,7 @@ impl RunningPeer {
 
     /// `insert_task`, but against the secondary group's `/g2/tasks` route.
     pub async fn insert_task_g2(&self, id: &str, title: &str, completed: bool) -> Result<()> {
-        let resp = reqwest::Client::new()
+        let resp = http_client()
             .post(format!("{}/g2/tasks", self.base_url))
             .json(&Task {
                 id: id.into(),
@@ -1220,7 +1234,7 @@ impl RunningPeer {
     /// Shared GET-by-id used by both `get_task` and `get_task_g2`. `route`
     /// is the collection path segment (`tasks` or `g2/tasks`).
     async fn get_task_at(&self, route: &str, id: &str) -> Result<Option<Task>> {
-        let resp = reqwest::Client::new()
+        let resp = http_client()
             .get(format!("{}/{}/{}", self.base_url, route, id))
             .send()
             .await?;
@@ -1235,7 +1249,7 @@ impl RunningPeer {
 
     /// List every task this peer's local SQLite currently holds.
     pub async fn list_tasks(&self) -> Result<Vec<Task>> {
-        Ok(reqwest::Client::new()
+        Ok(http_client()
             .get(format!("{}/tasks", self.base_url))
             .send()
             .await?
@@ -1246,7 +1260,7 @@ impl RunningPeer {
 
     /// Number of currently-connected libp2p peers (relay + sync peers).
     pub async fn connected_peer_count(&self) -> Result<usize> {
-        Ok(reqwest::Client::new()
+        Ok(http_client()
             .get(format!("{}/peers", self.base_url))
             .send()
             .await?
@@ -1260,7 +1274,7 @@ impl RunningPeer {
     /// Returns the wire-compatible JSON representation; we re-parse it
     /// as a typed value so scenarios can assert on specific counters.
     pub async fn diagnostics(&self) -> Result<DiagnosticsSnapshot> {
-        Ok(reqwest::Client::new()
+        Ok(http_client()
             .get(format!("{}/diagnostics", self.base_url))
             .send()
             .await?
@@ -1274,7 +1288,7 @@ impl RunningPeer {
     /// entry point against its own live database, which must reuse the live
     /// in-process engine. `timeout` is the simulated OS push budget.
     pub async fn push_wake(&self, timeout: Duration) -> Result<PushWakeOutcome> {
-        Ok(reqwest::Client::new()
+        Ok(http_client()
             .post(format!("{}/push_wake", self.base_url))
             // Generous HTTP timeout: the endpoint blocks for up to `timeout`.
             .timeout(timeout + Duration::from_secs(15))
