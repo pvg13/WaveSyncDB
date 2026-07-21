@@ -7,10 +7,43 @@
 > protocol + findings container; base device mechanics live in
 > docs/ios-device-protocol-2026-07.md (Sections C–E).
 
-## Session runner (connect the phone once, run one script)
+## Observational mode — the real-flow default
+
+The preferred shape: **Mediterranea used exactly as a real user uses it**,
+no orchestration, no writer, no prompts — the Mac only reads the evidence
+afterward, in one connection at the end of the day:
+
+1. Dev build enables the beacon itself (debug builds set
+   `WAVESYNC_M1_DIAG=1` via `std::env::set_var` before building the
+   engine — icon launches carry no env, so the app must set it).
+2. Use the phone naturally, hitting the scenarios as life provides them:
+   WiFi → walk onto cellular (S1/S4), background the app (S6), household
+   member adds items while it's locked (#92 banner, S5 wakes), a stint
+   with the hidden dev toggle flipping the #73 bind arm.
+3. End of day, one USB connection:
+   `sudo log collect --device-udid <udid> --last 8h`, flatten with the
+   `log show` predicate in `tests-e2e/ios/analyze_logarchive.sh`'s
+   header, run the analyzer → per-issue `summary.md` (beacon timeline,
+   #73 arm markers, #74 handoff laps off the device clock, bg_sync wake
+   tables, NSE lines).
+
+**Go/no-go smoke first (2 min):** launch the app from its icon and check
+Console.app for any wavesyncdb line. Observational mode requires the Rust
+logs to reach os_log outside Xcode — if they don't, Mediterranea needs a
+tracing→os_log bridge before the day (small, known crate), or fall back
+to the orchestrated runner below (whose `--console` capture does not
+depend on os_log).
+
+Mediterranea-side prep for this mode: the beacon env line in debug
+builds, and a hidden dev-settings toggle wired to the builder's
+`ios_unspecified_quic_bind` flag (#73's A/B without relaunch tooling).
+
+## Orchestrated runner (precision fallback)
 
 `tests-e2e/ios/run_device_session.sh` (run on the Mac) drives S1→S6 plus
-the #92 NSE check through a single USB connection:
+the #92 NSE check through a single USB connection — use it when the
+observational capture leaves a gap (e.g. the A/B needs same-conditions
+back-to-back runs, or os_log turns out not to carry the Rust logs):
 
 - **Env injection without Xcode:** `xcrun devicectl device process launch
   --console --environment-variables …` both toggles the #73 A/B arm
