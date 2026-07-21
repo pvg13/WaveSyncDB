@@ -410,6 +410,14 @@ impl EngineRunner {
     /// parallel — the fan-out never waits on the relay round-trip). If the
     /// relay isn't reachable, the version is still recorded as unacked so
     /// the healing path covers it on reconnect.
+    ///
+    /// With the #107 dial configured and at least one eligible peer
+    /// connected, the append is instead *deferred*: the version enters the
+    /// group's dial window and either settles by full peer-ack coverage
+    /// (append skipped — `note_mailbox_covered_by_acks`) or expires into a
+    /// real append on the maintenance tick. The deferral decision uses acks
+    /// and time ONLY — never version comparisons (see the module-doc
+    /// landmine).
     pub(super) async fn maybe_append_to_mailbox(
         &mut self,
         effective_topic: &str,
@@ -418,17 +426,17 @@ impl EngineRunner {
         if !self.config.mailbox_enabled {
             return;
         }
-        let relay_peer = self.mailbox_relay_peer();
+        let dial = self.config.mailbox_append_after;
+        let has_eligible_peers =
+            dial.is_some() && !self.eligible_push_peers(effective_topic).is_empty();
         let Some(g) = self.groups.get_mut(effective_topic) else {
             return;
         };
         // No passphrase → no key to seal with → no mailbox for this group.
-        let Some(ref gk) = g.group_key else {
+        if g.group_key.is_none() {
             return;
-        };
+        }
         let version = changeset.db_version;
-        let mailbox_key = gk.mailbox_key();
-        let topic_name = g.topic_name.clone();
         g.mailbox_unacked.insert(version);
 
         // Restore the W < min(unacked) invariant BEFORE anything can build a
@@ -437,6 +445,45 @@ impl EngineRunner {
         // produced, so this new version may be at or below the current W.
         let w = g.mailbox_acked_version;
         self.set_mailbox_watermark(effective_topic, w).await;
+
+        if let Some(delay) = dial
+            && has_eligible_peers
+        {
+            if let Some(g) = self.groups.get_mut(effective_topic) {
+                g.mailbox_deferred
+                    .insert(version, tokio::time::Instant::now() + delay);
+                tracing::debug!(
+                    topic = %short_topic(effective_topic),
+                    version,
+                    delay_ms = delay.as_millis() as u64,
+                    "mailbox append deferred: waiting for peer acks (#107 dial)"
+                );
+            }
+            return;
+        }
+        self.append_to_mailbox_now(effective_topic, changeset).await;
+    }
+
+    /// The unconditional send half of the append path: seal and dispatch one
+    /// changeset to the relay's mailbox. The version is expected to already
+    /// be in `mailbox_unacked` (inserted by `maybe_append_to_mailbox`, which
+    /// is the only writer of that set for the fast path); re-dispatch after
+    /// a dial-window expiry goes through here too.
+    pub(super) async fn append_to_mailbox_now(
+        &mut self,
+        effective_topic: &str,
+        changeset: &SyncChangeset,
+    ) {
+        let relay_peer = self.mailbox_relay_peer();
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        let Some(ref gk) = g.group_key else {
+            return;
+        };
+        let version = changeset.db_version;
+        let mailbox_key = gk.mailbox_key();
+        let topic_name = g.topic_name.clone();
 
         let Some(relay_peer) = relay_peer else {
             tracing::debug!(
