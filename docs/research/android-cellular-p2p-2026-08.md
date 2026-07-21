@@ -64,9 +64,37 @@ answers the Doze/lifecycle questions, never the carrier-NAT question.
 
 ## Findings
 
-### Emulator: Doze / App Standby (A4)
+### Emulator: Doze / App Standby (A4) — run 2026-07-21, emulator-5556 (SyncDemo AVD)
 
-_(pending run)_
+Full suite green; N14-era scenarios hold (A1 cold start 891 ms, A2
+wifi→cellular resume 2 351 ms, A3 airplane resume 224 ms). The new results:
+
+1. **Doze freezes sync completely.** A row written while the app sat in
+   forced Doze (`deviceidle force-idle`, 60 s) never arrived during the
+   freeze — the expected cached-app network freeze, confirming that Doze'd
+   devices are unreachable to live P2P and only a (high-priority) push or
+   the user's own foreground can end the gap.
+2. **Doze *recovery* is slow: 22 245 ms TTFS** on unforce + foreground —
+   an order of magnitude above every other resume scenario (224–2 351 ms).
+   Mechanism (matches the N14/bg-engine-reuse analysis): Doze freezes the
+   sockets without an interface change, so the plain foreground resume
+   keeps the "same network ⇒ connections still valid" anti-churn behavior
+   and waits out the reactive 2-strike sync-timeout eviction (~20 s)
+   before re-establishing. The killed-app push path already solves exactly
+   this with the wall-clock suspension-gap-gated relay reset
+   (`EngineCommand::PushWake`); the foreground resume path has no such
+   gate. **Filed as #111.**
+3. **The m1-diag beacon works end-to-end.** Post-recovery line:
+   `relayed_est=1 direct_est=4 demoted=0 dcutr=0/1 relay_bytes=4528
+   direct_bytes=31017 ratio=0.127 peers=1 peers_via_relay=0` — mostly
+   direct (host NAT is cone-like, as expected on an emulator), with the
+   relay blip and one terminal DCUtR outcome from the recovery window.
+   The classification signals a real-carrier run needs are all present.
+
+Ops lessons for future runs: the headless emulators wedge adb entirely
+after ~1 day of uptime (kill + relaunch fixes it; `adb kill-server` alone
+does not); use the SyncDemo AVD (emulator-5556) — the Pixel 9 Pro AVD
+hosts the Mediterranea test install and sits at 93% storage.
 
 ### Carrier NAT classification
 
