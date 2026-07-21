@@ -123,6 +123,53 @@ pub(crate) enum MailboxTaskMsg {
     },
 }
 
+/// #107 dial helpers — pure so the state transitions are unit-testable.
+///
+/// Does this group's unacked backlog need a healing delta? Versions inside
+/// their dial window are excluded: they are *waiting on acks*, not stranded,
+/// and healing them early would re-serialize every deferred append through
+/// the relay 3s after the write.
+pub(super) fn heal_needed(
+    unacked: &std::collections::BTreeSet<u64>,
+    deferred: &std::collections::HashMap<u64, tokio::time::Instant>,
+) -> bool {
+    unacked.iter().any(|v| !deferred.contains_key(v))
+}
+
+/// Remove and return every deferred version whose dial window has expired.
+pub(super) fn due_deferred(
+    deferred: &mut std::collections::HashMap<u64, tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Vec<u64> {
+    let due: Vec<u64> = deferred
+        .iter()
+        .filter(|(_, deadline)| **deadline <= now)
+        .map(|(v, _)| *v)
+        .collect();
+    for v in &due {
+        deferred.remove(v);
+    }
+    due
+}
+
+/// Full peer-ack coverage arrived for `version`. If it was still inside its
+/// dial window, settle it out of BOTH tracking sets — the append is skipped
+/// for good (the data provably lives on the acking replicas, and the
+/// watermark may now advance past it on the next idle tick). Returns whether
+/// a skip actually happened (drives the diagnostics counter).
+pub(super) fn settle_covered(
+    unacked: &mut std::collections::BTreeSet<u64>,
+    deferred: &mut std::collections::HashMap<u64, tokio::time::Instant>,
+    version: u64,
+) -> bool {
+    if deferred.remove(&version).is_some() {
+        unacked.remove(&version);
+        true
+    } else {
+        false
+    }
+}
+
 /// Greedy-pack `changes` into chunks of at most `max_bytes` serialized size
 /// WITHOUT ever splitting one row's cells across chunks. Cells are grouped by
 /// `(table, pk)` (first-appearance order) and whole rows are packed: a
@@ -1147,6 +1194,52 @@ mod tests {
     #[test]
     fn dial_defaults_to_none() {
         assert!(EngineConfig::default().mailbox_append_after.is_none());
+    }
+
+    /// #107 helper contracts. `deferred` is always a subset of `unacked`
+    /// (the watermark invariant rides on unacked; deferred only marks
+    /// which members are inside their dial window).
+    #[test]
+    fn dial_helpers() {
+        use std::collections::HashMap;
+        use tokio::time::Instant;
+
+        // heal_needed: a backlog that is ALL deferred must not trigger the
+        // unacked heal (the maintenance tick would otherwise append every
+        // deferred version 3s after the write and defeat the dial).
+        let now = Instant::now();
+        let unacked: BTreeSet<u64> = [5, 7].into_iter().collect();
+        let mut deferred: HashMap<u64, Instant> = HashMap::new();
+        deferred.insert(5, now);
+        deferred.insert(7, now);
+        assert!(!heal_needed(&unacked, &deferred));
+        // ...but one non-deferred unacked version (real outage backlog)
+        // does need healing.
+        deferred.remove(&7);
+        assert!(heal_needed(&unacked, &deferred));
+        // Empty unacked never needs the unacked heal.
+        assert!(!heal_needed(&BTreeSet::new(), &HashMap::new()));
+
+        // due_deferred: drains exactly the expired deadlines.
+        let later = now + std::time::Duration::from_secs(60);
+        let mut d: HashMap<u64, Instant> = HashMap::new();
+        d.insert(1, now); // due
+        d.insert(2, later); // not due
+        let mut due = due_deferred(&mut d, now);
+        due.sort_unstable();
+        assert_eq!(due, vec![1]);
+        assert!(d.contains_key(&2) && !d.contains_key(&1));
+
+        // settle_covered: a fully-acked deferred version leaves BOTH sets
+        // (skip); a non-deferred version is untouched (its append is
+        // in-flight or done — acks say nothing about the relay).
+        let mut unacked: BTreeSet<u64> = [3, 4].into_iter().collect();
+        let mut deferred: HashMap<u64, Instant> = HashMap::new();
+        deferred.insert(3, later);
+        assert!(settle_covered(&mut unacked, &mut deferred, 3));
+        assert!(!unacked.contains(&3) && deferred.is_empty());
+        assert!(!settle_covered(&mut unacked, &mut deferred, 4));
+        assert!(unacked.contains(&4));
     }
 
     async fn drain_test_db() -> DatabaseConnection {

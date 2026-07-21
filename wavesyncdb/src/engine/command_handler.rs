@@ -203,6 +203,7 @@ impl EngineRunner {
             mailbox_drain_in_flight: false,
             mailbox_drain_applied: 0,
             mailbox_heal: None,
+            mailbox_deferred: std::collections::HashMap::new(),
         };
         self.groups.insert(effective_topic.clone(), group);
         tracing::info!("Joined sync group (effective topic {effective_topic})");

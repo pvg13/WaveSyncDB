@@ -902,6 +902,7 @@ async fn run_engine(
         mailbox_drain_in_flight: false,
         mailbox_drain_applied: 0,
         mailbox_heal: None,
+        mailbox_deferred: std::collections::HashMap::new(),
     };
     let mut groups = HashMap::new();
     groups.insert(default_effective_topic.clone(), default_group);
@@ -1087,6 +1088,12 @@ pub(crate) struct GroupState {
     /// Active healing-delta batch. W advances to its `to` only when every
     /// chunk is acked. See [`mailbox_manager::MailboxHeal`].
     pub(crate) mailbox_heal: Option<mailbox_manager::MailboxHeal>,
+    /// #107 dial: local-write versions currently inside their ack-threshold
+    /// window, mapped to the deadline after which the append goes out
+    /// anyway. Always a subset of `mailbox_unacked` — a deferred version
+    /// still blocks the watermark, so a crash inside the window is covered
+    /// by the next session's startup heal. Empty when the dial is off.
+    pub(crate) mailbox_deferred: std::collections::HashMap<u64, tokio::time::Instant>,
 }
 
 /// A locally-originated changeset awaiting confirmed delivery. See
