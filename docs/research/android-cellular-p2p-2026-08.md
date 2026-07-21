@@ -224,6 +224,19 @@ ratio 0.0), DIGI LTE relay-carried, and the ~48 s keyguard-case doze
 recovery (consistent with #111's documented semantics; the unlocked
 flow stands at 2.9 s).
 
+### IPv6 availability on the tested carrier (2026-07-21)
+
+No v6 escape hatch on DIGI ES: the handset's APN profile requests
+dual-stack (`IPv4/IPv6`, user-verified in settings), but the core grants
+the internet APN **IPv4-only behind CGNAT** (`rmnet1`: `10.44.221.82/32`,
+no global v6) — while the IMS APN comes up IPv6, proving the core itself
+speaks v6 and the restriction is a deliberate provisioning choice on the
+consumer data APN. Consequence: on this carrier, v6-to-v6 direct paths
+are structurally unavailable regardless of peer support; the relay path
+(and #107's cost work) is the whole story. Worth re-checking per carrier
+in future runs — a beacon extension logging global-v6 presence on the
+data interface would answer it fleet-wide.
+
 ## Verdicts for M1
 
 _(to fill: which reducers matter on Android; is phone↔phone cellular
