@@ -129,7 +129,34 @@ Methodology notes (hard-earned):
 
 ### Carrier NAT classification
 
-_(pending device runs — table: carrier / network / beacon verdict)_
+| date | device | carrier / radio | topology | verdict | beacon |
+|---|---|---|---|---|---|
+| 2026-07-21 | Pixel 10 Pro | DIGI ES / LTE (+IWLAN listed) | phone-cellular ↔ host behind home NAT + **active ufw** | **relay-carried** (ratio 1.000, peers_via_relay=1, dcutr 0/1) | `relayed_est=2 direct_est=0 relay_bytes=23893 ratio=1.0` |
+| 2026-07-21 | Pixel 10 Pro | (same, WiFi baseline) | phone-WiFi ↔ host **same LAN** | **relay-carried** (ratio 1.000) — a same-LAN direct dial cannot fail at the NAT, so this points at the host's ufw dropping inbound UDP | `relayed_est=2 direct_est=0 ratio=1.0` |
+
+**Interpretation — honest about the confound:** the same-LAN result proves
+the host side was undialable (local firewall), so this run cannot isolate
+the carrier NAT: direct would have failed on the host side regardless of
+what DIGI's NAT allows. What the run DOES establish, as a true field data
+point: the common real topology "phone on LTE ↔ typical home machine
+(NAT + default-deny firewall)" runs entirely over the relay — and the UX
+is nonetheless excellent (**1 310 ms TTFS on LTE over a relay circuit**;
+WiFi baseline 1 344 ms). The relay cost question is therefore about server
+bytes, not user experience. A clean carrier-NAT isolation needs either the
+host's inbound UDP opened for the writer or a second phone
+(carrier↔carrier).
+
+### Doze on real hardware (#111 acceptance attempt)
+
+Pixel 10 Pro, forced Doze 90 s on cellular: the freeze held (row did not
+land during Doze) and **recovery took 47 069 ms** — despite the #111 fix
+demonstrably running: the post-recovery beacon shows `relayed_est` rising
+2→4 (the forced teardown + fresh circuits happened) yet `peers=0` even
+35 s after recovery. The reset half of #111 works; the residual is the
+**peer reintroduction after the forced reconnect** (the N14
+edge-triggered introduction one-shots racing the relay reconnect), with
+the periodic tick as the eventual rescue. #111's remaining scope is
+therefore reintroduction-after-reset, not socket detection.
 
 ### FCM delivery classes under throttling
 
