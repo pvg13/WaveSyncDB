@@ -529,6 +529,28 @@ impl EngineRunner {
         );
     }
 
+    /// Full peer-ack coverage arrived for one of this group's local writes
+    /// (`pending_pushes` just dropped it). If the version is still inside
+    /// its #107 dial window, skip its append for good. Safe even when the
+    /// eligible set shrank mid-window: this only runs off a real `PushAck`
+    /// (or a reconcile-digest convergence proof), so at least one other
+    /// replica provably holds the data.
+    pub(super) fn note_mailbox_covered_by_acks(&mut self, effective_topic: &str, version: u64) {
+        let Some(g) = self.groups.get_mut(effective_topic) else {
+            return;
+        };
+        if settle_covered(&mut g.mailbox_unacked, &mut g.mailbox_deferred, version) {
+            self.diagnostics
+                .mailbox_appends_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                topic = %short_topic(effective_topic),
+                version,
+                "mailbox append skipped: covered by peer acks (#107 dial)"
+            );
+        }
+    }
+
     /// Start a drain for every group. Called on relay reservation accepted
     /// and on resume/push-wake.
     pub(super) fn start_mailbox_drains_all(&mut self) {

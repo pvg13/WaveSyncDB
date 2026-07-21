@@ -2869,13 +2869,18 @@ impl EngineRunner {
             return;
         };
         let eligible = self.eligible_push_peers(&effective_topic);
+        let mut fully_acked = false;
         if let Some(g) = self.groups.get_mut(&effective_topic)
             && let Some(p) = g.pending_pushes.get_mut(&db_version)
         {
             p.acked_by.insert(peer);
             if eligible.iter().all(|pid| p.acked_by.contains(pid)) {
                 g.pending_pushes.remove(&db_version);
+                fully_acked = true;
             }
+        }
+        if fully_acked {
+            self.note_mailbox_covered_by_acks(&effective_topic, db_version);
         }
     }
 
@@ -2884,11 +2889,19 @@ impl EngineRunner {
     /// is concerned — mark them acked by it and drop any now fully-delivered.
     fn note_peer_converged_pushes(&mut self, effective_topic: &str, peer: libp2p::PeerId) {
         let eligible = self.eligible_push_peers(effective_topic);
+        let mut fully_acked: Vec<u64> = Vec::new();
         if let Some(g) = self.groups.get_mut(effective_topic) {
-            g.pending_pushes.retain(|_, p| {
+            g.pending_pushes.retain(|version, p| {
                 p.acked_by.insert(peer);
-                !eligible.iter().all(|pid| p.acked_by.contains(pid))
+                let done = eligible.iter().all(|pid| p.acked_by.contains(pid));
+                if done {
+                    fully_acked.push(*version);
+                }
+                !done
             });
+        }
+        for version in fully_acked {
+            self.note_mailbox_covered_by_acks(effective_topic, version);
         }
     }
 

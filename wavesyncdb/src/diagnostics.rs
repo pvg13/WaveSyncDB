@@ -192,6 +192,12 @@ pub(crate) struct Counters {
     /// Steady state is 0; a rising count means peers are offline longer than
     /// the relay's mailbox TTL (or the relay store was wiped).
     pub mailbox_gap_fallbacks: AtomicU64,
+    /// Mailbox appends skipped by the ack-threshold dial (#107): every
+    /// eligible peer acked the push inside the window, so the changeset was
+    /// never sent to the relay. The dial's savings counter — with the dial
+    /// on and a healthy overlapping fleet this should track the write rate
+    /// while `relay_bytes_out` stays flat.
+    pub mailbox_appends_skipped: AtomicU64,
 
     /// Per-bucket counts for catch-up (version-vector) round-trip latency.
     /// Each observation increments exactly ONE bucket — the smallest threshold
@@ -262,6 +268,7 @@ impl Counters {
             direct_bytes_in: self.direct_bytes_in.load(Ordering::Relaxed),
             mailbox_entries_drained: self.mailbox_entries_drained.load(Ordering::Relaxed),
             mailbox_gap_fallbacks: self.mailbox_gap_fallbacks.load(Ordering::Relaxed),
+            mailbox_appends_skipped: self.mailbox_appends_skipped.load(Ordering::Relaxed),
             sync_rtt_histogram: self.sync_rtt_histogram(),
         }
     }
@@ -317,6 +324,9 @@ pub struct Snapshot {
     /// See [`Counters::mailbox_gap_fallbacks`].
     #[serde(default)]
     pub mailbox_gap_fallbacks: u64,
+    /// See [`Counters::mailbox_appends_skipped`].
+    #[serde(default)]
+    pub mailbox_appends_skipped: u64,
     /// Catch-up round-trip-time histogram as `(le_ms, count)` pairs,
     /// `u64::MAX` marking the `+Inf` overflow bucket. Each count is the number
     /// of observations in that bucket. To get Prometheus-style cumulative 'le'
