@@ -91,10 +91,41 @@ wifi→cellular resume 2 351 ms, A3 airplane resume 224 ms). The new results:
    relay blip and one terminal DCUtR outcome from the recovery window.
    The classification signals a real-carrier run needs are all present.
 
-Ops lessons for future runs: the headless emulators wedge adb entirely
-after ~1 day of uptime (kill + relaunch fixes it; `adb kill-server` alone
-does not); use the SyncDemo AVD (emulator-5556) — the Pixel 9 Pro AVD
-hosts the Mediterranea test install and sits at 93% storage.
+### #111 fix round (2026-07-21, same emulator)
+
+Three-part fix landed (see the #111 commit): Resume consults the
+suspension-gap detector; the lifecycle layer converts a >=60s-backgrounded
+resume into a NetworkTransition (the gap detector is provably blind to the
+frozen-network Doze variant — the engine loop keeps running, log-verified);
+and the post-resume retry now re-attempts the relay reconnect (bounded
+re-arms), closing the measured ~45s window where the first post-Doze relay
+dial died against a still-waking network and nothing retried until the 30s
+periodic tick.
+
+Mechanism evidence (all log-verified): the lifecycle gate fires at
+foreground after forced Doze; the relay reservation returns ~7s after a
+cold forced teardown; best-case doze recovery measured **249 ms**
+(vs 22.2s pre-fix). A clean numeric acceptance (the <3s bar) is deferred
+to a stable device: across the day the emulator environment degraded until
+run-to-run variance dwarfed the signal — consecutive suite runs produced
+22.2s / 7.2s / 45s / 249ms / all-timeouts for the same scenario. The
+user's #108 device day should capture one A4 run on a real phone as the
+acceptance number.
+
+Methodology notes (hard-earned):
+- Clear app state (`pm clear`) before measuring: the demo app accumulates
+  rows across runs and re-seeds each fresh writer, inflating every TTFS.
+- The headless emulators wedge adb entirely after ~1 day of uptime (kill +
+  relaunch fixes it; `adb kill-server` alone does not), and a dying qemu
+  can linger holding the AVD lock — verify the process is gone before
+  relaunching, or the new instance dies with "multiple emulators with the
+  same AVD".
+- Emulator serial<->AVD mapping is not stable across relaunches (a
+  relaunched AVD grabs the lowest free port): verify identity via
+  `pm list packages`, never assume 5554/5556.
+- The Pixel 9 Pro AVD hosts the Mediterranea test install and sits at 93%
+  storage (installs fail with INSTALL_FAILED_INSUFFICIENT_STORAGE) — run
+  scenarios on the SyncDemo AVD.
 
 ### Carrier NAT classification
 
