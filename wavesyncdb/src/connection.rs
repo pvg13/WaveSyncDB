@@ -1911,6 +1911,9 @@ pub struct WaveSyncDbBuilder {
     /// Relay-mailbox participation (append-on-write + drain-on-wake).
     /// Default `true`; see `without_relay_mailbox`.
     mailbox_enabled: bool,
+    /// Ack-threshold mailbox dial (#107). Default `None` (always-append);
+    /// see `with_mailbox_append_after`.
+    mailbox_append_after: Option<std::time::Duration>,
     /// Whether the on-disk group-key cache is enabled. iOS only — see
     /// `with_group_key_cache`.
     group_key_cache_enabled: bool,
@@ -1955,6 +1958,7 @@ impl WaveSyncDbBuilder {
             tombstone_retention: None,
             ios_unspecified_quic_bind: defaults.ios_unspecified_quic_bind,
             mailbox_enabled: defaults.mailbox_enabled,
+            mailbox_append_after: defaults.mailbox_append_after,
             group_key_cache_enabled: true,
             key_cache_load_only: false,
             key_cache_load_only_miss: false,
@@ -2124,6 +2128,18 @@ impl WaveSyncDbBuilder {
     /// both sides are online simultaneously.
     pub fn without_relay_mailbox(mut self) -> Self {
         self.mailbox_enabled = false;
+        self
+    }
+
+    /// Enable the mailbox ack-threshold dial (#107): hold each write's
+    /// mailbox append for `delay`; skip it entirely when every connected
+    /// group peer acks the peer-to-peer push first. Fleets whose devices
+    /// overlap daily send ~zero mailbox bytes at steady state; a write no
+    /// connected peer acks in time (or made while alone) is appended as
+    /// usual, so never-overlapping peers keep the full store-and-forward
+    /// guarantee, just delayed by `delay`. Off by default (always-append).
+    pub fn with_mailbox_append_after(mut self, delay: std::time::Duration) -> Self {
+        self.mailbox_append_after = Some(delay);
         self
     }
 
@@ -2549,6 +2565,7 @@ impl WaveSyncDbBuilder {
             tcp_enabled: self.tcp_enabled,
             ios_unspecified_quic_bind: self.ios_unspecified_quic_bind,
             mailbox_enabled: self.mailbox_enabled,
+            mailbox_append_after: self.mailbox_append_after,
         };
 
         // Diagnostics counters are owned jointly by the engine task (writer)

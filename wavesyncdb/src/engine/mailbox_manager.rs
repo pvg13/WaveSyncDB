@@ -1142,6 +1142,13 @@ mod tests {
     const LOCAL_SITE: NodeId = NodeId([1u8; 16]);
     const REMOTE_SITE: NodeId = NodeId([2u8; 16]);
 
+    /// #107: the dial must default OFF — always-append is the 0.9.0
+    /// behavior and stays the default until field-proven.
+    #[test]
+    fn dial_defaults_to_none() {
+        assert!(EngineConfig::default().mailbox_append_after.is_none());
+    }
+
     async fn drain_test_db() -> DatabaseConnection {
         let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         shadow::create_meta_table(&db).await.unwrap();

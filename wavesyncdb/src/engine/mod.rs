@@ -266,6 +266,16 @@ pub struct EngineConfig {
     /// key ⇒ nothing to seal with). Opt out via
     /// `WaveSyncDbBuilder::without_relay_mailbox`.
     pub mailbox_enabled: bool,
+    /// Ack-threshold mailbox dial (#107). When set, a local write's mailbox
+    /// append is *held* for this window while at least one eligible peer is
+    /// connected; if every eligible peer acks the push inside the window the
+    /// append is skipped entirely — the data provably lives on other
+    /// replicas, and steady-state relay bytes drop to ~0 for fleets whose
+    /// devices overlap. If the window expires with un-acked peers the append
+    /// happens as usual, and a write made with no eligible peer connected
+    /// appends immediately. `None` (default) keeps the always-append
+    /// behavior. Configure via `WaveSyncDbBuilder::with_mailbox_append_after`.
+    pub mailbox_append_after: Option<Duration>,
 }
 
 impl Default for EngineConfig {
@@ -290,6 +300,7 @@ impl Default for EngineConfig {
             tcp_enabled: false,
             ios_unspecified_quic_bind: false,
             mailbox_enabled: true,
+            mailbox_append_after: None,
         }
     }
 }
