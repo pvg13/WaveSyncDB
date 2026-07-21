@@ -38,6 +38,31 @@ wavesyncdb rev ≥ the beacon commit (the same rebuild picks up the #92 NSE
 template fix); relay with APNs creds for S5/N1 (both phases skippable via
 `SKIP_S5=1` / `SKIP_NSE=1` if not ready).
 
+### Mediterranea-official arrangement (the default)
+
+Run the session with the real app through its own build pipeline
+(`scripts/ios_sign_install.sh`, `WITH_NSE=1`) — with two isolation rules
+that make it safe even on a phone that isn't the tester's:
+
+1. **Group isolation, not app isolation.** The host writer joins whatever
+   `TOPIC`/`PASSPHRASE` the runner is given — NEVER the real household's.
+   Create a fresh test account/household in the app on the phone for the
+   session and hand the runner *that* group. Real code, signing, APNs and
+   NSE pipeline; throwaway data plane. The real account stays untouched
+   and is switched back to afterwards.
+2. **Test relay, not production.** S5 needs `APNS_COALESCE_SECS=0` and
+   budget resets — relay-side settings you don't touch on prod. The dev
+   build must point at the test relay (a relay-override knob in the dev
+   build, Android-demo-style, if it doesn't have one yet); the
+   Mediterranea APNs key is per-bundle-id and works from the test relay.
+
+Additionally on a borrowed/household phone: skip the cold-cache
+*reinstall* variant of N1 on-device (the Simulator covers that row —
+NSEs run there and `xcrun simctl push` drives them); a dev build over an
+existing install is an upgrade-install (data kept), and the way back is
+a TestFlight/App Store reinstall. End-of-session restore: switch the app
+back to the real account, Developer Mode off, un-trust the Mac.
+
 ## Objective
 
 One hardware day resolving the open iOS connectivity cluster with device
