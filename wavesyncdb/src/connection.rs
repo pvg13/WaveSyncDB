@@ -672,11 +672,31 @@ impl WaveSyncDb {
     /// would resurrect the zombie-swarm / "database is locked" problems the
     /// `Weak` group map avoids). Used to auto-drive resume on app foreground.
     #[cfg(feature = "dioxus")]
-    pub(crate) fn resume_trigger(&self) -> impl Fn() + Clone + Send + 'static {
+    pub(crate) fn resume_trigger(
+        &self,
+    ) -> impl Fn(Option<std::time::Duration>) + Clone + Send + 'static {
         let cmd_tx = self.inner.node.cmd_tx.clone();
         let refresh_tx = self.inner.node.refresh_tx.clone();
-        move || {
-            let _ = cmd_tx.try_send(crate::engine::EngineCommand::Resume);
+        move |backgrounded: Option<std::time::Duration>| {
+            // #111: after a LONG background stay, the sockets are dead no
+            // matter which freeze variant the OS applied — but only the
+            // network-frozen variant is invisible to the engine's wall-gap
+            // detector (the loop keeps running, so `wake_wants_relay_reset`
+            // correctly sees no gap). The lifecycle layer is the one place
+            // that reliably knows how long the app was gone, so a
+            // long-backgrounded resume forces the full reconnect
+            // (NetworkTransition) while a quick tab-away keeps the
+            // anti-churn plain Resume. Threshold mirrors the engine's
+            // suspension-gap floor: connections rarely die under shorter
+            // gaps (keep-alives cover them).
+            const BACKGROUND_RESET_THRESHOLD: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            let cmd = if backgrounded.is_some_and(|d| d >= BACKGROUND_RESET_THRESHOLD) {
+                crate::engine::EngineCommand::NetworkTransition
+            } else {
+                crate::engine::EngineCommand::Resume
+            };
+            let _ = cmd_tx.try_send(cmd);
             let _ = refresh_tx.send(());
         }
     }

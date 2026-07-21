@@ -9,8 +9,21 @@ impl EngineRunner {
         match cmd {
             EngineCommand::Resume => {
                 while let Ok(EngineCommand::Resume) = self.cmd_rx.try_recv() {}
-                // Plain resume: keep healthy relay/peer connections (no churn).
-                self.handle_resume(false).await;
+                // Same suspension-gap gate as PushWake (#111): Doze / deep
+                // sleep freezes the sockets WITHOUT an interface change, so
+                // an unconditional keep-connections resume trusts dead
+                // sockets and waits out the ~20s reactive sync-timeout
+                // eviction (measured 22s Doze-recovery TTFS). A genuine
+                // quick resume observes no wall-clock gap and keeps the
+                // anti-churn path — the reservation-churn protection this
+                // arm exists for.
+                let force = self.wake_wants_relay_reset();
+                if force {
+                    tracing::info!(
+                        "Resume after suspension-length gap — forcing relay reset (dead frozen sockets)"
+                    );
+                }
+                self.handle_resume(force).await;
                 false
             }
             EngineCommand::NetworkTransition => {
@@ -30,7 +43,7 @@ impl EngineRunner {
                 // doesn't have. A wake without a detected suspension behaves
                 // exactly like a plain Resume, preserving the anti-churn
                 // guarantee for healthy relay reservations.
-                let force = self.push_wake_wants_relay_reset();
+                let force = self.wake_wants_relay_reset();
                 tracing::info!(
                     force_relay_reset = force,
                     "Push wake — rediscovery and sync"
@@ -343,5 +356,9 @@ impl EngineRunner {
 
         // 6. Schedule a delayed retry to catch peers rediscovered via mDNS/rendezvous
         self.resume_sync_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+        // Budget for the retry arm's bounded re-arms while the relay is
+        // still down (#111): post-suspension network wake can outlast the
+        // first retry.
+        self.resume_retries_left = 3;
     }
 }

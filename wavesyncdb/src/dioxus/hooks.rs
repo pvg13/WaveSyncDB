@@ -62,16 +62,28 @@ fn ensure_auto_resume(db: &WaveSyncDb) {
             };
             rt.block_on(async move {
                 let mut was_foreground = true;
+                // Wall clock (not Instant): CLOCK_MONOTONIC pauses across
+                // device suspend on Android, which would under-report
+                // exactly the pocket-doze gaps this measures (#111).
+                let mut background_since: Option<std::time::SystemTime> = None;
                 loop {
                     if rx.changed().await.is_err() {
                         break; // listener gone (e.g. desktop no-op) — stop.
                     }
                     let is_foreground = *rx.borrow_and_update();
                     if is_foreground && !was_foreground {
+                        // A backwards wall jump (NTP) yields None → plain
+                        // resume, the safe default.
+                        let backgrounded = background_since
+                            .take()
+                            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
                         tracing::info!(
+                            backgrounded_secs = backgrounded.map(|d| d.as_secs()).unwrap_or(0),
                             "wavesync: app returned to foreground — resync + UI refresh"
                         );
-                        trigger();
+                        trigger(backgrounded);
+                    } else if !is_foreground && was_foreground {
+                        background_since = Some(std::time::SystemTime::now());
                     }
                     was_foreground = is_foreground;
                 }

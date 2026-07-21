@@ -935,6 +935,7 @@ async fn run_engine(
         network_status,
         network_event_tx,
         resume_sync_deadline: None,
+        resume_retries_left: 0,
         last_loop_wall: std::time::SystemTime::now(),
         suspension_detected_until: None,
         api_key,
@@ -1307,6 +1308,11 @@ struct EngineRunner {
     pub(crate) network_event_tx: broadcast::Sender<crate::network_status::NetworkEvent>,
     /// Optional deadline for a post-resume sync retry (gives mDNS/rendezvous time to rediscover).
     pub(crate) resume_sync_deadline: Option<tokio::time::Instant>,
+    /// Remaining bounded re-arms of the post-resume retry while the relay is
+    /// still down (#111) — refilled by `handle_resume`, consumed by the
+    /// retry arm. Keeps the post-suspension recovery inside seconds without
+    /// turning the retry into an unbounded reconnect loop.
+    pub(crate) resume_retries_left: u8,
     /// Wall-clock stamp of the last event-loop iteration. A large jump
     /// between iterations means the process was suspended (see
     /// [`wall_gap_exceeded`]) — the signal that turns the next `PushWake`
@@ -2170,12 +2176,13 @@ impl EngineRunner {
         self.last_loop_wall = now;
     }
 
-    /// Whether a `PushWake` arriving now should force a relay reset: a
-    /// suspension gap was observed either live (this iteration spans the
-    /// frozen window — the command arm won the post-unfreeze race) or by a
-    /// recent loop-top check (a timer arm won). Consumes the sticky marker.
-    /// Meaningless without a relay configured, so gated on that.
-    pub(super) fn push_wake_wants_relay_reset(&mut self) -> bool {
+    /// Whether a wake (`PushWake` or a foreground `Resume`, #111) arriving
+    /// now should force a relay reset: a suspension gap was observed either
+    /// live (this iteration spans the frozen window — the command arm won
+    /// the post-unfreeze race) or by a recent loop-top check (a timer arm
+    /// won). Consumes the sticky marker. Meaningless without a relay
+    /// configured, so gated on that.
+    pub(super) fn wake_wants_relay_reset(&mut self) -> bool {
         let live = wall_gap_exceeded(
             self.last_loop_wall,
             std::time::SystemTime::now(),
@@ -2561,8 +2568,35 @@ impl EngineRunner {
                     for g in self.groups.values_mut() {
                         g.pending_sync_peers.clear();
                     }
+                    // Re-attempt the relay reconnect too (#111): a forced
+                    // post-suspension resume tears the relay down and redials
+                    // immediately — but right after a Doze/deep-sleep exit
+                    // the device's network can still be waking, the first
+                    // dial dies quietly, and nothing else retried the relay
+                    // until the periodic tick (30s default) — measured as a
+                    // ~45s recovery. `maybe_reconnect_relay` is state-guarded
+                    // (no-op while connected/listening), so healthy resumes
+                    // pay nothing.
+                    if self.config.relay_server.is_some() {
+                        self.maybe_reconnect_relay();
+                    }
                     if self.default_group().registry_is_ready {
                         self.sync_all_known_peers().await;
+                    }
+                    // Bounded re-arm while the relay is still down: the
+                    // network-wake window after a suspension can outlast a
+                    // single +2s retry. The budget (set in handle_resume)
+                    // keeps this from becoming a reconnect loop when the
+                    // relay is genuinely unreachable — the periodic tick
+                    // owns that case.
+                    let relay_up = matches!(
+                        self.relay_state,
+                        RelayState::Connected { .. } | RelayState::Listening { .. }
+                    );
+                    if self.config.relay_server.is_some() && !relay_up && self.resume_retries_left > 0 {
+                        self.resume_retries_left -= 1;
+                        self.resume_sync_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(3));
                     }
                 },
                 _ = async {
