@@ -635,6 +635,32 @@ impl EngineRunner {
         }
         let topics: Vec<String> = self.groups.keys().cloned().collect();
         for topic in topics {
+            // #107 dial: expire dial windows first, so an un-acked deferred
+            // version becomes a real append on this same tick rather than
+            // being mistaken for heal backlog below.
+            let now = tokio::time::Instant::now();
+            let mut due_appends: Vec<SyncChangeset> = Vec::new();
+            if let Some(g) = self.groups.get_mut(&topic) {
+                for version in due_deferred(&mut g.mailbox_deferred, now) {
+                    if let Some(p) = g.pending_pushes.get(&version) {
+                        due_appends.push(p.changeset.clone());
+                    } else {
+                        // Changeset already evicted from pending_pushes
+                        // (MAX_PENDING_PUSHES overflow). The version is
+                        // still in mailbox_unacked, so the heal below now
+                        // sees it (no longer deferred) and covers it from
+                        // the shadow tables.
+                        tracing::debug!(
+                            topic = %short_topic(&topic),
+                            version,
+                            "dial window expired without a cached changeset; heal will cover"
+                        );
+                    }
+                }
+            }
+            for changeset in due_appends {
+                self.append_to_mailbox_now(&topic, &changeset).await;
+            }
             self.maybe_heal_mailbox(&topic);
             // Freshness: with nothing outstanding, everything up to the
             // current stamp is covered (local writes acked; remote-origin
@@ -690,7 +716,10 @@ impl EngineRunner {
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(g.local_db_version);
         let needs_startup_heal = !g.mailbox_startup_healed && current > watermark;
-        let needs_unacked_heal = !g.mailbox_unacked.is_empty();
+        // #107 dial: versions inside their dial window are waiting on acks,
+        // not stranded — healing them would re-append every deferred write
+        // seconds after it happened and defeat the dial.
+        let needs_unacked_heal = heal_needed(&g.mailbox_unacked, &g.mailbox_deferred);
         if !needs_startup_heal && !needs_unacked_heal {
             // Nothing could be stranded: mark the startup pass done so the
             // freshness advance may engage.
@@ -699,6 +728,11 @@ impl EngineRunner {
         }
 
         let covers: Vec<u64> = g.mailbox_unacked.iter().copied().collect();
+        // A heal delta is built from get_changes_since(W), so its data spans
+        // every unacked version INCLUDING any still-deferred ones (they sit
+        // above W by the invariant). Fold them in: clear their windows so a
+        // later expiry can't double-append what this delta already carries.
+        g.mailbox_deferred.retain(|v, _| !covers.contains(v));
         let db = g.db.clone();
         let registry = g.registry.clone();
         let site_id = g.site_id;
@@ -1309,6 +1343,23 @@ mod tests {
         assert!(!unacked.contains(&3) && deferred.is_empty());
         assert!(!settle_covered(&mut unacked, &mut deferred, 4));
         assert!(unacked.contains(&4));
+    }
+
+    /// #107: a deferred version must keep blocking the watermark freshness
+    /// advance (it is in `mailbox_unacked`) while NOT triggering the
+    /// unacked heal. This is the pair of predicates that together keep the
+    /// dial safe: crash-coverage stays, early re-append doesn't happen.
+    #[test]
+    fn deferred_blocks_freshness_but_not_heal() {
+        use std::collections::HashMap;
+        let now = tokio::time::Instant::now();
+        let unacked: BTreeSet<u64> = [9].into_iter().collect();
+        let mut deferred = HashMap::new();
+        deferred.insert(9, now + std::time::Duration::from_secs(30));
+        // The freshness advance gate is `unacked.is_empty()` — still blocked.
+        assert!(!unacked.is_empty());
+        // The heal gate is heal_needed — not triggered.
+        assert!(!heal_needed(&unacked, &deferred));
     }
 
     async fn drain_test_db() -> DatabaseConnection {
