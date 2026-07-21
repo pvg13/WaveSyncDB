@@ -127,7 +127,38 @@ Methodology notes (hard-earned):
   storage (installs fail with INSTALL_FAILED_INSUFFICIENT_STORAGE) — run
   scenarios on the SyncDemo AVD.
 
-### Carrier NAT classification
+### Carrier NAT classification — CLEAN RUN (VPN off)
+
+> The first run's results (kept below for methodology) were fully
+> VPN-confounded: a phone VPN tunnels ALL traffic — including same-LAN
+> WiFi — through the VPN exit, inserting an unknown NAT in front of every
+> measurement. Always confirm no VPN before classifying.
+
+| date | device | carrier / radio | topology | verdict | beacon |
+|---|---|---|---|---|---|
+| 2026-07-21 | Pixel 10 Pro | (WiFi baseline, same LAN, no VPN) | phone-WiFi ↔ host | **DIRECT** — ratio 0.000, `direct_est=1 demoted=1` (circuit demoted once direct formed); host ufw not a blocker in practice | `relay_bytes=0 direct_bytes=13778 ratio=0.0 peers_via_relay=0` |
+| 2026-07-21 | Pixel 10 Pro | **DIGI ES / LTE**, no VPN | phone-cellular ↔ host behind home NAT | **RELAY-CARRIED** — new circuit for the cellular session, `peers_via_relay=1`, `dcutr 0/0`: the introduction cross-dials do NOT punch DIGI's carrier NAT (CGNAT/symmetric-like world) | `relay_bytes=+11764 ratio(cellular phase)≈1.0` |
+
+**Verdicts:** (1) On this carrier, mobile payload rides the relay — the
+#107 mailbox/cost work is the lever, UX is already fine over circuits.
+(2) LAN stays direct as designed. (3) NEW finding: a **foregrounded**
+WiFi→cellular flip took **36 s** to recover (P1 TTFS) — no trigger fires
+when the interface changes while the app is foregrounded (the A2
+scenario's fast number rides the background→resume path). Android needs a
+ConnectivityManager-driven NetworkTransition — the Android analogue of
+iOS's #74 NWPathMonitor item.
+
+### Doze on real hardware — #111 ACCEPTANCE MET (clean run)
+
+Pixel 10 Pro, forced Doze 90 s on cellular, VPN off: freeze held, and
+recovery took **2 774 ms** — under the <3 s acceptance bar (pre-fix
+emulator baseline 22.2 s; the earlier 47 s device number was
+VPN-polluted). The post-recovery beacon shows the forced reconnect
+(fresh circuit) and successful reintroduction (`peers=1`).
+
+### Superseded first run (VPN-confounded — kept for methodology)
+
+#### Carrier NAT classification (first run)
 
 | date | device | carrier / radio | topology | verdict | beacon |
 |---|---|---|---|---|---|
