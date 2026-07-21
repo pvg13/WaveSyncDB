@@ -1649,6 +1649,37 @@ impl EngineRunner {
         let _ = self.network_event_tx.send(event);
     }
 
+    /// The M1 classification beacon (env-gated — see the `WAVESYNC_M1_DIAG`
+    /// read in the run loop). Field-compatible with the Android demo app's
+    /// app-side `m1-diag` line so the same parsers read both; the iOS
+    /// device-session runner is the primary consumer.
+    fn emit_m1_diag_beacon(&self) {
+        let d = self.diagnostics.snapshot();
+        let peers: Vec<&libp2p::PeerId> = self
+            .peers
+            .keys()
+            .filter(|p| !self.infrastructure_peers.contains(p))
+            .collect();
+        let relayed_peers = peers
+            .iter()
+            .filter(|p| self.peer_via_relay.get(**p).copied().unwrap_or(false))
+            .count();
+        tracing::info!(
+            "m1-diag relayed_est={} direct_est={} demoted={} dcutr={}/{} \
+             relay_bytes={} direct_bytes={} ratio={:?} peers={} peers_via_relay={}",
+            d.relayed_connections_established,
+            d.direct_connections_established,
+            d.relay_connections_demoted,
+            d.dcutr_upgrades_succeeded,
+            d.dcutr_upgrades_attempted,
+            d.relay_bytes_in + d.relay_bytes_out,
+            d.direct_bytes_in + d.direct_bytes_out,
+            d.relay_traffic_ratio(),
+            peers.len(),
+            relayed_peers,
+        );
+    }
+
     /// Record `n` wire bytes exchanged with `peer` (see [`account_wire_bytes`]).
     /// For call sites that hold `&self`/`&mut self` directly — i.e. everywhere
     /// except the `tokio::spawn`'d HMAC responders, which call
@@ -2437,6 +2468,18 @@ impl EngineRunner {
         // nothing un-acked (the steady state).
         let mut redeliver_interval = tokio::time::interval(Duration::from_secs(3));
 
+        // Env-gated M1 classification beacon (#109 device-session tooling):
+        // with WAVESYNC_M1_DIAG truthy, emit the `m1-diag` line every 10th
+        // redeliver tick (~30s). Engine-side so ANY consuming app gets it
+        // with a plain rebuild — the iOS session runner injects the env at
+        // launch (devicectl) and greps the app's stdio for it. Same fields
+        // as the Android demo app's app-side beacon, so one parser reads
+        // both. Off by default: zero log noise for production apps.
+        let m1_diag_enabled = std::env::var("WAVESYNC_M1_DIAG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut m1_diag_ticks: u32 = 0;
+
         // Level-triggered reconnection (N14). Deliberately NOT gated on
         // `has_relay` — `wanted_peers` also carries cached-address peers,
         // and the announce half no-ops without a relay. First tick is
@@ -2477,6 +2520,12 @@ impl EngineRunner {
                     // advance idle groups' watermark freshness. No-op in the
                     // steady state.
                     self.mailbox_maintenance_tick().await;
+                    if m1_diag_enabled {
+                        m1_diag_ticks += 1;
+                        if m1_diag_ticks.is_multiple_of(10) {
+                            self.emit_m1_diag_beacon();
+                        }
+                    }
                 },
                 _ = reconnect_sweep.tick() => {
                     self.sweep_wanted_peers();

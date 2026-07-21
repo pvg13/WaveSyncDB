@@ -1,8 +1,42 @@
 # iOS mobile connectivity day — investigation (#109, M1/P1)
 
-> Status: PREPARED, awaiting the hardware day (two iPhones). This file is
-> the protocol + findings container; base device mechanics live in
+> Status: PREPARED + SCRIPTED (2026-07-22), awaiting the hardware sitting.
+> **One iPhone + one Mac now covers every phase except the
+> phone↔phone-cellular cell** (the Android day proved the one-phone +
+> host-writer topology answers the carrier questions). This file is the
+> protocol + findings container; base device mechanics live in
 > docs/ios-device-protocol-2026-07.md (Sections C–E).
+
+## Session runner (connect the phone once, run one script)
+
+`tests-e2e/ios/run_device_session.sh` (run on the Mac) drives S1→S6 plus
+the #92 NSE check through a single USB connection:
+
+- **Env injection without Xcode:** `xcrun devicectl device process launch
+  --console --environment-variables …` both toggles the #73 A/B arm
+  (`WAVESYNC_IOS_UNSPECIFIED_QUIC`) and streams the app's stdio into
+  stamped capture files — no scheme editing, no Console.app.
+- **Engine-side `m1-diag` beacon** (new, env-gated `WAVESYNC_M1_DIAG=1`):
+  the classification line the Android app logged app-side is now emitted
+  by the engine itself every ~30s when the env is set, so ANY consuming
+  app (Mediterranea) carries it after a plain rebuild against this rev.
+  Field-identical to the Android line — same parsers read both.
+- **Host writer** (`test-peer` built on the Mac) is the phone's peer, same
+  contract as the Android carrier probe; `RELAY_ADDR` points at the test
+  relay.
+- The only human actions are the ones iOS physically requires (Control
+  Center WiFi flips, HOME, foreground, reading the lock-screen banner) —
+  the script prompts and timestamps each one, and computes the latency
+  laps from the stamped captures.
+- Output: `.session-<ts>/summary.md` pre-filled per issue (#73 A/B
+  verdict inputs, #74 trial table, S1 classification beacons, S5 bg_sync
+  stage table, #92 banner observation) plus raw per-phase logs.
+- `--selftest` (any OS) exercises the log parsers against fixtures.
+
+Prerequisites for the sitting: dev-signed Mediterranea build against a
+wavesyncdb rev ≥ the beacon commit (the same rebuild picks up the #92 NSE
+template fix); relay with APNs creds for S5/N1 (both phases skippable via
+`SKIP_S5=1` / `SKIP_NSE=1` if not ready).
 
 ## Objective
 
@@ -16,12 +50,13 @@ plus M1's carrier-NAT classification and the push-budget reality. Feeds
 
 ### S1 — Carrier NAT classification (M1; mirrors Android's protocol)
 
-Same two-run structure as the Android doc: iPhone A cellular-only vs
-(a) iPhone B same-carrier cellular, (b) iPhone B home WiFi. Use the demo
-app; classification signals are the same (`PeerInfo.via_relay`, direct
-connections, relay ratio — read via the app's status surface or the
-Console.app engine logs; the m1-diag beacon is Android-side only, iOS
-reads the same counters through the debug status view).
+Primary run (scripted): iPhone WiFi-baseline then cellular-only against
+the host writer behind the home NAT — the same phone↔home-machine
+topology the Android day proved decisive. Optional second run if a second
+iPhone is available: same-carrier cellular↔cellular (the one cell the
+script can't cover). Classification signals are the engine-side `m1-diag`
+beacon lines (env-gated — the runner injects `WAVESYNC_M1_DIAG=1` at
+launch; field-identical to Android's).
 
 Record: carrier, radio (5G/LTE), per-phone verdict.
 
