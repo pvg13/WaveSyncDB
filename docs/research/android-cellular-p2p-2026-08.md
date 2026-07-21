@@ -148,13 +148,23 @@ scenario's fast number rides the background→resume path). Android needs a
 ConnectivityManager-driven NetworkTransition — the Android analogue of
 iOS's #74 NWPathMonitor item.
 
-### Doze on real hardware — #111 ACCEPTANCE MET (clean run)
+### Doze on real hardware — #111 acceptance NOT met (corrected)
 
-Pixel 10 Pro, forced Doze 90 s on cellular, VPN off: freeze held, and
-recovery took **2 774 ms** — under the <3 s acceptance bar (pre-fix
-emulator baseline 22.2 s; the earlier 47 s device number was
-VPN-polluted). The post-recovery beacon shows the forced reconnect
-(fresh circuit) and successful reintroduction (`peers=1`).
+**Correction (same day):** the 2 774 ms reading was an artifact — the
+user had woken the screen during the Doze window, ending forced idle
+early, so recovery pre-warmed before the measured foreground. A
+confirmation cycle with the phone untouched and Doze **verified held**
+(`dumpsys deviceidle: mState=IDLE` at the end of the window) measured
+recovery at **52 526 ms**. The earlier 47 s device number, previously
+dismissed as VPN noise, was evidently real.
+
+Standing conclusion: the #111 reset half works (forced reconnect and
+fresh circuits are observed), but real-hardware recovery is still gated
+on **reintroduction/sync-initiation after the forced reconnect** — the
+same residual seen on the emulator's 46 s run. The measured band for a
+genuinely held Doze is ~47–53 s. Methodology: always verify
+`mState=IDLE` at window end; a screen-on anywhere in the window voids
+the measurement.
 
 ### Superseded first run (VPN-confounded — kept for methodology)
 
