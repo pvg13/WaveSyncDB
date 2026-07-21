@@ -5,6 +5,6 @@ use tokio::sync::watch;
 /// The watch channel stays at `true` (foreground) forever.
 /// Use [`super::super::hooks::use_app_resume`] with a manual signal for
 /// desktop lifecycle control.
-pub fn start_lifecycle_listener(_tx: watch::Sender<bool>) {
+pub fn start_lifecycle_listener(_tx: watch::Sender<bool>, _net_tx: watch::Sender<u64>) {
     tracing::debug!("Auto lifecycle detection not available on this platform");
 }

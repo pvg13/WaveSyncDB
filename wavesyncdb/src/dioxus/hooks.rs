@@ -45,10 +45,12 @@ fn ensure_auto_resume(db: &WaveSyncDb) {
         return;
     }
     let trigger = db.resume_trigger();
+    let transition = db.transition_trigger();
     let (tx, mut rx) = tokio::sync::watch::channel(true);
+    let (net_tx, mut net_rx) = tokio::sync::watch::channel(0u64);
     std::thread::Builder::new()
         .name("wavesync-lifecycle".into())
-        .spawn(move || super::lifecycle::start_lifecycle_listener(tx))
+        .spawn(move || super::lifecycle::start_lifecycle_listener(tx, net_tx))
         .ok();
     std::thread::Builder::new()
         .name("wavesync-auto-resume".into())
@@ -66,26 +68,55 @@ fn ensure_auto_resume(db: &WaveSyncDb) {
                 // device suspend on Android, which would under-report
                 // exactly the pocket-doze gaps this measures (#111).
                 let mut background_since: Option<std::time::SystemTime> = None;
+                // Flap guard for network-change transitions (#112): a
+                // captive-portal dance or rapid interface bounce can emit
+                // several changes in a burst; one forced reconnect covers
+                // them all.
+                let mut last_transition: Option<tokio::time::Instant> = None;
+                const TRANSITION_MIN_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(3);
                 loop {
-                    if rx.changed().await.is_err() {
-                        break; // listener gone (e.g. desktop no-op) — stop.
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break; // listener gone (e.g. desktop no-op) — stop.
+                            }
+                            let is_foreground = *rx.borrow_and_update();
+                            if is_foreground && !was_foreground {
+                                // A backwards wall jump (NTP) yields None → plain
+                                // resume, the safe default.
+                                let backgrounded = background_since
+                                    .take()
+                                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
+                                tracing::info!(
+                                    backgrounded_secs = backgrounded.map(|d| d.as_secs()).unwrap_or(0),
+                                    "wavesync: app returned to foreground — resync + UI refresh"
+                                );
+                                trigger(backgrounded);
+                            } else if !is_foreground && was_foreground {
+                                background_since = Some(std::time::SystemTime::now());
+                            }
+                            was_foreground = is_foreground;
+                        }
+                        changed = net_rx.changed() => {
+                            if changed.is_err() {
+                                continue; // net watch gone; focus watch may live on.
+                            }
+                            let _ = net_rx.borrow_and_update();
+                            let now = tokio::time::Instant::now();
+                            if last_transition
+                                .is_some_and(|t| now.duration_since(t) < TRANSITION_MIN_INTERVAL)
+                            {
+                                tracing::debug!("network change within flap guard — coalesced");
+                                continue;
+                            }
+                            last_transition = Some(now);
+                            tracing::info!(
+                                "wavesync: default network changed while foregrounded — forcing reconnect"
+                            );
+                            transition();
+                        }
                     }
-                    let is_foreground = *rx.borrow_and_update();
-                    if is_foreground && !was_foreground {
-                        // A backwards wall jump (NTP) yields None → plain
-                        // resume, the safe default.
-                        let backgrounded = background_since
-                            .take()
-                            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok());
-                        tracing::info!(
-                            backgrounded_secs = backgrounded.map(|d| d.as_secs()).unwrap_or(0),
-                            "wavesync: app returned to foreground — resync + UI refresh"
-                        );
-                        trigger(backgrounded);
-                    } else if !is_foreground && was_foreground {
-                        background_since = Some(std::time::SystemTime::now());
-                    }
-                    was_foreground = is_foreground;
                 }
             });
         })
@@ -1181,32 +1212,58 @@ pub fn use_app_resume(db: WaveSyncDb, foreground: Signal<bool>) {
 /// use_auto_lifecycle(db);  // One line — done.
 /// ```
 pub fn use_auto_lifecycle(db: WaveSyncDb) {
-    let rx = use_hook(|| {
+    let channels = use_hook(|| {
         let (tx, rx) = tokio::sync::watch::channel(true);
+        let (net_tx, net_rx) = tokio::sync::watch::channel(0u64);
         std::thread::Builder::new()
             .name("wavesync-lifecycle".into())
             .spawn(move || {
-                super::lifecycle::start_lifecycle_listener(tx);
+                super::lifecycle::start_lifecycle_listener(tx, net_tx);
             })
             .ok();
-        rx
+        (rx, net_rx)
     });
 
     use_effect(move || {
-        let mut rx = rx.clone();
+        let (mut rx, mut net_rx) = channels.clone();
         let db = db.clone();
         let mut was_foreground = true;
+        // Flap guard for network-change transitions (#112) — one forced
+        // reconnect covers a burst of interface bounces.
+        let mut last_transition: Option<tokio::time::Instant> = None;
+        const TRANSITION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
         spawn(async move {
             loop {
-                if rx.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let is_foreground = *rx.borrow_and_update();
+                        if is_foreground && !was_foreground {
+                            tracing::info!("Auto-lifecycle: app resumed, triggering sync");
+                            db.resume();
+                        }
+                        was_foreground = is_foreground;
+                    }
+                    changed = net_rx.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let _ = net_rx.borrow_and_update();
+                        let now = tokio::time::Instant::now();
+                        if last_transition
+                            .is_some_and(|t| now.duration_since(t) < TRANSITION_MIN_INTERVAL)
+                        {
+                            continue;
+                        }
+                        last_transition = Some(now);
+                        tracing::info!(
+                            "Auto-lifecycle: default network changed while foregrounded — network transition"
+                        );
+                        db.network_transition();
+                    }
                 }
-                let is_foreground = *rx.borrow_and_update();
-                if is_foreground && !was_foreground {
-                    tracing::info!("Auto-lifecycle: app resumed, triggering sync");
-                    db.resume();
-                }
-                was_foreground = is_foreground;
             }
         });
     });

@@ -701,6 +701,20 @@ impl WaveSyncDb {
         }
     }
 
+    /// Like [`resume_trigger`](Self::resume_trigger) but unconditionally a
+    /// full network transition — for the FOREGROUNDED default-network
+    /// change (#112), where no lifecycle edge exists and the old sockets
+    /// are dead by definition. Holds only channel senders (no node `Arc`)
+    /// for the same teardown-safety reasons as `resume_trigger`.
+    pub(crate) fn transition_trigger(&self) -> impl Fn() + Clone + Send + 'static {
+        let cmd_tx = self.inner.node.cmd_tx.clone();
+        let refresh_tx = self.inner.node.refresh_tx.clone();
+        move || {
+            let _ = cmd_tx.try_send(crate::engine::EngineCommand::NetworkTransition);
+            let _ = refresh_tx.send(());
+        }
+    }
+
     /// Notify the engine that the network interface changed (e.g., WiFi to cellular).
     ///
     /// This force-disconnects all connections (including the relay) and

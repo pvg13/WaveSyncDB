@@ -6,7 +6,9 @@ use tokio::sync::watch;
 /// Observes `UIApplicationDidBecomeActiveNotification` and
 /// `UIApplicationWillResignActiveNotification` via `NSNotificationCenter`.
 /// Observer tokens are intentionally leaked (app-lifetime scope).
-pub fn start_lifecycle_listener(tx: watch::Sender<bool>) {
+pub fn start_lifecycle_listener(tx: watch::Sender<bool>, _net_tx: watch::Sender<u64>) {
+    // Foreground network-change detection on iOS is #74's scope
+    // (NWPathMonitor); the sender is unused here.
     unsafe { register_observers(tx) };
 }
 
