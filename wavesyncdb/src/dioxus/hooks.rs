@@ -1204,7 +1204,10 @@ pub fn use_app_resume(db: WaveSyncDb, foreground: Signal<bool>) {
 ///
 /// On **Android**, polls `hasWindowFocus()` via JNI to detect foreground state.
 /// On **iOS**, observes `UIApplicationDidBecomeActiveNotification` /
-/// `UIApplicationWillResignActiveNotification` via `NSNotificationCenter`.
+/// `UIApplicationWillResignActiveNotification` via `NSNotificationCenter` —
+/// **requires the `dioxus-ios-lifecycle` feature on the APP target** (#113:
+/// the UIKit observers are illegal in app extensions, so they are opt-in;
+/// without the feature this hook logs a warning and never fires on iOS).
 /// On **desktop** and other platforms, this is a no-op — use
 /// [`use_app_resume()`] with a manual signal if you need desktop lifecycle.
 ///

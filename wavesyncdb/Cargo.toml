@@ -152,7 +152,20 @@ derive = ["dep:wavesyncdb_derive"]
 # in the `[target.'cfg(...)'.dependencies]` sections above, so enabling `dioxus`
 # on desktop does not pull them in — Cargo silently skips `dep:` references
 # that point at target-gated optional deps on non-matching targets.
-dioxus = ["derive", "dep:dioxus", "dep:notify-rust", "dep:jni", "dep:ndk-context", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
+dioxus = ["derive", "dep:dioxus", "dep:notify-rust", "dep:jni", "dep:ndk-context"]
+# iOS UIApplication lifecycle observers for the dioxus auto pause/resume
+# hooks (#113). Split from `dioxus` because UIKit's UIApplication symbols are
+# ILLEGAL in app extensions: a Notification Service Extension staticlib built
+# with `-force_load` pulls in every compiled object, so the objc2-ui-kit dep
+# itself must stay out of extension builds — Cargo feature unification would
+# otherwise drag it in via any shared crate that enables `dioxus`. Enable
+# this ONLY on the app target (NEVER in an NSE/extension dependency tree);
+# without it, iOS builds compile a warn-noop lifecycle listener and the
+# auto pause/resume hooks simply never fire. (The SystemConfiguration
+# symbols an NSE link may also miss come from libp2p's if_watch and are
+# fixed downstream with `-framework SystemConfiguration` — unrelated to
+# this feature.)
+dioxus-ios-lifecycle = ["dioxus", "dep:objc2", "dep:objc2-foundation", "dep:objc2-ui-kit", "dep:block2"]
 # Cold-sync push notifications (FCM on Android, APNs on iOS). Bundles the
 # Kotlin AAR / Swift Package into consumer apps via manganis; gates the
 # Rust-side token-read helpers and FFI exports. Platform-specific code
