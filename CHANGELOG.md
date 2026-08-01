@@ -3,6 +3,20 @@
 ## Unreleased
 
 ### Fixed
+- **`use_synced_table` / `use_synced_row` could serve a stale snapshot indefinitely after a
+  write (#115).** The process-wide table cache the hooks paint from is written only by a *live*
+  driver, so a write that landed while no driver for that table was mounted — the common "editor
+  screen saves and navigates away on success" shape, or a background-sync process sharing the DB
+  file — left it holding the pre-write snapshot with nothing to correct it. Every later mount
+  took the cache hit and republished that stale list *without ever querying*, so the row stayed
+  invisible until the app was resumed or restarted (a resume bypasses the cache, which is why
+  backgrounding the app "fixed" it). The write itself always persisted, making this look exactly
+  like a lost write. The cache is now a **first-paint hint only**: the drivers still publish it
+  immediately for instant re-navigation, then always query and publish the verified snapshot —
+  so a start with a warm cache publishes twice, and a hit can no longer outlive its own
+  correctness. A failed initial query falls back to the hint rather than blanking a populated
+  list. The browser hook (`use_synced_table_client`) had the identical shape over IndexedDB and
+  got the same treatment.
 - **Capture trigger stale-scan could drop a sibling table's triggers, silently stopping its
   sync (#96).** `ensure_triggers`'s cleanup pass matched existing triggers with a `LIKE
   '_wavesync_tr_{table}_%'` prefix scan, which also matches a different table whose name starts

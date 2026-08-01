@@ -67,10 +67,20 @@ pub fn use_synced_table_client<E: BrowserEntity>(
             };
             let table = table.clone();
             spawn(async move {
-                // Check in-memory cache first — instant on page re-navigation.
-                let mut rows: Vec<E> = if let Some(cached) = c.get_table_cache::<Vec<E>>() {
-                    cached
-                } else if let Some(store) = c.store() {
+                // The in-memory cache is a FIRST-PAINT HINT, never a substitute
+                // for re-reading the store: paint it immediately (instant page
+                // re-navigation), then always re-materialize below.
+                //
+                // Only a *live* subscriber writes that cache, so a write that
+                // lands while no subscriber for this table is mounted — an
+                // editor route that navigates away on save — leaves it holding
+                // the pre-write snapshot with nothing to correct it, and every
+                // later mount would republish the stale list indefinitely.
+                let hint = c.get_table_cache::<Vec<E>>();
+                if let Some(hint) = hint.clone() {
+                    entities.set(hint);
+                }
+                let mut rows: Vec<E> = if let Some(store) = c.store() {
                     match store.list_table_rows(&table).await {
                         Ok(stored) => stored
                             .into_iter()
@@ -80,11 +90,15 @@ pub fn use_synced_table_client<E: BrowserEntity>(
                             tracing::warn!(
                                 "use_synced_table({table}): list_table_rows failed: {e}"
                             );
-                            Vec::new()
+                            // Keep the hint: a transient read failure degrades
+                            // to "possibly stale", never to a blanked list.
+                            hint.unwrap_or_default()
                         }
                     }
                 } else {
-                    Vec::new()
+                    // Ephemeral client (no store): the cache is the only
+                    // source there is.
+                    hint.unwrap_or_default()
                 };
                 let mut pk_index: HashMap<String, usize> = HashMap::new();
                 for (i, e) in rows.iter().enumerate() {

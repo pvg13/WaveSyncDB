@@ -669,6 +669,143 @@ async fn row_driver_publishes_initial_and_incremental_snapshots() {
 }
 
 // ---------------------------------------------------------------------------
+// #115 REGRESSION — the process-wide table cache is written ONLY by a live
+// driver, so a write that lands while no driver for the table is mounted (an
+// editor route that navigates away on save, a background-sync process sharing
+// the DB file) leaves it holding the pre-write snapshot. Serving that hit
+// unverified made the next mount republish the stale list forever — silent,
+// and indistinguishable from a lost write.
+//
+// The driver may still paint from the cache first (instant re-navigation),
+// but it must always verify against the database and publish the truth.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn table_driver_reverifies_cache_after_a_write_with_no_driver_mounted() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_stale_tbl"), "test-drv-stale-tbl")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    task::ActiveModel {
+        id: Set("s1".into()),
+        title: Set("first".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // Mount a driver (route A) — it fills the cache — then unmount it.
+    let (sink1, publish1) = collector::<Vec<task::Model>>();
+    let drv1 = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        publish1,
+    ));
+    wait_for(|| sink1.lock().unwrap().len() == 1, "cache-filling publish").await;
+    drv1.abort();
+    let _ = drv1.await; // the driver is fully gone before the write lands
+
+    // The write nobody is listening for.
+    task::ActiveModel {
+        id: Set("s2".into()),
+        title: Set("written while unmounted".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // Remount (navigate back to route A).
+    let (sink2, publish2) = collector::<Vec<task::Model>>();
+    let drv2 = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        publish2,
+    ));
+    wait_for(
+        || {
+            sink2
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|rows| rows.iter().any(|m| m.id == "s2"))
+        },
+        "remounted driver publishes the write made while unmounted",
+    )
+    .await;
+
+    // The instant-paint hint is still served first: the very first publish is
+    // the cached snapshot, not an empty placeholder.
+    assert_eq!(
+        sink2.lock().unwrap()[0].len(),
+        1,
+        "first publish should be the cached snapshot (instant re-navigation paint)"
+    );
+
+    drv2.abort();
+}
+
+// ---------------------------------------------------------------------------
+// #115 REGRESSION, row flavour — `run_row_driver` reads the same table cache
+// as its first-paint source, so a stale entry served unverified pinned the row
+// at its pre-write value too.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn row_driver_reverifies_cache_after_a_write_with_no_driver_mounted() {
+    let db = WaveSyncDbBuilder::new(&mem_db("drv_stale_row"), "test-drv-stale-row")
+        .build()
+        .await
+        .unwrap();
+    db.schema().register(task::Entity).sync().await.unwrap();
+
+    task::ActiveModel {
+        id: Set("r9".into()),
+        title: Set("before".into()),
+        completed: Set(false),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // A table driver fills the cache with the pre-write row, then unmounts.
+    let (sink, publish) = collector::<Vec<task::Model>>();
+    let drv = tokio::spawn(wavesyncdb::dioxus::run_table_driver::<task::Entity>(
+        db.clone(),
+        publish,
+    ));
+    wait_for(|| sink.lock().unwrap().len() == 1, "cache-filling publish").await;
+    drv.abort();
+    let _ = drv.await;
+
+    db.execute_unprepared("UPDATE tasks SET title = 'after' WHERE id = 'r9'")
+        .await
+        .unwrap();
+
+    let (row_sink, row_publish) = collector::<Option<task::Model>>();
+    let row_drv = tokio::spawn(wavesyncdb::dioxus::run_row_driver::<task::Entity>(
+        db.clone(),
+        "r9".to_string(),
+        row_publish,
+    ));
+    wait_for(
+        || {
+            row_sink
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|row| row.as_ref().is_some_and(|m| m.title == "after"))
+        },
+        "row driver publishes the value written while unmounted",
+    )
+    .await;
+
+    row_drv.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Issue #1 contract: before the initial load resolves NOTHING is
 // published (a _loaded consumer reads None = loading); the FIRST publish
 // is the loaded snapshot, even when the table is legitimately empty.

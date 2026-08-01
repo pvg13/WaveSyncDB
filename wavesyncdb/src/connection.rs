@@ -591,6 +591,13 @@ impl WaveSyncDb {
     /// Returns `None` on first load (cache miss). The Dioxus hooks call
     /// this before hitting the database — a cache hit means instant data
     /// on page navigation.
+    ///
+    /// **A hit is a first-paint hint, not an answer.** The cache is written
+    /// only by a live hook driver, so it goes stale — permanently — for any
+    /// write that lands while no driver for that table is mounted (an editor
+    /// screen that navigates away on save, a background-sync process sharing
+    /// the DB file). Callers must always follow a hit with the real query and
+    /// publish that result; serving the hit alone reads as a lost write.
     pub fn get_table_cache<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
         self.inner
             .table_cache

@@ -546,9 +546,11 @@ impl<T: 'static> LocalPublish<Option<T>> {
 // thread that runs the `dioxus::spawn`-driven task.
 unsafe impl<T> Send for LocalPublish<T> {}
 
-/// Drives one table subscription: initial load (cache fast path), then
-/// change-notification batches applied in place, publishing a full snapshot
-/// after the initial load and after every applied batch/reload. This is the
+/// Drives one table subscription: initial load (a cached snapshot painted
+/// first when there is one, then always the query — see the comment on that
+/// hint below), then change-notification batches applied in place, publishing
+/// a full snapshot after the initial load and after every applied batch or
+/// reload. A start with a warm cache therefore publishes twice. This is the
 /// hook loop, extracted so it can be driven and asserted by plain tokio
 /// tests — the Dioxus hooks are thin wrappers that feed `publish` into a
 /// `Signal`. Hidden from docs: not a public API commitment.
@@ -567,21 +569,32 @@ pub async fn run_table_driver<E>(
 
     let mut rx = db.change_rx();
 
-    // Check in-memory cache first — instant on page re-navigation.
-    let mut rows: Vec<E::Model> = if let Some(cached) = db.get_table_cache::<Vec<E::Model>>() {
-        cached
-    } else {
-        match E::find().all(&db).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Failed initial table load: {}", e);
-                // Falls through to `publish(rows.clone())` below with the
-                // empty Vec, same as a legitimately empty table. This is
-                // load-bearing for `use_synced_table_loaded`: a failed
-                // initial query still counts as "loaded" (Some([])), so a
-                // `_loaded` consumer never blocks on `None` forever.
-                Vec::new()
-            }
+    // The in-memory cache is a FIRST-PAINT HINT, never a substitute for the
+    // query: paint it immediately (instant page re-navigation), then always
+    // verify against the database below.
+    //
+    // It must not be trusted on its own because only a *live* driver ever
+    // writes it. Any write that lands while no driver for this table is
+    // mounted — an editor route that navigates away on save, a background-sync
+    // process sharing the DB file — leaves it holding the pre-write snapshot
+    // with nothing to correct it, and every later mount would republish that
+    // stale list indefinitely: silent, and indistinguishable from a lost write.
+    let hint = db.get_table_cache::<Vec<E::Model>>();
+    if let Some(hint) = hint.clone() {
+        publish(hint);
+    }
+    let mut rows: Vec<E::Model> = match E::find().all(&db).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed initial table load: {}", e);
+            // Falls through to `publish(rows.clone())` below with the hint
+            // (or an empty Vec when there was none), same as a legitimately
+            // empty table. This is load-bearing for `use_synced_table_loaded`:
+            // a failed initial query still counts as "loaded" (Some([])), so a
+            // `_loaded` consumer never blocks on `None` forever. Keeping the
+            // hint here also means a transient query failure degrades to
+            // "possibly stale" rather than blanking a populated list.
+            hint.unwrap_or_default()
         }
     };
     let mut pk_index: HashMap<String, usize> = rows
@@ -902,8 +915,9 @@ where
     signal
 }
 
-/// Drives one row subscription: initial load (cache fast path, falling back
-/// to `find_by_id`), then change-notification batches — filtered to this
+/// Drives one row subscription: initial load (the cached row painted first
+/// when there is one, then always `find_by_id` — see the comment on that hint
+/// below), then change-notification batches — filtered to this
 /// row's primary key — applied in place, publishing a snapshot after the
 /// initial load and after every applied batch/reload. Extracted from the
 /// hook loop so it can be driven and asserted by plain tokio tests; the
@@ -927,32 +941,30 @@ pub async fn run_row_driver<E>(
 
     let mut rx = db.change_rx();
 
-    // Try the table cache first — avoids a DB round trip on page
-    // re-navigation when use_synced_table already loaded.
-    let mut current: Option<E::Model> = db
-        .get_table_cache::<Vec<E::Model>>()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| SyncedModel::wavesync_pk_string(r) == pk_string)
-        })
-        .or_else(|| {
-            // Fallback: query by PK (blocking — runs on first load)
-            None
-        });
-    if current.is_none() {
-        current = match E::find_by_id(pk.clone()).one(&db).await {
-            Ok(row) => row,
-            Err(e) => {
-                tracing::error!("Failed initial row load: {}", e);
-                // Falls through to `publish(current.clone())` below with
-                // None, same as a legitimately absent row. Load-bearing for
-                // `use_synced_row_loaded`: a failed initial query still
-                // counts as "loaded" (Some(None)), so a `_loaded` consumer
-                // never blocks on the outer `None` forever.
-                None
-            }
-        };
+    // The table cache gives an instant first paint on page re-navigation when
+    // `use_synced_table` already loaded — but it is a HINT ONLY, for the same
+    // reason as in `run_table_driver`: only a live driver writes it, so a write
+    // that lands while nothing is mounted leaves it pinned at the pre-write
+    // value. Paint it, then always re-query this row.
+    let hint: Option<E::Model> = db.get_table_cache::<Vec<E::Model>>().and_then(|rows| {
+        rows.into_iter()
+            .find(|r| SyncedModel::wavesync_pk_string(r) == pk_string)
+    });
+    if hint.is_some() {
+        publish(hint.clone());
     }
+    let mut current: Option<E::Model> = match E::find_by_id(pk.clone()).one(&db).await {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!("Failed initial row load: {}", e);
+            // Falls through to `publish(current.clone())` below with the hint
+            // (None when there was none), same as a legitimately absent row.
+            // Load-bearing for `use_synced_row_loaded`: a failed initial query
+            // still counts as "loaded" (Some(None)), so a `_loaded` consumer
+            // never blocks on the outer `None` forever.
+            hint
+        }
+    };
     publish(current.clone());
 
     let mut last_full_reload = Instant::now();

@@ -1707,6 +1707,13 @@ impl WebGroupHandle {
     }
 
     /// Read a value from this group's per-handle [`TypeId`] cache.
+    ///
+    /// **A hit is a first-paint hint, not an answer.** The cache is written
+    /// only by a live hook subscriber, so it goes stale — permanently — for
+    /// any write that lands while nothing is subscribed for that table (an
+    /// editor route that navigates away on save). Callers must always follow
+    /// a hit with the real store read and publish that result; serving the
+    /// hit alone reads as a lost write.
     pub fn get_table_cache<T: Clone + 'static>(&self) -> Option<T> {
         self.table_cache
             .read()
