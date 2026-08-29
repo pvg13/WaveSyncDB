@@ -2002,12 +2002,27 @@ async fn apply_remote_column_changes(
         // corrupt convergence state without producing any user-table
         // write (the original WSDB-PoC-1).
         if !meta.columns.iter().any(|c| c == &change.cid.0) {
+            // Not applied — but NOT discarded. This branch fires both for a
+            // hostile injected column id and for the entirely benign staged
+            // rollout (a peer already on a build that added this column, us not
+            // yet), and the two are indistinguishable here. Dropping the cell
+            // outright loses it permanently: `increment_db_version` has already
+            // run for this chunk, so we ack past the sender's watermark and it
+            // never re-derives the change — not even after we're upgraded and
+            // the column becomes registered (#117).
+            //
+            // Quarantine it instead and replay on registration. The write lands
+            // in the same transaction as the `db_version` advance that strands
+            // it, so a crash can't separate the two. Errors propagate: rolling
+            // the chunk back leaves the changeset to be re-delivered, which is
+            // the fail-closed direction.
             tracing::warn!(
-                "Rejecting remote change for unregistered column: {}/{}/{}",
+                "Deferring remote change for unregistered column: {}/{}/{}",
                 table,
                 pk,
                 change.cid.0
             );
+            crate::deferred::quarantine(db, change, crate::deferred::now_secs()).await?;
             continue;
         }
         if change.cid.0 == meta.primary_key_column {

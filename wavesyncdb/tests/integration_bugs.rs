@@ -2428,3 +2428,351 @@ async fn test_bg_shared_file_wal_concurrent_reader_writer() {
 
     reader.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #117 regression: a column dropped because it wasn't registered must be
+// replayed once the receiver's schema catches up.
+//
+// The staged-rollout shape: two devices in one group, one on a build that added
+// a column and one not yet. Pre-fix the un-updated device applied every column
+// it knew and dropped the unknown one, while `increment_db_version` had already
+// advanced its `db_version` — so it acked past the sender's watermark and the
+// sender (`WHERE s.db_version > $1`) never re-derived the change. The value was
+// gone permanently, surviving the device's own upgrade; only a full resync
+// recovered it. A row meaning "skipped" read as "completed" forever.
+//
+// The fix quarantines the dropped cell in `_wavesync_deferred_changes` inside
+// the same transaction that advances `db_version`, then replays it through the
+// normal remote-apply path when registration makes the column known.
+//
+// Seeds 220-223 (integration_bugs.rs' own documented 220-229 block).
+// ---------------------------------------------------------------------------
+
+/// The `tasks` table as a NEWER build sees it: `task::Entity` plus `outcome`.
+/// Same `table_name`, so a peer registering this one is the upgraded device.
+mod task_v2 {
+    use sea_orm::entity::prelude::*;
+    use wavesyncdb_derive::SyncEntity;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, SyncEntity)]
+    #[sea_orm(table_name = "tasks")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: String,
+        pub title: String,
+        pub completed: bool,
+        pub outcome: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DeferredCntRow {
+    cnt: i64,
+}
+
+/// Rows sitting in the #117 quarantine for `table`.
+async fn deferred_count(db: &sea_orm::DatabaseConnection, table: &str) -> i64 {
+    DeferredCntRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT COUNT(*) AS cnt FROM _wavesync_deferred_changes WHERE tbl = $1",
+        [table.into()],
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap()
+    .cnt
+}
+
+/// Shadow-clock rows for one specific cell of `tasks`.
+async fn clock_entries_for_cid(db: &sea_orm::DatabaseConnection, pk: &str, cid: &str) -> i64 {
+    DeferredCntRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT COUNT(*) AS cnt FROM _wavesync_tasks_clock WHERE pk = $1 AND cid = $2",
+        [pk.into(), cid.into()],
+    ))
+    .one(db)
+    .await
+    .unwrap()
+    .unwrap()
+    .cnt
+}
+
+/// A peer on the NEW build: registers `tasks` with the `outcome` column.
+async fn make_peer_v2(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+    let peer = WaveSyncDbBuilder::new(db_url, topic)
+        .with_node_id(common::make_node_id(seed))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to create v2 peer");
+    peer.schema()
+        .register(task_v2::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync v2 schema");
+    peer
+}
+
+/// Reopen an existing OLD-build database as the NEW build: run the app's own
+/// `ALTER TABLE` migration, then register the wider entity. `sync()` is what
+/// triggers the replay, so the column must physically exist before it runs.
+async fn reopen_peer_as_v2(db_url: &str, topic: &str, seed: u8) -> wavesyncdb::WaveSyncDb {
+    let peer = WaveSyncDbBuilder::new(db_url, topic)
+        .with_node_id(common::make_node_id(seed))
+        .with_mdns_query_interval(Duration::from_millis(100))
+        .with_mdns_ttl(Duration::from_secs(5))
+        .with_sync_interval(Duration::from_secs(2))
+        .build()
+        .await
+        .expect("Failed to reopen peer");
+    peer.inner()
+        .execute_unprepared("ALTER TABLE tasks ADD COLUMN outcome TEXT")
+        .await
+        .expect("migration failed");
+    peer.schema()
+        .register(task_v2::Entity)
+        .sync()
+        .await
+        .expect("Failed to sync v2 schema on reopen");
+    peer
+}
+
+#[tokio::test]
+async fn test_117_unregistered_column_is_replayed_after_schema_catches_up() {
+    common::init_test_tracing();
+    let topic = format!("test-117-replay-{}", Uuid::new_v4().simple());
+    let timeout = Duration::from_secs(15);
+    let url_a = mem_db("117_old");
+
+    // A is the un-updated device (no `outcome`), B is on the new build.
+    let a = make_peer(&url_a, &topic, 220).await;
+    let b = make_peer_v2(&mem_db("117_new"), &topic, 221).await;
+
+    // B writes a row whose meaning lives entirely in the new column.
+    task_v2::ActiveModel {
+        id: Set("chore1".to_string()),
+        title: Set("take out bins".to_string()),
+        completed: Set(true),
+        outcome: Set(Some("skipped".to_string())),
+    }
+    .insert(&b)
+    .await
+    .unwrap();
+
+    // A converges on the columns it knows.
+    assert_eventually("A receives the row", timeout, || async {
+        task::Entity::find_by_id("chore1")
+            .one(&a)
+            .await
+            .unwrap()
+            .is_some_and(|m| m.title == "take out bins")
+    })
+    .await;
+
+    // The unknown cell was NOT discarded — it is quarantined for replay. This is
+    // the assertion that fails pre-fix: the value was simply gone.
+    assert_eventually("the outcome cell is quarantined on A", timeout, || async {
+        deferred_count(a.inner(), "tasks").await == 1
+    })
+    .await;
+
+    // A is updated to the new build.
+    a.shutdown().await;
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = reopen_peer_as_v2(&url_a, &topic, 220).await;
+
+    // The value arrives from the quarantine — no full resync, and B is not even
+    // required to be reachable for this leg.
+    let row = task_v2::Entity::find_by_id("chore1")
+        .one(&a2)
+        .await
+        .unwrap()
+        .expect("row must still exist after the upgrade");
+    assert_eq!(
+        row.outcome,
+        Some("skipped".to_string()),
+        "the column dropped before the upgrade must be replayed once registered (#117)"
+    );
+    // The other columns are untouched by the replay.
+    assert_eq!(row.title, "take out bins");
+    assert!(row.completed);
+
+    // Replayed rows are consumed exactly once.
+    assert_eq!(
+        deferred_count(a2.inner(), "tasks").await,
+        0,
+        "a committed replay must purge its quarantine rows"
+    );
+
+    // The replay went through the normal apply path, so the cell now has real
+    // clock coverage and converges like any other — not a bare column write.
+    assert_eq!(
+        clock_entries_for_cid(a2.inner(), "chore1", "outcome").await,
+        1,
+        "replayed cell must carry shadow-clock coverage, not just a column value"
+    );
+
+    // And it must not have echoed back onto the wire as a local write: B still
+    // holds the value it authored, at its own version.
+    assert_eq!(
+        task_v2::Entity::find_by_id("chore1")
+            .one(&b)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        Some("skipped".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_117_quarantine_keeps_only_the_winning_change_per_cell() {
+    common::init_test_tracing();
+    let topic = format!("test-117-supersede-{}", Uuid::new_v4().simple());
+    let timeout = Duration::from_secs(15);
+    let url_a = mem_db("117_sup_old");
+
+    let a = make_peer(&url_a, &topic, 222).await;
+    let b = make_peer_v2(&mem_db("117_sup_new"), &topic, 223).await;
+
+    task_v2::ActiveModel {
+        id: Set("chore2".to_string()),
+        title: Set("dishes".to_string()),
+        completed: Set(false),
+        outcome: Set(Some("first".to_string())),
+    }
+    .insert(&b)
+    .await
+    .unwrap();
+
+    assert_eventually("A receives the row", timeout, || async {
+        task::Entity::find_by_id("chore2")
+            .one(&a)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    assert_eventually("first outcome is quarantined", timeout, || async {
+        deferred_count(a.inner(), "tasks").await == 1
+    })
+    .await;
+
+    // B overwrites the same cell while A is still on the old build.
+    let mut m: task_v2::ActiveModel = task_v2::Entity::find_by_id("chore2")
+        .one(&b)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    m.outcome = Set(Some("second".to_string()));
+    m.update(&b).await.unwrap();
+
+    // Give the second write time to land and be quarantined.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        deferred_count(a.inner(), "tasks").await,
+        1,
+        "a superseding change must replace the quarantined cell, not accumulate"
+    );
+
+    a.shutdown().await;
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = reopen_peer_as_v2(&url_a, &topic, 222).await;
+
+    assert_eq!(
+        task_v2::Entity::find_by_id("chore2")
+            .one(&a2)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        Some("second".to_string()),
+        "replay must apply the comparator winner, never a superseded value"
+    );
+    assert_eq!(deferred_count(a2.inner(), "tasks").await, 0);
+}
+
+/// A replay must be adjudicated against local state like any other remote apply
+/// — in particular it must NOT resurrect a row deleted while the column was
+/// still unknown. The quarantine holds a pre-delete value; applying it blindly
+/// would undo the delete on the upgraded device only, diverging the group.
+#[tokio::test]
+async fn test_117_replay_does_not_resurrect_a_deleted_row() {
+    common::init_test_tracing();
+    let topic = format!("test-117-tombstone-{}", Uuid::new_v4().simple());
+    let timeout = Duration::from_secs(15);
+    let url_a = mem_db("117_tomb_old");
+
+    let a = make_peer(&url_a, &topic, 224).await;
+    let b = make_peer_v2(&mem_db("117_tomb_new"), &topic, 225).await;
+
+    task_v2::ActiveModel {
+        id: Set("chore3".to_string()),
+        title: Set("mop".to_string()),
+        completed: Set(false),
+        outcome: Set(Some("skipped".to_string())),
+    }
+    .insert(&b)
+    .await
+    .unwrap();
+
+    assert_eventually("A receives the row", timeout, || async {
+        task::Entity::find_by_id("chore3")
+            .one(&a)
+            .await
+            .unwrap()
+            .is_some()
+    })
+    .await;
+    assert_eventually("outcome is quarantined", timeout, || async {
+        deferred_count(a.inner(), "tasks").await == 1
+    })
+    .await;
+
+    // B deletes the row while A is still on the old build. A applies the
+    // tombstone; the quarantined cell is now pre-delete history.
+    task_v2::Entity::delete_by_id("chore3")
+        .exec(&b)
+        .await
+        .unwrap();
+    assert_eventually("A applies the delete", timeout, || async {
+        task::Entity::find_by_id("chore3")
+            .one(&a)
+            .await
+            .unwrap()
+            .is_none()
+    })
+    .await;
+
+    a.shutdown().await;
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = reopen_peer_as_v2(&url_a, &topic, 224).await;
+
+    assert!(
+        task_v2::Entity::find_by_id("chore3")
+            .one(&a2)
+            .await
+            .unwrap()
+            .is_none(),
+        "replaying a quarantined cell must not resurrect a row the group deleted"
+    );
+    // The entry is still consumed — it was adjudicated and lost to the
+    // tombstone, so leaving it would retry forever.
+    assert_eq!(
+        deferred_count(a2.inner(), "tasks").await,
+        0,
+        "an adjudicated replay must be consumed even when nothing applied"
+    );
+}

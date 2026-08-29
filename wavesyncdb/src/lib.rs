@@ -79,6 +79,10 @@ pub mod connection;
 // WaveSyncDb::diagnostics, itself native-only — no browser build consumes it.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod diagnostics;
+// Quarantine for column changes dropped because their column wasn't registered
+// yet (staged rollout), replayed once registration catches up. See #117.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod deferred;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(all(not(target_arch = "wasm32"), feature = "mobile-ffi"))]

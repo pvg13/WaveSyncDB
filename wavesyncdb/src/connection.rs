@@ -854,9 +854,11 @@ impl WaveSyncDb {
         // pre-existing per-call `drain_and_dispatch` is: a caller registering
         // one table at a time already drains after each registration, so this
         // adds no new not-yet-registered-table backlog hazard.
+        let meta_for_replay = meta.clone();
         if let Some((table_name, sql)) = self.register_table_detect(meta).await? {
             self.run_capture_repair(&table_name, &sql).await?;
         }
+        self.replay_deferred_changes(&meta_for_replay).await?;
         Ok(())
     }
 
@@ -921,6 +923,82 @@ impl WaveSyncDb {
                 table = %table_name,
                 repaired = n,
                 "capture repair: synthesized capture rows for rows missing clock coverage"
+            );
+        }
+        Ok(())
+    }
+
+    /// Replay any column changes quarantined for `meta` whose column this
+    /// registration has now made known (#117).
+    ///
+    /// Must run AFTER the table is registered — the replay goes through the
+    /// normal remote-apply path, which rejects unregistered tables and columns,
+    /// so replaying into a half-populated registry would simply re-quarantine
+    /// everything.
+    ///
+    /// Replayed changes keep their original `col_version`/`site_id`, so the
+    /// ordinary comparator decides the outcome: a local edit made while the
+    /// column was unknown, with a higher clock, still wins. This is a backfill,
+    /// not a forced overwrite.
+    ///
+    /// `notify: None` is deliberate. The `NotificationRegistry` lives in the
+    /// engine task and isn't reachable here, and firing user-facing
+    /// notifications for backfilled history would be wrong regardless (#114).
+    async fn replay_deferred_changes(&self, meta: &TableMeta) -> Result<(), DbErr> {
+        let (replayable, undecodable) =
+            crate::deferred::load_replayable(&self.inner.inner, &meta.table_name, &meta.columns)
+                .await?;
+        if !undecodable.is_empty() {
+            crate::deferred::purge(&self.inner.inner, &undecodable).await?;
+        }
+        if replayable.is_empty() {
+            return Ok(());
+        }
+
+        // Group by originating site so each replayed batch carries an honest
+        // `ChangeSource`. Order within a site is preserved from
+        // `load_replayable` (col_version, then insertion).
+        let mut by_site: Vec<(crate::messages::NodeId, Vec<i64>, Vec<ColumnChange>)> = Vec::new();
+        for (id, change) in replayable {
+            match by_site.iter_mut().find(|(s, _, _)| *s == change.site_id) {
+                Some((_, ids, changes)) => {
+                    ids.push(id);
+                    changes.push(change);
+                }
+                None => by_site.push((change.site_id, vec![id], vec![change])),
+            }
+        }
+
+        for (peer_site, ids, changes) in by_site {
+            let committed = crate::engine::sync_handler::apply_remote_changeset(
+                &self.inner.inner,
+                &self.inner.change_tx,
+                &self.inner.registry,
+                &changes,
+                Some(&self.inner.db_version_cache),
+                crate::messages::ChangeSource::Remote { peer_site },
+                None,
+            )
+            .await;
+
+            if !committed {
+                // Rolled back: NOT delivered. Leave the rows quarantined for the
+                // next registration rather than consuming them — a consume-once
+                // store that purges on anything weaker than a commit is the
+                // silent-loss bug this table exists to prevent (#104, #84).
+                tracing::warn!(
+                    table = %meta.table_name,
+                    deferred = ids.len(),
+                    "replay of deferred changes rolled back; leaving them quarantined"
+                );
+                continue;
+            }
+
+            crate::deferred::purge(&self.inner.inner, &ids).await?;
+            tracing::info!(
+                table = %meta.table_name,
+                replayed = ids.len(),
+                "replayed deferred column changes after schema caught up"
             );
         }
         Ok(())
@@ -1545,6 +1623,15 @@ impl<'a> SchemaBuilder<'a> {
         // purge a not-yet-registered table's backlog.
         for (table_name, sql) in &pending_repairs {
             self.db.run_capture_repair(table_name, sql).await?;
+        }
+        // Every table is registered, so a quarantined change whose column this
+        // build added can now be applied (#117). Same reason as the repairs for
+        // deferring to after the loop: the replay runs through the remote-apply
+        // path, which would re-reject anything still unregistered.
+        for entry in &self.entries {
+            if entry.synced {
+                self.db.replay_deferred_changes(&entry.meta).await?;
+            }
         }
         // Drain anything already captured: crash-window leftovers (a user
         // write committed but its bookkeeping never ran), writes from a

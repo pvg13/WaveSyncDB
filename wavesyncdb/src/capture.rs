@@ -67,6 +67,9 @@ pub(crate) async fn ensure_capture_tables(db: &impl ConnectionTrait) -> Result<(
         "INSERT OR IGNORE INTO {GUARD_TABLE} (id, suppressed) VALUES (1, 0)"
     ))
     .await?;
+    // Quarantine for cells dropped as unregistered-column (#117). Lives here so
+    // it is created at every site that prepares the internal schema.
+    crate::deferred::ensure_deferred_table(db).await?;
     Ok(())
 }
 
